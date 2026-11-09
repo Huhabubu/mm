@@ -56,3 +56,10 @@ python scripts/inspect_tardis.py --day 2026-11-01
 - 六天均观察到正向的 100ms 事件条件平均响应（约 +0.35 至 +0.54bps），匹配的单纯数量变化事件后仍有正向差值；额外 25—100ms 等待会缩小后续响应。
 - **严格边界**：这只是按事件条件统计 OKX 价格变化；全量原生 BBO 上旧 P2 并未胜过 P1，尚未证明样本外增量或做市净利润，且 Tardis 采集时间和 OKX 服务器迁移仍需做稳健性检验。
 - [六日期完整事件研究报告](docs/binance_price_event_study_2026-06_to_11.md)；源代码 `scripts/binance_price_events.py`，合成测试 `scripts/test_binance_price_events.py`。
+
+## 最新：Binance 价格事件条件下的真正增量预测（已完成）
+
+- [成功运行 #42599688211](https://github.com/Huhabubu/mm/actions/runs/42599688211)；[完整结果记录](docs/price_event_increment_results_2026-06_to_11.md)；[代码](scripts/predict_price_event_increment.py)。
+- 对同一批 Binance 原生 BBO **中间价实际变化事件**，P1 仅使用 OKX 本地状态，P2 额外使用 Binance 此次价格变动方向/幅度；共用目标、样本、模型形式；20 项合成测试通过。
+- **探索性结果（未来 100ms）**：零额外延迟下 P2 相对 P1 在 10/11 月的每日 MSE 改善为 **+4.02% / +7.89%**；额外延迟 25ms 后两天等权平均为 **−18.02%**，P1/P2 甚至均不如零预测基准。50ms 也明显失败，不能将前述响应当作真实可交易做市收益。
+- 9—11 月属于此前已查看的日期，未提供新的独立盲测。GLFT 报价中心平移 A 继续暂缓，待非零延迟下的跨时期预测增量验证后再推进。
