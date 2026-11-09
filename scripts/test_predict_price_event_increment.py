@@ -21,7 +21,7 @@ def make_native_samples(with_simultaneous=False):
         "spread": np.full(len(t), 0.2, dtype=np.float64),
     }
     price_up = start + np.arange(1_005_000, 1_305_000, 30_000, dtype=np.int64)
-    price_down = start + np.arange(1_020_000, 1_320_000, 30_000, dtype=np.int64)
+    price_down = start + np.arange(1_027_000, 1_327_000, 30_000, dtype=np.int64)
     if with_simultaneous:
         price_up = np.concatenate((price_up, np.array([start + 1_400_000])))
     events = {
