@@ -45,3 +45,12 @@
 - [ ] 下一步在**Binance 价格实际变化事件的共同决策集合**上，先检验 P1（OKX 本地）与 P2（再加入 Binance 价格变动方向和幅度）的真正样本外增量，再考虑添加 OFI。扩大未参与探索的新测试日期后，才考虑进入 GLFT 的 A 方案。
 
 详见：[官方采集位置与特征研究备忘](docs/tardis_collection_and_features_2026-11-09.md)。
+
+## 2026-11-09 价格事件条件下 P1/P2 增量预测（已完成）
+
+- [x] 新增独立 [配对预测代码](scripts/predict_price_event_increment.py)、[合成测试](scripts/test_predict_price_event_increment.py) 与 [Actions 工作流](.github/workflows/price-event-increment.yml)，P1 为 OKX 本地 5 特征，P2 再加入 Binance 当前价格事件方向和有符号变动幅度。
+- [x] [GitHub Actions #42599688211](https://github.com/Huhabubu/mm/actions/runs/42599688211) 实际处理 6 个日期原生 BBO，完成 0/25/50/100ms 延迟、20/50/100/200/500/1000ms 预测期限的逐日配对比较；**20 项合成测试通过**。同微秒发生 OKX 报价的事件被剔除。
+- [x] **核心初步结果**：0ms 额外延迟，未来 100ms 的 P2 相对 P1 的 MSE 改善：9 月 +3.321%、10 月 +4.022%、11 月 +7.887%，两探索测试日等权 +5.954%；25ms 额外延迟却为 −18.019%，50ms 为 −9.173%，100ms 为 +1.169%。**不能声称非零延迟下有稳定增量**。
+- [x] 25ms 情形下 P1/P2 的 100ms 样本外 MSE 均高于零预测基准，表明训练样本到测试样本之间可能存在模型幅度/结构失配；迁移前后的差异只是待检验假说。
+- [x] 结果及限制已永久保存在 [预测增量实测报告](docs/price_event_increment_results_2026-06_to_11.md)，完整 JSON 见 Actions 附件（14 天）。
+- [ ] **下一步限于主线**：检验训练与测试时期事件信号系数/预测幅度的失配，使用真实验证期做参数选择；需要新增未用于研发决策的独立测试日期或币种。完成后，才考虑用经过验证的预测进入 GLFT 参考价平移 A。
