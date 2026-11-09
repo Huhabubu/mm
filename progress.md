@@ -77,4 +77,6 @@
 
 - [x] 逐行核对 scripts/predict_price_event_increment.py：对于 0/25/50/100ms **各自生成不同决策时点和目标、重新拟合 P1/P2 Ridge、再按该档延迟的 9 月数据独立校准**。因此不存在零延迟模型直接套用 25ms 延迟的实现错误。
 - [x] 已定位下一问题：P2 即使在延迟之后重新训练，仍使用原始触发时刻的 Binance 方向和幅度；需与 OKX 对信号的快速吸收及时钟偏移问题区分，不能只以模型校准解释失效。
-- [ ] [反向事件检验工作流 #42637036552](https://github.com/Huhabubu/mm/actions/runs/42637036552) 已启动：对 2026-06～11 原生 BBO 做 Binance→OKX 与 OKX→Binance 对称价格事件检验，采用同一事件定义/过滤/延迟/期限。[事前方法](docs/symmetric_leadlag_review_protocol_2026-11-09.md)；以最终成功计算结果更新状态。
+- [x] [反向事件检验工作流 #42637036552](https://github.com/Huhabubu/mm/actions/runs/42637036552) **六个日期实际成功完成**，25 项合成测试通过；[8 月和 11 月独立并行复核 #42640763021](https://github.com/Huhabubu/mm/actions/runs/42640763021) 与主运行一致。方法见 [事前方案](docs/symmetric_leadlag_review_protocol_2026-11-09.md)，逐日结果见 [完整实证报告](docs/symmetric_leadlag_results_2026-06_to_11.md)。
+- [x] **重要实证结论**：OKX→Binance 的未来 100ms 有符号价格响应在六天同样全部为正；9—11 月按日平均 0ms 时 B→O +0.3506bps、O→B +0.2303bps，25ms 时 B→O +0.1330bps、O→B +0.1426bps；50ms 分别 +0.1040/+0.1122bps。此前单向领先的解释必须保留市场同步、采集时间偏差和事件分布不均衡的可能性。6—8 月则不同，尚不能归因于服务器迁移。
+- [ ] **下一步仅在审核后**：时间戳整体平移安慰剂（检验接收时钟偏移）、tick/半价差/手续费量级核查；G0 原始 GLFT 的 hftbacktest 教程基准准备可独立推进，但本轮不修改做市模型。
