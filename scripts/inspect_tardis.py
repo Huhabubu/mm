@@ -199,8 +199,10 @@ def align_quality(binance_path, okx_path, start_us, end_us, step_us=100_000, fre
                (("binance", binance_path), ("okx", okx_path))}
     pending = {name: next(stream, None) for name, stream in streams.items()}
     latest = {"binance": None, "okx": None}
+    thresholds_us = (20_000, 50_000, 100_000, 250_000, 500_000, 2_000_000)
     n = {"grid_points": 0, "both_seen": 0, "both_fresh": 0,
-         "missing_initial_side": 0, "stale_either_side": 0}
+         "missing_initial_side": 0, "stale_either_side": 0,
+         "both_fresh_by_threshold_us": {str(v): 0 for v in thresholds_us}}
     ages = {"binance": Sample(seed=1), "okx": Sample(seed=2)}
     relative_mid_bps = Sample(seed=3)
     for t in range(start_us, end_us, step_us):
@@ -215,6 +217,9 @@ def align_quality(binance_path, okx_path, start_us, end_us, step_us=100_000, fre
             continue
         n["both_seen"] += 1
         age_b, age_o = t - b[0], t - o[0]
+        for threshold in thresholds_us:
+            if age_b <= threshold and age_o <= threshold:
+                n["both_fresh_by_threshold_us"][str(threshold)] += 1
         if age_b > freshness_us or age_o > freshness_us:
             n["stale_either_side"] += 1
             continue
