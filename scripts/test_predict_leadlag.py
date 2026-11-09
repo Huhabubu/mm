@@ -40,17 +40,17 @@ class TestLeadLag(unittest.TestCase):
         self.assertEqual(now["rows"], delayed["rows"])
         self.assertGreaterEqual(now["rows"], 3)
         # At OKX 1.100s, the 1.115s Binance jump is in the future.
-        self.assertAlmostEqual(float(now["joint"][0, 4]), 0.0, places=4)
+        self.assertAlmostEqual(float(now["joint"][1, 4]), 0.0, places=4)
         # At OKX 1.120s, the jump has arrived only with zero added delay.
-        self.assertGreater(float(now["joint"][1, 4]), 100.0)
-        self.assertAlmostEqual(float(delayed["joint"][1, 4]), 0.0, places=4)
+        self.assertGreater(float(now["joint"][2, 4]), 100.0)
+        self.assertAlmostEqual(float(delayed["joint"][2, 4]), 0.0, places=4)
         # OKX-only baseline is unchanged by Binance delay.
         np.testing.assert_array_equal(now["local"], delayed["local"])
 
     def test_future_target_at_exact_horizon(self):
         s = make_samples(self.okx, self.binance, self.start, delay_ms=0)
         # At time 1.100s, future OKX mid at 1.120s is 100.2, +20 bps.
-        self.assertAlmostEqual(float(s["y"][0, 0]), 20.0, places=2)
+        self.assertAlmostEqual(float(s["y"][1, 0]), 20.0, places=2)
 
     def test_date_split_has_no_shared_day(self):
         self.assertEqual(len(set(TRAIN_DAYS + VALID_DAYS + TEST_DAYS)), 6)
