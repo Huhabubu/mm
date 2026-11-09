@@ -83,7 +83,10 @@ def make_samples(okx, binance, day_start_us, delay_ms=0, clock="okx"):
         event_t = trigger[chosen] + (int(delay_ms * 1000) if clock == "binance" else 0)
         o_now = chosen if clock == "okx" else asof(ot, event_t)
     b_cutoff = event_t - int(delay_ms * 1000)
-    b_now = asof(bt, b_cutoff)
+    # With native BBO, many successive rows share the same microsecond.
+    # At a Binance-trigger event only that exact triggering row is known;
+    # a timestamp-wide as-of lookup could silently include later rows.
+    b_now = chosen if clock == "binance" else asof(bt, b_cutoff)
     o_100 = asof(ot, event_t - LOOKBACK_US[0])
     o_500 = asof(ot, event_t - LOOKBACK_US[1])
     b_100 = asof(bt, b_cutoff - LOOKBACK_US[0])
