@@ -76,6 +76,19 @@ class TestLeadLag(unittest.TestCase):
         np.testing.assert_array_equal(no_delay["y"][:3], delay["y"][:3])
         self.assertNotEqual(float(no_delay["joint"][1, 4]), float(delay["joint"][1, 4]))
 
+    def test_same_microsecond_binance_rows_do_not_peek_ahead(self):
+        base = self.start
+        # Two native events share one microsecond; trigger is first in file order.
+        binance = make_quotes(
+            [base + v for v in (400_000, 900_000, 1_115_000, 1_115_000, 1_500_000)],
+            [100, 100, 101, 130, 130],
+        )
+        result = make_samples(self.okx, binance, base, clock="binance")
+        self.assertGreaterEqual(result["rows"], 1)
+        # Triggering row moved 100 -> 101 (+100bps), later same-us row 130
+        # cannot be read at this event by a timestamp-wide as-of lookup.
+        self.assertAlmostEqual(float(result["joint"][0, 4]), 100.0, places=2)
+
     def test_date_split_has_no_shared_day(self):
         self.assertEqual(len(set(TRAIN_DAYS + VALID_DAYS + TEST_DAYS)), 6)
         self.assertLess(max(TRAIN_DAYS), min(VALID_DAYS))
