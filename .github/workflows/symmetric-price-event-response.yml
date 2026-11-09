@@ -1,0 +1,38 @@
+name: Symmetric BTC price-event lead-lag direction review
+
+on:
+  push:
+    paths:
+      - ".github/workflows/symmetric-price-event-response.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reverse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned numerical package
+        run: python -m pip install numpy==2.1.3
+      - name: Run causal event order and response regression tests
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Check disk memory
+        run: |
+          df -h .
+          free -h
+      - name: Run six-day symmetric native BBO response comparison
+        run: python scripts/symmetric_price_event_response.py --days 2026-06-01,2026-07-01,2026-08-01,2026-09-01,2026-10-01,2026-11-01
+      - name: Save aggregate metrics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-symmetric-price-event-2026
+          path: reports/btc_symmetric_price_event_response_2026_06_to_11.json
+          if-no-files-found: warn
+          retention-days: 14
