@@ -107,6 +107,42 @@ def metrics(day, samples, pred1, pred2):
     return result
 
 
+
+def validation_shrink_scale(predictions, truth):
+    """MSE-minimizing shrink-only factors on a validation date, per horizon."""
+    predictions = np.asarray(predictions, dtype=np.float64)
+    truth = np.asarray(truth, dtype=np.float64)
+    if predictions.shape != truth.shape or predictions.ndim != 2:
+        raise ValueError("Prediction and truth must be equal 2D arrays")
+    numerator = np.mean(predictions * truth, axis=0)
+    denominator = np.mean(predictions ** 2, axis=0)
+    unconstrained = np.divide(
+        numerator, denominator, out=np.zeros_like(numerator),
+        where=denominator > 1e-16
+    )
+    return np.clip(unconstrained, 0.0, 1.0)
+
+
+def amplitude_diagnostic(truth, pred1, pred2, sign):
+    """Ex-post diagnostics only: do not change the trained models."""
+    truth, pred1, pred2 = (np.asarray(x, dtype=np.float64) for x in (truth, pred1, pred2))
+    out = {}
+    for k, h in enumerate(HORIZONS_MS):
+        y, a, b = truth[:, k], pred1[:, k], pred2[:, k]
+        out[str(h)] = {
+            "target_rms_bps": float(np.sqrt(np.mean(y ** 2))),
+            "p1_prediction_rms_bps": float(np.sqrt(np.mean(a ** 2))),
+            "p2_prediction_rms_bps": float(np.sqrt(np.mean(b ** 2))),
+            "target_signed_by_binance_bps": float(np.mean(y * sign)),
+            "p1_prediction_signed_by_binance_bps": float(np.mean(a * sign)),
+            "p2_prediction_signed_by_binance_bps": float(np.mean(b * sign)),
+            "target_mean_bps": float(np.mean(y)),
+            "p1_prediction_mean_bps": float(np.mean(a)),
+            "p2_prediction_mean_bps": float(np.mean(b)),
+        }
+    return out
+
+
 def fit_compare(prepared):
     # All model parameters are fit on training days only.
     tr = [prepared[d] for d in TRAIN]
@@ -125,6 +161,53 @@ def fit_compare(prepared):
             "mean_daily_improvement_pct": float(np.mean([x["improvement_pct"] for x in vals])),
             "days_p2_better": sum(x["mse_p2_bps2"] < x["mse_p1_bps2"] for x in vals),
         }
+
+    # September is the ONLY source for the shrink multipliers. Oct/Nov
+    # outcomes cannot affect this diagnostic adjustment.
+    v = prepared[VALID[0]]
+    v1, v2 = model1.predict(v["x1"]), model2.predict(v["x2"])
+    scale1 = validation_shrink_scale(v1, v["y"])
+    scale2 = validation_shrink_scale(v2, v["y"])
+    cal = {
+        "method": "one multiplicative shrink-only factor per model and horizon, fitted on September only, clipped to [0,1]",
+        "scales_from_validation": {
+            str(h): {"p1": float(scale1[k]), "p2": float(scale2[k])}
+            for k, h in enumerate(HORIZONS_MS)
+        },
+        "validation": metrics(VALID[0], v, v1 * scale1, v2 * scale2),
+        "exploratory_test": {},
+        "test_daily_equal_weight": {},
+        "amplitude_by_day": {},
+        "binance_coefficients": {
+            str(h): {
+                "direction_coef_bps_per_sign": float(model2.coef[-2, k] / model2.x_std[-2]),
+                "signed_move_coef_bps_per_event_bps": float(model2.coef[-1, k] / model2.x_std[-1]),
+            }
+            for k, h in enumerate(HORIZONS_MS)
+        },
+    }
+    for day in VALID + TEST:
+        sample = prepared[day]
+        p1 = model1.predict(sample["x1"])
+        p2 = model2.predict(sample["x2"])
+        cal["amplitude_by_day"][day] = amplitude_diagnostic(
+            sample["y"], p1, p2, sample["sign"]
+        )
+        if day in TEST:
+            cal["exploratory_test"][day] = metrics(
+                day, sample, p1 * scale1, p2 * scale2
+            )
+    for h in HORIZONS_MS:
+        vals = [cal["exploratory_test"][d]["horizons"][str(h)] for d in TEST]
+        cal["test_daily_equal_weight"][str(h)] = {
+            "mean_daily_improvement_pct": float(np.mean([x["improvement_pct"] for x in vals])),
+            "days_p2_better": sum(x["mse_p2_bps2"] < x["mse_p1_bps2"] for x in vals),
+            "days_p1_beats_zero": sum(x["mse_p1_bps2"] < x["mse_zero_bps2"] for x in vals),
+            "days_p2_beats_zero": sum(x["mse_p2_bps2"] < x["mse_zero_bps2"] for x in vals),
+            "mse_p1_bps2": float(np.mean([x["mse_p1_bps2"] for x in vals])),
+            "mse_p2_bps2": float(np.mean([x["mse_p2_bps2"] for x in vals])),
+        }
+    report["validation_amplitude_calibration"] = cal
     return report
 
 
@@ -152,6 +235,7 @@ def main():
             "Tardis collector cross-venue reception paths still differ; extra delay is a hypothetical sensitivity.",
             "Overlapping high-frequency outcomes are dependent; date count is six, exploratory test only two.",
             "An improvement in MSE is not evidence of executable or profitable GLFT quotes.",
+            "Validation-only shrinkage uses an already observed September date; Oct/Nov remain exploratory, not blind holdout.",
             "Price-event labels and feature magnitudes can be affected by tick size and differing BBO frequencies.",
         ],
     }
@@ -184,6 +268,13 @@ def main():
                 for d in days
             }
             result = fit_compare(prepared)
+            for h in (100, 500):
+                cc = result["validation_amplitude_calibration"]
+                s = cc["scales_from_validation"][str(h)]
+                score = cc["test_daily_equal_weight"][str(h)]
+                print(f"  validation-calibrated {h}ms: shrink P1={s['p1']:.3f}, "
+                      f"P2={s['p2']:.3f}; mean daily gain={score['mean_daily_improvement_pct']:+.3f}%, "
+                      f"P2 beats zero on {score['days_p2_beats_zero']}/2 days", flush=True)
             result["event_counts"] = {d: {
                 "up": int(raw[d]["counts"]["selected_up"]),
                 "down": int(raw[d]["counts"]["selected_down"]),
