@@ -28,12 +28,12 @@ jobs:
       - name: Runner available disk
         run: df -h .
       - name: Download six separate Tardis dates and compare P1 vs P2
-        run: python scripts/predict_leadlag.py --delays-ms 0,25,50,100
+        run: python scripts/predict_leadlag.py --clock binance --delays-ms 0,25,50,100
       - name: Upload aggregate results only
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: btc-cross-venue-prediction-pilot-2026
-          path: reports/prediction_pilot_btc_2026-06_to_11.json
+          name: btc-cross-venue-binance-trigger-2026
+          path: reports/prediction_pilot_btc_clock_binance_2026-06_to_11.json
           if-no-files-found: warn
           retention-days: 14
