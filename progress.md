@@ -17,7 +17,7 @@
 
 - [x] 实现逐报价事件的时点选择、跨所 as-of 特征、20–5000ms 未来 OKX 收益标签和固定 Ridge 回归。
 - [x] 测试数据切分：6/7/8 月 1 日训练、9 月 1 日验证、10/11 月 1 日独立测试；只使用对应 Tardis 免费日。
-- [x] 离线合成测试 7 项通过，覆盖未来信息隔离、Binance 先动/OKX 后动和额外延迟、目标构造与日期隔离。
+- [x] 离线合成测试 8 项通过，覆盖未来信息隔离、Binance 先动/OKX 后动和额外延迟、目标构造与日期隔离。
 - [x] [GitHub Actions #42562392532](https://github.com/Huhabubu/mm/actions/runs/42562392532) 完成六个月两所 quotes 下载、真实数据估计及 Binance 额外延迟 0/25/50/100ms 测试。
 - [x] 保存正式研究记录：[docs/prediction_pilot_2026-06_to_11.md](docs/prediction_pilot_2026-06_to_11.md)。零额外延迟、100ms 预测期在两测试日分别改善 16.53% 和 20.60% 的 MSE；50ms 额外延迟后两测试日平均改善约 0.065%。均为先导观察，不代表交易收益。
 - [x] [GitHub Actions #42562872097](https://github.com/Huhabubu/mm/actions/runs/42562872097) 完成预先固定的 100ms 时间网格对照（37ms 相位）。100ms 预测期在固定网格上平均改善 −0.446%，提示 Binance 事件触发的优势具有明显条件性。
