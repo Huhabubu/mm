@@ -1,0 +1,40 @@
+name: ENA native BBO P1 vs P2 predeclared cross-symbol test
+
+on:
+  push:
+    paths:
+      - ".github/workflows/ena-native-bbo-holdout.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ena:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install same pinned numerical library
+        run: python -m pip install numpy==2.1.3
+      - name: Run existing causal-alignment and calibration regression suite
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Check runner free disk
+        run: df -h .
+      - name: Preflight 2026-11-01 ENA native feeds on both exchanges
+        run: python scripts/check_alt_symbol.py --day 2026-11-01 --asset ENA --binance-symbol ENAUSDT --okx-symbol ENA-USDT-SWAP
+      - name: Six-day unchanged P1 P2 model and validation-only shrinkage
+        run: python scripts/predict_price_event_increment.py --asset ENA --binance-symbol ENAUSDT --okx-symbol ENA-USDT-SWAP
+      - name: Upload only aggregate data QA and model metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ena-native-bbo-p1-p2-cross-symbol-2026
+          path: |
+            reports/ena_native_bbo_preflight_2026-11-01.json
+            reports/price_event_p1_p2_native_bbo_ena_2026-06_to_11.json
+          if-no-files-found: warn
+          retention-days: 14
