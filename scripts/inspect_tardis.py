@@ -1,7 +1,7 @@
 """Download and inspect one free monthly Tardis day without republishing market data.
 
 No third-party dependencies; reads compressed CSV in constant memory.
-All timestamps are UTC epoch microseconds. The 100ms alignment is QA only.
+All timestamps are UTC epoch microseconds. The 10ms alignment is QA only.
 """
 import argparse
 import csv
@@ -193,7 +193,7 @@ def quotes(path):
                 continue
 
 
-def align_quality(binance_path, okx_path, start_us, end_us, step_us=100_000, freshness_us=2_000_000):
+def align_quality(binance_path, okx_path, start_us, end_us, step_us=10_000, freshness_us=2_000_000):
     """Full-day past-only as-of alignment on a fixed grid, retaining aggregate QA only."""
     streams = {name: iter(quotes(path)) for name, path in
                (("binance", binance_path), ("okx", okx_path))}
@@ -229,7 +229,7 @@ def align_quality(binance_path, okx_path, start_us, end_us, step_us=100_000, fre
         mb, mo = (b[1] + b[2]) / 2, (o[1] + o[2]) / 2
         relative_mid_bps.add((mb / mo - 1) * 10000)
     return {
-        "method": "past-only as-of by Tardis local_timestamp, 100ms grid; QA not trading signal",
+        "method": f"past-only as-of by Tardis local_timestamp, {step_us/1000:g}ms grid; QA not trading signal",
         "step_us": step_us, "max_quote_age_us": freshness_us, "counts": n,
         "coverage_pct": round(100 * n["both_fresh"] / max(1, n["grid_points"]), 4),
         "age_binance_us_approx": ages["binance"].result(),
