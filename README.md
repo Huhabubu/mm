@@ -41,3 +41,10 @@ python scripts/inspect_tardis.py --day 2026-11-01
 **真实运行和结果**：2026-11-09 在 [GitHub Actions #42562392532](https://github.com/Huhabubu/mm/actions/runs/42562392532) 完成 Binance 事件触发实验，在 [#42562872097](https://github.com/Huhabubu/mm/actions/runs/42562872097) 完成独立固定时间网格检验。两者短期预测结果存在明显差异；详见 [研究记录](docs/prediction_pilot_2026-06_to_11.md)。首次运行由提交工作流自动触发，之后可在仓库 Actions 页手动重跑。只保存汇总 JSON，原始 Tardis 文件始终在运行器中临时下载，不提交到仓库。
 
 特别注意：Binance 事件触发时 P1 的评估时点也由 Binance 行情活动选择，尚需固定评价时钟的稳健性对照；两所 Tardis 采集时间不等于同一实盘主机的同步接收时间。
+
+## 原生 BBO 复核（2026-11-09 已完成）
+
+- 使用 Tardis 原生 `book_ticker`（Binance `bookTicker` / OKX `bbo-tbt`），与由 L2 重建的 `quotes` 作同口径比较。
+- [真实 QA #42581171378](https://github.com/Huhabubu/mm/actions/runs/42581171378)：2026-11-01 Binance 原生 13,834,893 条、OKX 原生 1,468,859 条，均无异常报价或采集时间倒序。详见 [数据质量报告](docs/native_bbo_qa_2026-11-01.md)。
+- [原生预测 #42582157158](https://github.com/Huhabubu/mm/actions/runs/42582157158)：六个月实际数据、11 项合成测试通过。原先 `quotes` 下约 **+18.56%** 的 100ms MSE 改善在原生 BBO 下变为 **−0.97%**（Binance 事件时钟），固定网格为 **−2.62%**。详见 [预测复核报告](docs/native_bbo_prediction_2026-06_to_11.md)。
+- 研究状态：旧的 100ms 强预测改善**未复现**，不能将其作为交易所领先的证明。尚未进入 GLFT 回测；下一步先检查真实 Binance 价格变化事件与 OKX 的短期响应，评估 OFI、加权中间价等微观结构特征。
