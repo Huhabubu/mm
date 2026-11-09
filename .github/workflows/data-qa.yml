@@ -1,0 +1,36 @@
+name: Inspect Tardis BTC quotes/trades
+
+on:
+  push:
+    paths:
+      - ".github/workflows/data-qa.yml"
+      - "scripts/inspect_tardis.py"
+      - "scripts/test_inspect_tardis.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run focused offline tests
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Report runner disk space
+        run: df -h .
+      - name: Download and QA Binance and OKX free day
+        run: python scripts/inspect_tardis.py --day 2026-11-01
+      - name: Upload QA summary only (no licensed raw market data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tardis-btc-2026-11-01-qa
+          path: reports/*.json
+          if-no-files-found: warn
+          retention-days: 14
