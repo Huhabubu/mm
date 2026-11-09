@@ -52,6 +52,19 @@ class TestLeadLag(unittest.TestCase):
         # At time 1.100s, future OKX mid at 1.120s is 100.2, +20 bps.
         self.assertAlmostEqual(float(s["y"][1, 0]), 20.0, places=2)
 
+    def test_binance_trigger_before_okx_repricing(self):
+        # Binance moves at +1.115s, before the OKX quote changes at +1.120s.
+        immediate = make_samples(self.okx, self.binance, self.start, delay_ms=0, clock="binance")
+        delayed = make_samples(self.okx, self.binance, self.start, delay_ms=25, clock="binance")
+        self.assertGreaterEqual(immediate["rows"], 1)
+        self.assertGreaterEqual(delayed["rows"], 1)
+        # At +1.115s: OKX still 100.0, and +20ms forward mid is 100.2.
+        self.assertAlmostEqual(float(immediate["y"][0, 0]), 20.0, places=2)
+        # The 25ms delay makes decision +1.140s: OKX has already repriced.
+        self.assertAlmostEqual(float(delayed["y"][0, 0]), 0.0, places=2)
+        # Local OKX features reflect their distinct arrival-time states.
+        self.assertNotEqual(float(immediate["local"][0, 0]), float(delayed["local"][0, 0]))
+
     def test_date_split_has_no_shared_day(self):
         self.assertEqual(len(set(TRAIN_DAYS + VALID_DAYS + TEST_DAYS)), 6)
         self.assertLess(max(TRAIN_DAYS), min(VALID_DAYS))
