@@ -201,6 +201,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--delays-ms", default="0,25,50,100")
     parser.add_argument("--clock", choices=("okx", "binance", "grid"), default="binance")
+    parser.add_argument("--data-kind", choices=("quotes", "book_ticker"), default="quotes")
     parser.add_argument("--data-dir", default="data/raw")
     parser.add_argument("--report-dir", default="reports")
     args = parser.parse_args()
@@ -219,8 +220,8 @@ def main():
             ("okx", "okex-swap", "BTC-USDT-SWAP"),
             ("binance", "binance-futures", "BTCUSDT"),
         ):
-            dest = Path(args.data_dir) / day / f"{exchange}_{symbol}_quotes.csv.gz"
-            info = download(exchange, symbol, "quotes", day, dest)
+            dest = Path(args.data_dir) / day / f"{exchange}_{symbol}_{args.data_kind}.csv.gz"
+            info = download(exchange, symbol, args.data_kind, day, dest)
             downloads[day][name] = {
                 "compressed_bytes": info["compressed_bytes"],
                 "sha256_gzip": info["sha256_gzip"],
@@ -231,6 +232,7 @@ def main():
     report = {
         "status": "complete",
         "experiment": "pilot_predict_quote_features",
+        "data_kind": args.data_kind,
         "decision_clock": args.clock,
         "days": {"train": TRAIN_DAYS, "validation": VALID_DAYS, "test": TEST_DAYS},
         "target": "OKX as-of future mid return, bps",
@@ -250,7 +252,7 @@ def main():
             "Grid-clock tests use a fixed 100ms grid with a 37ms phase; different fixed phases can change microstructure results.",
             "No simulation of order execution, fees, live colocated network clocks, or trading profitability.",
             "Individual high-frequency events overlap; no per-tick p-values.",
-            "Quotes only; trade flow and L2 not included in this pilot.",
+            "BBO only; trade flow and depth not included in this pilot.",
             "Binance timestamps delayed in sensitivity, but collector-site time offset remains unidentified.",
         ],
     }
@@ -276,7 +278,8 @@ def main():
                 f"({s['days_better_joint']}/2 test days improved)",
                 flush=True,
             )
-    dest = Path(args.report_dir) / f"prediction_pilot_btc_clock_{args.clock}_2026-06_to_11.json"
+    suffix = "" if args.data_kind == "quotes" else f"_{args.data_kind}"
+    dest = Path(args.report_dir) / f"prediction_pilot_btc_clock_{args.clock}{suffix}_2026-06_to_11.json"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Saved aggregate summary: {dest}", flush=True)
