@@ -1,0 +1,36 @@
+name: Native BBO vs reconstructed L2 QA
+
+on:
+  push:
+    paths:
+      - ".github/workflows/native-bbo-qa.yml"
+      - "scripts/compare_bbo_feeds.py"
+      - "scripts/test_compare_bbo_feeds.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run synthetic QA tests
+        run: python -m unittest discover -s scripts -p 'test_compare_bbo_feeds.py' -v
+      - name: Report disk budget
+        run: df -h .
+      - name: Download and validate 2026-11-01 native BBO and L2 quotes
+        run: python scripts/compare_bbo_feeds.py --day 2026-11-01
+      - name: Save aggregate QA only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-bbo-source-qa-2026-11-01
+          path: reports/native_bbo_vs_l2_2026-11-01.json
+          if-no-files-found: warn
+          retention-days: 14
