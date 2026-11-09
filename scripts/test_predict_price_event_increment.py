@@ -5,7 +5,7 @@ import numpy as np
 
 from predict_price_event_increment import (
     DELAYS_MS, TRAIN, VALID, TEST, HORIZONS_MS,
-    event_samples, fit_compare, metrics
+    event_samples, fit_compare, metrics, validation_shrink_scale
 )
 
 
@@ -70,6 +70,27 @@ class TestPriceEventIncrement(unittest.TestCase):
         self.assertGreaterEqual(s["excluded_simultaneous"], 1)
         self.assertEqual(s["n_source_events"], 21)
         self.assertEqual(s["n"], 20)
+
+    def test_validation_shrink_scale_handles_overforecast_and_zero_signal(self):
+        pred = np.array([[2.0, -2.0, 0.0, 1.0],
+                         [4.0, -4.0, 0.0, -1.0]])
+        truth = np.array([[1.0, 2.0, 1.0, 3.0],
+                          [2.0, 4.0, 1.0, -3.0]])
+        scale = validation_shrink_scale(pred, truth)
+        np.testing.assert_allclose(scale, [0.5, 0.0, 0.0, 1.0])
+
+    def test_calibration_is_fit_on_validation_only(self):
+        okx, ev, start = make_native_samples()
+        sample = event_samples(okx, ev, start)
+        dates = {d: sample for d in TRAIN + VALID + TEST}
+        first = fit_compare(dates)["validation_amplitude_calibration"]["scales_from_validation"]
+        # Alter only the Oct/Nov labels: fitted shrink factors must be unchanged.
+        changed = dict(dates)
+        for d in TEST:
+            changed[d] = dict(sample)
+            changed[d]["y"] = sample["y"] * -4
+        second = fit_compare(changed)["validation_amplitude_calibration"]["scales_from_validation"]
+        self.assertEqual(first, second)
 
     def test_fixed_splits_and_horizons(self):
         self.assertEqual(set(TRAIN) & set(VALID + TEST), set())
