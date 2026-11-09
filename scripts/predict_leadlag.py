@@ -63,14 +63,19 @@ def asof(times, requested):
     return np.searchsorted(times, requested, side="right") - 1
 
 
-def make_samples(okx, binance, day_start_us, delay_ms=0):
-    """Build comparable P1/P2 rows and future OKX labels without forward-looking features."""
+def make_samples(okx, binance, day_start_us, delay_ms=0, clock="okx"):
+    """Paired P1/P2 on real quote events, preserving time-of-availability."""
+    if clock not in ("okx", "binance"):
+        raise ValueError("clock must be okx or binance")
     ot, bt = okx["t"], binance["t"]
-    # First observed OKX quote event in each 20ms bucket; no interpolation.
-    chosen = np.flatnonzero(np.r_[True, ot[1:] // DECISION_BUCKET_US != ot[:-1] // DECISION_BUCKET_US])
-    event_t = ot[chosen]
+    # First observed quote EVENT in a 20ms bucket (not periodic resampling).
+    trigger = ot if clock == "okx" else bt
+    chosen = np.flatnonzero(np.r_[True, trigger[1:] // DECISION_BUCKET_US != trigger[:-1] // DECISION_BUCKET_US])
+    # An extra cross-venue feed delay shifts WHEN Binance triggers the decision.
+    event_t = trigger[chosen] + (int(delay_ms * 1000) if clock == "binance" else 0)
     b_cutoff = event_t - int(delay_ms * 1000)
     b_now = asof(bt, b_cutoff)
+    o_now = chosen if clock == "okx" else asof(ot, event_t)
     o_100 = asof(ot, event_t - LOOKBACK_US[0])
     o_500 = asof(ot, event_t - LOOKBACK_US[1])
     b_100 = asof(bt, b_cutoff - LOOKBACK_US[0])
@@ -79,21 +84,23 @@ def make_samples(okx, binance, day_start_us, delay_ms=0):
     mask = (
         (event_t >= day_start_us + 1_000_000)
         & (event_t + max(HORIZONS_MS) * 1000 < day_end_us)
-        & (b_now >= 0) & (o_100 >= 0) & (o_500 >= 0)
+        & (o_now >= 0) & (b_now >= 0) & (o_100 >= 0) & (o_500 >= 0)
         & (b_100 >= 0) & (b_500 >= 0)
     )
     # Index arrays must be clipped before fancy indexing; exclude invalid rows via mask.
-    age = event_t - bt[np.maximum(b_now, 0)]
-    mask &= (age >= 0) & (age <= MAX_REMOTE_AGE_US)
-    chosen, event_t, b_now, o_100, o_500, b_100, b_500 = (
-        arr[mask] for arr in (chosen, event_t, b_now, o_100, o_500, b_100, b_500)
+    age_b = event_t - bt[np.maximum(b_now, 0)]
+    age_o = event_t - ot[np.maximum(o_now, 0)]
+    mask &= (age_b >= 0) & (age_b <= MAX_REMOTE_AGE_US)
+    mask &= (age_o >= 0) & (age_o <= MAX_REMOTE_AGE_US)
+    event_t, o_now, b_now, o_100, o_500, b_100, b_500 = (
+        arr[mask] for arr in (event_t, o_now, b_now, o_100, o_500, b_100, b_500)
     )
     om, bm = okx["mid"], binance["mid"]
     x_local = np.column_stack([
-        10_000 * (om[chosen] / om[o_100] - 1),
-        10_000 * (om[chosen] / om[o_500] - 1),
-        okx["obi"][chosen],
-        okx["spread"][chosen],
+        10_000 * (om[o_now] / om[o_100] - 1),
+        10_000 * (om[o_now] / om[o_500] - 1),
+        okx["obi"][o_now],
+        okx["spread"][o_now],
     ])
     x_joint = np.column_stack([
         x_local,
@@ -105,7 +112,7 @@ def make_samples(okx, binance, day_start_us, delay_ms=0):
     # AS-OF targets: future return at exactly t+h, carrying forward last OKX quote.
     # Targets can use future OKX information; FEATURES cannot.
     y = np.column_stack([
-        10_000 * (om[asof(ot, event_t + h * 1000)] / om[chosen] - 1)
+        10_000 * (om[asof(ot, event_t + h * 1000)] / om[o_now] - 1)
         for h in HORIZONS_MS
     ])
     return {
@@ -185,6 +192,7 @@ def run_fit(samples):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--delays-ms", default="0,25,50,100")
+    parser.add_argument("--clock", choices=("okx", "binance"), default="binance")
     parser.add_argument("--data-dir", default="data/raw")
     parser.add_argument("--report-dir", default="reports")
     args = parser.parse_args()
@@ -215,12 +223,13 @@ def main():
     report = {
         "status": "complete",
         "experiment": "pilot_predict_quote_features",
+        "decision_clock": args.clock,
         "days": {"train": TRAIN_DAYS, "validation": VALID_DAYS, "test": TEST_DAYS},
         "target": "OKX as-of future mid return, bps",
         "features_p1": ["OKX 100ms return", "OKX 500ms return", "OKX L1 imbalance", "OKX spread bps"],
         "features_p2_extra": ["Binance 100ms return", "Binance 500ms return", "Binance L1 imbalance", "Binance spread bps"],
         "horizons_ms": HORIZONS_MS,
-        "decision": "first OKX quote event in each 20ms bucket",
+        "decision": f"first {args.clock} quote event in each 20ms bucket; Binance trigger shifted by extra feed delay",
         "time_basis": "Tardis local_timestamp per venue, may reflect non-co-located collectors",
         "binance_extra_delay_ms": delays,
         "max_remote_quote_age_ms": MAX_REMOTE_AGE_US / 1000,
@@ -229,6 +238,7 @@ def main():
         "sensitivity": {},
         "limitations": [
             "Only two OOS dates; do not assert statistically significant alpha.",
+            "P1 evaluated at common Binance-trigger times when clock=binance, so event timing is conditioned on Binance activity.",
             "No simulation of order execution, fees, live colocated network clocks, or trading profitability.",
             "Individual high-frequency events overlap; no per-tick p-values.",
             "Quotes only; trade flow and L2 not included in this pilot.",
@@ -236,12 +246,12 @@ def main():
         ],
     }
     for delay in delays:
-        print(f"Fitting quote alpha; Binance artificially delayed {delay}ms", flush=True)
+        print(f"Fitting quote alpha; clock={args.clock}; Binance delayed {delay}ms", flush=True)
         samples = {}
         for day in day_list:
             start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1e6)
             venues = raw[day]
-            samples[day] = make_samples(venues["okx"], venues["binance"], start, delay)
+            samples[day] = make_samples(venues["okx"], venues["binance"], start, delay, clock=args.clock)
             if samples[day]["rows"] < 100:
                 raise RuntimeError(f"Too few samples: {day} delay={delay}ms")
             print(f"  {day}: {samples[day]['rows']:,} paired samples", flush=True)
@@ -257,7 +267,7 @@ def main():
                 f"({s['days_better_joint']}/2 test days improved)",
                 flush=True,
             )
-    dest = Path(args.report_dir) / "prediction_pilot_btc_2026-06_to_11.json"
+    dest = Path(args.report_dir) / f"prediction_pilot_btc_clock_{args.clock}_2026-06_to_11.json"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Saved aggregate summary: {dest}", flush=True)
