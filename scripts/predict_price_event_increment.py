@@ -215,10 +215,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="data/raw")
     ap.add_argument("--report-dir", default="reports")
+    ap.add_argument("--binance-symbol", default="BTCUSDT")
+    ap.add_argument("--okx-symbol", default="BTC-USDT-SWAP")
+    ap.add_argument("--asset", default="BTC")
     args = ap.parse_args()
+    if not (args.asset.isalpha() and args.asset.isupper()
+            and args.binance_symbol.endswith("USDT")
+            and args.okx_symbol.endswith("-USDT-SWAP")):
+        ap.error("Expected uppercase USDT-perpetual symbols and uppercase alphabetic asset")
     report = {
         "status": "started",
         "purpose": "Binance event-restricted incremental out-of-sample OKX midprice prediction",
+        "asset": args.asset,
+        "symbols": {"binance": args.binance_symbol, "okx": args.okx_symbol},
         "source": "Tardis native book_ticker; Binance event stream and OKX target both BBO",
         "selection": "first Binance native midpoint price CHANGE in each 20ms bucket, file order",
         "training_days": TRAIN, "validation_days": VALID, "exploratory_test_days": TEST,
@@ -239,7 +248,8 @@ def main():
             "Price-event labels and feature magnitudes can be affected by tick size and differing BBO frequencies.",
         ],
     }
-    outpath = Path(args.report_dir) / "price_event_p1_p2_native_bbo_2026-06_to_11.json"
+    suffix = "" if args.asset == "BTC" else f"_{args.asset.lower()}"
+    outpath = Path(args.report_dir) / f"price_event_p1_p2_native_bbo{suffix}_2026-06_to_11.json"
     outpath.parent.mkdir(parents=True, exist_ok=True)
     try:
         raw = {}
@@ -247,8 +257,8 @@ def main():
         for d in days:
             folder = Path(args.data_dir) / d
             prepared = {}
-            for venue, exchange, symbol in (("okx", "okex-swap", "BTC-USDT-SWAP"),
-                                            ("binance", "binance-futures", "BTCUSDT")):
+            for venue, exchange, symbol in (("okx", "okex-swap", args.okx_symbol),
+                                            ("binance", "binance-futures", args.binance_symbol)):
                 path = folder / f"{exchange}_{symbol}_book_ticker.csv.gz"
                 if not path.is_file():
                     print(f"Downloading {d}: {venue}", flush=True)
