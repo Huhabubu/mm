@@ -65,17 +65,25 @@ def asof(times, requested):
 
 def make_samples(okx, binance, day_start_us, delay_ms=0, clock="okx"):
     """Paired P1/P2 on real quote events, preserving time-of-availability."""
-    if clock not in ("okx", "binance"):
-        raise ValueError("clock must be okx or binance")
+    if clock not in ("okx", "binance", "grid"):
+        raise ValueError("clock must be okx, binance or grid")
     ot, bt = okx["t"], binance["t"]
-    # First observed quote EVENT in a 20ms bucket (not periodic resampling).
-    trigger = ot if clock == "okx" else bt
-    chosen = np.flatnonzero(np.r_[True, trigger[1:] // DECISION_BUCKET_US != trigger[:-1] // DECISION_BUCKET_US])
-    # An extra cross-venue feed delay shifts WHEN Binance triggers the decision.
-    event_t = trigger[chosen] + (int(delay_ms * 1000) if clock == "binance" else 0)
+    if clock == "grid":
+        # Fixed, venue-independent 100ms decision times with predeclared 37ms phase.
+        # Unlike Binance event sampling, this does not condition the test clock on a Binance tick.
+        event_t = np.arange(
+            day_start_us + 1_037_000, day_start_us + 86_400_000_000,
+            100_000, dtype=np.int64
+        )
+        o_now = asof(ot, event_t)
+    else:
+        trigger = ot if clock == "okx" else bt
+        chosen = np.flatnonzero(np.r_[True, trigger[1:] // DECISION_BUCKET_US != trigger[:-1] // DECISION_BUCKET_US])
+        # Extra delay shifts WHEN an incoming Binance event triggers a decision.
+        event_t = trigger[chosen] + (int(delay_ms * 1000) if clock == "binance" else 0)
+        o_now = chosen if clock == "okx" else asof(ot, event_t)
     b_cutoff = event_t - int(delay_ms * 1000)
     b_now = asof(bt, b_cutoff)
-    o_now = chosen if clock == "okx" else asof(ot, event_t)
     o_100 = asof(ot, event_t - LOOKBACK_US[0])
     o_500 = asof(ot, event_t - LOOKBACK_US[1])
     b_100 = asof(bt, b_cutoff - LOOKBACK_US[0])
@@ -192,7 +200,7 @@ def run_fit(samples):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--delays-ms", default="0,25,50,100")
-    parser.add_argument("--clock", choices=("okx", "binance"), default="binance")
+    parser.add_argument("--clock", choices=("okx", "binance", "grid"), default="binance")
     parser.add_argument("--data-dir", default="data/raw")
     parser.add_argument("--report-dir", default="reports")
     args = parser.parse_args()
@@ -229,7 +237,7 @@ def main():
         "features_p1": ["OKX 100ms return", "OKX 500ms return", "OKX L1 imbalance", "OKX spread bps"],
         "features_p2_extra": ["Binance 100ms return", "Binance 500ms return", "Binance L1 imbalance", "Binance spread bps"],
         "horizons_ms": HORIZONS_MS,
-        "decision": f"first {args.clock} quote event in each 20ms bucket; Binance trigger shifted by extra feed delay",
+        "decision": ("venue-independent 100ms grid with 37ms phase" if args.clock == "grid" else f"first {args.clock} quote event in each 20ms bucket; Binance trigger shifted by extra feed delay"),
         "time_basis": "Tardis local_timestamp per venue, may reflect non-co-located collectors",
         "binance_extra_delay_ms": delays,
         "max_remote_quote_age_ms": MAX_REMOTE_AGE_US / 1000,
@@ -239,6 +247,7 @@ def main():
         "limitations": [
             "Only two OOS dates; do not assert statistically significant alpha.",
             "P1 evaluated at common Binance-trigger times when clock=binance, so event timing is conditioned on Binance activity.",
+            "Grid-clock tests use a fixed 100ms grid with a 37ms phase; different fixed phases can change microstructure results.",
             "No simulation of order execution, fees, live colocated network clocks, or trading profitability.",
             "Individual high-frequency events overlap; no per-tick p-values.",
             "Quotes only; trade flow and L2 not included in this pilot.",
