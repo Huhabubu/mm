@@ -67,10 +67,10 @@ def event_samples(okx, events, start_us, delay_ms=0):
     ))
     combined = np.column_stack((local, sign, signed_size))
     # Target may use later data, features may not.
-    y = np.column_stack((
+    y = np.column_stack([
         10_000 * (om[np.searchsorted(ot, decision_t + h * 1_000, side="right") - 1] / om[now] - 1)
         for h in HORIZONS_MS
-    ))
+    ])
     return {
         "x1": local.astype(np.float32),
         "x2": combined.astype(np.float32),
