@@ -65,6 +65,17 @@ class TestLeadLag(unittest.TestCase):
         # Local OKX features reflect their distinct arrival-time states.
         self.assertNotEqual(float(immediate["local"][0, 0]), float(delayed["local"][0, 0]))
 
+    def test_fixed_grid_does_not_follow_binance_event_time(self):
+        no_delay = make_samples(self.okx, self.binance, self.start, delay_ms=0, clock="grid")
+        delay = make_samples(self.okx, self.binance, self.start, delay_ms=25, clock="grid")
+        self.assertGreaterEqual(no_delay["rows"], 3)
+        self.assertGreaterEqual(delay["rows"], 3)
+        # Only the Binance features may change. The fixed decision schedule and
+        # local OKX reference must not shift when the Binance feed is delayed.
+        np.testing.assert_array_equal(no_delay["local"][:3], delay["local"][:3])
+        np.testing.assert_array_equal(no_delay["y"][:3], delay["y"][:3])
+        self.assertNotEqual(float(no_delay["joint"][1, 4]), float(delay["joint"][1, 4]))
+
     def test_date_split_has_no_shared_day(self):
         self.assertEqual(len(set(TRAIN_DAYS + VALID_DAYS + TEST_DAYS)), 6)
         self.assertLess(max(TRAIN_DAYS), min(VALID_DAYS))
