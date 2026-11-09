@@ -48,3 +48,11 @@ python scripts/inspect_tardis.py --day 2026-11-01
 - [真实 QA #42581171378](https://github.com/Huhabubu/mm/actions/runs/42581171378)：2026-11-01 Binance 原生 13,834,893 条、OKX 原生 1,468,859 条，均无异常报价或采集时间倒序。详见 [数据质量报告](docs/native_bbo_qa_2026-11-01.md)。
 - [原生预测 #42582157158](https://github.com/Huhabubu/mm/actions/runs/42582157158)：六个月实际数据、11 项合成测试通过。原先 `quotes` 下约 **+18.56%** 的 100ms MSE 改善在原生 BBO 下变为 **−0.97%**（Binance 事件时钟），固定网格为 **−2.62%**。详见 [预测复核报告](docs/native_bbo_prediction_2026-06_to_11.md)。
 - 研究状态：旧的 100ms 强预测改善**未复现**，不能将其作为交易所领先的证明。尚未进入 GLFT 回测；下一步先检查真实 Binance 价格变化事件与 OKX 的短期响应，评估 OFI、加权中间价等微观结构特征。
+
+## Binance 价格变动事件研究（六个日期，已完成）
+
+- [9—11 月真实运行 #42590594754](https://github.com/Huhabubu/mm/actions/runs/42590594754)；[6—8 月真实运行 #42591370486](https://github.com/Huhabubu/mm/actions/runs/42591370486)。
+- 对原生 Binance BBO **中间价发生变化**的事件（每 20ms 桶最多取第一条）分别记录上涨、下跌及 OKX 未来 20—1000ms 的同向价格响应，采用相同微秒内的原始文件顺序。
+- 六天均观察到正向的 100ms 事件条件平均响应（约 +0.35 至 +0.54bps），匹配的单纯数量变化事件后仍有正向差值；额外 25—100ms 等待会缩小后续响应。
+- **严格边界**：这只是按事件条件统计 OKX 价格变化；全量原生 BBO 上旧 P2 并未胜过 P1，尚未证明样本外增量或做市净利润，且 Tardis 采集时间和 OKX 服务器迁移仍需做稳健性检验。
+- [六日期完整事件研究报告](docs/binance_price_event_study_2026-06_to_11.md)；源代码 `scripts/binance_price_events.py`，合成测试 `scripts/test_binance_price_events.py`。
