@@ -36,6 +36,8 @@
 - [x] 整理 Rajendran & Singaravelu (2026) 订单流毒性论文和 OFI、盘口加权价格、队列不平衡等候选微观结构指标。
 - [x] [GitHub Actions #42581171378](https://github.com/Huhabubu/mm/actions/runs/42581171378) 已下载并全量检查 2026-11-01 两所原生 `book_ticker`：Binance 13,834,893 条、OKX 1,468,859 条，均无异常报价与采集时间倒序；与旧 L2 `quotes` 存在更新频率差异。[完整质量报告](docs/native_bbo_qa_2026-11-01.md)。
 - [x] 发现 Binance 原生 BBO 有 4,979,295 条与上一行共用微秒时间戳；已修复 Binance 事件触发时读取同时间戳后续行的潜在前视问题，并补充合成回归测试。
-- [ ] **当前进行中**：用原生 `book_ticker` 重新运行 P1/P2（Binance 事件时钟及固定时钟），对比旧 `quotes` 的价格预测结果；以修复事件顺序后的最新代码输出为准。
+- [x] [GitHub Actions #42582157158](https://github.com/Huhabubu/mm/actions/runs/42582157158) 在修复微秒内事件顺序后，成功完成 6 个日期两所原生 `book_ticker` 预测重跑，包含 Binance 事件时钟、固定时钟与 0/25/50/100ms 额外延迟；11 项合成测试通过。
+- [x] **关键修正结论**：旧 `quotes` 在 100ms 预测期的 Binance 事件触发 MSE 改善约 +18.56%，原生 BBO 复核为 **−0.97%**，固定时钟为 **−2.62%**。先前强信号的学术证据不成立，已记录逐日和完整期限结果：[原生 BBO 预测复核](docs/native_bbo_prediction_2026-06_to_11.md)。
+- [ ] 下一步先在原生 BBO 上诊断 Binance 价格实际变化事件与 OKX 响应，并逐步增加 OFI 和加权中间价特征；扩大完全未用作模型筛选的独立测试日期。
 
 详见：[官方采集位置与特征研究备忘](docs/tardis_collection_and_features_2026-11-09.md)。
