@@ -1,0 +1,40 @@
+name: G0 OKX original GLFT baseline
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_baseline.py'
+      - 'scripts/test_g0_glft_baseline.py'
+      - '.github/workflows/g0-okx-glft.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  g0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned hftbacktest
+        run: pip install hftbacktest==2.4.4
+      - name: Run focused tests
+        run: python -m unittest discover -s scripts -p 'test_g0_glft_baseline.py' -v
+      - name: Runner resources
+        run: |
+          free -h
+          df -h .
+      - name: Calibrate and run real OKX GLFT with hftbacktest
+        run: python scripts/g0_glft_baseline.py --day 2026-11-01
+      - name: Upload only aggregate scenario results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-g0-glft-2026-11-01
+          path: reports/g0_glft_btc_2026-11-01.json
+          if-no-files-found: warn
+          retention-days: 14
