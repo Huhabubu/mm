@@ -37,9 +37,9 @@ class GLFTRollingTests(unittest.TestCase):
         changes=np.tile(np.array([-1.,0.,1.]),2000)
         result=fit_recent_arrivals(arr,changes)
         self.assertEqual(result[0],0)
-        arr[MIN_CROSSING_INTERVALS]=2.0
-        # With enough events, a constant horizontal curve still has k near zero
-        # and is rejected by the positivity criterion.
+        arr[:MIN_CROSSING_INTERVALS]=100.0
+        # With enough extreme events but equal intensity across all 70 bins,
+        # the fitted slope is numerically zero and cannot identify distance decay.
         self.assertEqual(fit_recent_arrivals(arr,changes)[0],0)
 
     def test_insufficient_order_flow_marks_invalid(self):

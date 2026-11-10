@@ -86,7 +86,7 @@ def fit_recent_arrivals(arrivals, changes):
     variance = max(0.0, squared/var_n - (total/var_n)**2)
     sigma = math.sqrt(variance / (STEP_NS / 1e9))
     if not (np.isfinite(a) and np.isfinite(k) and np.isfinite(sigma) and
-            a > 0 and k > 0 and sigma > 0):
+            a > 0 and k > 1e-8 and sigma > 0):
         return 0, a, k, sigma, n, qualifying_intervals, extreme_intervals
     return 1, a, k, sigma, n, qualifying_intervals, extreme_intervals
 
