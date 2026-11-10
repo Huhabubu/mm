@@ -25,3 +25,7 @@
 以后扩大到完整 UTC 日，日收益逐日独立评估；核实历史合约规格、费率、资金费率，实测下撤单延迟、队列成交假设，检查全日盘口 BBO 一致性及内存资源。未来 G2 仅加载完整 OKX 盘口，Binance 预先计算信号按时间对齐。
 
 资料：OKX https://www.okx.com/docs-v5/en/ ；OKX 官方 https://github.com/okx/agent-skills/blob/github-main/skills/okx-cex-market/references/instrument-commands.md ；Tardis https://docs.tardis.dev/downloadable-csv-files ；hftbacktest https://hftbacktest.readthedocs.io/en/py-v2.2.0/tutorials/GLFT%20Market%20Making%20Model%20and%20Grid%20Trading.html
+
+## 本轮运行与后续扩展记录
+
+首次 10min 校准加 5min 评价（Actions #42801137160）无真实数据模拟成交；后按相同 A/k/sigma 和相同策略公式延长为 10min 校准加 50min 评价（Actions #42801845615）得到买卖各 1 笔成交和净盯市权益 −0.15292666 USDT。该值仅是片段回测；完整证据见 [G0 结果报告](g0_glft_baseline_results_2026-11-10.md)。后续主线仍需完整每日独立评价。
