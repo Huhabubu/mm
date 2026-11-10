@@ -155,17 +155,17 @@ def calibrate_replay(hbt):
     return warm(hbt)
 
 
-def trade_replay(hbt, half_tick, skew_tick):
+def trade_replay(hbt, half_tick, skew_tick, trade_steps):
     from numba import njit
     from hftbacktest import BUY, SELL, GTX, LIMIT, FILLED
 
     @njit
-    def strategy(engine, half, skew):
+    def strategy(engine, half, skew, step_limit):
         n = submissions = cancels = buys = sells = 0
         max_pos = 0.0
         min_equity, max_equity = np.inf, -np.inf
         pre_fills = engine.state_values(0).num_trades
-        for _ in range(TRADE):
+        for _ in range(step_limit):
             if engine.elapse(STEP_NS) != 0:
                 break
             orders = engine.orders(0)
@@ -216,10 +216,10 @@ def trade_replay(hbt, half_tick, skew_tick):
         return (n, submissions, cancels, buys, sells, st.num_trades-pre_fills,
                 st.position, max_pos, st.balance, st.fee, st.trading_value,
                 final_mid, final_equity, min_equity, max_equity)
-    return strategy(hbt, half_tick, skew_tick)
+    return strategy(hbt, half_tick, skew_tick, trade_steps)
 
 
-def run_engine(paths, counts, folder):
+def run_engine(paths, counts, folder, trade_steps):
     from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
@@ -252,7 +252,7 @@ def run_engine(paths, counts, folder):
         params = calibrate(arrivals, changes)
         half, skew = quote_coefficients(params["A_per_second"], params["k_per_tick"],
                                          params["sigma_tick_per_sqrt_second"])
-        results = trade_replay(engine, half, skew)
+        results = trade_replay(engine, half, skew, trade_steps)
     finally:
         engine.close()
     keys = ("decision_steps", "submitted_orders", "cancel_requests",
@@ -277,13 +277,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--day", default="2026-11-01")
     p.add_argument("--report-dir", default="reports")
+    p.add_argument("--trade-minutes", type=int, default=5, choices=(5, 50))
     args = p.parse_args()
     day = datetime.strptime(args.day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     if day.day != 1:
         p.error("Tardis free days must be 1st of month")
-    end_us = int(day.timestamp()*1_000_000)+900_000_000
+    trade_steps = args.trade_minutes * 600
+    end_us = int(day.timestamp()*1_000_000) + (600 + args.trade_minutes * 60) * 1_000_000
     report = {"status": "started", "day_utc": args.day,
-              "window": "10min training + 5min out-of-training evaluation",
+              "window": f"10min calibration + {args.trade_minutes}min evaluation",
               "scenario": {"tick_size_usdt": TICK, "lot_contracts": LOT,
                            "ctval_btc_per_contract": CTVAL, "ctmult": 1,
                            "maker_fee": MAKER_FEE, "taker_fee": TAKER_FEE,
@@ -294,7 +296,7 @@ def main():
                            "historical_spec_verified": False, "actual_account_fee_verified": False,
                            "live_latency_measured": False},
               "NOT_daily_net_return": True}
-    out = Path(args.report_dir)/f"g0_glft_btc_{args.day}.json"
+    out = Path(args.report_dir)/f"g0_glft_btc_{args.day}_{10 + args.trade_minutes}m.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         report["live_instrument"] = read_live_spec()
@@ -305,10 +307,10 @@ def main():
             counts = {}
             for kind in SCHEMAS:
                 paths[kind] = work/(kind+".csv")
-                counts[kind] = extract_window(kind, args.day, end_us, paths[kind], max_rows=1_000_000)
+                counts[kind] = extract_window(kind, args.day, end_us, paths[kind], max_rows=2_500_000)
             report["feed_counts"] = counts
             report["units"] = unit_grid_audit(paths)
-            report["g0"] = run_engine(paths, counts, work)
+            report["g0"] = run_engine(paths, counts, work, trade_steps)
         report["status"] = "complete"
     except Exception as exc:
         report["status"] = "failed"

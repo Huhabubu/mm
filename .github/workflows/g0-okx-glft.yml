@@ -31,12 +31,12 @@ jobs:
           free -h
           df -h .
       - name: Calibrate and run real OKX GLFT with hftbacktest
-        run: python scripts/g0_glft_baseline.py --day 2026-11-01
+        run: python scripts/g0_glft_baseline.py --day 2026-11-01 --trade-minutes 50
       - name: Upload only aggregate scenario results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: okx-g0-glft-2026-11-01
-          path: reports/g0_glft_btc_2026-11-01.json
+          name: okx-g0-glft-2026-11-01-60m
+          path: reports/g0_glft_btc_2026-11-01_60m.json
           if-no-files-found: warn
           retention-days: 14
