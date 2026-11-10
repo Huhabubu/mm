@@ -1,0 +1,38 @@
+name: G0 executed maker fill markout diagnostic
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_fill_markout.py'
+      - 'scripts/test_g0_fill_markout.py'
+      - '.github/workflows/g0-fill-markout.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  markout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Check causal and censored fill markouts
+        run: |
+          python -m unittest discover -s scripts -p 'test_g0_fill_markout.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_fill_timestamp.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_rolling.py' -v
+      - name: Actual OKX November baseline maker fills and price markout
+        run: python scripts/g0_fill_markout.py --day 2026-11-01
+      - name: Upload aggregates only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-g0-markout-2026-11-01
+          path: reports/g0_fill_markout_2026-11-01_60m.json
+          if-no-files-found: warn
+          retention-days: 14
