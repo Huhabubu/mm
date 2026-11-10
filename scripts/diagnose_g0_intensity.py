@@ -296,8 +296,12 @@ def main():
                 holdout_arr, holdout_changes, n2 = calibrate_replay(engine)
             finally:
                 engine.close()
-            if n1 != TRAIN or n2 != TRAIN:
-                raise ValueError(f"Missing 100ms calibration/holdout steps {n1} / {n2}")
+            # Tardis ends at the last observed event, not exactly at the wall-clock boundary.
+            if n1 != TRAIN or n2 < TRAIN - 5:
+                raise ValueError(f"Missing too many 100ms calibration/holdout steps {n1} / {n2}")
+            report["train_replay_steps"] = n1
+            report["holdout_replay_steps"] = n2
+            report["holdout_replay_seconds"] = n2 * STEP_NS / 1_000_000_000
             prior = calibrate(train_arr, changes)
             report["legacy_estimate_original_unchanged"] = prior
             report["legacy_quote_original_unchanged"] = dict(zip(
