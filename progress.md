@@ -196,3 +196,13 @@
 - [x] 已核对部分场景结束时仍有未平仓库存；另按假设 taker 5bps 在期末中间价平仓**仅扣假想平仓手续费**做额外敏感性，低 gamma=0.001 的平均净权益由 −4.351→约 **−4.605 USDT**，旧 gamma 对应 −4.191→约 **−4.210 USDT**。实际平仓跨点差、冲击和资金费率未计，不能称已真实平仓收益。
 - [x] [完整结果、六日期 36 场景及局限](docs/g0_gamma_sweep_results_2026-11-10.md)，[事前协议](docs/g0_gamma_sweep_protocol_2026-11-10.md)，[6 日期工作流](.github/workflows/g0-gamma-sweep.yml)，每日期汇总 JSON 见成功 Actions 附件（14 天）。仅为此前已多次探索的每日期 **50min** 样本，非独立全日收益/严格盲测。
 - [ ] **风险预算未提供，尚无合法可解释的 gamma 优选值，不修改正式 G0 默认 gamma。** 下一步应优先检查 A/k 距离外推与 maker 费用/逆向选择，随后明确最大可承担库存波动与回撤标准，再在未参与研发的新样本中复核。
+
+## 2026-11-10 回归主线：G0-R 真实成交时刻 markout 与 Binance 做市指导方案
+
+- [x] **冻结参数调试，研究问题转为 Binance 是否帮助 OKX 避免不利 Maker 成交**。前期在 BTC/ENA 额外 25/50ms 下 P2 预测增量不稳定，故后续 G1（仅 OKX）和 G2（G1 + Binance）必须在**至少 25ms 额外信号等待**的情景与同一市场决策集合上进行成对真实交易模拟，不能预设 Binance 必定有收益优势。
+- [x] [官方 HBT 成交时戳证明 #42841961956](https://github.com/Huhabubu/mm/actions/runs/42841961956) **success**：可控样本中填单 `Order.exch_timestamp` 等于真正交易所触发成交时间，`Order.local_timestamp` 保留原提交时间。禁止以策略下一次 100ms 轮询发现 FILLED 的时刻代替真实成交时刻。
+- [x] 新增 [精确 maker 成交质量诊断](scripts/g0_fill_markout.py)、[5 项数据时间先后/删失/价格方向测试](scripts/test_g0_fill_markout.py)、[Actions](.github/workflows/g0-fill-markout.yml) 与 [后续 G1/G2 实验约束](docs/g0_binance_guidance_protocol_2026-11-10.md)；在原 G0-R 增加**默认关闭**的成交时间记录开关，不改变 gamma=0.05、HBT 队列/手续费/延迟和执行。
+- [x] [真实运行 #42843478410](https://github.com/Huhabubu/mm/actions/runs/42843478410) **success，12/12 测试通过**。2026-11-01 OKX BTC-USDT-SWAP 前 10min 校准后 50min 交易，官方填单 **54/54 完整归集**，期末净盯市权益 **−1.15322894 USDT** 与 G0-R 原回测严格一致。聚合 JSON 附件 `13776083669`；未上传市场逐笔数据或填单逐笔。
+- [x] 100ms 成交质量主指标：50/54 笔具备新鲜的成交前/未来原生 BBO，成交前至 +100ms 有 **48/50（96%）** 方向不利，平均总 markout **−0.798bps**。细分后首个严格后续 BBO 前的成交附近即时变动约 **−0.644bps**，之后继续移动约 **−0.154bps**，后续继续移动为负的比例 **44%**。因此 **96% 绝不能解释为‘成交后仍持续下跌/上涨’**；其约 81% 均值损失在首次后续报价前出现，需检验 Binance 能否更早预警并实际取消订单。
+- [x] 100ms 每笔有效成交均值：价差捕获 +0.002532 USDT、总 markout −0.006188 USDT、maker 费用 0.015517 USDT、价差+markout−费用的 100ms 估值代理 −0.019173 USDT；此代理不能替代引擎完整持仓账本。详细主/稳健 100ms/500ms/1s/2s 见 [实测完整报告](docs/g0_fill_markout_results_2026-11-10.md)。
+- [ ] **下一步直接进入 G1 vs G2 Binance 引导挂单对照**：在当前稳定 G0-R 代码和固定的 markout/费用/库存评价口径上加入严格时间可见的 Binance 本地可用特征，事前固定 25ms 主要延迟、50ms 稳健性，先小样本联调，再按独立日期净收益验证实际可执行指导效果；不能通过事后剔除不利成交或事后选择信号事件得到优势。
