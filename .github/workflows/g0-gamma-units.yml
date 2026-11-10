@@ -1,0 +1,27 @@
+name: G0 GLFT gamma economic unit audit
+
+on:
+  push:
+    paths:
+      - 'scripts/test_g0_gamma_units.py'
+      - '.github/workflows/g0-gamma-units.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gamma-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install verified simulator dependency
+        run: pip install hftbacktest==2.4.4
+      - name: Test current gamma units, cash conversion, fees, and quote invariance
+        run: |
+          python -m unittest discover -s scripts -p 'test_g0_gamma_units.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_rolling.py' -v
