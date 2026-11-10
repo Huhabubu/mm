@@ -62,16 +62,20 @@ def estimate_poisson_curve(exposure, fills, max_tick=FIT_MAX_TICK):
             step = np.linalg.solve(hessian, score)
         except np.linalg.LinAlgError:
             return {"status": "singular_information_matrix"}
+        # Newton's step becomes numerically stationary before objective changes
+        # are distinguishable in floating point, especially with many exposed bins.
+        if np.max(np.abs(step)) < 1e-8:
+            break
         old_loss = loss(beta)
         scale = 1.0
         while scale >= 1 / 65536 and loss(beta - scale*step) >= old_loss:
             scale *= 0.5
         if scale < 1 / 65536:
-            if np.max(np.abs(score)) < 1e-5:
+            if np.max(np.abs(step)) < 1e-6:
                 break
             return {"status": "line_search_failure"}
         beta -= scale * step
-        if np.max(np.abs(scale*step)) < 1e-9:
+        if np.max(np.abs(scale*step)) < 1e-8:
             break
     k = float(-beta[1])
     a = float(math.exp(beta[0] - beta[1]*center))
