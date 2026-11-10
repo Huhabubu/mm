@@ -29,12 +29,12 @@ jobs:
           free -h
           df -h .
       - name: Calibrate real OKX maker fills with active-order exposure
-        run: python scripts/g0_queue_intensity.py --day 2026-11-01
+        run: python scripts/g0_queue_intensity.py --day 2026-11-01 --compare-10ms
       - name: Upload aggregate result without raw exchange data
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: okx-g0-queue-intensity-2026-11-01
-          path: reports/g0_queue_intensity_2026-11-01.json
+          name: okx-g0-queue-intensity-compare-2026-11-01
+          path: reports/g0_queue_intensity_compare_2026-11-01.json
           retention-days: 14
           if-no-files-found: warn

@@ -2,10 +2,27 @@
 import unittest
 import numpy as np
 from g0_queue_intensity import (HALF_TICK_BINS, estimate_poisson_curve,
-                                 check_holdout, pool_rows)
+                                 check_holdout, pool_rows, observation_schedule)
 
 
 class QueueIntensityTests(unittest.TestCase):
+    def test_10ms_observation_preserves_100ms_decision_clock(self):
+        coarse_ns, coarse_per_quote, coarse_samples = observation_schedule(100)
+        fine_ns, fine_per_quote, fine_samples = observation_schedule(10)
+        self.assertEqual((coarse_ns, coarse_per_quote, coarse_samples), (100_000_000,1,6000))
+        self.assertEqual((fine_ns, fine_per_quote, fine_samples), (10_000_000,10,60000))
+        self.assertEqual(coarse_samples//coarse_per_quote, fine_samples//fine_per_quote)
+        self.assertEqual([(i+1)*coarse_ns for i in range(100)],
+                         [(i+1)*fine_per_quote*fine_ns for i in range(100)])
+        with self.assertRaises(ValueError):
+            observation_schedule(25)
+
+    def test_exposure_seconds_are_sampling_invariant(self):
+        # 50 completed 10ms intervals and 5 completed 100ms intervals are both .5s.
+        for ms in (10, 100):
+            step_ns, _, _ = observation_schedule(ms)
+            self.assertAlmostEqual((500_000_000//step_ns)*(step_ns/1e9),0.5)
+
     def test_exposure_rate_not_nominal_time(self):
         e = np.zeros(HALF_TICK_BINS)
         n = np.zeros(HALF_TICK_BINS)

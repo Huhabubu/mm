@@ -24,6 +24,14 @@ FIT_MAX_TICK = 100.0
 INTERVAL_SECONDS = STEP_NS / 1e9
 
 
+def observation_schedule(observation_ms):
+    """Keep the 100ms strategy clock invariant while refining observation clock."""
+    if observation_ms not in (10, 100):
+        raise ValueError("Observation resolution must be 10ms or 100ms")
+    step_ns = observation_ms * 1_000_000
+    return step_ns, STEP_NS // step_ns, TRAIN * (STEP_NS // step_ns)
+
+
 def estimate_poisson_curve(exposure, fills, max_tick=FIT_MAX_TICK):
     """Poisson MLE with per-bin exposure offset: E[N]=exposure*A*exp(-k*d).
 
@@ -120,8 +128,8 @@ def check_holdout(fit, exposure, fills):
             "training_constant_poisson_deviance": deviance(n, baseline)}
 
 
-def simulate_window(npz, low, high, target, phase):
-    """Replay official queue engine; count 100ms exposure only for status NEW.
+def simulate_window(npz, low, high, target, phase, observation_ms=100):
+    """Replay official engine; sample accepted-order exposure at observation_ms.
 
     An order filled after being NONE at interval start is reported unmatched
     and excluded from the numerator: its exchange-active time was not observed.
@@ -130,15 +138,18 @@ def simulate_window(npz, low, high, target, phase):
                              FILLED, GTX, LIMIT)
     from numba import njit
 
+    step_ns, steps_per_quote, planned_steps = observation_schedule(observation_ms)
+    step_seconds = step_ns / 1e9
+
     @njit
-    def replay(hbt, target_depth, steps):
+    def replay(hbt, target_depth, steps, sample_ns, sample_seconds, quote_every):
         exposure = np.zeros(HALF_TICK_BINS, np.float64)
         buy_exposure = np.zeros(HALF_TICK_BINS, np.float64)
         sell_exposure = np.zeros(HALF_TICK_BINS, np.float64)
         fills = np.zeros(HALF_TICK_BINS, np.int64)
         buy_fills = np.zeros(HALF_TICK_BINS, np.int64)
         sell_fills = np.zeros(HALF_TICK_BINS, np.int64)
-        processed = submitted = canceled = unmatched = unmatched_new = overflow = pending = 0
+        processed = quote_decisions = submitted = canceled = unmatched = unmatched_new = overflow = pending = 0
         total_fills = 0
         max_pos = 0.0
         min_actual = np.inf
@@ -174,16 +185,16 @@ def simulate_window(npz, low, high, target, phase):
                 else:
                     if o.status != FILLED:
                         pending += 1
-            if hbt.elapse(STEP_NS) != 0:
+            if hbt.elapse(sample_ns) != 0:
                 break
-            # An entire 100ms is credited for accepted orders seen at the start.
-            # Exposure timing uncertainty is at most one step per order transition.
+            # Credit one observation interval to orders accepted at its start.
+            # Transition timing uncertainty shrinks from 100ms to 10ms.
             if bid_bin > 0:
-                exposure[bid_bin] += INTERVAL_SECONDS
-                buy_exposure[bid_bin] += INTERVAL_SECONDS
+                exposure[bid_bin] += sample_seconds
+                buy_exposure[bid_bin] += sample_seconds
             if ask_bin > 0:
-                exposure[ask_bin] += INTERVAL_SECONDS
-                sell_exposure[ask_bin] += INTERVAL_SECONDS
+                exposure[ask_bin] += sample_seconds
+                sell_exposure[ask_bin] += sample_seconds
             processed += 1
 
             order_map = hbt.orders(0)
@@ -205,6 +216,10 @@ def simulate_window(npz, low, high, target, phase):
                             unmatched_new += 1
             hbt.clear_inactive_orders(0)
             hbt.clear_last_trades(0)
+            # Strategy is deliberately still updated only every 100ms.
+            if processed % quote_every != 0:
+                continue
+            quote_decisions += 1
             d = hbt.depth(0)
             bid, ask = d.best_bid_tick, d.best_ask_tick
             if bid <= 0 or ask <= bid or ask >= 1_000_000_000:
@@ -238,7 +253,7 @@ def simulate_window(npz, low, high, target, phase):
                 hbt.submit_sell_order(0, oid, want_ask*TICK, ORDER_QTY, GTX, LIMIT, False)
                 submitted += 1
         st = hbt.state_values(0)
-        return (processed, exposure, buy_exposure, sell_exposure, fills, buy_fills,
+        return (processed, quote_decisions, exposure, buy_exposure, sell_exposure, fills, buy_fills,
                 sell_fills, total_fills, unmatched, unmatched_new, overflow, pending,
                 submitted, canceled, st.num_trades, st.position, max_pos, min_actual)
 
@@ -246,13 +261,17 @@ def simulate_window(npz, low, high, target, phase):
     try:
         if phase == "holdout" and engine.elapse(TRAIN*STEP_NS) != 0:
             raise RuntimeError("unable to reach holdout start")
-        result = replay(engine, float(target), TRAIN)
+        result = replay(engine, float(target), planned_steps, step_ns, step_seconds, steps_per_quote)
     finally:
         engine.close()
-    (steps, exposure, be, se, fills, bf, sf, total, unmatched, unmatched_new,
+    (steps, quote_decisions, exposure, be, se, fills, bf, sf, total, unmatched, unmatched_new,
      overflow, pending, submitted, canceled, engine_trades, pos, max_pos, minimum) = result
-    if steps < TRAIN - 5:
-        raise ValueError(f"{phase} {target}: only {steps} decision steps")
+    # The last local event can precede the 10min boundary by <500ms.
+    tolerance = max(5, 500_000_000 // step_ns)
+    if steps < planned_steps - tolerance:
+        raise ValueError(f"{phase} {target}: only {steps}/{planned_steps} observed intervals")
+    if quote_decisions != steps // steps_per_quote:
+        raise ValueError(f"{phase} {target}: 100ms quote schedule drift")
     if int(total) != int(engine_trades):
         raise ValueError(f"{phase} {target}: fill state mismatch {total} / {engine_trades}")
     if not np.allclose(exposure, be+se):
@@ -264,11 +283,16 @@ def simulate_window(npz, low, high, target, phase):
     if abs(pos) > POSITION_CAP + ORDER_QTY + 1e-9:
         raise ValueError(f"{phase} {target}: inventory cap exceeded")
     nonzero = np.flatnonzero(exposure[1:] > 0) + 1
-    return {"phase": phase, "target_ticks": target, "decision_steps": int(steps),
+    return {"phase": phase, "target_ticks": target,
+            "observation_ms": observation_ms,
+            "observed_intervals": int(steps), "observed_seconds": steps*step_seconds,
+            "decision_steps": int(quote_decisions),
             "submitted": int(submitted), "cancellation_requests": int(canceled),
             "total_engine_fills": int(total), "exposure_matched_fills": int(np.sum(fills)),
             "unmatched_fills": int(unmatched), "unmatched_new_order_fills": int(unmatched_new),
             "unmeasured_accepted_steps": int(overflow), "pending_order_steps": int(pending),
+            "pending_order_seconds": float(pending*step_seconds),
+            "unmeasured_accepted_seconds": float(overflow*step_seconds),
             "active_exposure_seconds": float(np.sum(exposure)),
             "active_bid_exposure_seconds": float(np.sum(be)),
             "active_ask_exposure_seconds": float(np.sum(se)),
@@ -292,12 +316,12 @@ def pool_rows(records):
     return exp, fills
 
 
-def run_diagnostic(npz, low, high):
+def run_diagnostic(npz, low, high, observation_ms=100):
     train = []
     holdout = []
     for target in TARGET_TICKS:
-        train.append(simulate_window(npz,low,high,target,"train"))
-        holdout.append(simulate_window(npz,low,high,target,"holdout"))
+        train.append(simulate_window(npz,low,high,target,"train", observation_ms))
+        holdout.append(simulate_window(npz,low,high,target,"holdout", observation_ms))
     e1,n1 = pool_rows(train)
     e2,n2 = pool_rows(holdout)
     fitted = estimate_poisson_curve(e1,n1)
@@ -314,7 +338,9 @@ def run_diagnostic(npz, low, high):
     for record in train+holdout:
         record.pop("exposure_by_half_tick_seconds")
         record.pop("matched_fills_by_half_tick")
-    return {"training_scenarios":train, "holdout_scenarios":holdout,
+    return {"observation_ms": observation_ms,
+            "quote_decision_ms": 100,
+            "training_scenarios":train, "holdout_scenarios":holdout,
             "exposure_binned_by_actual_price_distance":rows,
             "train_poisson_fit":fitted, "out_of_sample_validation":checked,
             "training_total_exposure_seconds":float(e1.sum()),
@@ -329,6 +355,8 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--day",default="2026-11-01")
     parser.add_argument("--report-dir",default="reports")
+    parser.add_argument("--compare-10ms",action="store_true",
+                        help="Run both 100ms and 10ms observation; quote decisions remain 100ms")
     args=parser.parse_args()
     day=datetime.strptime(args.day,"%Y-%m-%d").replace(tzinfo=timezone.utc)
     if day.day!=1:
@@ -343,8 +371,11 @@ def main():
             "entry_response_latency_ms":[1,1],
             "queue_model":"power_prob_queue_model(2.0)",
             "fill_model":"no_partial_fill_exchange",
-            "exposure_approximation":"100ms accepted-order-start snapshots; fills without observed active exposure excluded and counted"}
-    output=Path(args.report_dir)/f"g0_queue_intensity_{args.day}.json"
+            "exposure_approximation":"accepted-order-start observations; fills without observed active exposure excluded and counted",
+            "observation_ms": [100,10] if args.compare_10ms else [100]}
+    filename=(f"g0_queue_intensity_compare_{args.day}.json" if args.compare_10ms
+              else f"g0_queue_intensity_{args.day}.json")
+    output=Path(args.report_dir)/filename
     output.parent.mkdir(parents=True,exist_ok=True)
     try:
         from hftbacktest.data.utils import tardis
@@ -372,7 +403,29 @@ def main():
                 for row in csv.DictReader(fh):
                     low=min(low,float(row["bid_price"]))
                     high=max(high,float(row["ask_price"]))
-            report["calibration"]=run_diagnostic(npz,low,high)
+            if args.compare_10ms:
+                old = run_diagnostic(npz,low,high,100)
+                fine = run_diagnostic(npz,low,high,10)
+                comparable = []
+                for side in ("training", "holdout"):
+                    for index, target in enumerate(TARGET_TICKS):
+                        before = old[f"{side}_scenarios"][index]
+                        after = fine[f"{side}_scenarios"][index]
+                        comparable.append({
+                            "phase": side, "target_ticks": target,
+                            "engine_fills_100ms": before["total_engine_fills"],
+                            "engine_fills_10ms": after["total_engine_fills"],
+                            "order_submissions_100ms": before["submitted"],
+                            "order_submissions_10ms": after["submitted"],
+                            "order_cancellations_100ms": before["cancellation_requests"],
+                            "order_cancellations_10ms": after["cancellation_requests"],
+                            "quote_decisions_100ms": before["decision_steps"],
+                            "quote_decisions_10ms": after["decision_steps"]})
+                report["comparison"]={"baseline_100ms":old, "fine_10ms":fine,
+                                       "per_target_execution_consistency":comparable,
+                                       "note":"If engine fills or quote counts differ, schedule/measurement coupling must be investigated"}
+            else:
+                report["calibration"]=run_diagnostic(npz,low,high,100)
         report["status"]="complete"
     except Exception as exc:
         report["status"]="failed"
