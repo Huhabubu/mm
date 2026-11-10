@@ -1,0 +1,40 @@
+name: G0 OKX hftbacktest data compatibility
+
+on:
+  push:
+    paths:
+      - '.github/workflows/g0-okx-data-compat.yml'
+      - 'scripts/check_okx_hft_data.py'
+      - 'scripts/test_check_okx_hft_data.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned hftbacktest converter
+        run: pip install hftbacktest==2.4.4
+      - name: Run focused offline tests
+        run: python -m unittest discover -s scripts -p 'test_check_okx_hft_data.py' -v
+      - name: Inspect runner resources
+        run: |
+          free -h
+          df -h .
+      - name: Check real Tardis OKX 60-second window
+        run: python scripts/check_okx_hft_data.py --day 2026-11-01 --seconds 60
+      - name: Upload aggregate QA only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-g0-hft-data-compat
+          path: reports/g0_okx_data_compat_2026-11-01.json
+          if-no-files-found: warn
+          retention-days: 14
