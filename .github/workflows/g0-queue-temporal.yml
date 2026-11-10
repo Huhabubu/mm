@@ -1,0 +1,42 @@
+name: G0 queue intensity monthly time-stability
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_queue_temporal.py'
+      - 'scripts/test_g0_queue_temporal.py'
+      - '.github/workflows/g0-queue-temporal.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  temporal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official engine
+        run: pip install hftbacktest==2.4.4
+      - name: Test chronological split, no leakage, and rate summaries
+        run: |
+          python -m unittest discover -s scripts -p 'test_g0_queue_temporal.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_queue_intensity.py' -v
+      - name: Resources
+        run: |
+          free -h
+          df -h .
+      - name: Six monthly first-day real OKX maker fill intensity tests
+        run: python scripts/g0_queue_temporal.py
+      - name: Upload aggregated temporal diagnosis only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-g0-queue-temporal-2026-06-to-11
+          path: reports/g0_queue_temporal_2026-06_to_11.json
+          retention-days: 14
+          if-no-files-found: warn
