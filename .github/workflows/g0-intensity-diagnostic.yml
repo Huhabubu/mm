@@ -1,0 +1,40 @@
+name: G0 OKX intensity diagnosis
+
+on:
+  push:
+    paths:
+      - 'scripts/diagnose_g0_intensity.py'
+      - 'scripts/test_g0_intensity_diagnostic.py'
+      - '.github/workflows/g0-intensity-diagnostic.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official engine pinned
+        run: pip install hftbacktest==2.4.4
+      - name: Run focused regression tests
+        run: python -m unittest discover -s scripts -p 'test_g0_intensity_diagnostic.py' -v
+      - name: Inspect memory and disk
+        run: |
+          free -h
+          df -h .
+      - name: Compare real OKX strict crossing, touch, fits and engine fills
+        run: python scripts/diagnose_g0_intensity.py --day 2026-11-01
+      - name: Upload aggregated diagnostics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-g0-intensity-diagnostic-2026-11-01
+          path: reports/g0_intensity_diagnostic_2026-11-01.json
+          retention-days: 14
+          if-no-files-found: warn
