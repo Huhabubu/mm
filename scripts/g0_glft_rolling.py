@@ -92,19 +92,19 @@ def fit_recent_arrivals(arrivals, changes):
 
 
 @njit
-def glft_coefficients(a, k, sigma):
-    """Retain original G0 scenario gamma and contract-based order quantity."""
-    u = GAMMA * ORDER_QTY / k
-    c1 = math.log1p(u) / (GAMMA * ORDER_QTY)
-    c2 = math.sqrt(GAMMA / (2 * a * ORDER_QTY * k)
-                   * math.exp((k/(GAMMA * ORDER_QTY) + 1) * math.log1p(u)))
+def glft_coefficients(a, k, sigma, gamma_code=GAMMA):
+    """Risk aversion gamma_code is in inverse (contract * price tick) units."""
+    u = gamma_code * ORDER_QTY / k
+    c1 = math.log1p(u) / (gamma_code * ORDER_QTY)
+    c2 = math.sqrt(gamma_code / (2 * a * ORDER_QTY * k)
+                   * math.exp((k/(gamma_code * ORDER_QTY) + 1) * math.log1p(u)))
     half = c1 + ORDER_QTY/2 * c2 * sigma
     skew = c2 * sigma
     return half, skew
 
 
 @njit
-def run_strategy(engine, rolling, trade_steps):
+def run_strategy(engine, rolling, trade_steps, gamma_code=GAMMA):
     """One official simulator run: warmup and trading in one causal event loop."""
     # Reusable ring: every sample is collected *after* replaying past 100ms.
     arrivals = np.full(TRAIN, np.nan, np.float64)
@@ -120,6 +120,11 @@ def run_strategy(engine, rolling, trade_steps):
     min_equity, max_equity = np.inf, -np.inf
     max_position = 0.0
     first_equity = np.nan
+    peak_equity = 0.0
+    max_drawdown = 0.0
+    inventory_abs_contract_seconds = 0.0
+    inventory_squared_contract_seconds = 0.0
+    time_at_position_cap_seconds = 0.0
     pre_fills = engine.state_values(0).num_trades
     actual_steps = 0
     # First 6000 intervals for warmup only, then trade decision every 100ms.
@@ -158,7 +163,7 @@ def run_strategy(engine, rolling, trade_steps):
             valid, new_a, new_k, new_sigma, fit_levels, trade_intervals, extremes = (
                 fit_recent_arrivals(arrivals, changes))
             if valid:
-                new_half, new_skew = glft_coefficients(new_a, new_k, new_sigma)
+                new_half, new_skew = glft_coefficients(new_a, new_k, new_sigma, gamma_code)
                 if (np.isfinite(new_half) and np.isfinite(new_skew)
                         and new_half > 0 and new_skew > 0):
                     a, k, sigma, half, skew = (
@@ -210,6 +215,12 @@ def run_strategy(engine, rolling, trade_steps):
         min_equity = min(min_equity,equity)
         max_equity = max(max_equity,equity)
         max_position = max(max_position,abs(pos))
+        inventory_abs_contract_seconds += abs(pos) * (STEP_NS / 1e9)
+        inventory_squared_contract_seconds += pos*pos * (STEP_NS / 1e9)
+        if abs(pos) >= POSITION_CAP - 1e-9:
+            time_at_position_cap_seconds += STEP_NS / 1e9
+        peak_equity = max(peak_equity, equity)
+        max_drawdown = max(max_drawdown, peak_equity-equity)
         desired_reservation = mid-skew*pos
         want_bid = min(round(desired_reservation-half),bid)
         want_ask = max(round(desired_reservation+half),ask)
@@ -245,11 +256,15 @@ def run_strategy(engine, rolling, trade_steps):
     final_mid = (b.best_bid + b.best_ask)/2.0
     final_equity = final.balance+CTVAL*final.position*final_mid-final.fee
     max_position = max(max_position,abs(final.position))
+    peak_equity = max(peak_equity, final_equity)
+    max_drawdown = max(max_drawdown, peak_equity-final_equity)
     return (actual_steps, decision_steps, attempted, rejected, first_good,
             initial_valid, updates[:n_updates], submissions, cancels, buys, sells,
             final.num_trades-pre_fills, final.position, max_position,
             final.balance,final.fee,final.trading_value,final_mid,
-            final_equity,min_equity,max_equity,first_equity)
+            final_equity,min_equity,max_equity,first_equity,
+            max_drawdown,inventory_abs_contract_seconds,
+            inventory_squared_contract_seconds,time_at_position_cap_seconds)
 
 
 def asset_for(npz, lb, ub):
@@ -262,16 +277,18 @@ def asset_for(npz, lb, ub):
             .last_trades_capacity(20_000))
 
 
-def run_mode(npz, lb, ub, minutes, rolling):
+def run_mode(npz, lb, ub, minutes, rolling, gamma_code=GAMMA):
     from hftbacktest import ROIVectorMarketDepthBacktest
     engine = ROIVectorMarketDepthBacktest([asset_for(npz, lb, ub)])
     try:
-        raw = run_strategy(engine, rolling, minutes*600)
+        raw = run_strategy(engine, rolling, minutes*600, gamma_code)
     finally:
         engine.close()
     (actual, steps, attempted, rejected, successful, initial_ok, updates,
      submissions, cancels, buys, sells, fills, position, max_pos, balance, fee,
-     turnover, final_mid, final_equity, lo_equity, hi_equity, first_equity) = raw
+     turnover, final_mid, final_equity, lo_equity, hi_equity, first_equity,
+     max_drawdown, inventory_abs_contract_seconds,
+     inventory_squared_contract_seconds, time_at_position_cap_seconds) = raw
     if initial_ok != 1 or successful < 1:
         raise RuntimeError("Initial 10min GLFT calibration failed; no trading result")
     if actual < TRAIN+minutes*600-5:
@@ -311,7 +328,13 @@ def run_mode(npz, lb, ub, minutes, rolling):
             "end_net_marked_equity_usdt":float(final_equity),
             "first_marked_equity_usdt":float(first_equity),
             "min_marked_equity_usdt":float(lo_equity),
-            "max_marked_equity_usdt":float(hi_equity)}}
+            "max_marked_equity_usdt":float(hi_equity),
+            "max_observed_drawdown_usdt":float(max_drawdown),
+            "mean_abs_inventory_contracts":float(inventory_abs_contract_seconds /
+                                                   max(steps*STEP_NS/1e9, 1e-12)),
+            "rms_inventory_contracts":float(math.sqrt(inventory_squared_contract_seconds /
+                                                       max(steps*STEP_NS/1e9, 1e-12))),
+            "seconds_at_inventory_cap":float(time_at_position_cap_seconds)}}
 
 
 def main():
