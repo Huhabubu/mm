@@ -127,7 +127,7 @@ def simulate_window(npz, low, high, target, phase):
     and excluded from the numerator: its exchange-active time was not observed.
     """
     from hftbacktest import (ROIVectorMarketDepthBacktest, BUY, SELL, NEW,
-                             PARTIALLY_FILLED, FILLED, GTX, LIMIT)
+                             FILLED, GTX, LIMIT)
     from numba import njit
 
     @njit
@@ -157,7 +157,7 @@ def simulate_window(npz, low, high, target, phase):
             it = order_map.values()
             while it.has_next():
                 o = it.get()
-                if o.status == NEW or o.status == PARTIALLY_FILLED:
+                if o.status == NEW:
                     if mid_ok:
                         distance = (mid - o.price_tick) if o.side == BUY else (o.price_tick - mid)
                         idx = int(round(distance * 2.0))
