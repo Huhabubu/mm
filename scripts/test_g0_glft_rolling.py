@@ -2,7 +2,7 @@
 import unittest
 import math
 import numpy as np
-from g0_glft_rolling import (FIT_BINS, TRAIN, fit_recent_arrivals,
+from g0_glft_rolling import (FIT_BINS, TRAIN, MIN_CROSSING_INTERVALS, fit_recent_arrivals,
                              glft_coefficients, UPDATE_EVERY_STEPS)
 
 
@@ -30,6 +30,17 @@ class GLFTRollingTests(unittest.TestCase):
         self.assertEqual(second[0],1)
         self.assertNotAlmostEqual(first[2],second[2],places=3)
         self.assertEqual(len(old),TRAIN)
+
+    def test_threshold_guard_for_extreme_only_events(self):
+        arr=np.full(TRAIN,np.nan)
+        arr[:MIN_CROSSING_INTERVALS-1]=100.0
+        changes=np.tile(np.array([-1.,0.,1.]),2000)
+        result=fit_recent_arrivals(arr,changes)
+        self.assertEqual(result[0],0)
+        arr[MIN_CROSSING_INTERVALS]=2.0
+        # With enough events, a constant horizontal curve still has k near zero
+        # and is rejected by the positivity criterion.
+        self.assertEqual(fit_recent_arrivals(arr,changes)[0],0)
 
     def test_insufficient_order_flow_marks_invalid(self):
         arr=np.full(TRAIN,np.nan)

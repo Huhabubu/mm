@@ -23,6 +23,7 @@ from g0_glft_baseline import (CTVAL, GAMMA, LOT, MAKER_FEE, ORDER_QTY,
 UPDATE_EVERY_STEPS = 50                 # 5sec / 100ms
 FIT_BINS = 70                           # 0.5..35 actual price ticks
 FIT_STEP_TICKS = 0.5
+MIN_CROSSING_INTERVALS = 10               # minimum distinct 100ms trade-through events
 WINDOW_SECONDS = TRAIN * STEP_NS / 1e9
 TRADE_CHOICES_MINUTES = (5, 50)
 
@@ -72,7 +73,7 @@ def fit_recent_arrivals(arrivals, changes):
             var_n += 1
             total += value
             squared += value*value
-    if n < 5 or var_n < TRAIN // 2:
+    if n < 5 or qualifying_intervals < MIN_CROSSING_INTERVALS or var_n < TRAIN // 2:
         return 0, np.nan, np.nan, np.nan, n, qualifying_intervals, extreme_intervals
 
     denominator = n*sxx - sx*sx
