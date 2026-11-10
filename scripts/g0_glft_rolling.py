@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 from numba import njit
+from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
 
 from check_okx_hft_data import SCHEMAS, extract_window
 from g0_glft_baseline import (CTVAL, GAMMA, LOT, MAKER_FEE, ORDER_QTY,
@@ -104,7 +105,6 @@ def glft_coefficients(a, k, sigma):
 @njit
 def run_strategy(engine, rolling, trade_steps):
     """One official simulator run: warmup and trading in one causal event loop."""
-    from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
     # Reusable ring: every sample is collected *after* replaying past 100ms.
     arrivals = np.full(TRAIN, np.nan, np.float64)
     changes = np.full(TRAIN, np.nan, np.float64)
