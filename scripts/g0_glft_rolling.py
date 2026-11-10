@@ -104,7 +104,7 @@ def glft_coefficients(a, k, sigma, gamma_code=GAMMA):
 
 
 @njit
-def run_strategy(engine, rolling, trade_steps, gamma_code=GAMMA):
+def run_strategy(engine, rolling, trade_steps, gamma_code=GAMMA, capture_fills=False):
     """One official simulator run: warmup and trading in one causal event loop."""
     # Reusable ring: every sample is collected *after* replaying past 100ms.
     arrivals = np.full(TRAIN, np.nan, np.float64)
@@ -126,6 +126,12 @@ def run_strategy(engine, rolling, trade_steps, gamma_code=GAMMA):
     inventory_squared_contract_seconds = 0.0
     time_at_position_cap_seconds = 0.0
     pre_fills = engine.state_values(0).num_trades
+    # Optional diagnostic: preserve exact exchange fill timestamps as int64.
+    # Disabled for all existing G0 and gamma-sweep callers.
+    fill_capacity = 2 * trade_steps + 2 if capture_fills else 1
+    fill_ts_ns = np.empty(fill_capacity, np.int64)
+    fill_data = np.empty((fill_capacity, 4), np.float64)
+    fill_count = 0
     actual_steps = 0
     # First 6000 intervals for warmup only, then trade decision every 100ms.
     for sample in range(TRAIN + trade_steps):
@@ -201,6 +207,15 @@ def run_strategy(engine, rolling, trade_steps, gamma_code=GAMMA):
                     buys += 1
                 else:
                     sells += 1
+                if capture_fills:
+                    if fill_count >= fill_capacity:
+                        raise ValueError("Fill audit allocation exceeded")
+                    fill_ts_ns[fill_count] = order.exch_timestamp
+                    fill_data[fill_count, 0] = 1.0 if order.side == BUY else -1.0
+                    fill_data[fill_count, 1] = order.exec_price
+                    fill_data[fill_count, 2] = order.exec_qty
+                    fill_data[fill_count, 3] = float(order.order_id)
+                    fill_count += 1
         engine.clear_inactive_orders(0)
         book = engine.depth(0)
         bid, ask = book.best_bid_tick, book.best_ask_tick
@@ -264,7 +279,8 @@ def run_strategy(engine, rolling, trade_steps, gamma_code=GAMMA):
             final.balance,final.fee,final.trading_value,final_mid,
             final_equity,min_equity,max_equity,first_equity,
             max_drawdown,inventory_abs_contract_seconds,
-            inventory_squared_contract_seconds,time_at_position_cap_seconds)
+            inventory_squared_contract_seconds,time_at_position_cap_seconds,
+            fill_ts_ns[:fill_count], fill_data[:fill_count])
 
 
 def asset_for(npz, lb, ub):
@@ -277,24 +293,27 @@ def asset_for(npz, lb, ub):
             .last_trades_capacity(20_000))
 
 
-def run_mode(npz, lb, ub, minutes, rolling, gamma_code=GAMMA):
+def run_mode(npz, lb, ub, minutes, rolling, gamma_code=GAMMA, capture_fills=False):
     from hftbacktest import ROIVectorMarketDepthBacktest
     engine = ROIVectorMarketDepthBacktest([asset_for(npz, lb, ub)])
     try:
-        raw = run_strategy(engine, rolling, minutes*600, gamma_code)
+        raw = run_strategy(engine, rolling, minutes*600, gamma_code, capture_fills)
     finally:
         engine.close()
     (actual, steps, attempted, rejected, successful, initial_ok, updates,
      submissions, cancels, buys, sells, fills, position, max_pos, balance, fee,
      turnover, final_mid, final_equity, lo_equity, hi_equity, first_equity,
      max_drawdown, inventory_abs_contract_seconds,
-     inventory_squared_contract_seconds, time_at_position_cap_seconds) = raw
+     inventory_squared_contract_seconds, time_at_position_cap_seconds,
+     fill_ts_ns, fill_data) = raw
     if initial_ok != 1 or successful < 1:
         raise RuntimeError("Initial 10min GLFT calibration failed; no trading result")
     if actual < TRAIN+minutes*600-5:
         raise RuntimeError(f"Unexpected early market end: {actual} steps")
     if fills != buys+sells:
         raise RuntimeError(f"Maker-fill accounting differs from official engine: {fills} vs {buys+sells}")
+    if capture_fills and len(fill_ts_ns) != fills:
+        raise RuntimeError("Time-stamped fill trace does not reconcile with engine fills")
     if max_pos > POSITION_CAP + ORDER_QTY + 1e-9:
         raise RuntimeError("Inventory cap violated")
     if not math.isfinite(final_equity):
@@ -307,7 +326,7 @@ def run_mode(npz, lb, ub, minutes, rolling, gamma_code=GAMMA):
          "out_of_range_crossing_intervals":int(r[8])}
         for r in updates
     ]
-    return {
+    result = {
         "mode": "rolling" if rolling else "static",
         "observation_step_ms": 100, "calibration_window_seconds": 600,
         "parameter_update_interval_seconds": 5 if rolling else None,
@@ -335,6 +354,15 @@ def run_mode(npz, lb, ub, minutes, rolling, gamma_code=GAMMA):
             "rms_inventory_contracts":float(math.sqrt(inventory_squared_contract_seconds /
                                                        max(steps*STEP_NS/1e9, 1e-12))),
             "seconds_at_inventory_cap":float(time_at_position_cap_seconds)}}
+    if capture_fills:
+        result["fill_trace"] = [
+            {"exch_timestamp_ns":int(fill_ts_ns[i]),
+             "side_sign":int(fill_data[i,0]),
+             "execution_price_usdt_per_btc":float(fill_data[i,1]),
+             "executed_qty_contracts":float(fill_data[i,2]),
+             "order_id":int(fill_data[i,3])}
+            for i in range(len(fill_ts_ns))]
+    return result
 
 
 def main():
