@@ -24,6 +24,8 @@ jobs:
         run: pip install hftbacktest==2.4.4
       - name: Run focused tests
         run: python -m unittest discover -s scripts -p 'test_g0_glft_baseline.py' -v
+      - name: Verify maker fill accounting using official engine on synthetic events
+        run: python -m unittest discover -s scripts -p 'test_g0_execution.py' -v
       - name: Runner resources
         run: |
           free -h
