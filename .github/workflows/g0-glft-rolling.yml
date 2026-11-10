@@ -1,0 +1,42 @@
+name: G0 GLFT rolling vs corrected static baseline
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_rolling.py'
+      - 'scripts/test_g0_glft_rolling.py'
+      - '.github/workflows/g0-glft-rolling.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  g0-rolling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official engine
+        run: pip install hftbacktest==2.4.4
+      - name: Test rolling calibration with synthetic buffers
+        run: |
+          python -m unittest discover -s scripts -p 'test_g0_glft_rolling.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_execution.py' -v
+      - name: Runner resources
+        run: |
+          free -h
+          df -h .
+      - name: Refit every five seconds and replay actual OKX orders
+        run: python scripts/g0_glft_rolling.py --day 2026-11-01 --trade-minutes 50
+      - name: Upload aggregate paired PnL and parameter trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-g0-rolling-vs-static-2026-11-01
+          path: reports/g0_rolling_vs_static_2026-11-01_50m.json
+          if-no-files-found: warn
+          retention-days: 14
