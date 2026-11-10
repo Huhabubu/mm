@@ -21,6 +21,7 @@ TEST = ("2026-10-01", "2026-11-01")
 HORIZONS_MS = (20, 50, 100, 200, 500, 1000)
 SHORT_HORIZONS_MS = (5, 10, 20, 50, 100)
 DELAYS_MS = (0, 25, 50, 100)
+MICRO_DELAYS_MS = (0, 1, 2, 5, 10)
 MAX_OKX_QUOTE_AGE_US = 2_000_000
 LOOKBACK_1_US = 100_000
 LOOKBACK_2_US = 500_000
@@ -232,10 +233,16 @@ def main():
     ap.add_argument("--asset", default="BTC")
     ap.add_argument("--short-horizons", action="store_true",
                     help="Compare future OKX returns at 5,10,20,50,100ms without changing original experiment")
+    ap.add_argument("--micro-delays", action="store_true",
+                    help="Use 0,1,2,5,10ms extra Binance delays for short-horizon prediction")
     args = ap.parse_args()
-    global HORIZONS_MS
+    global HORIZONS_MS, DELAYS_MS
+    if args.micro_delays and not args.short_horizons:
+        ap.error("--micro-delays requires --short-horizons")
     if args.short_horizons:
         HORIZONS_MS = SHORT_HORIZONS_MS
+    if args.micro_delays:
+        DELAYS_MS = MICRO_DELAYS_MS
     if not (args.asset.isalpha() and args.asset.isupper()
             and args.binance_symbol.endswith("USDT")
             and args.okx_symbol.endswith("-USDT-SWAP")):
@@ -269,6 +276,8 @@ def main():
     suffix = "" if args.asset == "BTC" else f"_{args.asset.lower()}"
     if args.short_horizons:
         suffix += "_short"
+    if args.micro_delays:
+        suffix += "_micro"
     outpath = Path(args.report_dir) / f"price_event_p1_p2_native_bbo{suffix}_2026-06_to_11.json"
     outpath.parent.mkdir(parents=True, exist_ok=True)
     try:
