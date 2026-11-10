@@ -6,7 +6,7 @@ import numpy as np
 
 import predict_price_event_increment as event_module
 from predict_price_event_increment import (
-    DELAYS_MS, TRAIN, VALID, TEST, HORIZONS_MS,
+    DELAYS_MS, MICRO_DELAYS_MS, TRAIN, VALID, TEST, HORIZONS_MS,
     event_samples, fit_compare, metrics, validation_shrink_scale
 )
 
@@ -110,6 +110,22 @@ class TestPriceEventIncrement(unittest.TestCase):
                 row = outcome["horizons"][str(h)]
                 self.assertGreaterEqual(row["future_quote_arrival_pct"], row["nonzero_label_pct"])
                 self.assertGreaterEqual(row["nonzero_label_pct"], row["nontrivial_label_pct"])
+
+    def test_micro_delay_horizons_preserve_matching_and_recalculate_features(self):
+        okx, events, start = make_native_samples()
+        self.assertEqual(MICRO_DELAYS_MS, (0, 1, 2, 5, 10))
+        with patch.object(event_module, "HORIZONS_MS", (5, 10, 20, 50, 100)):
+            samples = {d: event_module.event_samples(okx, events, start, delay_ms=d)
+                       for d in MICRO_DELAYS_MS}
+        for d, s in samples.items():
+            self.assertEqual(s["n"], len(s["y"]))
+            self.assertEqual(s["y"].shape[1], 5)
+            self.assertTrue(np.isfinite(s["y"]).all())
+            np.testing.assert_array_equal(s["x1"], s["x2"][:, :5])
+            self.assertTrue(np.all(s["y"][~s["future_quote_arrivals"]] == 0))
+        # Even for the same originating Binance event, the local OKX
+        # reference quote and/or age updates as the decision is delayed.
+        self.assertFalse(np.array_equal(samples[0]["x1"], samples[10]["x1"]))
 
     def test_fixed_splits_and_horizons(self):
         self.assertEqual(set(TRAIN) & set(VALID + TEST), set())
