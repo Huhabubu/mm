@@ -1,0 +1,53 @@
+name: G0 multi-date gamma cash-risk sensitivity
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_gamma_sweep.py'
+      - 'scripts/test_g0_gamma_sweep.py'
+      - '.github/workflows/g0-gamma-sweep.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gamma-sweep:
+    name: OKX BTC gamma sweep ${{ matrix.day }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        day:
+          - '2026-06-01'
+          - '2026-07-01'
+          - '2026-08-01'
+          - '2026-09-01'
+          - '2026-10-01'
+          - '2026-11-01'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official pinned hftbacktest
+        run: pip install hftbacktest==2.4.4
+      - name: Focused regression tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_g0_gamma_sweep.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_gamma_units.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_rolling.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_execution.py' -v
+      - name: Runner memory
+        run: free -h
+      - name: Run pre-declared six Gamma policies
+        run: python scripts/g0_gamma_sweep.py --day "${{ matrix.day }}"
+      - name: Upload aggregate diagnostics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamma-sweep-${{ matrix.day }}
+          path: reports/g0_gamma_sweep_${{ matrix.day }}_60m.json
+          if-no-files-found: warn
+          retention-days: 14
