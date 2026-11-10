@@ -35,7 +35,8 @@ class TestClockShiftAndCostScale(unittest.TestCase):
             binance = Path(tmp) / "b.gz"
             okx = Path(tmp) / "o.gz"
             write_bbo(binance, [(0, 99, 101), (2_020_000, 100, 102)])
-            write_bbo(okx, [(0, 99, 101), (2_060_000, 100, 102)])
+            write_bbo(okx, [(0, 99, 101), (1_900_000, 99, 101),
+                            (2_060_000, 100, 102), (62_000_000, 100, 102)])
             source, _ = select_binance_events(binance)
             target = read_quotes(okx)
             p0 = evaluate_direction(shifted_events(source, 0), target, 0)
