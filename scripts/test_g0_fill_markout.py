@@ -43,7 +43,11 @@ class FillMarkoutTests(unittest.TestCase):
         self.assertAlmostEqual(m["mean_maker_fee_usdt"],0.0000199)
         self.assertAlmostEqual(m["mean_horizon_net_proxy_usdt"],
                                .0005-.001-.0000199)
-        self.assertAlmostEqual(m["adverse_fill_fraction"],1)
+        self.assertAlmostEqual(m["adverse_pre_fill_to_horizon_fraction"],1)
+        self.assertEqual(m["n_valid_impact_continuation_split"],1)
+        self.assertAlmostEqual(m["mean_immediate_signed_move_usdt"],-0.001)
+        self.assertAlmostEqual(m["mean_continuation_signed_move_usdt"],0)
+        self.assertAlmostEqual(m["continuation_adverse_fraction"],0)
 
     def test_sell_has_opposite_markout_sign(self):
         t0=1_000_000_000_000
