@@ -30,7 +30,8 @@ def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.re
              "initial_snapshot_ask": 0, "incremental_rows": 0,
              "local_backwards": 0, "invalid_rows": 0, "same_local_ts": 0,
              "first_local_us": None, "last_local_us": None,
-             "first_snapshot": None, "initial_snapshot_complete": False}
+             "first_snapshot": None, "initial_snapshot_complete": False,
+             "skipped_pre_snapshot": 0}
     started_snapshot = False
     left_initial_snapshot = False
     last_ts = None
@@ -62,8 +63,10 @@ def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.re
                             stats["invalid_rows"] += 1
                         if kind == "incremental_book_L2":
                             snapshot = row["is_snapshot"].lower() == "true"
-                            if stats["rows"] == 0 and not snapshot:
-                                raise ValueError("incremental_book_L2: missing start-of-day snapshot")
+                            # Tardis can start with pre-snapshot deltas; they have no valid book state.
+                            if not started_snapshot and not snapshot:
+                                stats["skipped_pre_snapshot"] += 1
+                                continue
                             if row["is_snapshot"].lower() not in ("true", "false"):
                                 stats["invalid_rows"] += 1
                             if snapshot:

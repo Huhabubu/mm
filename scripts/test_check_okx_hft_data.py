@@ -39,9 +39,26 @@ class ProbeTests(unittest.TestCase):
             f"okex-swap,BTC-USDT-SWAP,{BASE},{BASE},false,bid,100,10",
         ])
         with tempfile.TemporaryDirectory() as folder:
-            with self.assertRaisesRegex(ValueError, "missing start-of-day"):
+            with self.assertRaisesRegex(ValueError, "no complete opening"):
                 extract_window("incremental_book_L2", DAY, BASE+2_000_000,
                                Path(folder)/"bad.csv", opener=lambda *a, **k: io.BytesIO(data))
+
+    def test_pre_snapshot_deltas_are_dropped(self):
+        data = sample([
+            "exchange,symbol,timestamp,local_timestamp,is_snapshot,side,price,amount",
+            f"okex-swap,BTC-USDT-SWAP,{BASE},{BASE},false,bid,99,1",
+            f"okex-swap,BTC-USDT-SWAP,{BASE+1},{BASE+1},true,bid,100,20",
+            f"okex-swap,BTC-USDT-SWAP,{BASE+1},{BASE+1},true,ask,101,30",
+            f"okex-swap,BTC-USDT-SWAP,{BASE+2},{BASE+2},false,bid,100,19",
+        ])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"depth.csv"
+            stats = extract_window("incremental_book_L2", DAY, BASE+2_000_000, path,
+                                   opener=lambda *a, **k: io.BytesIO(data))
+            self.assertEqual(stats["skipped_pre_snapshot"], 1)
+            self.assertEqual(stats["rows"], 3)
+            self.assertTrue(stats["initial_snapshot_complete"])
+            self.assertNotIn("99,1", path.read_text())
 
     def test_local_timestamp_backwards_rejected(self):
         data = sample([
