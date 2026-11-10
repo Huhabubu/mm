@@ -19,6 +19,7 @@ TRAIN = ("2026-06-01", "2026-07-01", "2026-08-01")
 VALID = ("2026-09-01",)
 TEST = ("2026-10-01", "2026-11-01")
 HORIZONS_MS = (20, 50, 100, 200, 500, 1000)
+SHORT_HORIZONS_MS = (5, 10, 20, 50, 100)
 DELAYS_MS = (0, 25, 50, 100)
 MAX_OKX_QUOTE_AGE_US = 2_000_000
 LOOKBACK_1_US = 100_000
@@ -66,15 +67,24 @@ def event_samples(okx, events, start_us, delay_ms=0):
         quote_age / 1_000,  # Local quote age, milliseconds.
     ))
     combined = np.column_stack((local, sign, signed_size))
-    # Target may use later data, features may not.
-    y = np.column_stack([
-        10_000 * (om[np.searchsorted(ot, decision_t + h * 1_000, side="right") - 1] / om[now] - 1)
+    # Targets are historical as-of midprices at each future endpoint.
+    # Record whether a new OKX BBO actually arrived within that window:
+    # sub-10ms horizons are otherwise dominated by unchanged labels.
+    future_idx = [
+        np.searchsorted(ot, decision_t + h * 1_000, side="right") - 1
         for h in HORIZONS_MS
+    ]
+    y = np.column_stack([
+        10_000 * (om[idx] / om[now] - 1) for idx in future_idx
+    ])
+    future_quote_arrivals = np.column_stack([
+        idx > now for idx in future_idx
     ])
     return {
         "x1": local.astype(np.float32),
         "x2": combined.astype(np.float32),
         "y": y.astype(np.float32),
+        "future_quote_arrivals": future_quote_arrivals,
         "sign": sign.astype(np.int8),
         "signed_size": signed_size.astype(np.float32),
         "n": len(bt),
@@ -98,6 +108,8 @@ def metrics(day, samples, pred1, pred2):
             "mse_zero_bps2": float(np.mean(truth**2)),
             "improvement_pct": 100 * (err_a - err_b) / err_a if err_a > 0 else None,
             "nontrivial_label_pct": 100 * float(np.mean(nonzero)),
+            "nonzero_label_pct": 100 * float(np.mean(truth != 0.0)),
+            "future_quote_arrival_pct": 100 * float(np.mean(samples["future_quote_arrivals"][:, k])),
             "direction_p1_conditional_nontrivial_pct": 100 * float(np.mean(np.sign(a[nonzero]) == np.sign(truth[nonzero]))) if nonzero.any() else None,
             "direction_p2_conditional_nontrivial_pct": 100 * float(np.mean(np.sign(b[nonzero]) == np.sign(truth[nonzero]))) if nonzero.any() else None,
             "mean_signed_okx_response_bps": float(np.mean(truth * sign)),
@@ -218,7 +230,12 @@ def main():
     ap.add_argument("--binance-symbol", default="BTCUSDT")
     ap.add_argument("--okx-symbol", default="BTC-USDT-SWAP")
     ap.add_argument("--asset", default="BTC")
+    ap.add_argument("--short-horizons", action="store_true",
+                    help="Compare future OKX returns at 5,10,20,50,100ms without changing original experiment")
     args = ap.parse_args()
+    global HORIZONS_MS
+    if args.short_horizons:
+        HORIZONS_MS = SHORT_HORIZONS_MS
     if not (args.asset.isalpha() and args.asset.isupper()
             and args.binance_symbol.endswith("USDT")
             and args.okx_symbol.endswith("-USDT-SWAP")):
@@ -246,9 +263,12 @@ def main():
             "An improvement in MSE is not evidence of executable or profitable GLFT quotes.",
             "Validation-only shrinkage uses an already observed September date; Oct/Nov remain exploratory, not blind holdout.",
             "Price-event labels and feature magnitudes can be affected by tick size and differing BBO frequencies.",
+            "At 5/10ms, most future midprice labels can equal zero because no new target BBO has arrived; always review quote arrivals and nonzero label percentages.",
         ],
     }
     suffix = "" if args.asset == "BTC" else f"_{args.asset.lower()}"
+    if args.short_horizons:
+        suffix += "_short"
     outpath = Path(args.report_dir) / f"price_event_p1_p2_native_bbo{suffix}_2026-06_to_11.json"
     outpath.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -278,7 +298,7 @@ def main():
                 for d in days
             }
             result = fit_compare(prepared)
-            for h in (100, 500):
+            for h in (h for h in (100, 500) if h in HORIZONS_MS):
                 cc = result["validation_amplitude_calibration"]
                 s = cc["scales_from_validation"][str(h)]
                 score = cc["test_daily_equal_weight"][str(h)]
@@ -292,7 +312,7 @@ def main():
                 "ambiguous_simultaneous_excluded": prepared[d]["excluded_simultaneous"],
             } for d in days}
             report["sensitivity"][str(delay)] = result
-            for h in (20, 100, 500, 1000):
+            for h in (h for h in (20, 100, 500, 1000) if h in HORIZONS_MS):
                 score = result["test_daily_equal_weight"][str(h)]
                 print(f"  {h:4d}ms: P1 mse={score['mse_p1_bps2']:.6f}, "
                       f"P2 mse={score['mse_p2_bps2']:.6f}; "
