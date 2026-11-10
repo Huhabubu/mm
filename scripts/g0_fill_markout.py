@@ -61,11 +61,11 @@ def asof_exchange_mid(exchange_ns, mids, targets_ns, strict=False,
 
 
 def evaluate_fill_markouts(fills,exchange_ns,quote_mid,horizons_ms=HORIZONS_MS):
-    """Signed markout s*q*ctval*(M(t+h)-M(t)) in USDT.
+    """Evaluate pre-fill-to-future markout, and separate instantaneous vs continuation.
 
-    Execution 'spread capture' is s*q*ctval*(M(t)-fill_px).
-    Maker fee is q*ctval*fill_px*maker_fee.
-    Horizons are counterfactual valuations, NOT realized net strategy PnL.
+    Only ex-post market quotes; the POST-FILL quote is NOT a tradable reference
+    available at the instant of fill. A first strictly later BBO within 100ms
+    is used to diagnose how much of adverse movement is contemporaneous.
     """
     fills=list(fills)
     n=len(fills)
@@ -77,37 +77,68 @@ def evaluate_fill_markouts(fills,exchange_ns,quote_mid,horizons_ms=HORIZONS_MS):
     q=np.array([r["executed_qty_contracts"] for r in fills],dtype=np.float64)
     if not np.all(np.isin(s,(-1,1))) or np.any(q<=0) or np.any(p<=0):
         raise ValueError("invalid fills")
-    mid0,good0,_=asof_exchange_mid(exchange_ns,quote_mid,ts,strict=True)
-    capture=s*q*CTVAL*(mid0-p)
+    exchange_ns=np.asarray(exchange_ns,dtype=np.int64)
+    quote_mid=np.asarray(quote_mid,dtype=np.float64)
+    before,good_before,_=asof_exchange_mid(exchange_ns,quote_mid,ts,strict=True)
+    capture=s*q*CTVAL*(before-p)
     fee=q*CTVAL*p*MAKER_FEE
-    answer={"n_fills":int(n),"n_valid_reference_mid":int(good0.sum()),
+
+    # First book ticker strictly AFTER exchange fill time; never substitute
+    # first local fill-response time. Must appear within 100ms or be censored.
+    post_index=np.searchsorted(exchange_ns,ts,side="right")
+    index_safe=np.minimum(post_index,len(exchange_ns)-1)
+    post_mid=quote_mid[index_safe]
+    post_time=exchange_ns[index_safe]
+    good_post=(post_index<len(exchange_ns)) & (post_time>ts) & (
+        post_time-ts<=100_000_000)
+
+    answer={"n_fills":int(n),
+            "n_valid_reference_mid":int(good_before.sum()),
+            "n_valid_first_postfill_bbo":int((good_before&good_post).sum()),
             "horizons":{}}
     for horizon in horizons_ms:
-        if horizon <= 0:
+        if horizon<=0:
             raise ValueError("horizon must be positive")
         future,good_future,_=asof_exchange_mid(
             exchange_ns,quote_mid,ts+horizon*1_000_000,strict=False)
-        valid=good0 & good_future
+        valid=good_before&good_future
         count=int(valid.sum())
         if not count:
             answer["horizons"][str(horizon)]={"n_valid":0,"n_censored":n}
             continue
-        moved=s*q*CTVAL*(future-mid0)
-        gross=capture+moved
+
+        total_move=s*q*CTVAL*(future-before)
+        gross=capture+total_move
         net=gross-fee
-        adverse=moved[valid]<0
-        answer["horizons"][str(horizon)]={
+        adverse=total_move[valid]<0
+        split_valid=valid & good_post & (post_time<=ts+horizon*1_000_000)
+        n_split=int(split_valid.sum())
+        item={
             "n_valid":count,"n_censored":n-count,
-            "adverse_fill_fraction":float(np.mean(adverse)),
+            "adverse_pre_fill_to_horizon_fraction":float(np.mean(adverse)),
             "mean_spread_capture_usdt":float(np.mean(capture[valid])),
-            "mean_signed_markout_usdt":float(np.mean(moved[valid])),
+            "mean_signed_markout_usdt":float(np.mean(total_move[valid])),
             "mean_maker_fee_usdt":float(np.mean(fee[valid])),
             "mean_horizon_net_proxy_usdt":float(np.mean(net[valid])),
-            "sum_signed_markout_usdt":float(np.sum(moved[valid])),
+            "sum_signed_markout_usdt":float(np.sum(total_move[valid])),
             "sum_horizon_net_proxy_usdt":float(np.sum(net[valid])),
-            "mean_signed_markout_bps":float(
-                np.mean(10000*s[valid]*(future[valid]-mid0[valid])/mid0[valid])),
+            "mean_signed_markout_bps":float(np.mean(
+                10000*s[valid]*(future[valid]-before[valid])/before[valid])),
+            "n_valid_impact_continuation_split":n_split,
+            "n_censored_impact_continuation_split":n-n_split
         }
+        if n_split:
+            immediate=s*q*CTVAL*(post_mid-before)
+            continuation=s*q*CTVAL*(future-post_mid)
+            item.update({
+                "mean_immediate_signed_move_usdt":float(np.mean(immediate[split_valid])),
+                "mean_continuation_signed_move_usdt":float(np.mean(continuation[split_valid])),
+                "continuation_adverse_fraction":float(np.mean(continuation[split_valid]<0)),
+                "mean_continuation_signed_move_bps":float(np.mean(
+                    10000*s[split_valid]*(future[split_valid]-post_mid[split_valid])/
+                    post_mid[split_valid]))
+            })
+        answer["horizons"][str(horizon)]=item
     return answer
 
 
