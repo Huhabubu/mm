@@ -1,8 +1,10 @@
 """Focused synthetic tests for matched P1/P2 Binance-price-event prediction."""
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
+import predict_price_event_increment as event_module
 from predict_price_event_increment import (
     DELAYS_MS, TRAIN, VALID, TEST, HORIZONS_MS,
     event_samples, fit_compare, metrics, validation_shrink_scale
@@ -91,6 +93,23 @@ class TestPriceEventIncrement(unittest.TestCase):
             changed[d]["y"] = sample["y"] * -4
         second = fit_compare(changed)["validation_amplitude_calibration"]["scales_from_validation"]
         self.assertEqual(first, second)
+
+    def test_short_horizons_report_sparse_quote_arrivals(self):
+        okx, events, start = make_native_samples()
+        with patch.object(event_module, "HORIZONS_MS", (5, 10, 20, 50, 100)):
+            s = event_module.event_samples(okx, events, start)
+            self.assertEqual(s["y"].shape[1], 5)
+            self.assertEqual(s["future_quote_arrivals"].shape, s["y"].shape)
+            # If no OKX quote arrives, the as-of target mid cannot move.
+            self.assertTrue(np.all(s["y"][~s["future_quote_arrivals"]] == 0))
+            arrival = s["future_quote_arrivals"].astype(int)
+            self.assertTrue(np.all(np.diff(arrival, axis=1) >= 0))
+            outcome = event_module.metrics("synthetic", s, np.zeros_like(s["y"]),
+                                           np.zeros_like(s["y"]))
+            for h in (5, 10, 20, 50, 100):
+                row = outcome["horizons"][str(h)]
+                self.assertGreaterEqual(row["future_quote_arrival_pct"], row["nonzero_label_pct"])
+                self.assertGreaterEqual(row["nonzero_label_pct"], row["nontrivial_label_pct"])
 
     def test_fixed_splits_and_horizons(self):
         self.assertEqual(set(TRAIN) & set(VALID + TEST), set())
