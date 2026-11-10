@@ -102,10 +102,10 @@ def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.re
     stats["initial_snapshot_complete"] = (started_snapshot and left_initial_snapshot
                                            and stats["initial_snapshot_bid"] > 0
                                            and stats["initial_snapshot_ask"] > 0)
-    if not stats["rows"] or stats["local_backwards"] or stats["invalid_rows"]:
-        raise ValueError(f"{kind}: empty, nonmonotonic or invalid sample: {stats}")
     if kind == "incremental_book_L2" and not stats["initial_snapshot_complete"]:
         raise ValueError(f"{kind}: no complete opening bid/ask snapshot followed by an update: {stats}")
+    if not stats["rows"] or stats["local_backwards"] or stats["invalid_rows"]:
+        raise ValueError(f"{kind}: empty, nonmonotonic or invalid sample: {stats}")
     return stats
 
 
