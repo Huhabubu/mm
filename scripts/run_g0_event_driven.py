@@ -17,7 +17,7 @@ import numpy as np
 from check_okx_hft_data import SCHEMAS, extract_window
 from cross_venue_event_probe import read_binance_bbo, visible_timestamps
 from g0_glft_baseline import LOT, TICK, TRAIN, STEP_NS, GAMMA
-from g0_glft_rolling import asset_for
+from g0_glft_rolling import asset_for, run_mode
 from g0_glft_event_driven import run_event_glft, summarize
 
 
@@ -93,6 +93,18 @@ def main():
             b_ts_local, b_mid = read_binance_bbo(args.day, end_us)
             b_visible = visible_timestamps(b_ts_local, args.extra_binance_delay_ms)
             results = run_pair(npz, low, high, b_visible, b_mid, args.minutes)
+            legacy = run_mode(npz, low, high, args.minutes, True)
+            for key in ("A_per_second", "k_per_real_tick",
+                        "sigma_tick_per_sqrt_second",
+                        "half_spread_ticks", "skew_ticks_per_contract"):
+                current_key = "k_per_tick" if key == "k_per_real_tick" else key
+                got = results[0]["initial_parameters"][current_key]
+                expected = legacy["initial_parameters"][key]
+                if not math.isclose(got, expected, rel_tol=1e-10, abs_tol=1e-10):
+                    raise RuntimeError(
+                        f"100ms calibration drift: {key} event={got}, legacy={expected}")
+            report["legacy_100ms_G0_R_trading"] = legacy["trading"]
+            report["initial_parameters_equal_to_legacy"] = True
             report.update({"status": "complete", "okx_market_counts": counts,
                            "okx_fused_rows": event_rows,
                            "binance_bbo_rows": int(len(b_visible)),
