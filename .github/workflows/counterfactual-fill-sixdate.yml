@@ -1,0 +1,63 @@
+name: Six-date OKX maker counterfactual adverse-selection audit
+
+on:
+  push:
+    paths:
+      - 'scripts/counterfactual_fill_markout.py'
+      - 'scripts/test_counterfactual_fill_markout.py'
+      - '.github/workflows/counterfactual-fill-sixdate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fill-mechanism:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01', '2026-07-01', '2026-08-01',
+              '2026-09-01', '2026-10-01', '2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official hftbacktest 2.4.4
+        run: pip install hftbacktest==2.4.4
+      - name: Synthetic exact-match, cancel, 100/500ms censoring tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_counterfactual_fill_markout.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+      - name: Official HBT 50min maker fills and exchange-confirmed canceled quotes
+        run: python scripts/run_beta_one_direct_gap.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25 --experiment mechanism
+      - name: Print aggregate mechanism evidence
+        if: success()
+        run: |
+          DAY="${{ matrix.day }}" python - <<'PY'
+          import json,os
+          day=os.environ["DAY"]
+          r=json.load(open(f"reports/counterfactual_fill_markout_{day}_50m.json"))
+          a=r["mechanism_audit"]
+          print("DAY",day,"BASE_FILLS",a["baseline_fills"])
+          for name,c in a["comparisons"].items():
+              print("STRATEGY",name,
+                    "FILL",c["alternative_fills"],
+                    "SHARED",c["exact_exchange_time_side_price_overlap"],
+                    "BASE_UNMATCHED",c["baseline_only_exact_quote"],
+                    "CONFIRMED_CANCEL_PROXY",c["confirmed_same_quote_cancel_within_500ms_baseline_only"],
+                    "MISSING_MARKOUT_100",c["groups"]["baseline_quote_not_filled_in_alternative"]["horizons"]["100"],
+                    "MATCHED_MARKOUT_100",c["groups"]["baseline_quote_shared_exact_fill"]["horizons"]["100"],
+                    "MISSING_MARKOUT_500",c["groups"]["baseline_quote_not_filled_in_alternative"]["horizons"]["500"])
+          PY
+      - name: Upload aggregate metrics only (no market tape or per-order records)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maker-counterfactual-${{ matrix.day }}
+          path: reports/counterfactual_fill_markout_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 14
