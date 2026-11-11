@@ -233,13 +233,20 @@ def main():
         report["fit"] = fitted
         report["day_counts"] = summaries
         report["scores"] = {}
+        report["within_day_fit_DESCRIPTIVE_ONLY"] = {}
         for day in days:
             parts = all_days[day]
             report["scores"][day] = {"combined": score(parts, fitted)}
+            # Never select or update fitted beta using the evaluation day's labels.
+            report["within_day_fit_DESCRIPTIVE_ONLY"][day] = {
+                "combined": fit_beta(parts)
+            }
             for src, tag in ((0, "okx_trigger"), (1, "binance_trigger")):
                 mask = parts["source"] == src
                 if np.any(mask):
-                    report["scores"][day][tag] = score(subset(parts, mask), fitted)
+                    one = subset(parts, mask)
+                    report["scores"][day][tag] = score(one, fitted)
+                    report["within_day_fit_DESCRIPTIVE_ONLY"][day][tag] = fit_beta(one)
         report["status"] = "complete"
     except Exception as e:
         report["status"] = "failed"
