@@ -1,0 +1,57 @@
+name: Cross-venue gap sampling robustness, 24h
+
+on:
+  push:
+    paths:
+      - 'scripts/gap_event_regression.py'
+      - 'scripts/full_day_gap_rolling.py'
+      - 'scripts/test_gap_sampling_robustness.py'
+      - '.github/workflows/gap-sampling-robustness.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sampling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        mode: [binance_last_per_microsecond, fixed_10ms, fixed_50ms]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install research dependency
+        run: pip install numpy
+      - name: Verify no future quote or label and chunk consistency
+        run: |
+          python -m unittest discover -s scripts -p 'test_gap_event_regression.py' -v
+          python -m unittest discover -s scripts -p 'test_full_day_gap_rolling.py' -v
+          python -m unittest discover -s scripts -p 'test_gap_sampling_robustness.py' -v
+      - name: Complete 24-hour Binance and OKX BBO sample-sensitivity replay
+        run: python scripts/full_day_gap_rolling.py --day 2026-11-01 --hours 24 --chunk-minutes 15 --sample-mode ${{ matrix.mode }}
+      - name: Print same-clock sampling model scores
+        if: success()
+        run: |
+          MODE="${{ matrix.mode }}" python - <<'PY'
+          import json, os
+          m = os.environ["MODE"]
+          p = f"reports/full_day_gap_rolling_2026-11-01_24h_{m}.json"
+          r = json.load(open(p))
+          print("MODE", m, "SAMPLES", r["sampling"])
+          print("BETA", r["rolling_beta_updates"])
+          print("SCORES", r["matched_out_of_sample_scores"])
+          PY
+      - name: Upload aggregate JSON only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-sampling-2026-11-01-${{ matrix.mode }}
+          path: reports/full_day_gap_rolling_2026-11-01_24h_${{ matrix.mode }}.json
+          if-no-files-found: warn
+          retention-days: 14
