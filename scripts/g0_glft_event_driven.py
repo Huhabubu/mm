@@ -79,6 +79,12 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     """
     if capture_mechanism and (audit_fill_prices is None or audit_cancels is None):
         raise ValueError("Audit trace buffers required")
+    # Numba also specializes legacy capture=False callers with omitted arrays.
+    # Supply tiny unused arrays so its nopython type inference never sees len(None).
+    if audit_fill_prices is None:
+        audit_fill_prices = np.empty(1, np.int64)
+    if audit_cancels is None:
+        audit_cancels = np.empty((1, 3), np.int64)
     if (filter_enter_ticks > 0.0 and
             (beta == 0.0 or filter_exit_ticks < 0.0 or
              filter_exit_ticks >= filter_enter_ticks or
