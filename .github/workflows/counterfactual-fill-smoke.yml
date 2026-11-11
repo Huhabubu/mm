@@ -1,0 +1,60 @@
+name: Counterfactual GLFT fill 100ms 500ms markout smoke
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_event_driven.py'
+      - 'scripts/run_counterfactual_fill_markout.py'
+      - 'scripts/test_counterfactual_fill_markout.py'
+      - '.github/workflows/counterfactual-fill-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fill-probe-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT replay engine
+        run: pip install hftbacktest==2.4.4
+      - name: Test exact fill multiset, probe classification, and baseline GLFT
+        run: |
+          python -m unittest discover -s scripts -p 'test_counterfactual_fill_markout.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_gap_filter_placebo.py' -v
+      - name: Real 5min paired fill audit and non-intrusive snapshot replay
+        run: python scripts/run_counterfactual_fill_markout.py --day 2026-11-01 --minutes 5
+      - name: Print baseline-only fill outcomes and probe effect
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open("reports/counterfactual_fill_markout_2026-11-01_5m.json"))
+          print("TRACE_INVARIANCE",r["probe_invariance_against_unprobed_beta1"])
+          print("REFERENCE",r["reference"])
+          for name,v in r["variants"].items():
+              c=v["comparison_to_beta_0"]
+              print("VARIANT",name,"fills",v["trading"]["engine_fills"],
+                    "reference_only",c["baseline_only_fill_count"],
+                    "coincident",c["same_exact_exchange_time_and_side_matched_fill_count"],
+                    "exchange_probe",c["baseline_only_exchange_probe_counts"],
+                    "clock",v["fill_clock_alignment"])
+              for key in ("baseline_only_no_same_time_side_fill",
+                          "baseline_shared_same_time_side_fill","variant_all"):
+                  print(key,c["groups"][key]["horizons"])
+          PY
+      - name: Upload aggregate JSON only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: counterfactual-fill-5min
+          path: reports/counterfactual_fill_markout_2026-11-01_5m.json
+          if-no-files-found: warn
+          retention-days: 14
