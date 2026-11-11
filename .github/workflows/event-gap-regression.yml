@@ -1,0 +1,36 @@
+name: Causal event-gap regression diagnostic
+
+on:
+  push:
+    paths:
+      - 'scripts/gap_event_regression.py'
+      - 'scripts/test_gap_event_regression.py'
+      - '.github/workflows/event-gap-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gap-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned requirements for BBO diagnostic
+        run: pip install numpy
+      - name: Synthetic gap and estimator tests
+        run: python -m unittest discover -s scripts -p 'test_gap_event_regression.py' -v
+      - name: Six previously explored dates, train vs validation and diagnostics
+        run: python scripts/gap_event_regression.py --minutes 12 --basis-seconds 60 --tau-ms 100 --delay-ms 25
+      - name: Save aggregate coefficients and bin means only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: event-gap-beta-exploratory-six-days
+          path: reports/event_gap_regression_exploratory.json
+          if-no-files-found: warn
+          retention-days: 14
