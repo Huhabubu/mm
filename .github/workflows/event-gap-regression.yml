@@ -5,6 +5,7 @@ on:
     paths:
       - 'scripts/gap_event_regression.py'
       - 'scripts/test_gap_event_regression.py'
+      - 'scripts/plot_gap_event_bins.py'
       - '.github/workflows/event-gap-regression.yml'
   workflow_dispatch:
 
@@ -21,16 +22,34 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install pinned requirements for BBO diagnostic
-        run: pip install numpy
+        run: pip install numpy matplotlib
       - name: Synthetic gap and estimator tests
         run: python -m unittest discover -s scripts -p 'test_gap_event_regression.py' -v
       - name: Six previously explored dates, train vs validation and diagnostics
         run: python scripts/gap_event_regression.py --minutes 12 --basis-seconds 60 --tau-ms 100 --delay-ms 25
+      - name: Plot nine exploratory gap-bin figures
+        run: python scripts/plot_gap_event_bins.py
+      - name: Print aggregate research diagnostics
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open("reports/event_gap_regression_exploratory.json"))
+          print("TRAIN beta:", r["fit"]["beta"], "alpha:", r["fit"]["alpha_usdt_per_btc"],
+                "exploratory_t_5s:", r["fit"]["beta_t_5s_blocks_exploratory"])
+          for d in r["dates"]:
+              a=r["scores"][d]
+              print(d, "events", r["day_counts"][d]["n_causal_decisions"],
+                    "r2_zero_both", a["combined"]["r2_vs_zero"],
+                    "r2_zero_okx", a["okx_trigger"]["r2_vs_zero"],
+                    "r2_zero_binance", a["binance_trigger"]["r2_vs_zero"])
+          PY
       - name: Save aggregate coefficients and bin means only
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: event-gap-beta-exploratory-six-days
-          path: reports/event_gap_regression_exploratory.json
+          path: |
+            reports/event_gap_regression_exploratory.json
+            reports/event_gap_bins_*.png
           if-no-files-found: warn
           retention-days: 14
