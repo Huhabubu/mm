@@ -17,6 +17,25 @@ MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
 
 @njit
+def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
+                             okx_native_ns, okx_native_mid, basis_grid_ns,
+                             basis_values):
+    """No forward BBO / basis access. Strict past OKX and basis, fresh Binance."""
+    if beta == 0.0 or not np.isfinite(binance_mid):
+        return 0.0
+    if binance_visible_ns < 0 or now < binance_visible_ns or now-binance_visible_ns > 250_000_000:
+        return 0.0
+    oi = np.searchsorted(okx_native_ns, now, side="left") - 1
+    gi = np.searchsorted(basis_grid_ns, now, side="left") - 1
+    if oi < 0 or gi < 0 or now < okx_native_ns[oi] or now-okx_native_ns[oi] > 250_000_000:
+        return 0.0
+    if not np.isfinite(basis_values[gi]):
+        return 0.0
+    gap_usdt_per_btc = binance_mid - okx_native_mid[oi] - basis_values[gi]
+    return beta * gap_usdt_per_btc / TICK
+
+
+@njit
 def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    rolling=True, gamma_code=GAMMA, read_binance=False,
                    beta=0.0, okx_native_ns=None, okx_native_mid=None,
@@ -219,17 +238,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             # Missing or stale quotes -> beta shift 0; no future labels enter.
             shift_ticks = 0.0
             if beta != 0.0:
-                if (latest_binance_ns >= 0 and
-                        0 <= now - latest_binance_ns <= 250_000_000):
-                    oi = np.searchsorted(okx_native_ns, now, side="left") - 1
-                    gi = np.searchsorted(basis_grid_ns, now, side="left") - 1
-                    if (oi >= 0 and gi >= 0 and
-                            0 <= now - okx_native_ns[oi] <= 250_000_000 and
-                            np.isfinite(basis_values[gi]) and
-                            np.isfinite(latest_binance)):
-                        gap_usdt = (latest_binance - okx_native_mid[oi] -
-                                    basis_values[gi])
-                        shift_ticks = beta * gap_usdt / TICK
+                shift_ticks = causal_price_shift_ticks(
+                    now, latest_binance_ns, latest_binance, beta,
+                    okx_native_ns, okx_native_mid, basis_grid_ns, basis_values)
             reservation = mid - skew * pos + shift_ticks
             want_bid = min(round(reservation - half), bid)
             want_ask = max(round(reservation + half), ask)
@@ -301,7 +312,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             t0, now)
 
 
-def summarize(raw, minutes, rolling):
+def summarize(raw, minutes, rolling, beta=0.0):
     """Aggregate only; no trades or raw market data leave the runner."""
     (samples, decisions, attempts, rejects, successes, initial_ok, updates,
      submits, cancels, buys, sells, fills, pos, max_pos, balance, fee,
@@ -322,7 +333,7 @@ def summarize(raw, minutes, rolling):
         raise RuntimeError("Invalid exchange fill timestamps")
     return {
         "mode": "rolling" if rolling else "static",
-        "beta": 0, "parameter_observation_ms": 100,
+        "beta": float(beta), "parameter_observation_ms": 100,
         "rolling_fit_interval_s": 5 if rolling else None,
         "min_per_side_order_action_ms": MIN_REQUOTE_NS/1e6,
         "start_time_ns": int(start), "end_time_ns": int(end),
