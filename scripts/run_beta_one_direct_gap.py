@@ -131,7 +131,7 @@ def pretrade_gap_thresholds(ot, om, bt, bm, basis_t, basis, day_start_ns):
 
 
 def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
-             experiment=False, thresholds=None):
+             experiment=False, thresholds=None, mechanism=False):
     from hftbacktest import ROIVectorMarketDepthBacktest
 
     specifications = [("beta_0", 0.0, 0.0, 0.0),
@@ -149,6 +149,7 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
              thresholds["widen_control_extra_half_ticks"]),
         ])
     variants = {}
+    traces = {}
     for name, beta, enter, extra_half in specifications:
         engine = ROIVectorMarketDepthBacktest([asset_for(npz, low, high)])
         try:
@@ -157,7 +158,13 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                 True, GAMMA, True, beta, ot, om, basis_t, basis,
                 enter, (thresholds["release_ticks"] if enter else 0.0),
                 (thresholds["refresh_min_change_ticks"] if enter else 10.0),
-                250_000_000, extra_half)
+                250_000_000, extra_half, mechanism)
+            if mechanism:
+                traces[name] = {
+                    "ts_ns": raw[31].copy(), "side": raw[32].copy(),
+                    "price_tick": raw[35].copy(),
+                    "confirmed_canceled": raw[36].copy(),
+                }
             variants[name] = summarize(
                 raw, trade_minutes, True, beta=beta)
         finally:
@@ -177,10 +184,11 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
             raise RuntimeError(f"Changed 100ms observation calendar for {name}")
         if base["calibration_trace"] != candidate["calibration_trace"]:
             raise RuntimeError(f"Changed causal GLFT calibration history for {name}")
-    return variants
+    return (variants, traces) if mechanism else variants
 
 
-def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
+def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False,
+        mechanism=False):
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
     if minutes not in (5, 50):
@@ -188,7 +196,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
     day_start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
         tzinfo=timezone.utc).timestamp()) * 1_000_000
     end_us = day_start_us + (600 + minutes*60) * 1_000_000 + 500_000
-    label = "gap_filter_placebo" if experiment else "beta_one_direct_gap"
+    label = ("counterfactual_fill_markout" if mechanism else
+             "gap_filter_placebo" if experiment else "beta_one_direct_gap")
     target = Path(report_dir)/f"{label}_{day}_{minutes}m.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     report = {
@@ -234,9 +243,19 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
             thresholds = (pretrade_gap_thresholds(
                 ot, om, bt, bm, base_t, base, day_start_us*1000)
                 if experiment else None)
-            result = run_pair(
+            paired = run_pair(
                 npz, low, high, bt, bm, ot, om, base_t, base, minutes,
-                experiment=experiment, thresholds=thresholds)
+                experiment=experiment, thresholds=thresholds, mechanism=mechanism)
+            result, traces = paired if mechanism else (paired, None)
+            mechanism_report = None
+            if mechanism:
+                from g0_fill_markout import read_exchange_bbo
+                from counterfactual_fill_markout import evaluate_mechanisms
+                ex_t, ex_m = read_exchange_bbo(paths["book_ticker"])
+                mechanism_report = evaluate_mechanisms(traces, ex_t, ex_m)
+                for name, v in result.items():
+                    if len(traces[name]["ts_ns"]) != v["trading"]["engine_fills"]:
+                        raise RuntimeError("Official maker fill count mismatched mechanism trace")
             report.update({
                 "status": "complete",
                 "okx_fused_event_rows": int(n_events),
@@ -246,6 +265,7 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
                 "gap_visibility_audit_100ms": audit,
                 "variants": result,
                 "pretrade_filter_thresholds": thresholds,
+                "mechanism_audit": mechanism_report,
                 "experiment": "placebo_filter" if experiment else "beta_one_direct",
                 "paired_net_difference_beta1_minus_beta0_usdt": (
                     result["beta_1"]["trading"]["end_net_marked_equity_usdt"] -
@@ -269,12 +289,13 @@ def main():
     p.add_argument("--minutes", type=int, default=5, choices=(5, 50))
     p.add_argument("--extra-binance-delay-ms", type=int, default=25)
     p.add_argument("--report-dir", default="reports")
-    p.add_argument("--experiment", choices=("base", "placebo_filter"), default="base")
+    p.add_argument("--experiment", choices=("base", "placebo_filter", "mechanism"),
+                   default="base")
     a = p.parse_args()
     if datetime.strptime(a.day, "%Y-%m-%d").day != 1:
         p.error("Tardis free historical day must be the first of month UTC")
     run(a.day, a.minutes, a.extra_binance_delay_ms, a.report_dir,
-        experiment=(a.experiment == "placebo_filter"))
+        experiment=(a.experiment != "base"), mechanism=(a.experiment == "mechanism"))
 
 
 if __name__ == "__main__":
