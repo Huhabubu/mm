@@ -43,7 +43,7 @@ class DirectGapTests(unittest.TestCase):
         self.assertEqual(causal_price_shift_ticks(
             now, now+1, 110., 1., ot, om, gt, bv), 0.)
         self.assertEqual(causal_price_shift_ticks(
-            now+251_000_000, now+240_000_000, 110., 1., ot, om, gt, bv), 0.)
+            now+500_000_000, now+490_000_000, 110., 1., ot, om, gt, bv), 0.)
         self.assertEqual(causal_price_shift_ticks(
             now, now-25_000_000, 110., 1., ot, om, gt,
             np.array([np.nan, 999.])), 0.)
@@ -54,7 +54,7 @@ class DirectGapTests(unittest.TestCase):
             now, now-25_000_000, 110., 1., ot, om, gt, bv), normal)
 
     def test_causal_60s_basis_matches_simple_constant_spread(self):
-        times = np.arange(710, dtype=np.int64)*NS + 10_000_000
+        times = np.arange(7100, dtype=np.int64)*100_000_000 + 10_000_000
         ot, om = times, np.full(len(times), 100.)
         bt, bm = times + 10_000_000, np.full(len(times), 103.)
         grid, basis = causal_60s_basis(ot, om, bt, bm)
