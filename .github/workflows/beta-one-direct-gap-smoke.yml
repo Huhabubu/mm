@@ -1,0 +1,53 @@
+name: Direct beta-one anomaly gap GLFT 5min smoke
+
+on:
+  push:
+    paths:
+      - 'scripts/run_beta_one_direct_gap.py'
+      - 'scripts/test_beta_one_direct_gap.py'
+      - '.github/workflows/beta-one-direct-gap-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  beta-one-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official matching engine
+        run: pip install hftbacktest==2.4.4
+      - name: Causal gap and event-driven GLFT unit tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+      - name: Run same-clock beta-zero and beta-one official HBT for 5min
+        run: python scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 5 --extra-binance-delay-ms 25
+      - name: Compare real maker fills and net equity
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          a=json.load(open('reports/beta_one_direct_gap_2026-11-01_5m.json'))
+          print("COVERAGE",a["gap_visibility_audit_100ms"])
+          for k,v in a["variants"].items():
+              print(k,"beta",v["beta"],"fills",v["trading"]["engine_fills"],
+                    "net_usdt",v["trading"]["end_net_marked_equity_usdt"],
+                    "submit",v["trading"]["submissions"],
+                    "cancel",v["trading"]["cancel_requests"],
+                    "fee_usdt",v["trading"]["fee_usdt"])
+          print("DIFFERENCE",a["paired_net_difference_beta1_minus_beta0_usdt"])
+          PY
+      - name: Upload only summary not raw data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beta-one-2026-11-01-5min
+          path: reports/beta_one_direct_gap_2026-11-01_5m.json
+          if-no-files-found: warn
+          retention-days: 14
