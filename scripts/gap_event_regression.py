@@ -52,7 +52,8 @@ def read_okx_bbo(day, end_us, opener=urllib.request.urlopen):
 
 
 def event_gap_samples(okx_time, okx_mid, bin_time, bin_mid,
-                      basis_seconds=60, tau_ms=100, max_age_ms=250):
+                      basis_seconds=60, tau_ms=100, max_age_ms=250,
+                      decision_times=None):
     """Produce samples at EVERY received native-BBO event of both venues.
 
     Market-source rows at equal timestamps retain their own exact row index;
@@ -73,15 +74,25 @@ def event_gap_samples(okx_time, okx_mid, bin_time, bin_mid,
     if basis_seconds < 2 or tau_ms <= 0 or max_age_ms <= 0:
         raise ValueError("Invalid basis/horizon/freshness configuration")
     age_limit = max_age_ms * 1_000_000
-    # Exactly one decision per original source row; never as-of the source's
-    # *later* records with the same local timestamp.
-    t = np.concatenate((ot, bt))
-    source = np.concatenate((np.zeros(len(ot), np.int8),
-                             np.ones(len(bt), np.int8)))
-    oi = np.concatenate((np.arange(len(ot)), np.searchsorted(ot, bt, side="left") - 1))
-    bi = np.concatenate((np.searchsorted(bt, ot, side="left") - 1, np.arange(len(bt))))
-    order = np.argsort(t, kind="stable")
-    t, source, oi, bi = (a[order] for a in (t, source, oi, bi))
+    if decision_times is None:
+        # Event clock: own event row is visible, OTHER source strictly prior.
+        # Same-local-timestamp rows retain the original source order.
+        t = np.concatenate((ot, bt))
+        source = np.concatenate((np.zeros(len(ot), np.int8),
+                                 np.ones(len(bt), np.int8)))
+        oi = np.concatenate((np.arange(len(ot)), np.searchsorted(ot, bt, side="left") - 1))
+        bi = np.concatenate((np.searchsorted(bt, ot, side="left") - 1, np.arange(len(bt))))
+        order = np.argsort(t, kind="stable")
+        t, source, oi, bi = (a[order] for a in (t, source, oi, bi))
+    else:
+        # Exogenous wall-clock grid: both venues strictly before sampling time.
+        # Source=2 distinguishes fixed-time decisions from exchange events.
+        t = np.asarray(decision_times, dtype=np.int64)
+        if t.ndim != 1 or (len(t) > 1 and np.any(np.diff(t) <= 0)):
+            raise ValueError("Decision clock must be a strictly increasing 1D timestamp grid")
+        source = np.full(len(t), 2, np.int8)
+        oi = np.searchsorted(ot, t, side="left") - 1
+        bi = np.searchsorted(bt, t, side="left") - 1
 
     # Historical basis on an exogenous 1-second clock, strictly BEFORE grid t.
     start = ((max(int(ot[0]), int(bt[0])) + SECOND_NS - 1) // SECOND_NS) * SECOND_NS
