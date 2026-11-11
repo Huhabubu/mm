@@ -7,6 +7,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from check_okx_hft_data import SCHEMAS, extract_window
 from cross_venue_event_probe import read_binance_bbo, replay_union, visible_timestamps
 from g0_glft_baseline import LOT, TICK
@@ -69,9 +71,8 @@ def main():
                     if depth.best_bid_tick > 0 and depth.best_ask_tick > depth.best_bid_tick:
                         observed["valid_okx_bbo"] += 1
                         if math.isfinite(mid):
-                            if now - (b_ts[max(0, __import__("numpy").searchsorted(
-                                    visible, now, side="right") - 1)] +
-                                    args.delay_ms * 1_000_000 + 1) <= 250_000_000:
+                            i = int(np.searchsorted(visible, now, side="right")) - 1
+                            if i >= 0 and 0 <= now - int(visible[i]) <= 250_000_000:
                                 observed["valid_gap"] += 1
                             else:
                                 observed["stale_signal"] += 1
