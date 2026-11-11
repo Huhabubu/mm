@@ -18,12 +18,23 @@ MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
 @njit
 def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
-                   rolling=True, gamma_code=GAMMA, read_binance=False):
+                   rolling=True, gamma_code=GAMMA, read_binance=False,
+                   beta=0.0, okx_native_ns=None, okx_native_mid=None,
+                   basis_grid_ns=None, basis_values=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
     Signal-read flag has NO effect on fair price; paired beta=0 test uses both.
     """
+    if beta != 0.0:
+        if (okx_native_ns is None or okx_native_mid is None or
+                basis_grid_ns is None or basis_values is None):
+            raise ValueError("Nonzero beta needs causal OKX BBO and baseline arrays")
+        if (len(okx_native_ns) != len(okx_native_mid) or
+                len(basis_grid_ns) != len(basis_values)):
+            raise ValueError("BBO and basis shapes differ")
+        if not np.isfinite(beta):
+            raise ValueError("Nonfinite beta")
     if engine.elapse(0) != 0:
         raise ValueError("Cannot initialize OKX market replay")
     t0 = engine.current_timestamp
@@ -46,6 +57,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     okx_feed_events = order_reply_events = binance_events = 0
     observed_binance = 0.0
     count_binance_reads = 0
+    latest_binance = np.nan
+    latest_binance_ns = -1
     initial_trade_count = engine.state_values(0).num_trades
     max_position = 0.0
     min_equity = np.inf
@@ -85,6 +98,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         # External rows at same timestamp are consumed IN ORIGINAL ROW ORDER.
         signal_event = False
         while idx < len(binance_visible_ns) and binance_visible_ns[idx] <= now:
+            latest_binance = binance_mid[idx]
+            latest_binance_ns = binance_visible_ns[idx]
             if read_binance:
                 observed_binance += binance_mid[idx]  # diagnostic; price never enters quote.
                 count_binance_reads += 1
@@ -199,7 +214,23 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 continue
             mid = (bid + ask) / 2.0
             pos = engine.position(0)
-            reservation = mid - skew * pos  # Exactly beta=0, GLFT original.
+            # Use only last locally visible Binance BBO, strictly older OKX BBO,
+            # and strictly earlier completed-second 60s causal basis.
+            # Missing or stale quotes -> beta shift 0; no future labels enter.
+            shift_ticks = 0.0
+            if beta != 0.0:
+                if (latest_binance_ns >= 0 and
+                        0 <= now - latest_binance_ns <= 250_000_000):
+                    oi = np.searchsorted(okx_native_ns, now, side="left") - 1
+                    gi = np.searchsorted(basis_grid_ns, now, side="left") - 1
+                    if (oi >= 0 and gi >= 0 and
+                            0 <= now - okx_native_ns[oi] <= 250_000_000 and
+                            np.isfinite(basis_values[gi]) and
+                            np.isfinite(latest_binance)):
+                        gap_usdt = (latest_binance - okx_native_mid[oi] -
+                                    basis_values[gi])
+                        shift_ticks = beta * gap_usdt / TICK
+            reservation = mid - skew * pos + shift_ticks
             want_bid = min(round(reservation - half), bid)
             want_ask = max(round(reservation + half), ask)
 
