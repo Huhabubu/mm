@@ -2,7 +2,7 @@
 
 Estimator: exactly the existing G0-R fixed 100ms ring and 5s refit.
 Quoting: on OKX feed, order reply, Binance *clock*, or maintenance.
-Binance prices remain diagnostic-only; beta is exactly zero in both modes.
+Default beta is zero; optional direct-gap/placebo/filter experimental modes.
 """
 import math
 
@@ -36,15 +36,53 @@ def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
 
 
 @njit
+def filtered_gap_shift(now, raw_shift_ticks, held_shift_ticks, last_update_ns,
+                       enter_ticks, exit_ticks, refresh_change_ticks,
+                       refresh_interval_ns):
+    """Pretrade P90/P50 hysteresis plus bounded signal-centre refresh.
+
+    This filters Binance-driven quote centre changes, not OKX/GLFT quote
+    changes. A stale signal resets to zero immediately.
+    """
+    if not np.isfinite(raw_shift_ticks):
+        raw_shift_ticks = 0.0
+    if held_shift_ticks == 0.0:
+        if abs(raw_shift_ticks) >= enter_ticks:
+            return raw_shift_ticks, now
+        return 0.0, last_update_ns
+    if abs(raw_shift_ticks) <= exit_ticks:
+        return 0.0, now
+    if raw_shift_ticks * held_shift_ticks < 0.0:
+        if abs(raw_shift_ticks) >= enter_ticks:
+            return raw_shift_ticks, now
+        return 0.0, now
+    if (now - last_update_ns >= refresh_interval_ns and
+            abs(raw_shift_ticks - held_shift_ticks) >= refresh_change_ticks):
+        return raw_shift_ticks, now
+    return held_shift_ticks, last_update_ns
+
+
+@njit
 def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    rolling=True, gamma_code=GAMMA, read_binance=False,
                    beta=0.0, okx_native_ns=None, okx_native_mid=None,
-                   basis_grid_ns=None, basis_values=None):
+                   basis_grid_ns=None, basis_values=None,
+                   filter_enter_ticks=0.0, filter_exit_ticks=0.0,
+                   filter_refresh_change_ticks=10.0,
+                   filter_refresh_ns=250_000_000,
+                   extra_half_ticks=0.0):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
-    Signal-read flag has NO effect on fair price; paired beta=0 test uses both.
+    Signal-read flag only adds telemetry; beta and filter parameters select quote shifts.
     """
+    if (filter_enter_ticks > 0.0 and
+            (beta == 0.0 or filter_exit_ticks < 0.0 or
+             filter_exit_ticks >= filter_enter_ticks or
+             filter_refresh_change_ticks <= 0.0 or filter_refresh_ns < 0)):
+        raise ValueError("Invalid gap hysteresis configuration")
+    if extra_half_ticks < 0.0 or not np.isfinite(extra_half_ticks):
+        raise ValueError("Invalid GLFT no-signal widening")
     if beta != 0.0:
         if (okx_native_ns is None or okx_native_mid is None or
                 basis_grid_ns is None or basis_values is None):
@@ -78,6 +116,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     count_binance_reads = 0
     latest_binance = np.nan
     latest_binance_ns = -1
+    held_shift_ticks = 0.0
+    last_shift_update_ns = t0 - filter_refresh_ns
     initial_trade_count = engine.state_values(0).num_trades
     max_position = 0.0
     min_equity = np.inf
@@ -120,7 +160,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             latest_binance = binance_mid[idx]
             latest_binance_ns = binance_visible_ns[idx]
             if read_binance:
-                observed_binance += binance_mid[idx]  # diagnostic; price never enters quote.
+                observed_binance += binance_mid[idx]  # Diagnostic telemetry only.
                 count_binance_reads += 1
             binance_events += 1
             idx += 1
@@ -243,9 +283,15 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 shift_ticks = causal_price_shift_ticks(
                     now, latest_binance_ns, latest_binance, beta,
                     okx_native_ns, okx_native_mid, basis_grid_ns, basis_values)
+            if filter_enter_ticks > 0.0:
+                held_shift_ticks, last_shift_update_ns = filtered_gap_shift(
+                    now, shift_ticks, held_shift_ticks, last_shift_update_ns,
+                    filter_enter_ticks, filter_exit_ticks,
+                    filter_refresh_change_ticks, filter_refresh_ns)
+                shift_ticks = held_shift_ticks
             reservation = mid - skew * pos + shift_ticks
-            want_bid = min(round(reservation - half), bid)
-            want_ask = max(round(reservation + half), ask)
+            want_bid = min(round(reservation - half - extra_half_ticks), bid)
+            want_ask = max(round(reservation + half + extra_half_ticks), ask)
 
             # One side may be pending cancellation; no replacement until cleared.
             has_bid = has_ask = False
