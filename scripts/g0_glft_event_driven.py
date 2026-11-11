@@ -410,9 +410,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             pos_abs_seconds, pos_sq_seconds, at_cap_seconds,
             binance_events, okx_feed_events, order_reply_events, count_binance_reads,
             observed_binance, fill_ts_ns[:n_fills], fill_sides[:n_fills],
-            t0, now, fill_observed_ns[:n_fills],
-            fill_exec_price[:n_fills], fill_exec_qty[:n_fills],
-            probe_rows)
+            t0, (now, fill_observed_ns[:n_fills],
+                 fill_exec_price[:n_fills], fill_exec_qty[:n_fills],
+                 probe_rows))
 
 
 def summarize(raw, minutes, rolling, beta=0.0):
@@ -422,6 +422,9 @@ def summarize(raw, minutes, rolling, beta=0.0):
      turnover, mid, equity, min_eq, max_eq, first_eq, drawdown,
      abs_seconds, sq_seconds, at_cap_seconds, bin_events, okx_events,
      order_events, reads, observed, fill_ts, fill_sides, start, end) = raw[:35]
+    # Diagnostic variants return additional trace arrays with the end timestamp.
+    if isinstance(end, tuple):
+        end = end[0]
     if initial_ok != 1 or successes < 1:
         raise RuntimeError("G0-R first 10 minutes cannot identify GLFT parameters")
     if samples < TRAIN + minutes * 600 - 5:
