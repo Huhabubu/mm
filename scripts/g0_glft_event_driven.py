@@ -391,7 +391,7 @@ def summarize(raw, minutes, rolling, beta=0.0):
      submits, cancels, buys, sells, fills, pos, max_pos, balance, fee,
      turnover, mid, equity, min_eq, max_eq, first_eq, drawdown,
      abs_seconds, sq_seconds, at_cap_seconds, bin_events, okx_events,
-     order_events, reads, observed, fill_ts, fill_sides, start, end) = raw[:33]
+     order_events, reads, observed, fill_ts, fill_sides, start, end) = raw[:35]
     if initial_ok != 1 or successes < 1:
         raise RuntimeError("G0-R first 10 minutes cannot identify GLFT parameters")
     if samples < TRAIN + minutes * 600 - 5:
