@@ -181,6 +181,37 @@ class ScoreAccumulator:
         return r
 
 
+class GapBinAccumulator:
+    """Descriptive extreme-gap response; thresholds fixed from pretrade warmup."""
+    def __init__(self):
+        self.n = 0
+        self.sx = self.sy = self.signed_y = 0.0
+        self.directional = self.nonzero = 0
+
+    def add(self, x, y):
+        if not len(x):
+            return
+        self.n += len(x)
+        self.sx += float(x.sum())
+        self.sy += float(y.sum())
+        direction = np.sign(x) * y
+        self.signed_y += float(direction.sum())
+        self.directional += int(np.count_nonzero(direction > 0))
+        self.nonzero += int(np.count_nonzero(direction != 0))
+
+    def report(self):
+        if not self.n:
+            return {"events": 0}
+        return {
+            "events": self.n,
+            "mean_gap_usdt_per_btc": self.sx / self.n,
+            "mean_okx_future_change_usdt_per_btc": self.sy / self.n,
+            "mean_gap_direction_aligned_change_usdt_per_btc": self.signed_y / self.n,
+            "fraction_moving_in_gap_direction_all_events": self.directional / self.n,
+            "fraction_zero_directional_change": 1 - self.nonzero / self.n,
+        }
+
+
 def minute_block_bootstrap(minute_scores, block_minutes=5, repetitions=1000,
                            seed=20261111):
     """Fixed-width adjacent-minute cluster resampling of already scored predictions.
@@ -230,7 +261,7 @@ def minute_block_bootstrap(minute_scores, block_minutes=5, repetitions=1000,
 def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                 delay_ms=25, tau_ms=100, rolling_minutes=10,
                 update_seconds=5, max_age_ms=250, sample_mode="joint_events",
-                with_minute_bootstrap=False):
+                with_minute_bootstrap=False, with_gap_bins=False):
     """Full UTC day with exactly-once core processing and no future-label training."""
     if not 0 < hours <= 24 or 60 % update_seconds:
         raise ValueError("Unsupported hour horizon or update step")
@@ -249,6 +280,11 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
     # Plus tau and 2s for final event-time labels.
     n_cells = int(total_s) + 10
     stats = np.zeros((n_cells, 5), np.float64)
+    gap_bins = ({kind: GapBinAccumulator() for kind in
+                 ("abs_low_le_p50", "abs_mid_p50_p90", "abs_extreme_gt_p90",
+                  "positive_extreme", "negative_extreme")}
+                if with_gap_bins else None)
+    gap_thresholds = None
     by_source = {"combined": ScoreAccumulator(),
                  "okx_trigger": ScoreAccumulator(),
                  "binance_trigger": ScoreAccumulator()}
@@ -291,6 +327,15 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                                         basis_seconds=basis_seconds,
                                         tau_ms=tau_ms, max_age_ms=max_age_ms,
                                         decision_times=decision_times)
+            if gap_bins is not None and gap_thresholds is None:
+                warm = ((samples["t_ns"] >= start_ns + 61*NS) &
+                        (samples["t_ns"] < start_ns + 600*NS))
+                if core_start == start_ns and np.count_nonzero(warm) >= 1000:
+                    gap_thresholds = np.quantile(
+                        np.abs(samples["gap_usdt_per_btc"][warm]),
+                        [0.5, 0.9]).tolist()
+                elif core_start != start_ns:
+                    raise RuntimeError("Missing pretrade gap thresholds")
             core = ((samples["t_ns"] >= core_start) &
                     (samples["t_ns"] < core_end))
             x = samples["gap_usdt_per_btc"][core]
@@ -344,6 +389,18 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                         if minute_scores is not None:
                             minute_index = int(cutoff_sec // 60)
                             minute_scores[minute_index].add(qx, qy, beta0, beta, alpha)
+                        if gap_bins is not None and gap_thresholds is not None:
+                            magnitude = np.abs(qx)
+                            p50, p90 = gap_thresholds
+                            masks = {
+                                "abs_low_le_p50": magnitude <= p50,
+                                "abs_mid_p50_p90": (magnitude > p50) & (magnitude <= p90),
+                                "abs_extreme_gt_p90": magnitude > p90,
+                                "positive_extreme": qx > p90,
+                                "negative_extreme": qx < -p90,
+                            }
+                            for key, mask in masks.items():
+                                gap_bins[key].add(qx[mask], qy[mask])
 
                 # Ex-post within-hour slope is DESCRIPTIVE, uses its own future
                 # labels and must never be used by the live online predictor.
@@ -411,6 +468,11 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
     return {
         "status": "complete", "day": day, "hours_requested": hours,
         "minute_block_bootstrap": bootstrap,
+        "ex_post_gap_bins_pretrade_fixed_quantiles": (
+            {"thresholds": {"abs_p50_usdt_per_btc": gap_thresholds[0],
+                            "abs_p90_usdt_per_btc": gap_thresholds[1]},
+             "bins": {key: val.report() for key, val in gap_bins.items()}}
+            if gap_bins is not None and gap_thresholds is not None else None),
         "sample_mode": sample_mode,
         "chunks_processed": chunks_done, "minutes_per_chunk": chunk_minutes,
         "no_valid_samples_chunk_seconds": no_sample_chunks,
@@ -456,6 +518,8 @@ def main():
     p.add_argument("--day", default="2026-11-01")
     p.add_argument("--hours", type=float, default=24.)
     p.add_argument("--chunk-minutes", type=int, default=15)
+    p.add_argument("--gap-bins", action="store_true",
+                   help="exploratory response by pretrade absolute gap quantiles")
     p.add_argument("--minute-block-bootstrap", action="store_true",
                    help="compute 5-minute clustered 95% confidence intervals")
     p.add_argument("--sample-mode", default="joint_events",
@@ -472,7 +536,8 @@ def main():
     try:
         report = run_one_day(args.day, hours=args.hours, chunk_minutes=args.chunk_minutes,
                              sample_mode=args.sample_mode,
-                             with_minute_bootstrap=args.minute_block_bootstrap)
+                             with_minute_bootstrap=args.minute_block_bootstrap,
+                             with_gap_bins=args.gap_bins)
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
