@@ -1,0 +1,54 @@
+name: Counterfactual maker fill mechanism 5min smoke
+
+on:
+  push:
+    paths:
+      - 'scripts/counterfactual_fill_markout.py'
+      - 'scripts/test_counterfactual_fill_markout.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - '.github/workflows/counterfactual-fill-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mechanism-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT matching engine 2.4.4
+        run: pip install hftbacktest==2.4.4
+      - name: Verify exact-matching, no future, cancellation and GLFT regressions
+        run: |
+          python -m unittest discover -s scripts -p 'test_counterfactual_fill_markout.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+          python -m unittest discover -s scripts -p 'test_gap_filter_placebo.py' -v
+      - name: Replay official maker fills and confirmed cancellations for all six modes
+        run: python scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 5 --experiment mechanism
+      - name: Print aggregate baseline-only markout and confirmed cancel evidence
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open("reports/counterfactual_fill_markout_2026-11-01_5m.json"))
+          print("STATUS",r["status"],"BASE_FILLS",r["mechanism_audit"]["baseline_fills"])
+          for name,d in r["mechanism_audit"]["comparisons"].items():
+              print("MODE",name,"EXACT_MATCH",d["exact_exchange_time_side_price_overlap"],
+                    "BASE_ONLY",d["baseline_only_exact_quote"],
+                    "CONFIRMED_CANCEL_PROXY",d["confirmed_same_quote_cancel_within_500ms_baseline_only"],
+                    "BASE_ONLY_MARKOUT_100",d["groups"]["baseline_quote_not_filled_in_alternative"]["horizons"]["100"])
+          PY
+      - name: Upload aggregates only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: counterfactual-mechanism-2026-11-01-5min
+          path: reports/counterfactual_fill_markout_2026-11-01_5m.json
+          if-no-files-found: warn
+          retention-days: 14
