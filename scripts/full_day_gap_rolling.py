@@ -181,9 +181,87 @@ class ScoreAccumulator:
         return r
 
 
+class GapBinAccumulator:
+    """Descriptive extreme-gap response; thresholds fixed from pretrade warmup."""
+    def __init__(self):
+        self.n = 0
+        self.sx = self.sy = self.signed_y = 0.0
+        self.directional = self.nonzero = 0
+
+    def add(self, x, y):
+        if not len(x):
+            return
+        self.n += len(x)
+        self.sx += float(x.sum())
+        self.sy += float(y.sum())
+        direction = np.sign(x) * y
+        self.signed_y += float(direction.sum())
+        self.directional += int(np.count_nonzero(direction > 0))
+        self.nonzero += int(np.count_nonzero(direction != 0))
+
+    def report(self):
+        if not self.n:
+            return {"events": 0}
+        return {
+            "events": self.n,
+            "mean_gap_usdt_per_btc": self.sx / self.n,
+            "mean_okx_future_change_usdt_per_btc": self.sy / self.n,
+            "mean_gap_direction_aligned_change_usdt_per_btc": self.signed_y / self.n,
+            "fraction_moving_in_gap_direction_all_events": self.directional / self.n,
+            "fraction_zero_directional_change": 1 - self.nonzero / self.n,
+        }
+
+
+def minute_block_bootstrap(minute_scores, block_minutes=5, repetitions=1000,
+                           seed=20261111):
+    """Fixed-width adjacent-minute cluster resampling of already scored predictions.
+
+    Values are SSE sums, not β re-estimates. Covers estimator's realized
+    prequential predictions, preserving within-block event dependence.
+    No claim of independent, unseen trading days or economic significance.
+    """
+    if block_minutes < 1 or repetitions < 100 or len(minute_scores) < block_minutes:
+        raise ValueError("Insufficient minute groups for specified bootstrap")
+    n_groups = (len(minute_scores) + block_minutes - 1) // block_minutes
+    vals = np.asarray([
+        [v.n, v.y2, v.fixed, v.fixed_beta0, v.rolling0, v.rolling_free]
+        for v in minute_scores], dtype=np.float64)
+    groups = np.asarray([
+        vals[start:start + block_minutes].sum(axis=0)
+        for start in range(0, len(vals), block_minutes)], dtype=np.float64)
+    overall = groups.sum(axis=0)
+    if overall[0] <= 0 or overall[1] <= 0:
+        raise ValueError("No bootstrap evaluation observations")
+    rng = np.random.default_rng(seed)
+    draw = rng.integers(0, n_groups, size=(repetitions, n_groups))
+    sampled = groups[draw].sum(axis=1)
+    valid = sampled[:, 1] > 0
+    if not valid.all():
+        raise ValueError("Bootstrap drew zero-variance samples")
+    result = {}
+    for name, col in (("fixed_alpha_beta", 2), ("fixed_beta_alpha0", 3),
+                      ("rolling_beta_alpha0", 4), ("rolling_alpha_beta", 5)):
+        boot = 1.0 - sampled[:, col] / sampled[:, 1]
+        point = 1.0 - overall[col] / overall[1]
+        result[name] = {
+            "point_r2_vs_zero": float(point),
+            "ci95_percentile": np.quantile(boot, [0.025, 0.975]).tolist(),
+            "bootstrap_fraction_positive": float(np.mean(boot > 0)),
+        }
+    return {
+        "method": "nonoverlapping contiguous minute blocks resampled with replacement; "
+                  "point statistics from actual strictly chronological predictions",
+        "cluster_minutes": int(block_minutes), "clusters": int(n_groups),
+        "bootstrap_repetitions": int(repetitions), "seed": int(seed),
+        "caveat": "only one historical day; minutes across regimes may be dependent",
+        "scores": result
+    }
+
+
 def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                 delay_ms=25, tau_ms=100, rolling_minutes=10,
-                update_seconds=5, max_age_ms=250, sample_mode="joint_events"):
+                update_seconds=5, max_age_ms=250, sample_mode="joint_events",
+                with_minute_bootstrap=False, with_gap_bins=False):
     """Full UTC day with exactly-once core processing and no future-label training."""
     if not 0 < hours <= 24 or 60 % update_seconds:
         raise ValueError("Unsupported hour horizon or update step")
@@ -202,10 +280,17 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
     # Plus tau and 2s for final event-time labels.
     n_cells = int(total_s) + 10
     stats = np.zeros((n_cells, 5), np.float64)
+    gap_bins = ({kind: GapBinAccumulator() for kind in
+                 ("abs_low_le_p50", "abs_mid_p50_p90", "abs_extreme_gt_p90",
+                  "positive_extreme", "negative_extreme")}
+                if with_gap_bins else None)
+    gap_thresholds = None
     by_source = {"combined": ScoreAccumulator(),
                  "okx_trigger": ScoreAccumulator(),
                  "binance_trigger": ScoreAccumulator()}
     by_hour = {str(h): ScoreAccumulator() for h in range(math.ceil(hours))}
+    minute_scores = ([ScoreAccumulator() for _ in range(math.ceil(hours * 60))]
+                     if with_minute_bootstrap else None)
     hourly_expost = np.zeros((math.ceil(hours), 3, 5), np.float64)
     # Hour index, [combined, OKX, Binance], [n, sx, sy, xx, xy].
     roller = []
@@ -242,6 +327,15 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                                         basis_seconds=basis_seconds,
                                         tau_ms=tau_ms, max_age_ms=max_age_ms,
                                         decision_times=decision_times)
+            if gap_bins is not None and gap_thresholds is None:
+                warm = ((samples["t_ns"] >= start_ns + 61*NS) &
+                        (samples["t_ns"] < start_ns + 600*NS))
+                if core_start == start_ns and np.count_nonzero(warm) >= 1000:
+                    gap_thresholds = np.quantile(
+                        np.abs(samples["gap_usdt_per_btc"][warm]),
+                        [0.5, 0.9]).tolist()
+                elif core_start != start_ns:
+                    raise RuntimeError("Missing pretrade gap thresholds")
             core = ((samples["t_ns"] >= core_start) &
                     (samples["t_ns"] < core_end))
             x = samples["gap_usdt_per_btc"][core]
@@ -292,6 +386,21 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                                                  beta0, beta, alpha)
                         hour = int(cutoff_sec // 3600)
                         by_hour[str(hour)].add(qx, qy, beta0, beta, alpha)
+                        if minute_scores is not None:
+                            minute_index = int(cutoff_sec // 60)
+                            minute_scores[minute_index].add(qx, qy, beta0, beta, alpha)
+                        if gap_bins is not None and gap_thresholds is not None:
+                            magnitude = np.abs(qx)
+                            p50, p90 = gap_thresholds
+                            masks = {
+                                "abs_low_le_p50": magnitude <= p50,
+                                "abs_mid_p50_p90": (magnitude > p50) & (magnitude <= p90),
+                                "abs_extreme_gt_p90": magnitude > p90,
+                                "positive_extreme": qx > p90,
+                                "negative_extreme": qx < -p90,
+                            }
+                            for key, mask in masks.items():
+                                gap_bins[key].add(qx[mask], qy[mask])
 
                 # Ex-post within-hour slope is DESCRIPTIVE, uses its own future
                 # labels and must never be used by the live online predictor.
@@ -354,8 +463,16 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
         raise ValueError("No valid full-day gap / online beta samples")
     if chunks_done != math.ceil((end_ns - start_ns) / chunk_ns):
         raise RuntimeError("Not all UTC chunks completed")
+    bootstrap = (minute_block_bootstrap(minute_scores)
+                 if minute_scores is not None else None)
     return {
         "status": "complete", "day": day, "hours_requested": hours,
+        "minute_block_bootstrap": bootstrap,
+        "ex_post_gap_bins_pretrade_fixed_quantiles": (
+            {"thresholds": {"abs_p50_usdt_per_btc": gap_thresholds[0],
+                            "abs_p90_usdt_per_btc": gap_thresholds[1]},
+             "bins": {key: val.report() for key, val in gap_bins.items()}}
+            if gap_bins is not None and gap_thresholds is not None else None),
         "sample_mode": sample_mode,
         "chunks_processed": chunks_done, "minutes_per_chunk": chunk_minutes,
         "no_valid_samples_chunk_seconds": no_sample_chunks,
@@ -401,6 +518,10 @@ def main():
     p.add_argument("--day", default="2026-11-01")
     p.add_argument("--hours", type=float, default=24.)
     p.add_argument("--chunk-minutes", type=int, default=15)
+    p.add_argument("--gap-bins", action="store_true",
+                   help="exploratory response by pretrade absolute gap quantiles")
+    p.add_argument("--minute-block-bootstrap", action="store_true",
+                   help="compute 5-minute clustered 95% confidence intervals")
     p.add_argument("--sample-mode", default="joint_events",
                    choices=("joint_events", "binance_last_per_microsecond",
                             "fixed_10ms", "fixed_50ms"))
@@ -414,7 +535,9 @@ def main():
     report = {"status": "started", "day": args.day, "hours_requested": args.hours}
     try:
         report = run_one_day(args.day, hours=args.hours, chunk_minutes=args.chunk_minutes,
-                             sample_mode=args.sample_mode)
+                             sample_mode=args.sample_mode,
+                             with_minute_bootstrap=args.minute_block_bootstrap,
+                             with_gap_bins=args.gap_bins)
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
