@@ -70,7 +70,7 @@ class MechanismTests(unittest.TestCase):
         self.assertEqual(v["groups"]["baseline_quote_not_filled_in_alternative"]["fills"],2)
 
     def test_markout_censoring_when_bbo_horizon_unavailable(self):
-        ext = np.array([10*NS, 10*NS+10_000_000],dtype=np.int64)
+        ext = np.array([9*NS+850_000_000, 9*NS+860_000_000],dtype=np.int64)
         mids = np.array([100.,100.])
         t = fixture([10.05],[1],[1000])
         out = evaluate_one_trace(t,ext,mids)
