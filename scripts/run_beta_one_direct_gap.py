@@ -152,18 +152,22 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
     traces = {}
     for name, beta, enter, extra_half in specifications:
         engine = ROIVectorMarketDepthBacktest([asset_for(npz, low, high)])
+        # Side-effect audit buffers leave the legacy Numba return tuple unchanged.
+        audit_capacity = 2 * (trade_minutes*60_000//20) + 100
+        fill_px = np.full(audit_capacity if mechanism else 1, -1, np.int64)
+        canceled = np.full((audit_capacity if mechanism else 1, 3), -1, np.int64)
         try:
             raw = run_event_glft(
                 engine, bt, bm, trade_minutes*600,
                 True, GAMMA, True, beta, ot, om, basis_t, basis,
                 enter, (thresholds["release_ticks"] if enter else 0.0),
                 (thresholds["refresh_min_change_ticks"] if enter else 10.0),
-                250_000_000, extra_half, mechanism)
+                250_000_000, extra_half, mechanism, fill_px, canceled)
             if mechanism:
                 traces[name] = {
                     "ts_ns": raw[31].copy(), "side": raw[32].copy(),
-                    "price_tick": raw[35].copy(),
-                    "confirmed_canceled": raw[36].copy(),
+                    "price_tick": fill_px[:len(raw[31])].copy(),
+                    "confirmed_canceled": canceled[canceled[:, 0] > 0].copy(),
                 }
             variants[name] = summarize(
                 raw, trade_minutes, True, beta=beta)
