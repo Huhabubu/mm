@@ -172,6 +172,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
 
         if sample_count > TRAIN and (feed_status == 2 or feed_status == 3 or
                                        signal_event or sample_event):
+            # Observe live inventory peaks at every event, not only 100ms samples.
+            max_position = max(max_position, abs(engine.position(0)))
             # Always collect fills BEFORE discarding inactive orders.
             orders = engine.orders(0)
             it = orders.values()
@@ -311,6 +313,16 @@ def summarize(raw, minutes, rolling):
             "half_spread_ticks": float(updates[-1,4]),
             "skew_ticks_per_contract": float(updates[-1,5])
         },
+        "calibration_trace": [
+            {
+                "elapsed_seconds_after_training": float(row[0]),
+                "A_per_second": float(row[1]),
+                "k_per_real_tick": float(row[2]),
+                "sigma_tick_per_sqrt_second": float(row[3]),
+                "half_spread_ticks": float(row[4]),
+                "skew_ticks_per_contract": float(row[5])
+            } for row in updates
+        ],
         "time_count": {"binance": int(bin_events), "okx_feed": int(okx_events),
                        "order_reply": int(order_events), "binance_reads": int(reads)},
         "trading": {
