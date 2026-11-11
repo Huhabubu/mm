@@ -58,7 +58,7 @@ def event_gap_samples(okx_time, okx_mid, bin_time, bin_mid,
     Market-source rows at equal timestamps retain their own exact row index;
     other-source as-of search is strictly earlier (left) at tied timestamps.
     The basis is a strictly trailing time-weighted 1-second grid average.
-    A complete basis window with fresh quotes is mandatory; no backfilling.
+    A full-length basis window with >=75% fresh 1-second points is mandatory; no backfilling.
     bin_time must already include assumed availability delay and +1ns tie policy.
     """
     ot = np.asarray(okx_time, dtype=np.int64)
@@ -100,9 +100,10 @@ def event_gap_samples(okx_time, okx_mid, bin_time, bin_mid,
     counts = np.r_[0, np.cumsum(good_grid.astype(np.int64))]
     basis = np.full(len(grid), np.nan, dtype=np.float64)
     w = basis_seconds
-    valid_window = (counts[w:] - counts[:-w]) == w
+    coverage = counts[w:] - counts[:-w]
+    valid_window = coverage >= int(np.ceil(0.75 * w))
     basis[w - 1:] = np.where(valid_window,
-                             (sums[w:] - sums[:-w]) / w, np.nan)
+                             (sums[w:] - sums[:-w]) / np.maximum(coverage, 1), np.nan)
 
     basis_idx = np.searchsorted(grid, t, side="left") - 1
     current = (oi >= 0) & (bi >= 0)
@@ -116,7 +117,7 @@ def event_gap_samples(okx_time, okx_mid, bin_time, bin_mid,
     future = np.searchsorted(ot, target, side="right") - 1
     current &= target <= ot[-1]
     if not np.any(current):
-        raise ValueError("No event samples remain after causal checks")
+        raise ValueError(f"No causal samples: basis_valid={int(np.isfinite(basis).sum())}, fresh_events={int(np.count_nonzero((oi >= 0) & (bi >= 0)))}, total_events={len(t)}")
     keep = np.flatnonzero(current)
     oidx, bidx, fidx = oi[keep], bi[keep], future[keep]
     return {
@@ -130,6 +131,7 @@ def event_gap_samples(okx_time, okx_mid, bin_time, bin_mid,
         "all_event_rows": int(len(t)),
         "basis_grid_seconds": int(len(grid)),
         "basis_valid_seconds": int(np.isfinite(basis).sum()),
+        "basis_min_fresh_coverage_fraction": 0.75,
     }
 
 
@@ -204,7 +206,8 @@ def main():
               "validation": VALID_DAYS, "exploratory_diagnostics": DIAG_DAYS,
               "new_blind_test": False, "tau_ms": args.tau_ms,
               "signal_delay_ms": args.delay_ms, "basis_seconds": args.basis_seconds,
-              "max_age_ms": 250, "duration_minutes": args.minutes}
+              "max_age_ms": 250, "basis_min_fresh_coverage_fraction": 0.75,
+              "duration_minutes": args.minutes}
     out = Path(args.report_dir) / "event_gap_regression_exploratory.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
