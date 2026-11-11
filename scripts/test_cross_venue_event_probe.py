@@ -75,15 +75,15 @@ class OfficialCancelCompetition(unittest.TestCase):
             root = Path(folder)
             books, trades, npz = (root / n for n in ("book.csv", "trade.csv", "okx.npz"))
             books.write_text(
-                "exchange,symbol,timestamp,local_timestamp,is_snapshot,side,price,amount\\n"
-                f"okex-swap,BTC-USDT-SWAP,{t0_us},{t0_us},true,bid,100.0,1\\n"
-                f"okex-swap,BTC-USDT-SWAP,{t0_us},{t0_us},true,ask,101.0,1\\n"
-                f"okex-swap,BTC-USDT-SWAP,{t0_us+5100},{t0_us+5100},false,bid,100.0,0\\n"
-                f"okex-swap,BTC-USDT-SWAP,{t0_us+5101},{t0_us+5101},false,bid,99.9,2\\n"
-                f"okex-swap,BTC-USDT-SWAP,{t0_us+8000},{t0_us+8000},false,ask,101.0,2\\n")
+                "exchange,symbol,timestamp,local_timestamp,is_snapshot,side,price,amount\n"
+                f"okex-swap,BTC-USDT-SWAP,{t0_us},{t0_us},true,bid,100.0,1\n"
+                f"okex-swap,BTC-USDT-SWAP,{t0_us},{t0_us},true,ask,101.0,1\n"
+                f"okex-swap,BTC-USDT-SWAP,{t0_us+5100},{t0_us+5100},false,bid,100.0,0\n"
+                f"okex-swap,BTC-USDT-SWAP,{t0_us+5101},{t0_us+5101},false,bid,99.9,2\n"
+                f"okex-swap,BTC-USDT-SWAP,{t0_us+8000},{t0_us+8000},false,ask,101.0,2\n")
             trades.write_text(
-                "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\\n"
-                f"okex-swap,BTC-USDT-SWAP,{t0_us+5000},{t0_us+5000},s1,sell,99.9,100\\n")
+                "exchange,symbol,timestamp,local_timestamp,id,side,price,amount\n"
+                f"okex-swap,BTC-USDT-SWAP,{t0_us+5000},{t0_us+5000},s1,sell,99.9,100\n")
             tardis.convert([str(trades), str(books)], output_filename=str(npz),
                            buffer_size=10000, ss_buffer_size=1000, snapshot_mode="process")
             asset = (BacktestAsset().data([str(npz)]).linear_asset(0.01)
