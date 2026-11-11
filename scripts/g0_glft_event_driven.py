@@ -237,7 +237,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             # and strictly earlier completed-second 60s causal basis.
             # Missing or stale quotes -> beta shift 0; no future labels enter.
             shift_ticks = 0.0
-            if beta != 0.0:
+            if (beta != 0.0 and okx_native_ns is not None and
+                    okx_native_mid is not None and basis_grid_ns is not None and
+                    basis_values is not None):
                 shift_ticks = causal_price_shift_ticks(
                     now, latest_binance_ns, latest_binance, beta,
                     okx_native_ns, okx_native_mid, basis_grid_ns, basis_values)
