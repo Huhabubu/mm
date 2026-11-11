@@ -1,0 +1,58 @@
+name: Full-day causal rolling beta stress diagnostic
+
+on:
+  push:
+    paths:
+      - 'scripts/full_day_gap_rolling.py'
+      - 'scripts/test_full_day_gap_rolling.py'
+      - '.github/workflows/full-day-gap-rolling.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-day-gap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install BBO diagnostic dependencies
+        run: pip install numpy
+      - name: Causality, old regression and streaming chunk-invariance tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_gap_event_regression.py' -v
+          python -m unittest discover -s scripts -p 'test_full_day_gap_rolling.py' -v
+      - name: 30-minute real Binance/OKX smoke - same no-leak rolling beta
+        run: python scripts/full_day_gap_rolling.py --day 2026-11-01 --hours 0.5 --chunk-minutes 15
+      - name: One full 24-hour UTC Tardis day: rolling beta (NO ORDERS)
+        run: python scripts/full_day_gap_rolling.py --day 2026-11-01 --hours 24 --chunk-minutes 15
+      - name: Show core diagnostics, full-day vs first 30 minutes
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          a=json.load(open("reports/full_day_gap_rolling_2026-11-01_24h.json"))
+          b=json.load(open("reports/full_day_gap_rolling_2026-11-01_0.5h.json"))
+          print("FULL_24H:", a["sampling"], a["data"])
+          print("ROLLING_BETA:", a["rolling_beta_updates"])
+          for k,v in a["matched_out_of_sample_scores"].items():
+              print("24H", k, v)
+          for item in a["by_hour"]:
+              print("HOUR",item["hour_utc"],"online",item["online_score"],
+                    "ex_post_desc",item["expost_only"])
+          print("SMOKE_0.5H:", b["sampling"], b["matched_out_of_sample_scores"])
+          PY
+      - name: Upload only JSON summary, not raw market data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-day-gap-rolling-2026-11-01
+          path: |
+            reports/full_day_gap_rolling_2026-11-01_24h.json
+            reports/full_day_gap_rolling_2026-11-01_0.5h.json
+          if-no-files-found: warn
+          retention-days: 14
