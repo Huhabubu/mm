@@ -1,0 +1,56 @@
+name: G0 event-driven six-date 50min sanity
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_event_driven.py'
+      - 'scripts/run_g0_event_driven.py'
+      - '.github/workflows/g0-event-multiday.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  g0-multiday:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        day: ['2026-06-01', '2026-07-01', '2026-08-01',
+              '2026-09-01', '2026-10-01', '2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official hftbacktest 2.4.4
+        run: pip install hftbacktest==2.4.4
+      - name: Run identical beta-zero event GLFT pair and legacy estimator check
+        run: python scripts/run_g0_event_driven.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25
+      - name: Print actual official market fill accounting
+        if: success()
+        run: |
+          DAY="${{ matrix.day }}" python - <<'PY'
+          import json, os
+          day=os.environ["DAY"]
+          r=json.load(open(f"reports/g0_event_driven_{day}_50m.json"))
+          new=r["modes"]["beta_zero_no_signal_read"]
+          old=r["legacy_100ms_G0_R_trading"]
+          print(day, "paired_beta_zero_identical", r["paired_equal_except_diagnostic_reads"],
+                "samples", new["samples"], "refits", new["successful_calibrations"],
+                "fills_event", new["trading"]["engine_fills"],
+                "fills_legacy", old["engine_fills"],
+                "net_event", new["trading"]["end_net_marked_equity_usdt"],
+                "net_legacy", old["end_net_marked_equity_usdt"])
+          PY
+      - name: Aggregate output only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-event-driven-${{ matrix.day }}
+          path: reports/g0_event_driven_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 14
