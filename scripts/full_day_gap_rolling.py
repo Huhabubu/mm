@@ -181,9 +181,56 @@ class ScoreAccumulator:
         return r
 
 
+def minute_block_bootstrap(minute_scores, block_minutes=5, repetitions=1000,
+                           seed=20261111):
+    """Fixed-width adjacent-minute cluster resampling of already scored predictions.
+
+    Values are SSE sums, not β re-estimates. Covers estimator's realized
+    prequential predictions, preserving within-block event dependence.
+    No claim of independent, unseen trading days or economic significance.
+    """
+    if block_minutes < 1 or repetitions < 100 or len(minute_scores) < block_minutes:
+        raise ValueError("Insufficient minute groups for specified bootstrap")
+    n_groups = (len(minute_scores) + block_minutes - 1) // block_minutes
+    vals = np.asarray([
+        [v.n, v.y2, v.fixed, v.fixed_beta0, v.rolling0, v.rolling_free]
+        for v in minute_scores], dtype=np.float64)
+    groups = np.asarray([
+        vals[start:start + block_minutes].sum(axis=0)
+        for start in range(0, len(vals), block_minutes)], dtype=np.float64)
+    overall = groups.sum(axis=0)
+    if overall[0] <= 0 or overall[1] <= 0:
+        raise ValueError("No bootstrap evaluation observations")
+    rng = np.random.default_rng(seed)
+    draw = rng.integers(0, n_groups, size=(repetitions, n_groups))
+    sampled = groups[draw].sum(axis=1)
+    valid = sampled[:, 1] > 0
+    if not valid.all():
+        raise ValueError("Bootstrap drew zero-variance samples")
+    result = {}
+    for name, col in (("fixed_alpha_beta", 2), ("fixed_beta_alpha0", 3),
+                      ("rolling_beta_alpha0", 4), ("rolling_alpha_beta", 5)):
+        boot = 1.0 - sampled[:, col] / sampled[:, 1]
+        point = 1.0 - overall[col] / overall[1]
+        result[name] = {
+            "point_r2_vs_zero": float(point),
+            "ci95_percentile": np.quantile(boot, [0.025, 0.975]).tolist(),
+            "bootstrap_fraction_positive": float(np.mean(boot > 0)),
+        }
+    return {
+        "method": "nonoverlapping contiguous minute blocks resampled with replacement; "
+                  "point statistics from actual strictly chronological predictions",
+        "cluster_minutes": int(block_minutes), "clusters": int(n_groups),
+        "bootstrap_repetitions": int(repetitions), "seed": int(seed),
+        "caveat": "only one historical day; minutes across regimes may be dependent",
+        "scores": result
+    }
+
+
 def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                 delay_ms=25, tau_ms=100, rolling_minutes=10,
-                update_seconds=5, max_age_ms=250, sample_mode="joint_events"):
+                update_seconds=5, max_age_ms=250, sample_mode="joint_events",
+                with_minute_bootstrap=False):
     """Full UTC day with exactly-once core processing and no future-label training."""
     if not 0 < hours <= 24 or 60 % update_seconds:
         raise ValueError("Unsupported hour horizon or update step")
@@ -206,6 +253,8 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                  "okx_trigger": ScoreAccumulator(),
                  "binance_trigger": ScoreAccumulator()}
     by_hour = {str(h): ScoreAccumulator() for h in range(math.ceil(hours))}
+    minute_scores = ([ScoreAccumulator() for _ in range(math.ceil(hours * 60))]
+                     if with_minute_bootstrap else None)
     hourly_expost = np.zeros((math.ceil(hours), 3, 5), np.float64)
     # Hour index, [combined, OKX, Binance], [n, sx, sy, xx, xy].
     roller = []
@@ -292,6 +341,9 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
                                                  beta0, beta, alpha)
                         hour = int(cutoff_sec // 3600)
                         by_hour[str(hour)].add(qx, qy, beta0, beta, alpha)
+                        if minute_scores is not None:
+                            minute_index = int(cutoff_sec // 60)
+                            minute_scores[minute_index].add(qx, qy, beta0, beta, alpha)
 
                 # Ex-post within-hour slope is DESCRIPTIVE, uses its own future
                 # labels and must never be used by the live online predictor.
@@ -354,8 +406,11 @@ def run_one_day(day, hours=24, chunk_minutes=15, basis_seconds=60,
         raise ValueError("No valid full-day gap / online beta samples")
     if chunks_done != math.ceil((end_ns - start_ns) / chunk_ns):
         raise RuntimeError("Not all UTC chunks completed")
+    bootstrap = (minute_block_bootstrap(minute_scores)
+                 if minute_scores is not None else None)
     return {
         "status": "complete", "day": day, "hours_requested": hours,
+        "minute_block_bootstrap": bootstrap,
         "sample_mode": sample_mode,
         "chunks_processed": chunks_done, "minutes_per_chunk": chunk_minutes,
         "no_valid_samples_chunk_seconds": no_sample_chunks,
@@ -401,6 +456,8 @@ def main():
     p.add_argument("--day", default="2026-11-01")
     p.add_argument("--hours", type=float, default=24.)
     p.add_argument("--chunk-minutes", type=int, default=15)
+    p.add_argument("--minute-block-bootstrap", action="store_true",
+                   help="compute 5-minute clustered 95% confidence intervals")
     p.add_argument("--sample-mode", default="joint_events",
                    choices=("joint_events", "binance_last_per_microsecond",
                             "fixed_10ms", "fixed_50ms"))
@@ -414,7 +471,8 @@ def main():
     report = {"status": "started", "day": args.day, "hours_requested": args.hours}
     try:
         report = run_one_day(args.day, hours=args.hours, chunk_minutes=args.chunk_minutes,
-                             sample_mode=args.sample_mode)
+                             sample_mode=args.sample_mode,
+                             with_minute_bootstrap=args.minute_block_bootstrap)
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
