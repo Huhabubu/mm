@@ -28,7 +28,7 @@ jobs:
           python -m unittest discover -s scripts -p 'test_full_day_gap_rolling.py' -v
       - name: 30-minute real Binance/OKX smoke - same no-leak rolling beta
         run: python scripts/full_day_gap_rolling.py --day 2026-11-01 --hours 0.5 --chunk-minutes 15
-      - name: One full 24-hour UTC Tardis day: rolling beta (NO ORDERS)
+      - name: 'One full 24-hour UTC Tardis day: rolling beta (NO ORDERS)'
         run: python scripts/full_day_gap_rolling.py --day 2026-11-01 --hours 24 --chunk-minutes 15
       - name: Show core diagnostics, full-day vs first 30 minutes
         if: success()
