@@ -49,18 +49,20 @@ def gap_at_strict_past_times(okx_time, okx_mid, bin_time, bin_mid, times):
         return np.empty(0, np.float64), np.empty(0, bool)
     # event_gap_samples maintains exactly the previous valid 60s causal
     # basis and strict as-of < decision time across both sources.
+    unique_times, restore = np.unique(np.asarray(times, dtype=np.int64),
+                                      return_inverse=True)
     observed = event_gap_samples(
         okx_time, okx_mid, bin_time, bin_mid, basis_seconds=60,
         tau_ms=HORIZON_MS, max_age_ms=MAX_AGE_MS,
-        decision_times=np.asarray(times, dtype=np.int64))
-    got = np.full(len(times), np.nan)
-    valid = np.zeros(len(times), dtype=bool)
-    idx = np.searchsorted(times, observed["t_ns"], side="left")
-    if np.any(idx >= len(times)) or not np.array_equal(times[idx], observed["t_ns"]):
+        decision_times=unique_times)
+    unique_gaps = np.full(len(unique_times), np.nan)
+    idx = np.searchsorted(unique_times, observed["t_ns"], side="left")
+    if np.any(idx >= len(unique_times)) or not np.array_equal(
+            unique_times[idx], observed["t_ns"]):
         raise RuntimeError("Gap query accidentally matched a different timestamp")
-    got[idx] = observed["gap_usdt_per_btc"]
-    valid[idx] = True
-    return got, valid
+    unique_gaps[idx] = observed["gap_usdt_per_btc"]
+    got = unique_gaps[restore]
+    return got, np.isfinite(got)
 
 
 def strict_warmup_thresholds(ot, om, bt, bm, start_ns):
