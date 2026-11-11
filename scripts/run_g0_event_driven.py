@@ -17,7 +17,7 @@ import numpy as np
 from check_okx_hft_data import SCHEMAS, extract_window
 from cross_venue_event_probe import read_binance_bbo, visible_timestamps
 from g0_glft_baseline import LOT, TICK, TRAIN, STEP_NS, GAMMA
-from g0_glft_rolling import asset_for, run_mode
+from g0_glft_rolling import asset_for, run_mode, UPDATE_EVERY_STEPS
 from g0_glft_event_driven import run_event_glft, summarize
 
 
@@ -42,8 +42,10 @@ def run_pair(npz, low, high, b_ts, b_mid, minutes, rolling=True):
     check["time_count"]["binance_reads"] = first["time_count"]["binance_reads"]
     if first != check:
         raise RuntimeError("beta=0 paired executions diverged on identical event clocks")
-    if first["calibration_attempts"] != 1 + minutes * 60 // 5:
-        raise RuntimeError("5s parameter update schedule was not preserved")
+    expected = 1 + max(first["samples"] - TRAIN, 0) // UPDATE_EVERY_STEPS
+    if first["calibration_attempts"] != expected:
+        raise RuntimeError(
+            f"5s calibration schedule changed: {first['calibration_attempts']} vs {expected}")
     return result
 
 
