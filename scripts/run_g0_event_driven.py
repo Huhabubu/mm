@@ -105,8 +105,24 @@ def main():
                 if not math.isclose(got, expected, rel_tol=1e-10, abs_tol=1e-10):
                     raise RuntimeError(
                         f"100ms calibration drift: {key} event={got}, legacy={expected}")
+            # This is stronger than matching only the initial calibration:
+            # official engine execution must leave every 100ms calibration
+            # observation and every 5s estimator result unchanged.
+            ev_trace = results[0]["calibration_trace"]
+            old_trace = legacy["calibration_trace"]
+            if len(ev_trace) != len(old_trace):
+                raise RuntimeError(
+                    f"5s full parameter trace length drift: {len(ev_trace)} vs {len(old_trace)}")
+            for step, (new, prev) in enumerate(zip(ev_trace, old_trace)):
+                for key in ("elapsed_seconds_after_training", "A_per_second",
+                            "k_per_real_tick", "sigma_tick_per_sqrt_second",
+                            "half_spread_ticks", "skew_ticks_per_contract"):
+                    if not math.isclose(new[key], prev[key], rel_tol=1e-9, abs_tol=1e-9):
+                        raise RuntimeError(f"Rolling parameter drift at step {step}, {key}: "
+                                           f"event={new[key]}, legacy={prev[key]}")
             report["legacy_100ms_G0_R_trading"] = legacy["trading"]
             report["initial_parameters_equal_to_legacy"] = True
+            report["all_5s_calibrations_equal_to_legacy"] = True
             report.update({"status": "complete", "okx_market_counts": counts,
                            "okx_fused_rows": event_rows,
                            "binance_bbo_rows": int(len(b_visible)),
