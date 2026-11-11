@@ -336,6 +336,21 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports"):
                 if (variant_report["time_count"]["binance"] !=
                         base_report["time_count"]["binance"]):
                     raise RuntimeError(f"{name} used a different Binance feed clock")
+                if name == "beta_1":
+                    # Pure read-only probes must not change strategy PnL/orders
+                    # or the official filled orders. Check on actual replay.
+                    check_report, check_fills, check_probe = replay_variant(
+                        npz, low, high, bt, bm, ot, om, basis_t, basis,
+                        minutes, name, thresholds, probes=None)
+                    if (check_report["trading"] != variant_report["trading"] or
+                            check_fills != fill_trace or
+                            check_report["calibration_trace"] !=
+                            variant_report["calibration_trace"]):
+                        raise RuntimeError(
+                            "Diagnostic probe changed beta=1 trading outcomes")
+                    if check_probe.shape[0] != 0:
+                        raise RuntimeError("Unprobed replay created audit rows")
+                    report["probe_invariance_against_unprobed_beta1"] = True
                 report.setdefault("variants", {})[name] = {
                     "trading": variant_report["trading"],
                     "fill_clock_alignment": describe_coverage(fill_trace),
