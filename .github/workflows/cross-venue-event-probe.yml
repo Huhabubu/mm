@@ -1,0 +1,37 @@
+name: Cross-venue event ordering and HBT cancel race
+
+on:
+  push:
+    paths:
+      - 'scripts/cross_venue_event_probe.py'
+      - 'scripts/run_cross_venue_event_probe.py'
+      - 'scripts/test_cross_venue_event_probe.py'
+      - '.github/workflows/cross-venue-event-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  event-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official hftbacktest 2.4.4
+        run: pip install hftbacktest==2.4.4
+      - name: Deterministic scheduler and official-engine cancellation regression
+        run: python -m unittest discover -s scripts -p 'test_cross_venue_event_probe.py' -v
+      - name: Real 60-second OKX fused tape and Binance BBO joint replay
+        run: python scripts/run_cross_venue_event_probe.py --day 2026-11-01 --seconds 60 --delay-ms 25
+      - name: Publish aggregate counters only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-venue-event-probe-2026-11-01
+          path: reports/cross_venue_event_probe_2026-11-01.json
+          if-no-files-found: warn
+          retention-days: 14
