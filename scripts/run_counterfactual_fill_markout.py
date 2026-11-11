@@ -33,14 +33,15 @@ HORIZONS = (100, 500)
 
 
 def extract_official_fills(raw):
-    """Raw legacy slots 31:33 and opt-in extended trace 35:38."""
-    if len(raw) < 39:
-        raise RuntimeError("Event runner missing official fill audit arrays")
+    """Raw legacy slots 31:33 and nested diagnostic arrays at slot 34."""
+    if len(raw) != 35 or not isinstance(raw[34], tuple):
+        raise RuntimeError("Event runner missing nested official fill audit arrays")
+    diagnostics = raw[34]
     ts, side, observed, price, qty = (np.asarray(raw[31], np.int64),
                                        np.asarray(raw[32], np.int64),
-                                       np.asarray(raw[35], np.int64),
-                                       np.asarray(raw[36], np.float64),
-                                       np.asarray(raw[37], np.float64))
+                                       np.asarray(diagnostics[1], np.int64),
+                                       np.asarray(diagnostics[2], np.float64),
+                                       np.asarray(diagnostics[3], np.float64))
     if not (len(ts) == len(side) == len(observed) == len(price) == len(qty)):
         raise RuntimeError("Official fills and local observation lengths disagree")
     if (np.any(ts <= 0) or np.any(price <= 0) or np.any(qty <= 0) or
@@ -251,7 +252,7 @@ def replay_variant(npz, low, high, bt, bm, ot, om, basis_t, basis,
     trace = extract_official_fills(raw)
     if len(trace) != result["trading"]["engine_fills"]:
         raise RuntimeError(f"{name} missing official fill trace")
-    return result, trace, raw[38]
+    return result, trace, raw[34][4]
 
 
 def run(day, minutes=50, delay_ms=25, report_dir="reports"):
