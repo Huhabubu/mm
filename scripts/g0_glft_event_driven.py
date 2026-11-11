@@ -41,7 +41,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     prev_mid = np.nan
     a = k = sigma = half = skew = np.nan
     attempts = rejects = successes = initial_ok = 0
-    bid_action = ask_action = -9_000_000_000_000_000_000
+    bid_action = ask_action = t0 - MIN_REQUOTE_NS
     submits = cancels = buy_fills = sell_fills = decisions = 0
     okx_feed_events = order_reply_events = binance_events = 0
     observed_binance = 0.0
@@ -54,7 +54,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     max_drawdown = 0.0
     peak_equity = 0.0
     pos_abs_seconds = pos_sq_seconds = at_cap_seconds = 0.0
-    fill_limit = max(2 * trade_steps + 2, 100)
+    fill_limit = max(2 * (trade_steps * STEP_NS // MIN_REQUOTE_NS) + 10, 100)
     fill_ts_ns = np.empty(fill_limit, np.int64)
     fill_sides = np.empty(fill_limit, np.int64)
     n_fills = 0
@@ -170,7 +170,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     peak_equity = max(peak_equity, equity)
                     max_drawdown = max(max_drawdown, peak_equity - equity)
 
-        if sample_count >= TRAIN and (feed_status == 2 or feed_status == 3 or
+        if sample_count > TRAIN and (feed_status == 2 or feed_status == 3 or
                                        signal_event or sample_event):
             # Always collect fills BEFORE discarding inactive orders.
             orders = engine.orders(0)
