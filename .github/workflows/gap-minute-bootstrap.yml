@@ -1,0 +1,50 @@
+name: 24h gap minute-bootstrap and extreme response
+
+on:
+  push:
+    paths:
+      - 'scripts/full_day_gap_rolling.py'
+      - 'scripts/test_gap_minute_ci_fill_markout.py'
+      - '.github/workflows/gap-minute-bootstrap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install numpy
+      - name: Unit tests (no engine required)
+        run: |
+          python -m unittest discover -s scripts -p 'test_gap_event_regression.py' -v
+          python -m unittest discover -s scripts -p 'test_full_day_gap_rolling.py' -v
+          python -m unittest discover -s scripts -p 'test_gap_sampling_robustness.py' -v
+          python -m unittest discover -s scripts -p 'test_gap_minute_ci_fill_markout.py' -v
+      - name: Full 24h native Binance-OKX BBO 10ms with causal minute-block bootstrap
+        run: python scripts/full_day_gap_rolling.py --day 2026-11-01 --hours 24 --chunk-minutes 15 --sample-mode fixed_10ms --minute-block-bootstrap --gap-bins
+      - name: Print confirmed confidence interval and gap buckets
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open('reports/full_day_gap_rolling_2026-11-01_24h_fixed_10ms.json'))
+          print("BOOTSTRAP", r["minute_block_bootstrap"])
+          print("GAP_BINS", r["ex_post_gap_bins_pretrade_fixed_quantiles"])
+          print("DAY_SCORE", r["matched_out_of_sample_scores"]["combined"])
+          PY
+      - name: Upload only aggregate metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-minute-ci-response-2026-11-01
+          path: reports/full_day_gap_rolling_2026-11-01_24h_fixed_10ms.json
+          if-no-files-found: warn
+          retention-days: 14
