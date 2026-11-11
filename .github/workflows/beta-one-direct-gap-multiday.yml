@@ -1,0 +1,62 @@
+name: Beta-one direct Binance gap six-date 50min official HBT
+
+on:
+  push:
+    paths:
+      - 'scripts/run_beta_one_direct_gap.py'
+      - 'scripts/test_beta_one_direct_gap.py'
+      - '.github/workflows/beta-one-direct-gap-multiday.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  direct-gap-50min:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01', '2026-07-01', '2026-08-01',
+              '2026-09-01', '2026-10-01', '2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned HBT engine
+        run: pip install hftbacktest==2.4.4
+      - name: Verify beta-one causal basis and source freshness
+        run: python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+      - name: Paired beta0 vs beta1 identical clock, first 10min warmup and next 50min
+        run: python scripts/run_beta_one_direct_gap.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25
+      - name: Print causal-execution net PnL and orders
+        if: success()
+        run: |
+          DAY="${{ matrix.day }}" python - <<'PY'
+          import json,os
+          d=os.environ["DAY"]
+          a=json.load(open(f"reports/beta_one_direct_gap_{d}_50m.json"))
+          print("DAY",d,"BBO_COVERAGE",a["gap_visibility_audit_100ms"])
+          for key,v in a["variants"].items():
+              t=v["trading"]
+              print("BETA",key,"fills",t["engine_fills"],
+                    "net",t["end_net_marked_equity_usdt"],
+                    "fees",t["fee_usdt"],
+                    "submits",t["submissions"],
+                    "cancels",t["cancel_requests"],
+                    "position",t["end_position_contracts"],
+                    "peak_position",t["max_abs_position_contracts"])
+          print("NET_BETA1_MINUS_BETA0",
+                a["paired_net_difference_beta1_minus_beta0_usdt"])
+          PY
+      - name: Upload per-day aggregate report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beta-one-direct-${{ matrix.day }}-50min
+          path: reports/beta_one_direct_gap_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 14
