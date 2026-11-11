@@ -1,0 +1,64 @@
+name: Six-date official counterfactual maker fill adverse selection audit
+
+on:
+  push:
+    paths:
+      - 'scripts/run_counterfactual_fill_markout.py'
+      - 'scripts/test_counterfactual_fill_markout.py'
+      - '.github/workflows/counterfactual-fill-multiday.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  counterfactual-six-date:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01',
+              '2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official matching engine
+        run: pip install hftbacktest==2.4.4
+      - name: Test paired fill matching and defensive audit
+        run: python -m unittest discover -s scripts -p 'test_counterfactual_fill_markout.py' -v
+      - name: Real G0 G1 filter reverse and wide controls 50min official HBT
+        run: python scripts/run_counterfactual_fill_markout.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25
+      - name: Print aggregate conditional avoided-fill markouts
+        if: success()
+        run: |
+          DAY="${{ matrix.day }}" python - <<'PY'
+          import json,os
+          day=os.environ["DAY"]
+          r=json.load(open(f"reports/counterfactual_fill_markout_{day}_50m.json"))
+          print("DAY",day,"BASELINE",r["reference"]["total_baseline_fills"],
+                "CLOCK",r["reference"]["fill_clock_alignment"],
+                "INVARIANCE",r["probe_invariance_against_unprobed_beta1"])
+          for k,item in r["variants"].items():
+              c=item["comparison_to_beta_0"]
+              print("VARIANT",k,"FILLS",item["trading"]["engine_fills"],
+                    "BASELINE_ONLY",c["baseline_only_fill_count"],
+                    "MATCHED",c["same_exact_exchange_time_and_side_matched_fill_count"],
+                    "EXCHANGE_PROBE_STATES",c["baseline_only_exchange_probe_counts"],
+                    "LOCAL_PROBE_STATES",c["baseline_only_local_probe_counts"],
+                    "DISAGREEMENT",c["baseline_only_probe_disagreement_count"])
+              for group in ("baseline_only_no_same_time_side_fill",
+                            "baseline_shared_same_time_side_fill","variant_all"):
+                  print("GROUP",k,group,"OUTCOMES",c["groups"][group]["horizons"])
+          PY
+      - name: Upload aggregate by-date data only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: counterfactual-fill-${{ matrix.day }}-50min
+          path: reports/counterfactual_fill_markout_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 14
