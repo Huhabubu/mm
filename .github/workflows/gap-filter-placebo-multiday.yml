@@ -1,0 +1,63 @@
+name: Six-date gap filter reverse placebo and widen control official HBT
+
+on:
+  push:
+    paths:
+      - 'scripts/test_gap_filter_placebo.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - '.github/workflows/gap-filter-placebo-multiday.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  filtered-six-date:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01', '2026-07-01', '2026-08-01',
+              '2026-09-01', '2026-10-01', '2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official hftbacktest pinned version
+        run: pip install hftbacktest==2.4.4
+      - name: Causal-filter and GLFT default behavior tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_gap_filter_placebo.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+      - name: Real official HBT six variants 10m pretraining and 50m trading
+        run: python scripts/run_beta_one_direct_gap.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25 --experiment placebo_filter
+      - name: Compare all variants, paired same raw tape and GLFT estimator
+        if: success()
+        run: |
+          DAY="${{ matrix.day }}" python - <<'PY'
+          import json,os
+          d=os.environ["DAY"]
+          r=json.load(open(f"reports/gap_filter_placebo_{d}_50m.json"))
+          print("DAY",d,"PRETRADE_THRESHOLDS",r["pretrade_filter_thresholds"])
+          print("GAP_COVERAGE",r["gap_visibility_audit_100ms"])
+          for name,v in r["variants"].items():
+              t=v["trading"]
+              print("VARIANT",name,"NET",t["end_net_marked_equity_usdt"],
+                    "FILLS",t["engine_fills"],
+                    "CANCELS",t["cancel_requests"],
+                    "SUBMISSIONS",t["submissions"],
+                    "FEES",t["fee_usdt"],"POS",t["end_position_contracts"],
+                    "MAX_POS",t["max_abs_position_contracts"])
+          PY
+      - name: Store only aggregate output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-filter-placebo-${{ matrix.day }}-50min
+          path: reports/gap_filter_placebo_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 14

@@ -98,17 +98,67 @@ def quote_gap_coverage(okx_ts, okx_mid, bin_ts, bin_mid, basis_ts, basis,
     }
 
 
-def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes):
+def pretrade_gap_thresholds(ot, om, bt, bm, basis_t, basis, day_start_ns):
+    """Pre-fixed absolute gap P50/P90 from first 10min, on a 100ms time grid."""
+    start = day_start_ns + 61*NS
+    stop = day_start_ns + 600*NS - 100_000_000
+    clock = np.arange(start, stop, 100_000_000, dtype=np.int64)
+    oi = np.searchsorted(ot, clock, side="left") - 1
+    bi = np.searchsorted(bt, clock, side="left") - 1
+    gi = np.searchsorted(basis_t, clock, side="left") - 1
+    osafe, bsafe, gsafe = [np.maximum(v, 0) for v in (oi, bi, gi)]
+    good = (oi >= 0) & (bi >= 0) & (gi >= 0)
+    good &= clock-ot[osafe] <= MAX_QUOTE_AGE_NS
+    good &= clock-bt[bsafe] <= MAX_QUOTE_AGE_NS
+    good &= np.isfinite(basis[gsafe])
+    gaps = np.abs(bm[bsafe[good]] - om[osafe[good]] - basis[gsafe[good]])
+    if len(gaps) < 300:
+        raise RuntimeError("Insufficient pretrade 100ms gap observations to set filter")
+    p50, p90 = np.quantile(gaps, [0.5, 0.9])
+    if not (np.isfinite(p50) and np.isfinite(p90) and 0 <= p50 < p90):
+        raise RuntimeError("No separable pretrade gap quantiles")
+    return {
+        "history_cutoff_ns_exclusive": int(stop),
+        "training_clock_samples": int(len(gaps)),
+        "abs_gap_p50_usdt_per_btc": float(p50),
+        "abs_gap_p90_usdt_per_btc": float(p90),
+        "activate_ticks": float(p90/TICK),
+        "release_ticks": float(p50/TICK),
+        "refresh_min_change_ticks": 10.0,
+        "refresh_min_interval_ms": 250.0,
+        "widen_control_extra_half_ticks": float(p90/TICK),
+    }
+
+
+def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
+             experiment=False, thresholds=None):
     from hftbacktest import ROIVectorMarketDepthBacktest
 
+    specifications = [("beta_0", 0.0, 0.0, 0.0),
+                      ("beta_1", 1.0, 0.0, 0.0)]
+    if experiment:
+        if thresholds is None:
+            raise ValueError("Placebo/filter experiment requires pretrade thresholds")
+        specifications.extend([
+            ("beta_minus_1", -1.0, 0.0, 0.0),
+            ("beta_1_filtered", 1.0, thresholds["activate_ticks"], 0.0),
+            ("beta_minus_1_filtered", -1.0, thresholds["activate_ticks"], 0.0),
+            # This control uses the SAME pretrade threshold to widen GLFT
+            # half-spreads, without any directional Binance information.
+            ("no_signal_widen_p90", 0.0, 0.0,
+             thresholds["widen_control_extra_half_ticks"]),
+        ])
     variants = {}
-    for beta in (0.0, 1.0):
+    for name, beta, enter, extra_half in specifications:
         engine = ROIVectorMarketDepthBacktest([asset_for(npz, low, high)])
         try:
             raw = run_event_glft(
                 engine, bt, bm, trade_minutes*600,
-                True, GAMMA, True, beta, ot, om, basis_t, basis)
-            variants[f"beta_{int(beta)}"] = summarize(
+                True, GAMMA, True, beta, ot, om, basis_t, basis,
+                enter, (thresholds["release_ticks"] if enter else 0.0),
+                (thresholds["refresh_min_change_ticks"] if enter else 10.0),
+                250_000_000, extra_half)
+            variants[name] = summarize(
                 raw, trade_minutes, True, beta=beta)
         finally:
             engine.close()
@@ -119,17 +169,18 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes):
     # Therefore counts of HBT feed wakeups vary ENDOGENOUSLY across strategies.
     # Only Binance's exogenous event stream and the 100ms calibration calendar
     # must be identical; the underlying OKX market tape is the same NPZ.
-    for name in ("binance", "binance_reads"):
-        if base["time_count"][name] != test["time_count"][name]:
-            raise RuntimeError(f"Different Binance external event clocks: {name}")
-    if base["samples"] != test["samples"] or base["decisions"] == 0:
-        raise RuntimeError("Different 100ms input observations")
-    if base["calibration_trace"] != test["calibration_trace"]:
-        raise RuntimeError("Changing quotes altered GLFT calibration sequence")
+    for name, candidate in variants.items():
+        for clock_field in ("binance", "binance_reads"):
+            if base["time_count"][clock_field] != candidate["time_count"][clock_field]:
+                raise RuntimeError(f"Changed external event clocks for {name}: {clock_field}")
+        if base["samples"] != candidate["samples"] or base["decisions"] == 0:
+            raise RuntimeError(f"Changed 100ms observation calendar for {name}")
+        if base["calibration_trace"] != candidate["calibration_trace"]:
+            raise RuntimeError(f"Changed causal GLFT calibration history for {name}")
     return variants
 
 
-def run(day, minutes=50, delay_ms=25, report_dir="reports"):
+def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
     if minutes not in (5, 50):
@@ -137,7 +188,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports"):
     day_start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
         tzinfo=timezone.utc).timestamp()) * 1_000_000
     end_us = day_start_us + (600 + minutes*60) * 1_000_000 + 500_000
-    target = Path(report_dir)/f"beta_one_direct_gap_{day}_{minutes}m.json"
+    label = "gap_filter_placebo" if experiment else "beta_one_direct_gap"
+    target = Path(report_dir)/f"{label}_{day}_{minutes}m.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "status": "started", "date_utc": day,
@@ -179,8 +231,12 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports"):
             if audit["usable_gap_points"] == 0:
                 raise RuntimeError("No possible online beta-one signals")
             low, high = float(np.min(om))-1000, float(np.max(om))+1000
+            thresholds = (pretrade_gap_thresholds(
+                ot, om, bt, bm, base_t, base, day_start_us*1000)
+                if experiment else None)
             result = run_pair(
-                npz, low, high, bt, bm, ot, om, base_t, base, minutes)
+                npz, low, high, bt, bm, ot, om, base_t, base, minutes,
+                experiment=experiment, thresholds=thresholds)
             report.update({
                 "status": "complete",
                 "okx_fused_event_rows": int(n_events),
@@ -189,6 +245,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports"):
                 "basis_valid_1sec_points": base_valid,
                 "gap_visibility_audit_100ms": audit,
                 "variants": result,
+                "pretrade_filter_thresholds": thresholds,
+                "experiment": "placebo_filter" if experiment else "beta_one_direct",
                 "paired_net_difference_beta1_minus_beta0_usdt": (
                     result["beta_1"]["trading"]["end_net_marked_equity_usdt"] -
                     result["beta_0"]["trading"]["end_net_marked_equity_usdt"]),
@@ -211,10 +269,12 @@ def main():
     p.add_argument("--minutes", type=int, default=5, choices=(5, 50))
     p.add_argument("--extra-binance-delay-ms", type=int, default=25)
     p.add_argument("--report-dir", default="reports")
+    p.add_argument("--experiment", choices=("base", "placebo_filter"), default="base")
     a = p.parse_args()
     if datetime.strptime(a.day, "%Y-%m-%d").day != 1:
         p.error("Tardis free historical day must be the first of month UTC")
-    run(a.day, a.minutes, a.extra_binance_delay_ms, a.report_dir)
+    run(a.day, a.minutes, a.extra_binance_delay_ms, a.report_dir,
+        experiment=(a.experiment == "placebo_filter"))
 
 
 if __name__ == "__main__":

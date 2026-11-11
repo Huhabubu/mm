@@ -1,0 +1,54 @@
+name: Gap signal filter and reverse placebo short smoke
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_event_driven.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - 'scripts/test_gap_filter_placebo.py'
+      - '.github/workflows/gap-filter-placebo-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  filter-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official HBT matching engine
+        run: pip install hftbacktest==2.4.4
+      - name: Prior regression and new filter unit tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_gap_filter_placebo.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+      - name: Real first 10min calibration plus next 5min placebo and filtered HBT
+        run: python scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 5 --extra-binance-delay-ms 25 --experiment placebo_filter
+      - name: Print every variant's official execution and order counts
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          r=json.load(open("reports/gap_filter_placebo_2026-11-01_5m.json"))
+          print("FILTER_THRESHOLDS",r["pretrade_filter_thresholds"])
+          for name,item in r["variants"].items():
+              t=item["trading"]
+              print("VARIANT",name,"net",t["end_net_marked_equity_usdt"],
+                    "fills",t["engine_fills"],"cancel",t["cancel_requests"],
+                    "submit",t["submissions"],"fees",t["fee_usdt"],
+                    "position",t["end_position_contracts"])
+          PY
+      - name: Upload aggregate reports only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-filter-placebo-smoke
+          path: reports/gap_filter_placebo_2026-11-01_5m.json
+          if-no-files-found: warn
+          retention-days: 14
