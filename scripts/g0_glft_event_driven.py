@@ -70,7 +70,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    filter_enter_ticks=0.0, filter_exit_ticks=0.0,
                    filter_refresh_change_ticks=10.0,
                    filter_refresh_ns=250_000_000,
-                   extra_half_ticks=0.0):
+                   extra_half_ticks=0.0, probe_ns=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -129,7 +129,19 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     fill_limit = max(2 * (trade_steps * STEP_NS // MIN_REQUOTE_NS) + 10, 100)
     fill_ts_ns = np.empty(fill_limit, np.int64)
     fill_sides = np.empty(fill_limit, np.int64)
+    fill_observed_ns = np.empty(fill_limit, np.int64)
+    fill_exec_price = np.empty(fill_limit, np.float64)
+    fill_exec_qty = np.empty(fill_limit, np.float64)
     n_fills = 0
+    # Optional read-only audit deadlines, never a trading signal/trigger.
+    n_probes = 0
+    if probe_ns is not None:
+        n_probes = len(probe_ns)
+        for jj in range(1, n_probes):
+            if probe_ns[jj] <= probe_ns[jj-1]:
+                raise ValueError("Diagnostic probe timestamps must increase")
+    probe_rows = np.full((n_probes, 7), np.nan)
+    probe_idx = 0
 
     now = t0
     while now < t_stop:
@@ -137,6 +149,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         if idx < len(binance_visible_ns):
             next_binance = binance_visible_ns[idx]
         due = min(t_stop, next_sample, next_binance)
+        if probe_ns is not None and probe_idx < n_probes:
+            if probe_ns[probe_idx] >= now:
+                due = min(due, probe_ns[probe_idx])
         feed_status = 0
         if due > now:
             # Relative timeout in nanoseconds: do NOT pass an epoch timestamp.
@@ -244,6 +259,38 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     peak_equity = max(peak_equity, equity)
                     max_drawdown = max(max_drawdown, peak_equity - equity)
 
+        # Local order snapshot at preselected counterfactual observation times.
+        # Pure audit: does not submit, cancel or trigger the quoting decision.
+        if probe_ns is not None:
+            while probe_idx < n_probes and probe_ns[probe_idx] <= now:
+                best_buy = -1.0
+                best_sell = 1e12
+                count_buy = count_sell = 0
+                cancellable_buy = cancellable_sell = 0
+                values = engine.orders(0).values()
+                while values.has_next():
+                    oo = values.get()
+                    if oo.status == FILLED:
+                        continue
+                    if oo.side == BUY:
+                        count_buy += 1
+                        if oo.cancellable:
+                            cancellable_buy += 1
+                            best_buy = max(best_buy, float(oo.price_tick))
+                    elif oo.side == SELL:
+                        count_sell += 1
+                        if oo.cancellable:
+                            cancellable_sell += 1
+                            best_sell = min(best_sell, float(oo.price_tick))
+                probe_rows[probe_idx, 0] = best_buy if best_buy >= 0 else np.nan
+                probe_rows[probe_idx, 1] = best_sell if best_sell < 1e11 else np.nan
+                probe_rows[probe_idx, 2] = float(count_buy)
+                probe_rows[probe_idx, 3] = float(count_sell)
+                probe_rows[probe_idx, 4] = float(cancellable_buy)
+                probe_rows[probe_idx, 5] = float(cancellable_sell)
+                probe_rows[probe_idx, 6] = engine.position(0)
+                probe_idx += 1
+
         if sample_count > TRAIN and (feed_status == 2 or feed_status == 3 or
                                        signal_event or sample_event):
             # Observe live inventory peaks at every event, not only 100ms samples.
@@ -258,6 +305,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                         raise ValueError("Exceeded fill trace allocation")
                     fill_ts_ns[n_fills] = order.exch_timestamp
                     fill_sides[n_fills] = order.side
+                    fill_observed_ns[n_fills] = now
+                    fill_exec_price[n_fills] = order.exec_price
+                    fill_exec_qty[n_fills] = order.exec_qty
                     n_fills += 1
                     if order.side == BUY:
                         buy_fills += 1
@@ -337,6 +387,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 raise ValueError("Exceeded last fill allocation")
             fill_ts_ns[n_fills] = order.exch_timestamp
             fill_sides[n_fills] = order.side
+            fill_observed_ns[n_fills] = now
+            fill_exec_price[n_fills] = order.exec_price
+            fill_exec_qty[n_fills] = order.exec_qty
             n_fills += 1
             if order.side == BUY:
                 buy_fills += 1
@@ -357,7 +410,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             pos_abs_seconds, pos_sq_seconds, at_cap_seconds,
             binance_events, okx_feed_events, order_reply_events, count_binance_reads,
             observed_binance, fill_ts_ns[:n_fills], fill_sides[:n_fills],
-            t0, now)
+            t0, (now, fill_observed_ns[:n_fills],
+                 fill_exec_price[:n_fills], fill_exec_qty[:n_fills],
+                 probe_rows))
 
 
 def summarize(raw, minutes, rolling, beta=0.0):
@@ -366,7 +421,10 @@ def summarize(raw, minutes, rolling, beta=0.0):
      submits, cancels, buys, sells, fills, pos, max_pos, balance, fee,
      turnover, mid, equity, min_eq, max_eq, first_eq, drawdown,
      abs_seconds, sq_seconds, at_cap_seconds, bin_events, okx_events,
-     order_events, reads, observed, fill_ts, fill_sides, start, end) = raw
+     order_events, reads, observed, fill_ts, fill_sides, start, end) = raw[:35]
+    # Diagnostic variants return additional trace arrays with the end timestamp.
+    if isinstance(end, tuple):
+        end = end[0]
     if initial_ok != 1 or successes < 1:
         raise RuntimeError("G0-R first 10 minutes cannot identify GLFT parameters")
     if samples < TRAIN + minutes * 600 - 5:
