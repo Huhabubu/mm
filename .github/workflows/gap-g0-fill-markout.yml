@@ -1,0 +1,56 @@
+name: Real OKX maker fills versus causal Binance gap
+
+on:
+  push:
+    paths:
+      - 'scripts/gap_g0_fill_markout.py'
+      - 'scripts/test_gap_minute_ci_fill_markout.py'
+      - '.github/workflows/gap-g0-fill-markout.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  maker-gap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01', '2026-07-01', '2026-08-01',
+              '2026-09-01', '2026-10-01', '2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official matching engine 2.4.4
+        run: pip install hftbacktest==2.4.4
+      - name: Run official maker fill and causal-gap invariant tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_gap_minute_ci_fill_markout.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_fill_markout.py' -v
+      - name: Genuine G0-R fills plus pre-fill cross-venue gap 100ms adverse markout
+        run: python scripts/gap_g0_fill_markout.py --day ${{ matrix.day }}
+      - name: Report aggregate official fills and extreme gap risk
+        if: success()
+        run: |
+          DAY="${{ matrix.day }}" python - <<'PY'
+          import json,os
+          day=os.environ["DAY"]
+          r=json.load(open(f"reports/gap_g0_fill_markout_{day}_50m.json"))
+          print("DAY",day,"fills",r["official_g0"]["engine_fills"],
+                "net_usdt",r["official_g0"]["end_net_marked_equity_usdt"],
+                "bin_p50_p90",r["thresholds"])
+          print("BIN",r["bin_diagnostic"])
+          PY
+      - name: Upload aggregate statistics only (no fills or native feeds)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-g0-fill-${{ matrix.day }}
+          path: reports/gap_g0_fill_markout_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 14
