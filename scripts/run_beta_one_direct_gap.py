@@ -115,11 +115,13 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes):
     base, test = variants["beta_0"], variants["beta_1"]
     if base["time_count"]["binance_reads"] != base["time_count"]["binance"]:
         raise RuntimeError("Baseline did not consume all Binance BBO events")
-    if base["time_count"] != test["time_count"]:
-        # Response events vary endogenously with orders, not clock changes:
-        for name in ("binance", "okx_feed", "binance_reads"):
-            if base["time_count"][name] != test["time_count"][name]:
-                raise RuntimeError(f"Different exogenous event clocks: {name}")
+    # Order responses and OKX feed can be consumed in the SAME HBT clock step.
+    # Therefore counts of HBT feed wakeups vary ENDOGENOUSLY across strategies.
+    # Only Binance's exogenous event stream and the 100ms calibration calendar
+    # must be identical; the underlying OKX market tape is the same NPZ.
+    for name in ("binance", "binance_reads"):
+        if base["time_count"][name] != test["time_count"][name]:
+            raise RuntimeError(f"Different Binance external event clocks: {name}")
     if base["samples"] != test["samples"] or base["decisions"] == 0:
         raise RuntimeError("Different 100ms input observations")
     if base["calibration_trace"] != test["calibration_trace"]:
