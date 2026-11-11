@@ -70,12 +70,15 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    filter_enter_ticks=0.0, filter_exit_ticks=0.0,
                    filter_refresh_change_ticks=10.0,
                    filter_refresh_ns=250_000_000,
-                   extra_half_ticks=0.0, capture_mechanism=False):
+                   extra_half_ticks=0.0, capture_mechanism=False,
+                   audit_fill_prices=None, audit_cancels=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
     Signal-read flag only adds telemetry; beta and filter parameters select quote shifts.
     """
+    if capture_mechanism and (audit_fill_prices is None or audit_cancels is None):
+        raise ValueError("Audit trace buffers required")
     if (filter_enter_ticks > 0.0 and
             (beta == 0.0 or filter_exit_ticks < 0.0 or
              filter_exit_ticks >= filter_enter_ticks or
@@ -131,8 +134,6 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     fill_sides = np.empty(fill_limit, np.int64)
     # Optional per-fill and per-order observation for exchange-time mechanism audit.
     # Disabled in every previously verified GLFT caller.
-    fill_prices = np.empty(fill_limit if capture_mechanism else 1, np.int64)
-    confirmed_cancel = np.empty((fill_limit if capture_mechanism else 1, 3), np.int64)
     cancel_count = 0
     n_fills = 0
 
@@ -264,18 +265,20 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     fill_ts_ns[n_fills] = order.exch_timestamp
                     fill_sides[n_fills] = order.side
                     if capture_mechanism:
-                        fill_prices[n_fills] = order.price_tick
+                        if n_fills >= len(audit_fill_prices):
+                            raise ValueError("Fill mechanism buffer full")
+                        audit_fill_prices[n_fills] = order.price_tick
                     n_fills += 1
                     if order.side == BUY:
                         buy_fills += 1
                     else:
                         sell_fills += 1
                 if capture_mechanism and order.status == CANCELED:
-                    if cancel_count >= len(confirmed_cancel):
+                    if cancel_count >= len(audit_cancels):
                         raise ValueError("Exceeded cancellation mechanism allocation")
-                    confirmed_cancel[cancel_count, 0] = order.exch_timestamp
-                    confirmed_cancel[cancel_count, 1] = order.side
-                    confirmed_cancel[cancel_count, 2] = order.price_tick
+                    audit_cancels[cancel_count, 0] = order.exch_timestamp
+                    audit_cancels[cancel_count, 1] = order.side
+                    audit_cancels[cancel_count, 2] = order.price_tick
                     cancel_count += 1
             engine.clear_inactive_orders(0)
             if now >= t_stop or not np.isfinite(half):
@@ -352,18 +355,20 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             fill_ts_ns[n_fills] = order.exch_timestamp
             fill_sides[n_fills] = order.side
             if capture_mechanism:
-                fill_prices[n_fills] = order.price_tick
+                if n_fills >= len(audit_fill_prices):
+                    raise ValueError("Final fill mechanism buffer full")
+                audit_fill_prices[n_fills] = order.price_tick
             n_fills += 1
             if order.side == BUY:
                 buy_fills += 1
             else:
                 sell_fills += 1
         if capture_mechanism and order.status == CANCELED:
-            if cancel_count >= len(confirmed_cancel):
+            if cancel_count >= len(audit_cancels):
                 raise ValueError("Exceeded final cancellation mechanism allocation")
-            confirmed_cancel[cancel_count, 0] = order.exch_timestamp
-            confirmed_cancel[cancel_count, 1] = order.side
-            confirmed_cancel[cancel_count, 2] = order.price_tick
+            audit_cancels[cancel_count, 0] = order.exch_timestamp
+            audit_cancels[cancel_count, 1] = order.side
+            audit_cancels[cancel_count, 2] = order.price_tick
             cancel_count += 1
     final = engine.state_values(0)
     book = engine.depth(0)
@@ -380,9 +385,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             pos_abs_seconds, pos_sq_seconds, at_cap_seconds,
             binance_events, okx_feed_events, order_reply_events, count_binance_reads,
             observed_binance, fill_ts_ns[:n_fills], fill_sides[:n_fills],
-            t0, now,
-            fill_prices[:n_fills] if capture_mechanism else fill_prices[:0],
-            confirmed_cancel[:cancel_count])
+            t0, now)
 
 
 def summarize(raw, minutes, rolling, beta=0.0):
@@ -391,7 +394,7 @@ def summarize(raw, minutes, rolling, beta=0.0):
      submits, cancels, buys, sells, fills, pos, max_pos, balance, fee,
      turnover, mid, equity, min_eq, max_eq, first_eq, drawdown,
      abs_seconds, sq_seconds, at_cap_seconds, bin_events, okx_events,
-     order_events, reads, observed, fill_ts, fill_sides, start, end) = raw[:35]
+     order_events, reads, observed, fill_ts, fill_sides, start, end) = raw
     if initial_ok != 1 or successes < 1:
         raise RuntimeError("G0-R first 10 minutes cannot identify GLFT parameters")
     if samples < TRAIN + minutes * 600 - 5:
