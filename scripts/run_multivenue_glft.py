@@ -160,7 +160,9 @@ def run(day, exchange, coin, minutes=50, delay_ms=25,
         raise ValueError("Pilot supports 5min or 50min after 10min warmup")
     start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
         tzinfo=timezone.utc).timestamp())*1_000_000
-    end_us = start_us + (600 + minutes*60)*1_000_000 + 500_000
+    end_us = start_us + (600 + minutes*60)*1_000_000 + 5_000_000
+    # Allow the HBT feed clock to reach trade end on low-message-rate tapes.
+    # Replay remains causally stopped at t0 + warmup + requested trade time.
     report_path = Path(report_dir)
     report_path.mkdir(parents=True, exist_ok=True)
     label = f"{exchange}_{coin}_{day}_{minutes}m"
