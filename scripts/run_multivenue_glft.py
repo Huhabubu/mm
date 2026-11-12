@@ -149,7 +149,7 @@ def validate_record(rec, summary):
         raise ValueError("Recorder fees exceed official HBT fees")
 
 
-def run(day, exchange, coin, minutes=50, delay_ms=25,
+def run(day, exchange, coin, minutes=50, delay_ms=2.5,
         report_dir="reports", capture_recorder=True):
     from hftbacktest import Recorder, ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
@@ -298,7 +298,7 @@ def main():
     p.add_argument("--exchange",choices=("okx","bitget"),required=True)
     p.add_argument("--coin",choices=("BTC","SOL"),required=True)
     p.add_argument("--minutes",type=int,choices=(5,50),default=5)
-    p.add_argument("--extra-binance-delay-ms",type=int,default=25)
+    p.add_argument("--extra-binance-delay-ms",type=float,default=2.5)
     p.add_argument("--report-dir",default="reports")
     p.add_argument("--no-recorder",action="store_true")
     args=p.parse_args()
