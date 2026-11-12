@@ -92,13 +92,13 @@ def fit_recent_arrivals(arrivals, changes):
 
 
 @njit
-def glft_coefficients(a, k, sigma, gamma_code=GAMMA):
+def glft_coefficients(a, k, sigma, gamma_code=GAMMA, order_qty=ORDER_QTY):
     """Risk aversion gamma_code is in inverse (contract * price tick) units."""
-    u = gamma_code * ORDER_QTY / k
-    c1 = math.log1p(u) / (gamma_code * ORDER_QTY)
-    c2 = math.sqrt(gamma_code / (2 * a * ORDER_QTY * k)
-                   * math.exp((k/(gamma_code * ORDER_QTY) + 1) * math.log1p(u)))
-    half = c1 + ORDER_QTY/2 * c2 * sigma
+    u = gamma_code * order_qty / k
+    c1 = math.log1p(u) / (gamma_code * order_qty)
+    c2 = math.sqrt(gamma_code / (2 * a * order_qty * k)
+                   * math.exp((k/(gamma_code * order_qty) + 1) * math.log1p(u)))
+    half = c1 + order_qty/2 * c2 * sigma
     skew = c2 * sigma
     return half, skew
 
