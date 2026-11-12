@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from full_day_fill_quality import multiset_match, evaluate_full_day_fill_quality
+from g0_glft_event_driven import audit_rolling_request_2s
 
 NS = 1_000_000_000
 
@@ -71,6 +72,17 @@ class FullDayFillQualityTests(unittest.TestCase):
         self.assertEqual(d["signal_only_exact_quote"],1)
         self.assertEqual(d["groups"][
             "baseline_without_simultaneous_same_side_signal_fill"]["n_fills"],2)
+
+    def test_request_rate_rolling_2second_boundary_and_limit(self):
+        # Synthetic local send clock. 2-second-old requests leave the window.
+        clock=np.empty(32,np.int64)
+        head=tail=peak=over=0
+        for tt in (0,100_000_000,1_900_000_000,2_000_000_000,2_100_000_000):
+            head,tail,peak,over=audit_rolling_request_2s(
+                clock,head,tail,tt,peak,over,2)
+        self.assertEqual(peak,3)
+        self.assertEqual(over,3)
+        self.assertEqual(tail-head,3)
 
     def test_invalid_fill_or_unsorted_bbo_fails(self):
         t=10*NS
