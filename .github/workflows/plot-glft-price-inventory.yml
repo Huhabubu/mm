@@ -1,0 +1,41 @@
+name: Classic GLFT price-and-inventory plots
+
+on:
+  push:
+    paths:
+      - 'scripts/plot_glft_price_inventory.py'
+      - '.github/workflows/plot-glft-price-inventory.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  classic-plots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT and plotting library
+        run: pip install hftbacktest==2.4.4 matplotlib
+      - name: Recreate official 50min GLFT beta0/beta1 and draw charts
+        run: python scripts/plot_glft_price_inventory.py --day 2026-11-01 --report-dir reports
+      - name: Verify output chart files
+        run: |
+          test -s reports/classic_glft_2026-11-01_beta_0_50m.png
+          test -s reports/classic_glft_2026-11-01_beta_1_50m.png
+          cat reports/classic_glft_2026-11-01_audit.json
+      - name: Upload charts and summary only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: classic-glft-price-inventory-2026-11-01
+          path: |
+            reports/classic_glft_2026-11-01_beta_0_50m.png
+            reports/classic_glft_2026-11-01_beta_1_50m.png
+            reports/classic_glft_2026-11-01_audit.json
+          if-no-files-found: warn
+          retention-days: 14
