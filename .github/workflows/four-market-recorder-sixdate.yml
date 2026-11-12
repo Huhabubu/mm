@@ -44,14 +44,15 @@ jobs:
         run: |
           python scripts/run_multivenue_glft.py --day "$DAY" \
             --exchange "$VENUE" --coin "$COIN" \
-            --minutes 50 --extra-binance-delay-ms 25
+            --minutes 50 --extra-binance-delay-ms 2.5
       - name: Verify time-series Recorder and paired economics, or report non-identifiability
         run: |
           python - <<'PY'
           import json,os,numpy as np
           day,venue,coin=os.environ["DAY"],os.environ["VENUE"],os.environ["COIN"]
           obj=json.load(open(f"reports/{venue}_{coin}_{day}_50m.json",encoding="utf-8"))
-          print("CASE",day,venue,coin,"STATUS",obj["status"])
+          assert obj["extra_binance_delay_ms"] == 2.5
+          print("CASE",day,venue,coin,"DELAY_MS",obj["extra_binance_delay_ms"],"STATUS",obj["status"])
           if obj["status"]=="no_glft_calibration":
               diag=obj["calibration_diagnostic"]
               assert not diag["valid"]
@@ -91,7 +92,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: recorder-${{ matrix.market.exchange }}-${{ matrix.market.coin }}-${{ matrix.day }}-50min
+          name: recorder-${{ matrix.market.exchange }}-${{ matrix.market.coin }}-${{ matrix.day }}-2p5ms-50min
           path: |
             reports/${{ matrix.market.exchange }}_${{ matrix.market.coin }}_${{ matrix.day }}_50m.json
             reports/recorder/${{ matrix.market.exchange }}_${{ matrix.market.coin }}_${{ matrix.day }}_50m/*.npz
