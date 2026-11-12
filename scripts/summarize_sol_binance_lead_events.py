@@ -22,7 +22,7 @@ def summarize(rows):
                 "still_valid_after_2p5ms":
                     sum(x["visible_good_count"] for x in z),
                 "okx_still_unchanged_after_2p5ms":
-                    sum(x["visible_still_same_okx_price_count"] for x in z),
+                    sum(x["first_visible_still_same_okx_price_count"] for x in z),
                 "still_ge_10bps_corrected_gap_after_2p5ms":
                     sum(x["visible_gap_still_at_least_10bps_count"] for x in z),
                 "first_event_survival_counts":{
