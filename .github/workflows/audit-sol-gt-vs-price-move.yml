@@ -1,0 +1,35 @@
+name: Audit SOL cross-venue G vs raw spread and own price moves
+on:
+  push:
+    paths:
+      - '.github/workflows/audit-sol-gt-vs-price-move.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore audited six-day SOL market price snapshots
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43241824083
+          github-token: ${{ github.token }}
+          name: binance-okx-SOL-Gt-2p5ms-sixdate-descriptive
+          path: archived
+      - name: Install NumPy for independent accounting
+        run: python -m pip install numpy==2.2.6
+      - name: Diagnose SOL G against native price movement and raw price gap
+        run: |
+          python scripts/audit_sol_gt_vs_raw_and_returns.py \
+            --source archived --out reports/okx_sol_signal_definition_audit.json
+      - name: Preserve numeric diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: sol-2p5ms-Gt-raw-gap-and-price-move-audit
+          path: reports/okx_sol_signal_definition_audit.json
+          if-no-files-found: error
+          retention-days: 90
