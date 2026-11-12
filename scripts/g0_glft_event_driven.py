@@ -260,7 +260,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 valid, new_a, new_k, new_sigma, fit_levels, crossed, extreme = (
                     fit_recent_arrivals(arrivals, changes))
                 if valid:
-                    new_half, new_skew = glft_coefficients(new_a, new_k, new_sigma, gamma_code)
+                    new_half, new_skew = glft_coefficients(new_a, new_k, new_sigma, gamma_code, order_qty)
                     if np.isfinite(new_half) and np.isfinite(new_skew) and new_half > 0 and new_skew > 0:
                         a, k, sigma, half, skew = (
                             new_a, new_k, new_sigma, new_half, new_skew)
