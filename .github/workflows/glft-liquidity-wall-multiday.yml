@@ -32,7 +32,7 @@ jobs:
       - name: L2 wall selection correctness
         run: python -m unittest discover -s scripts -p 'test_glft_liquidity_wall.py' -v
       - name: Full 10min pretrade + 50min trading per model, 50 tick scenario
-        run: python scripts/run_beta_one_direct_gap.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50
+        run: python scripts/run_beta_one_direct_gap.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50 --hbt-stats
       - name: Independent paired official gross, fees, net and fills
         if: success()
         run: |

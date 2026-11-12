@@ -105,7 +105,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    filter_refresh_change_ticks=10.0,
                    filter_refresh_ns=250_000_000,
                    extra_half_ticks=0.0, probe_ns=None,
-                   wall_search_ticks=0):
+                   wall_search_ticks=0, recorder=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -276,6 +276,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 else:
                     rejects += 1
 
+            # Optional official recorder; read-only, same 100ms accounting clock.
+            if recorder is not None and sample_count >= TRAIN:
+                recorder.record(engine)
             # For fair reporting, inventory/equity are still sampled every 100ms.
             if sample_count > TRAIN:
                 book = engine.depth(0)
@@ -444,6 +447,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 buy_fills += 1
             else:
                 sell_fills += 1
+    if recorder is not None:
+        recorder.record(engine)
     final = engine.state_values(0)
     book = engine.depth(0)
     final_mid = (book.best_bid + book.best_ask) / 2.0

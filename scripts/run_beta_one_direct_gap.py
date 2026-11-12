@@ -16,7 +16,7 @@ import numpy as np
 
 from check_okx_hft_data import SCHEMAS, extract_window
 from cross_venue_event_probe import read_binance_bbo, visible_timestamps
-from g0_glft_baseline import GAMMA, LOT, TICK, TRAIN
+from g0_glft_baseline import CTVAL, GAMMA, LOT, TICK, TRAIN
 from g0_glft_rolling import asset_for
 from g0_glft_event_driven import run_event_glft, summarize
 from gap_event_regression import event_gap_samples
@@ -131,8 +131,12 @@ def pretrade_gap_thresholds(ot, om, bt, bm, basis_t, basis, day_start_ns):
 
 
 def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
-             experiment=False, thresholds=None, wall_search_ticks=0):
-    from hftbacktest import ROIVectorMarketDepthBacktest
+             experiment=False, thresholds=None, wall_search_ticks=0,
+              stats_out=None):
+    from hftbacktest import ROIVectorMarketDepthBacktest, Recorder
+    from hftbacktest.stats import (LinearAssetRecord, Ret, MaxDrawdown,
+                                  NumberOfTrades, TradingValue,
+                                  ReturnOverTrade, MaxPositionValue)
 
     specifications = [("beta_0", 0.0, 0.0, 0.0),
                       ("beta_1", 1.0, 0.0, 0.0)]
@@ -158,6 +162,8 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
     variants = {}
     for name, beta, enter, extra_half in specifications:
         engine = ROIVectorMarketDepthBacktest([asset_for(npz, low, high)])
+        recorder = (Recorder(engine.num_assets, trade_minutes * 600 + 100)
+                    if stats_out is not None else None)
         try:
             raw = run_event_glft(
                 engine, bt, bm, trade_minutes*600,
@@ -165,9 +171,33 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                 enter, (thresholds["release_ticks"] if enter else 0.0),
                 (thresholds["refresh_min_change_ticks"] if enter else 10.0),
                 250_000_000, extra_half, None,
-                wall_search_ticks if name.endswith("_wall") else 0)
+                wall_search_ticks if name.endswith("_wall") else 0,
+                recorder.recorder if recorder is not None else None)
             variants[name] = summarize(
                 raw, trade_minutes, True, beta=beta)
+            if recorder is not None:
+                data = recorder.get(0)
+                result = (LinearAssetRecord(data).contract_size(CTVAL)
+                          .resample("1s")
+                          .stats([Ret, MaxDrawdown, NumberOfTrades, TradingValue,
+                                  ReturnOverTrade, MaxPositionValue]))
+                numbers = result.entire.to_dicts()[0]
+                first = float(data[0]["balance"] + CTVAL * data[0]["position"]
+                              * data[0]["price"] - data[0]["fee"])
+                last = float(data[-1]["balance"] + CTVAL * data[-1]["position"]
+                             * data[-1]["price"] - data[-1]["fee"])
+                stats_out[name] = {
+                    "library": "hftbacktest.stats.LinearAssetRecord",
+                    "resample": "1s", "contract_size_btc_per_contract": CTVAL,
+                    "record_samples": int(len(data)),
+                    "recorded_first_equity_usdt": first,
+                    "recorded_last_equity_usdt": last,
+                    "engine_net_equity_usdt": variants[name]["trading"]["end_net_marked_equity_usdt"],
+                    "end_equity_reconciliation_usdt": last - variants[name]["trading"]["end_net_marked_equity_usdt"],
+                    "metrics": {k: (float(v) if v is not None else None)
+                                for k, v in numbers.items()
+                                if k not in ("start", "end")},
+                }
         finally:
             engine.close()
     base, test = variants["beta_0"], variants["beta_1"]
@@ -189,7 +219,7 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
 
 
 def run(day, minutes=50, delay_ms=25, report_dir="reports",
-        experiment=False, wall_search_ticks=0):
+        experiment=False, wall_search_ticks=0, with_hbt_stats=False):
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
     if minutes not in (5, 50):
@@ -248,10 +278,12 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
             thresholds = (pretrade_gap_thresholds(
                 ot, om, bt, bm, base_t, base, day_start_us*1000)
                 if experiment else None)
+            stats_out = {} if with_hbt_stats else None
             result = run_pair(
                 npz, low, high, bt, bm, ot, om, base_t, base, minutes,
                 experiment=experiment, thresholds=thresholds,
-                wall_search_ticks=wall_search_ticks)
+                wall_search_ticks=wall_search_ticks,
+                stats_out=stats_out)
             report.update({
                 "status": "complete",
                 "okx_fused_event_rows": int(n_events),
@@ -272,6 +304,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                     result["beta_0"]["trading"]["end_net_marked_equity_usdt"]),
                 "glft_5sec_calibration_trace_identical": True,
             })
+            if stats_out is not None:
+                report["hbt_builtin_stats"] = stats_out
     except Exception as exc:
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
@@ -290,6 +324,8 @@ def main():
     p.add_argument("--extra-binance-delay-ms", type=int, default=25)
     p.add_argument("--report-dir", default="reports")
     p.add_argument("--experiment", choices=("base", "placebo_filter", "wall_anchor"), default="base")
+    p.add_argument("--hbt-stats", action="store_true",
+                   help="Read-only official Recorder + LinearAssetRecord statistics")
     p.add_argument("--wall-search-ticks", type=int, default=0,
                    help="Scenario-specific bounded outward L2 tick range (1..1000); 0 disabled")
     a = p.parse_args()
@@ -301,7 +337,8 @@ def main():
         p.error("--wall-search-ticks can only be used with wall_anchor mode")
     run(a.day, a.minutes, a.extra_binance_delay_ms, a.report_dir,
         experiment=(a.experiment == "placebo_filter"),
-        wall_search_ticks=a.wall_search_ticks)
+        wall_search_ticks=a.wall_search_ticks,
+         with_hbt_stats=a.hbt_stats)
 
 
 if __name__ == "__main__":
