@@ -1,0 +1,91 @@
+name: Six full UTC dates actual HBT maker-fill adverse-selection 100 500ms
+
+on:
+  push:
+    paths:
+      - '.github/workflows/full-day-fill-quality-sixdate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  markout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01',
+              '2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT 2.4.4
+        run: pip install hftbacktest==2.4.4
+      - name: Unit check markout direction, censoring and multiset pairing
+        run: |
+          python -m unittest discover -s scripts -p 'test_full_day_fill_quality.py' -v
+          python -m unittest discover -s scripts -p 'test_counterfactual_fill_markout.py' -v
+      - name: Keep original 4 execution strategies, audit actual maker fills with OKX exchange BBO
+        run: |
+          python -u scripts/run_beta_one_direct_gap.py --day ${{ matrix.day }} --minutes 1430 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50 --audit-markout --convert-chunk-minutes 60
+      - name: Verify actual UTC end, actual fills, aggregate prices and account identities
+        if: success()
+        run: |
+          DAY="${{ matrix.day }}" python - <<'PY'
+          import os,json
+          from datetime import datetime,timezone,timedelta
+          day=os.environ["DAY"]
+          r=json.load(open(f"reports/glft_full_day_fill_quality_{day}_1430m.json"))
+          assert r["status"]=="complete" and r["full_utc_day_requested"]
+          assert r["glft_5sec_calibration_trace_identical"]
+          assert r["wall_anchor_method"]=="first_strict_local_usdt_notional_peak"
+          a=r["fill_quality_audit"]
+          goal=(datetime.strptime(day,"%Y-%m-%d").replace(tzinfo=timezone.utc)
+                +timedelta(days=1)).timestamp()*1e9
+          for name in ("beta_0","beta_1","beta_0_wall","beta_1_wall"):
+              t=r["variants"][name]["trading"]
+              assert a["all_actual_fills"][name]["n_fills"]==t["engine_fills"]
+              short_ns=goal-r["variants"][name]["end_time_ns"]
+              assert 0<=short_ns<=2e9, (name,short_ns)
+              assert t["engine_fills"]==t["buy_fills"]+t["sell_fills"]
+              print("DAILY",day,name,"GROSS",
+                    t["end_net_marked_equity_usdt"]+t["fee_usdt"],
+                    "FEES",t["fee_usdt"],"NET",t["end_net_marked_equity_usdt"],
+                    "FILLS",t["engine_fills"],
+                    "CANCELS",t["cancel_requests"],
+                    "SUBMISSIONS",t["submissions"],flush=True)
+              for horizon in ("100","500"):
+                  h=a["all_actual_fills"][name]["horizons"][horizon]
+                  print("FULL_MARKOUT",day,name,horizon,
+                        "VALID",h["n_valid"],"PRE_BPS",h["mean_signed_markout_bps"],
+                        "POST_BPS",h.get("mean_continuation_signed_move_bps"),
+                        "POST_ADVERSE",h.get("continuation_adverse_fraction"),
+                        "NET_PER_EXEC_USDT",h["mean_horizon_net_proxy_usdt"],flush=True)
+          for pair,x in a["paired_baseline_versus_signal"].items():
+              print("PAIR",day,pair,"SHARED",x["same_exchange_ns_side_overlap"],
+                    "STRICT",x["same_exchange_ns_side_execution_price_tick_overlap"],
+                    "BASE_UNMATCHED",x["baseline_only_time_side"],
+                    "SIGNAL_UNMATCHED",x["signal_only_time_side"],flush=True)
+              for group,m in x["groups"].items():
+                  for horizon in ("100","500"):
+                      h=m["horizons"].get(horizon,{})
+                      print("COHORT",day,pair,group,horizon,
+                            "VALID",h.get("n_valid",0),
+                            "PRE_BPS",h.get("mean_signed_markout_bps"),
+                            "POST_BPS",h.get("mean_continuation_signed_move_bps"),
+                            "POST_ADVERSE",h.get("continuation_adverse_fraction"),
+                            flush=True)
+          PY
+      - name: Upload aggregate reports only, no raw Tardis or individual maker fills
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbt-maker-quality-${{ matrix.day }}
+          path: reports/glft_full_day_fill_quality_${{ matrix.day }}_1430m.json
+          if-no-files-found: warn
+          retention-days: 14
