@@ -1,0 +1,28 @@
+name: Four-market BTC SOL Tardis data and contract QA
+on:
+  push:
+    paths:
+      - 'scripts/qa_multivenue_data.py'
+      - '.github/workflows/four-market-data-qa.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  data-qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Inspect OKX and Bitget BTC SOL feeds plus current contract spec
+        run: python scripts/qa_multivenue_data.py --day 2026-11-01 --seconds 75
+      - name: Upload aggregate QA metadata only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: four-market-venue-data-qa-2026-11-01
+          path: reports/venue_qa_2026-11-01.json
+          if-no-files-found: warn
+          retention-days: 14
