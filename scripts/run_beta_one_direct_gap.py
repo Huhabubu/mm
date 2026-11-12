@@ -197,7 +197,7 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
     day_start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
         tzinfo=timezone.utc).timestamp()) * 1_000_000
     end_us = day_start_us + (600 + minutes*60) * 1_000_000 + 500_000
-    label = ("glft_liquidity_wall" if wall_search_ticks > 0 else
+    label = ("glft_local_peak" if wall_search_ticks > 0 else
              "gap_filter_placebo" if experiment else "beta_one_direct_gap")
     if wall_search_ticks < 0 or wall_search_ticks > 1000:
         raise ValueError("Wall range must be between 1 and 1000 ticks, or disabled at 0")
@@ -264,6 +264,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                 "experiment": ("liquidity_wall" if wall_search_ticks > 0 else
                                "placebo_filter" if experiment else "beta_one_direct"),
                 "wall_search_ticks": wall_search_ticks,
+                "wall_anchor_method": ("first_strict_local_usdt_notional_peak"
+                                       if wall_search_ticks > 0 else "disabled"),
                 "wall_search_width_usdt_per_btc": wall_search_ticks*TICK,
                 "paired_net_difference_beta1_minus_beta0_usdt": (
                     result["beta_1"]["trading"]["end_net_marked_equity_usdt"] -
