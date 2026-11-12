@@ -201,14 +201,42 @@ def run_one(day):
         target_no_move=(
             np.searchsorted(change_ts,t,side="right")-
             np.searchsorted(change_ts,anchor,side="right"))==0
+        # A second, completely unfiltered check identifies apparent large
+        # leads hidden by the 250ms freshness/basis rule. Such cases are NOT
+        # reliable proof of a real leading market: the target tape may be stale.
+        history_available=(ib>=0)&(ostart>=0)&(okx_i>=0)
+        unfiltered_delta=np.full(len(ids),np.nan)
+        unfiltered_delta[history_available]=1e4*(
+            bm[ids[history_available]]-bm[bb[history_available]])/
+            bm[bb[history_available]]
+        apparent10=history_available&target_no_move&(
+            np.abs(unfiltered_delta)>=10.)
+        app_ids=np.flatnonzero(apparent10)
+        app_segments=target_segment[app_ids]
+        app_first=app_ids[np.r_[True,app_segments[1:]!=app_segments[:-1]]]
         price_delta=np.full(len(ids),np.nan)
-        price_delta[valid]=1e4*(
-            bm[ids[valid]]-bm[bb[valid]])/bm[bb[valid]]
+        price_delta[valid]=unfiltered_delta[valid]
         intact=valid&target_no_move
         horizon={"valid_both_venues":int(np.count_nonzero(valid)),
                  "valid_target_unchanged":int(np.count_nonzero(intact)),
                  "max_abs_binance_price_move_bps":stats(np.abs(price_delta)),
                  "max_abs_when_target_unchanged":stats(np.abs(price_delta[intact])),
+                 "apparent_unfiltered_ge10bps":int(len(app_ids)),
+                 "apparent_unfiltered_ge10bps_first_per_okx_segment":int(len(app_first)),
+                 "apparent_ge10bps_with_fresh_source_target_quotes_but_no_basis":int(np.count_nonzero(
+                     apparent10&start_fresh&(~rawgood))),
+                 "apparent_ge10bps_with_fresh_source_target_quotes":int(np.count_nonzero(
+                     apparent10&start_fresh&(t-ot[o]<=MAX_AGE_NS))),
+                 "apparent_ge10bps_excluded_by_freshness_or_basis":int(np.count_nonzero(
+                     apparent10&(~valid))),
+                 "apparent_ge10bps_first_examples":[{
+                     "utc":datetime.fromtimestamp(int(t[i])/1e9,tz=timezone.utc).isoformat(),
+                     "binance_move_bps":float(unfiltered_delta[i]),
+                     "okx_quote_age_ms":float((t[i]-ot[o[i]])/1e6),
+                     "source_anchor_age_ms":float((anchor[i]-bt_raw[bb[i]])/1e6),
+                     "valid_under_strategy_guard":bool(valid[i]),
+                     "time_to_next_okx_price_change_ms":float(target_follow_ns[i]/1e6)
+                 } for i in app_first[:8]],
                  "thresholds":{}}
         for thr in THRESHOLDS_BPS:
             event=intact&(np.abs(price_delta)>=thr)
@@ -243,6 +271,8 @@ def main():
                 if a["max_abs_when_target_unchanged"]["n"] else None,
               "SOURCE10",a["thresholds"]["10bps"]["event_count"],
               "UNIQUE10",a["thresholds"]["10bps"]["unique_okx_unchanged_segments"],
+              "APPARENT_UNFILTERED10",a["apparent_unfiltered_ge10bps"],
+              "APPARENT_FRESH10",a["apparent_ge10bps_with_fresh_source_target_quotes"],
               "SOURCE5",a["thresholds"]["5bps"]["event_count"],
               "SOURCE2",a["thresholds"]["2bps"]["event_count"],flush=True)
     print("FILE",out/f"{args.day}.json",flush=True)
