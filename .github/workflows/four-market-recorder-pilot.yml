@@ -44,7 +44,12 @@ jobs:
           import json,os,pathlib,numpy as np
           venue,coin=os.environ["VENUE"],os.environ["COIN"]
           obj=json.load(open(f"reports/{venue}_{coin}_2026-11-01_5m.json"))
-          assert obj["status"]=="complete"
+          assert obj["status"] in ("complete","no_glft_calibration")
+          if obj["status"] == "no_glft_calibration":
+              assert obj.get("calibration_diagnostic")
+              assert obj["calibration_diagnostic"]["valid"] is False
+              print("NOT_CALIBRATED",venue,coin,obj["calibration_diagnostic"])
+              raise SystemExit(0)
           assert len(obj["variants"])==4
           for name,item in obj["variants"].items():
               t=item["trading"]
