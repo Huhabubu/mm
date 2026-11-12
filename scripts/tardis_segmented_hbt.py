@@ -38,6 +38,10 @@ def convert_fuse_parts(paths, counts, root, day_start_us, end_us, chunk_minutes,
         index = 0
         while start < end_us:
             end = min(start + chunk_minutes * 60 * 1_000_000, end_us)
+            # Short-window runners append 0.5s of cleanup tape after 60m.
+            # Merge that tiny tail into this last full segment, preserving it.
+            if end_us - end <= 1_000_000:
+                end = end_us
             part_csv = {}
             part_counts = {}
             for kind, fields in SCHEMAS.items():
