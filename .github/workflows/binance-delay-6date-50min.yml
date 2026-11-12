@@ -1,0 +1,93 @@
+name: Binance extra delay six dates 50min official HBT
+
+on:
+  push:
+    paths:
+      - '.github/workflows/binance-delay-6date-50min.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  six-date-delay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        day: ['2026-06-01', '2026-07-01', '2026-08-01', '2026-09-01', '2026-10-01', '2026-11-01']
+        delay_ms: [1, 5, 10, 25, 50]
+    env:
+      DAY: ${{ matrix.day }}
+      DELAY_MS: ${{ matrix.delay_ms }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pin official hftbacktest execution model
+        run: pip install hftbacktest==2.4.4
+      - name: Verify causal gap and existing event replay invariants
+        run: |
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+      - name: Run unchanged 10min warmup and 50min trade for paired beta0 beta1
+        run: |
+          python scripts/run_beta_one_direct_gap.py \
+            --day "$DAY" --minutes 50 --extra-binance-delay-ms "$DELAY_MS"
+      - name: Validate actual execution results and print net economics
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          day = os.environ["DAY"]
+          delay = int(os.environ["DELAY_MS"])
+          f = Path(f"reports/beta_one_direct_gap_{day}_50m.json")
+          report = json.loads(f.read_text(encoding="utf-8"))
+          assert report["status"] == "complete"
+          assert report["date_utc"] == day
+          assert report["warmup_minutes"] == 10 and report["trade_minutes"] == 50
+          assert report["extra_binance_local_feed_delay_ms"] == delay
+          assert report["glft_5sec_calibration_trace_identical"]
+          base, guided = report["variants"]["beta_0"], report["variants"]["beta_1"]
+          assert base["calibration_trace"] == guided["calibration_trace"]
+          assert base["samples"] == guided["samples"]
+          rows = []
+          for name, variant in (("beta_0", base), ("beta_1", guided)):
+              t = variant["trading"]
+              net = t["end_net_marked_equity_usdt"]
+              fee = t["fee_usdt"]
+              gross = net + fee
+              rows.append((name,gross,fee,net,t["engine_fills"],
+                           t["submissions"],t["cancel_requests"],
+                           t["max_abs_position_contracts"]))
+              print("MODEL", name, "GROSS", gross, "FEE", fee,
+                    "NET", net, "FILLS", t["engine_fills"],
+                    "SUBMITS", t["submissions"], "CANCELS", t["cancel_requests"])
+          diff = rows[1][3] - rows[0][3]
+          assert abs(diff - report["paired_net_difference_beta1_minus_beta0_usdt"]) < 1e-8
+          print("RESULT",day,delay,"BETA_0_NET",rows[0][3],
+                "BETA_1_NET",rows[1][3],"DELTA_NET",diff)
+          if delay == 25 and day == "2026-11-01":
+              assert abs(rows[0][3] + 1.67721892) < 1e-5
+              assert abs(rows[1][3] + 1.41993678) < 1e-5
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a",encoding="utf-8") as f:
+              f.write(f"### {day} / Binance extra {delay}ms / 50min\n\n")
+              f.write("| Model | Gross USDT | Fee USDT | Net USDT | Fills | Submit | Cancel |\n"
+                      "|---|---:|---:|---:|---:|---:|---:|\n")
+              for r in rows:
+                  f.write(f"| {r[0]} | {r[1]:+.6f} | {r[2]:.6f} | {r[3]:+.6f} "
+                          f"| {r[4]} | {r[5]} | {r[6]} |\n")
+              f.write(f"\n**Beta1 − Beta0:** {diff:+.6f} USDT\n")
+          PY
+      - name: Store summary only (14-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delay-${{ matrix.delay_ms }}ms-${{ matrix.day }}-50min
+          path: reports/beta_one_direct_gap_${{ matrix.day }}_50m.json
+          retention-days: 14
+          if-no-files-found: warn
