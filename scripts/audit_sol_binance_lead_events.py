@@ -113,10 +113,13 @@ def run_one(day):
     baseline_time,baseline=causal_60s_basis(ot,om,bt_visible,bm)
     start=base_us*1000+600*NS
     stop=base_us*1000+3600*NS
-    all_i=np.flatnonzero((bt_raw>=start)&(bt_raw<stop))
-    # Source BBO messages with an actual change in Binance mid.
-    moved=np.r_[False, bm[1:]!=bm[:-1]]
-    ids=all_i[moved[all_i]]
+    # Multiple Binance rows at an identical microsecond are consumed as one
+    # event by the HBT union loop. Only inspect the LAST row at that time.
+    batch_last=np.r_[bt_raw[1:] != bt_raw[:-1], True]
+    batch_ids=np.flatnonzero(batch_last)
+    batch_changed=np.r_[False, bm[batch_ids[1:]]!=bm[batch_ids[:-1]]]
+    ids=batch_ids[(bt_raw[batch_ids]>=start)&
+                  (bt_raw[batch_ids]<stop)&batch_changed]
     if len(ids)==0:
         raise ValueError("No source price-changing events")
     t=bt_raw[ids]
