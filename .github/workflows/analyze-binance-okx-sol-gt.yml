@@ -1,0 +1,69 @@
+name: Describe Binance to OKX SOL Gt at 2p5ms with unit audit
+on:
+  push:
+    paths:
+      - '.github/workflows/analyze-binance-okx-sol-gt.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pin same dependencies and unit/spec regression
+        run: |
+          pip install hftbacktest==2.4.4
+          python -m unittest discover -s scripts -p 'test_binance_okx_sol_gt_distribution.py' -v
+          python -m unittest discover -s scripts -p 'test_binance_okx_gt_distribution.py' -v
+      - name: Read native Tardis SOL USDT per coin price and compute fixed clock G
+        run: |
+          python scripts/analyze_binance_okx_sol_gt_distribution.py \
+            --day ${{ matrix.day }} --extra-binance-delay-ms 2.5 \
+            --out reports/binance_okx_sol_gt_2p5ms
+      - name: Preserve SOL-specific 100ms observation arrays
+        uses: actions/upload-artifact@v4
+        with:
+          name: sol-gt-${{ matrix.day }}-2p5ms-100ms
+          path: reports/binance_okx_sol_gt_2p5ms/${{ matrix.day }}_100ms_G_SOL.npz
+          if-no-files-found: error
+          retention-days: 90
+  aggregate:
+    needs: sample
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact estimator dependencies
+        run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sol-gt-*-2p5ms-100ms
+          path: reports/binance_okx_sol_gt_2p5ms
+          merge-multiple: true
+      - name: Combine six dates without re-fetching Tardis
+        run: |
+          python scripts/analyze_binance_okx_sol_gt_distribution.py \
+            --extra-binance-delay-ms 2.5 --reuse-saved \
+            --out reports/binance_okx_sol_gt_2p5ms
+          cat reports/binance_okx_sol_gt_2p5ms/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload complete SOL G summary and six source time series
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-okx-SOL-Gt-2p5ms-sixdate-descriptive
+          path: reports/binance_okx_sol_gt_2p5ms/*
+          if-no-files-found: error
+          retention-days: 90
