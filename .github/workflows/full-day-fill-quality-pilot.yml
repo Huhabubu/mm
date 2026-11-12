@@ -1,0 +1,82 @@
+name: Full-day 100ms 500ms fill quality pilot (read only HBT)
+
+on:
+  push:
+    paths:
+      - 'scripts/full_day_fill_quality.py'
+      - 'scripts/test_full_day_fill_quality.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - '.github/workflows/full-day-fill-quality-pilot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-day-markout-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact official HBT engine
+        run: pip install hftbacktest==2.4.4
+      - name: Deterministic markout and GLFT no-change checks
+        run: |
+          python -m unittest discover -s scripts -p 'test_full_day_fill_quality.py' -v
+          python -m unittest discover -s scripts -p 'test_counterfactual_fill_markout.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+      - name: Replay actual November full day and audit four original strategies
+        run: |
+          python -u scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 1430 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50 --audit-markout
+      - name: Confirm audited executions match already verified full-day reference
+        if: success()
+        run: |
+          python - <<'PY'
+          import json,math
+          r=json.load(open("reports/glft_full_day_fill_quality_2026-11-01_1430m.json"))
+          assert r["status"]=="complete" and r["fill_quality_readonly_audit"]
+          assert r["full_utc_day_requested"] and r["glft_5sec_calibration_trace_identical"]
+          expected={
+              "beta_0":(-57.841130960000015,2413),
+              "beta_1":(-56.41664790000001,2336),
+              "beta_0_wall":(-53.29382949999976,2181),
+              "beta_1_wall":(-53.17475626000015,2214),
+          }
+          m=r["fill_quality_audit"]
+          for name,(net,fills) in expected.items():
+              t=r["variants"][name]["trading"]
+              assert t["engine_fills"]==fills, (name,"fills",t["engine_fills"])
+              assert math.isclose(t["end_net_marked_equity_usdt"],net,abs_tol=.01), (
+                  name,"net",t["end_net_marked_equity_usdt"],net)
+              assert m["all_actual_fills"][name]["n_fills"]==fills
+              h=m["all_actual_fills"][name]["horizons"]
+              print("STRATEGY",name,"GROSS",net+t["fee_usdt"],
+                    "FEE",t["fee_usdt"],"NET",t["end_net_marked_equity_usdt"],
+                    "FILL",fills,"CANCELS",t["cancel_requests"],
+                    "FULL_100",h["100"],"FULL_500",h["500"])
+          for name,d in m["paired_baseline_versus_signal"].items():
+              print("PAIR",name,"SHARED",d["same_exchange_ns_side_overlap"],
+                    "STRICT_SHARED",d["same_exchange_ns_side_execution_price_tick_overlap"],
+                    "BASE_ONLY",d["baseline_only_time_side"],
+                    "SIGNAL_ONLY",d["signal_only_time_side"])
+              for g,record in d["groups"].items():
+                  for horizon in ("100","500"):
+                      h=record["horizons"].get(horizon,{})
+                      print("MARKOUT",name,g,horizon,
+                            "N",h.get("n_valid"),
+                            "M_PRE_BPS",h.get("mean_signed_markout_bps"),
+                            "M_POST_BPS",h.get("mean_continuation_signed_move_bps"),
+                            "F_POST_NEG",h.get("continuation_adverse_fraction"),
+                            "NET_PROXY",h.get("mean_horizon_net_proxy_usdt"))
+          PY
+      - name: Upload aggregate only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-day-november-official-hbt-fill-quality
+          path: reports/glft_full_day_fill_quality_2026-11-01_1430m.json
+          if-no-files-found: warn
+          retention-days: 14
