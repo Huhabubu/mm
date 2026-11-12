@@ -192,11 +192,14 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
         experiment=False, wall_search_ticks=0):
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
-    if minutes not in (5, 50):
-        raise ValueError("Only validated 5 or 50 trading-minute windows")
+    if minutes not in (5, 50, 1430):
+        raise ValueError("Supported trade windows: 5m, 50m, 1430m (full UTC day after 10m warmup)")
     day_start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
         tzinfo=timezone.utc).timestamp()) * 1_000_000
-    end_us = day_start_us + (600 + minutes*60) * 1_000_000 + 500_000
+    full_day = minutes == 1430
+    end_us = day_start_us + (600 + minutes*60) * 1_000_000
+    if not full_day:
+        end_us += 500_000
     label = ("glft_local_peak" if wall_search_ticks > 0 else
              "gap_filter_placebo" if experiment else "beta_one_direct_gap")
     if wall_search_ticks < 0 or wall_search_ticks > 1000:
@@ -212,7 +215,11 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
         "same_native_bbo_clocks_and_order_latency": True,
         "beta_1_hypothesis": "full Binance-OKX abnormal spread is OKX quote-centre shift",
         "no_beta_fitting": True, "not_new_blind_holdout": True,
-        "not_daily_pnl": True,
+        "not_daily_pnl": not full_day,
+        "full_utc_day_requested": full_day,
+        "full_day_validation_rules": ("Require both OKX book ticker and Binance book ticker "
+                                      "to cover UTC 23:59:30 and official HBT replay "
+                                      "to reach the specified day end." if full_day else None),
     }
     try:
         with tempfile.TemporaryDirectory(prefix="mm_beta_one_") as tmp:
@@ -221,7 +228,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
             for kind in SCHEMAS:
                 paths[kind] = root/f"{kind}.csv"
                 counts[kind] = extract_window(
-                    kind, day, end_us, paths[kind], max_rows=2_500_000)
+                    kind, day, end_us, paths[kind],
+                    max_rows=75_000_000 if full_day else 2_500_000)
             npz = root/"fused.npz"
             fused = tardis.convert_fuse(
                 str(paths["trades"]), str(paths["incremental_book_L2"]),
@@ -234,6 +242,15 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
             del fused
             ot, om = read_local_bbo(paths["book_ticker"])
             b_local, bm = read_binance_bbo(day, end_us)
+            if full_day:
+                # Detect silently truncated day feeds; do not report as 24h.
+                coverage_floor_us = end_us - 30 * 1_000_000
+                if (counts["book_ticker"]["last_local_us"] < coverage_floor_us or
+                        b_local[-1] < coverage_floor_us * 1000):
+                    raise RuntimeError("Full-day BBO not covered through last 30s UTC")
+                report["data_coverage_last_okx_local_us"] = int(
+                    counts["book_ticker"]["last_local_us"])
+                report["data_coverage_last_binance_local_ns"] = int(b_local[-1])
             bt = visible_timestamps(b_local, delay_ms)
             base_t, base = causal_60s_basis(ot, om, bt, bm)
             base_valid = int(np.count_nonzero(np.isfinite(base)))
@@ -271,6 +288,10 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                     result["beta_1"]["trading"]["end_net_marked_equity_usdt"] -
                     result["beta_0"]["trading"]["end_net_marked_equity_usdt"]),
                 "glft_5sec_calibration_trace_identical": True,
+                "pnl_reporting": "gross=net+fee; fee actual HBT; net=marked equity",
+                "daily_pnl_utc_interpretation":
+                    ("UTC day with initial 10min calibration excluded from trading"
+                     if full_day else "historical intraday 50min/5min experiment"),
             })
     except Exception as exc:
         report["status"] = "failed"
@@ -286,7 +307,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--day", default="2026-11-01")
-    p.add_argument("--minutes", type=int, default=5, choices=(5, 50))
+    p.add_argument("--minutes", type=int, default=5, choices=(5, 50, 1430),
+                   help="1430m means 10min warmup then trade to UTC day end (full day)")
     p.add_argument("--extra-binance-delay-ms", type=int, default=25)
     p.add_argument("--report-dir", default="reports")
     p.add_argument("--experiment", choices=("base", "placebo_filter", "wall_anchor"), default="base")
