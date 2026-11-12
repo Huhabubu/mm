@@ -231,6 +231,8 @@ def main():
     p.add_argument("--day",choices=DAYS,help="Optional individual sample date")
     p.add_argument("--extra-binance-delay-ms",type=float,default=2.5)
     p.add_argument("--out",default="reports/binance_okx_btc_gt_2p5ms")
+    p.add_argument("--reuse-saved",action="store_true",
+                   help="Aggregate previously recorded NPZ from per-day matrix jobs")
     args=p.parse_args()
     if args.extra_binance_delay_ms!=2.5:
         raise ValueError("This fixed-protocol experiment is for 2.5ms only")
@@ -240,12 +242,19 @@ def main():
     stats=[]
     vectors=[]
     for day in days:
-        data,metadata=read_day(day,args.extra_binance_delay_ms)
+        if args.reuse_saved:
+            file=out/f"{day}_100ms_G.npz"
+            with np.load(file) as z:
+                data={k:z[k].copy() for k in z.files}
+            metadata={"source":"previous_matrix_download"}
+        else:
+            data,metadata=read_day(day,args.extra_binance_delay_ms)
         s=summarize(day,data)
         s["source_metadata"]={k:v for k,v in metadata.items() if k!="okx_extract_metadata"}
         stats.append(s)
         vectors.append(data)
-        np.savez_compressed(out/f"{day}_100ms_G.npz",**data)
+        if not args.reuse_saved:
+            np.savez_compressed(out/f"{day}_100ms_G.npz",**data)
         print("DATE",day,"VALID",s["valid_points"],"/",s["clock_points"],
               "MEAN",s["G_signed_USDT"].get("mean"),
               "MEDIAN_ABS",s["G_absolute_USDT"].get("p50"),
