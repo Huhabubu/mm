@@ -189,14 +189,20 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
 
 
 def run(day, minutes=50, delay_ms=25, report_dir="reports",
-        experiment=False, wall_search_ticks=0):
+        experiment=False, wall_search_ticks=0, convert_chunk_minutes=0):
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
-    if minutes not in (5, 50):
-        raise ValueError("Only validated 5 or 50 trading-minute windows")
+    if minutes not in (5, 50, 1430):
+        raise ValueError("Supported trade windows: 5m, 50m, 1430m (full UTC day after 10m warmup)")
     day_start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
         tzinfo=timezone.utc).timestamp()) * 1_000_000
-    end_us = day_start_us + (600 + minutes*60) * 1_000_000 + 500_000
+    full_day = minutes == 1430
+    chunk_minutes = convert_chunk_minutes or (60 if full_day else 0)
+    if chunk_minutes < 0 or chunk_minutes > 1440:
+        raise ValueError("Invalid Tardis conversion chunk minutes")
+    end_us = day_start_us + (600 + minutes*60) * 1_000_000
+    if not full_day:
+        end_us += 500_000
     label = ("glft_local_peak" if wall_search_ticks > 0 else
              "gap_filter_placebo" if experiment else "beta_one_direct_gap")
     if wall_search_ticks < 0 or wall_search_ticks > 1000:
@@ -212,7 +218,12 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
         "same_native_bbo_clocks_and_order_latency": True,
         "beta_1_hypothesis": "full Binance-OKX abnormal spread is OKX quote-centre shift",
         "no_beta_fitting": True, "not_new_blind_holdout": True,
-        "not_daily_pnl": True,
+        "not_daily_pnl": not full_day,
+        "full_utc_day_requested": full_day,
+        "conversion_chunk_minutes": chunk_minutes,
+        "full_day_validation_rules": ("Require both OKX book ticker and Binance book ticker "
+                                      "to cover UTC 23:59:30 and official HBT replay "
+                                      "to reach the specified day end." if full_day else None),
     }
     try:
         with tempfile.TemporaryDirectory(prefix="mm_beta_one_") as tmp:
@@ -220,20 +231,52 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
             paths, counts = {}, {}
             for kind in SCHEMAS:
                 paths[kind] = root/f"{kind}.csv"
+                if full_day:
+                    print("FULL_DAY_DATA_BEGIN", kind, day, flush=True)
                 counts[kind] = extract_window(
-                    kind, day, end_us, paths[kind], max_rows=2_500_000)
-            npz = root/"fused.npz"
-            fused = tardis.convert_fuse(
-                str(paths["trades"]), str(paths["incremental_book_L2"]),
-                str(paths["book_ticker"]), tick_size=TICK, lot_size=LOT,
-                output_filename=str(npz),
-                ss_buffer_size=max(1000, counts["incremental_book_L2"]["snapshot_rows"] + 100),
-                snapshot_mode="process")
-            validate_event_order(fused)
-            n_events = len(fused)
-            del fused
+                    kind, day, end_us, paths[kind],
+                    max_rows=75_000_000 if full_day else 2_500_000)
+                if full_day:
+                    print("FULL_DAY_DATA_END", kind,
+                          counts[kind]["rows"], "rows",
+                          paths[kind].stat().st_size, "bytes", flush=True)
+            if chunk_minutes:
+                from tardis_segmented_hbt import convert_fuse_parts
+                npz, part_details = convert_fuse_parts(
+                    paths, counts, root, day_start_us, end_us,
+                    chunk_minutes, TICK, LOT)
+                n_events = sum(part["hbt_events"] for part in part_details)
+                report["hbt_conversion_parts"] = len(npz)
+                report["hbt_conversion_part_event_counts"] = [
+                    part["hbt_events"] for part in part_details]
+                if full_day:
+                    print("FULL_DAY_FUSED_READY", n_events, "events",
+                          "parts", len(npz), flush=True)
+            else:
+                npz = root/"fused.npz"
+                fused = tardis.convert_fuse(
+                    str(paths["trades"]), str(paths["incremental_book_L2"]),
+                    str(paths["book_ticker"]), tick_size=TICK, lot_size=LOT,
+                    output_filename=str(npz),
+                    ss_buffer_size=max(1000, counts["incremental_book_L2"]["snapshot_rows"] + 100),
+                    snapshot_mode="process")
+                if full_day:
+                    print("FULL_DAY_FUSED_READY", len(fused), "events", flush=True)
+                validate_event_order(fused)
+                n_events = len(fused)
+                del fused
+                report["hbt_conversion_parts"] = 1
             ot, om = read_local_bbo(paths["book_ticker"])
             b_local, bm = read_binance_bbo(day, end_us)
+            if full_day:
+                # Detect silently truncated day feeds; do not report as 24h.
+                coverage_floor_us = end_us - 30 * 1_000_000
+                if (counts["book_ticker"]["last_local_us"] < coverage_floor_us or
+                        b_local[-1] < coverage_floor_us * 1000):
+                    raise RuntimeError("Full-day BBO not covered through last 30s UTC")
+                report["data_coverage_last_okx_local_us"] = int(
+                    counts["book_ticker"]["last_local_us"])
+                report["data_coverage_last_binance_local_ns"] = int(b_local[-1])
             bt = visible_timestamps(b_local, delay_ms)
             base_t, base = causal_60s_basis(ot, om, bt, bm)
             base_valid = int(np.count_nonzero(np.isfinite(base)))
@@ -248,6 +291,12 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
             thresholds = (pretrade_gap_thresholds(
                 ot, om, bt, bm, base_t, base, day_start_us*1000)
                 if experiment else None)
+            if full_day:
+                total_npz_bytes = (sum(p.stat().st_size for p in npz)
+                                   if isinstance(npz, list) else npz.stat().st_size)
+                print("FULL_DAY_HBT_BEGIN", "data_size_bytes", total_npz_bytes,
+                      "variants", "4" if wall_search_ticks else "2",
+                      "parts", report["hbt_conversion_parts"], flush=True)
             result = run_pair(
                 npz, low, high, bt, bm, ot, om, base_t, base, minutes,
                 experiment=experiment, thresholds=thresholds,
@@ -271,6 +320,10 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                     result["beta_1"]["trading"]["end_net_marked_equity_usdt"] -
                     result["beta_0"]["trading"]["end_net_marked_equity_usdt"]),
                 "glft_5sec_calibration_trace_identical": True,
+                "pnl_reporting": "gross=net+fee; fee actual HBT; net=marked equity",
+                "daily_pnl_utc_interpretation":
+                    ("UTC day with initial 10min calibration excluded from trading"
+                     if full_day else "historical intraday 50min/5min experiment"),
             })
     except Exception as exc:
         report["status"] = "failed"
@@ -286,12 +339,16 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--day", default="2026-11-01")
-    p.add_argument("--minutes", type=int, default=5, choices=(5, 50))
+    p.add_argument("--minutes", type=int, default=5, choices=(5, 50, 1430),
+                   help="1430m means 10min warmup then trade to UTC day end (full day)")
     p.add_argument("--extra-binance-delay-ms", type=int, default=25)
     p.add_argument("--report-dir", default="reports")
     p.add_argument("--experiment", choices=("base", "placebo_filter", "wall_anchor"), default="base")
     p.add_argument("--wall-search-ticks", type=int, default=0,
                    help="Scenario-specific bounded outward L2 tick range (1..1000); 0 disabled")
+    p.add_argument("--convert-chunk-minutes", type=int, default=0,
+                   help="0 means 60m for full day and single file for short runs; "
+                        "positive N converts N-minute parts for ONE continuous official HBT engine")
     a = p.parse_args()
     if datetime.strptime(a.day, "%Y-%m-%d").day != 1:
         p.error("Tardis free historical day must be the first of month UTC")
@@ -301,7 +358,8 @@ def main():
         p.error("--wall-search-ticks can only be used with wall_anchor mode")
     run(a.day, a.minutes, a.extra_binance_delay_ms, a.report_dir,
         experiment=(a.experiment == "placebo_filter"),
-        wall_search_ticks=a.wall_search_ticks)
+        wall_search_ticks=a.wall_search_ticks,
+        convert_chunk_minutes=a.convert_chunk_minutes)
 
 
 if __name__ == "__main__":

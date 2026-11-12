@@ -1,0 +1,69 @@
+name: Full UTC day official HBT pilot (one date, beta0/beta1)
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_event_driven.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - '.github/workflows/full-day-hbt-pilot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Resource budget
+        run: |
+          free -h
+          df -h /tmp .
+      - name: Install official HBT
+        run: pip install hftbacktest==2.4.4
+      - name: Focused engine and unchanged quotation tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+          python -m unittest discover -s scripts -p 'test_glft_liquidity_wall.py' -v
+      - name: Full UTC 2026-11-01 00:00—24:00, first 10min warmup, original beta0/1
+        run: |
+          python -u scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 1430 --extra-binance-delay-ms 25 --experiment base
+      - name: Audit actual end clock, daily gross fees net
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          from datetime import datetime,timezone,timedelta
+          r=json.load(open("reports/beta_one_direct_gap_2026-11-01_1430m.json"))
+          assert r["status"]=="complete"
+          assert r["full_utc_day_requested"]
+          utc_end=datetime(2026,11,2,tzinfo=timezone.utc).timestamp()*1e9
+          for name,v in r["variants"].items():
+              t=v["trading"]
+              # explicitly inspect and require replay to reach last 2s of UTC day
+              short_ns=utc_end-v["end_time_ns"]
+              assert 0 <= short_ns <= 2e9, (name,"truncated",short_ns)
+              assert v["samples"]>=6000+1430*600-20, (name,v["samples"])
+              assert t["engine_fills"]==t["buy_fills"]+t["sell_fills"]
+              print("FULL_DAY",name,"actual_end_shortfall_ns",int(short_ns),
+                    "GROSS",t["end_net_marked_equity_usdt"]+t["fee_usdt"],
+                    "FEES",t["fee_usdt"],
+                    "NET",t["end_net_marked_equity_usdt"],
+                    "FILLS",t["engine_fills"],
+                    "CANCELS",t["cancel_requests"],
+                    "SUBMISSIONS",t["submissions"])
+          assert r["glft_5sec_calibration_trace_identical"] is True
+          PY
+      - name: Save aggregate report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-utc-day-2026-11-01-beta0-beta1
+          path: reports/beta_one_direct_gap_2026-11-01_1430m.json
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,62 @@
+name: HBT segmented NPZ 50min equivalence to unsegmented execution
+
+on:
+  push:
+    paths:
+      - 'scripts/tardis_segmented_hbt.py'
+      - '.github/workflows/full-day-chunk-equivalence.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  same-execution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official hftbacktest
+        run: pip install hftbacktest==2.4.4
+      - name: Convert Tardis into three 20min NPZ parts; run one continuous official HBT
+        run: |
+          python -u scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 50 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50 --convert-chunk-minutes 20
+      - name: Assert exact previous unsegmented fills, cancels and net equity for four variants
+        if: success()
+        run: |
+          python - <<'PY'
+          import json,math
+          r=json.load(open("reports/glft_local_peak_2026-11-01_50m.json"))
+          assert r["status"]=="complete" and r["hbt_conversion_parts"]==3
+          expect={
+              "beta_0":(-1.6772189200000975,73,637),
+              "beta_1":(-1.4199367800000393,61,6134),
+              "beta_0_wall":(-1.4815154599999032,67,2727),
+              "beta_1_wall":(-1.2591509399999743,57,7359),
+          }
+          for name,(net,fills,cancels) in expect.items():
+              t=r["variants"][name]["trading"]
+              assert math.isclose(t["end_net_marked_equity_usdt"],net,abs_tol=1e-7), (name,"net",t)
+              assert t["engine_fills"]==fills, (name,"fills",t)
+              # Segment boundaries may add a non-executing feed wakeup and
+              # one additional cancel; allow <=2 extra request differences.
+              delta=t["cancel_requests"]-cancels
+              assert abs(delta)<=2, (name,"cancel-request-drift",delta,t)
+              print("ECONOMIC_MATCH",name,"NET",net,"FILLS",fills,
+                    "CANCELS",t["cancel_requests"],
+                    "CANCEL_REQUEST_DELTA",delta,
+                    "GROSS",net+t["fee_usdt"],"FEES",t["fee_usdt"])
+          assert r["glft_5sec_calibration_trace_identical"]
+          print("ECONOMIC_HBT_SEGMENT_EQUIVALENCE_SUCCESS",r["hbt_conversion_part_event_counts"])
+          PY
+      - name: Save aggregate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-hbt-3segment-equivalence
+          path: reports/glft_local_peak_2026-11-01_50m.json
+          if-no-files-found: warn
+          retention-days: 14

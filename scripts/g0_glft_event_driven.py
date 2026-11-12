@@ -163,7 +163,11 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     max_drawdown = 0.0
     peak_equity = 0.0
     pos_abs_seconds = pos_sq_seconds = at_cap_seconds = 0.0
-    fill_limit = max(2 * (trade_steps * STEP_NS // MIN_REQUOTE_NS) + 10, 100)
+    # Retain short-window allocation; cap long-day traces to avoid O(day_length)
+    # preallocation (a full-day upper bound would consume ~170MB per model).
+    # Existing FILLED observations still fail loudly if this cap is reached.
+    fill_limit = min(max(2 * (trade_steps * STEP_NS // MIN_REQUOTE_NS) + 10, 100),
+                     100_000)
     fill_ts_ns = np.empty(fill_limit, np.int64)
     fill_sides = np.empty(fill_limit, np.int64)
     fill_observed_ns = np.empty(fill_limit, np.int64)

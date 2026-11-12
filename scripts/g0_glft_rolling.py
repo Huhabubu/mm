@@ -285,7 +285,10 @@ def run_strategy(engine, rolling, trade_steps, gamma_code=GAMMA, capture_fills=F
 
 def asset_for(npz, lb, ub):
     from hftbacktest import BacktestAsset
-    return (BacktestAsset().data([str(npz)]).linear_asset(CTVAL)
+    # Official HBT lazily loads a sequence of converted NPZ parts and preserves
+    # one continuous exchange, queue, inventory and cash state across files.
+    sources = [str(p) for p in npz] if isinstance(npz, (list, tuple)) else [str(npz)]
+    return (BacktestAsset().data(sources).linear_asset(CTVAL)
             .constant_order_latency(1_000_000, 1_000_000)
             .power_prob_queue_model(2.0).no_partial_fill_exchange()
             .trading_value_fee_model(MAKER_FEE, TAKER_FEE)
