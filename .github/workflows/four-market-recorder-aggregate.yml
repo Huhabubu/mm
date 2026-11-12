@@ -1,0 +1,46 @@
+name: Aggregate four-market Recorder-backed model results
+on:
+  workflow_run:
+    workflows:
+      - "Four-market GLFT 6date 50min with native Recorder"
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Run ID for four-market GLFT 6date 50min"
+        required: true
+        default: "43192665567"
+permissions:
+  contents: read
+  actions: read
+jobs:
+  aggregate:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch all completed scenario summaries and recorder NPZ
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          pattern: recorder-*-50min
+          path: gathered
+          merge-multiple: false
+      - name: Validate recorder existence and calculate daily-equal market means
+        run: |
+          python scripts/summarize_multivenue_recorder.py \
+            --source gathered --out reports/multivenue_sixdate_summary
+          cat reports/multivenue_sixdate_summary/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload complete model, per-day and missing-calibration summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: four-market-recorder-combined-summary
+          path: reports/multivenue_sixdate_summary/*
+          if-no-files-found: warn
+          retention-days: 90
