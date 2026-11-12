@@ -29,16 +29,18 @@ jobs:
           python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
       - name: Real OKX L2 maker execution 10min warmup and 5min trade, example 50 ticks
         run: python scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 5 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50
-      - name: Compare original vs wall after quoting
+      - name: Compare original vs first local-peak quote
         if: success()
         run: |
           python - <<'PY'
           import json
-          d=json.load(open("reports/glft_liquidity_wall_2026-11-01_5m.json"))
+          d=json.load(open("reports/glft_local_peak_2026-11-01_5m.json"))
           print("WALL_SCENARIO_TICKS",d["wall_search_ticks"])
           for name,v in d["variants"].items():
               t=v["trading"]
-              print("VARIANT",name,"NET",t["end_net_marked_equity_usdt"],
+              print("VARIANT",name,
+                    "GROSS",t["end_net_marked_equity_usdt"]+t["fee_usdt"],
+                    "FEES",t["fee_usdt"],"NET",t["end_net_marked_equity_usdt"],
                     "FILLS",t["engine_fills"],"CANCELS",t["cancel_requests"],
                     "SUBMISSIONS",t["submissions"],"FEE",t["fee_usdt"],
                     "MAX_POSITION",t["max_abs_position_contracts"])
@@ -48,6 +50,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: glft-wall-2026-11-01-5min-50ticks
-          path: reports/glft_liquidity_wall_2026-11-01_5m.json
+          path: reports/glft_local_peak_2026-11-01_5m.json
           if-no-files-found: warn
           retention-days: 14
