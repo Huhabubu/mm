@@ -1,0 +1,32 @@
+name: Inspect 2.5ms GLFT recorder markout quality diagnostics
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect-markout-quality.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read already audited recorder attribution summary
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43217389652
+          github-token: ${{ github.token }}
+          name: glft-2p5ms-market-venue-pnl-100ms-500ms-markout-analysis
+          path: audited
+      - name: Show adverse-markout fractions and native BBO freshness
+        run: |
+          python scripts/inspect_markout_quality.py \
+            --input audited/summary.json --out reports/markout_quality_2p5ms.md
+          cat reports/markout_quality_2p5ms.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glft-2p5ms-fresh-bbo-and-unfavorable-fill-proportions
+          path: reports/markout_quality_2p5ms.md
+          retention-days: 90
