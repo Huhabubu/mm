@@ -1,0 +1,49 @@
+name: GLFT 2.5ms Recorder PnL and 100ms 500ms markout attribution
+on:
+  push:
+    paths:
+      - '.github/workflows/glft-recorder-pnl-markout-audit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  attribute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SOURCE_RUN: "43198245510"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install numerical dependency
+        run: python -m pip install numpy==2.2.6
+      - name: Exact accounting and signed markout synthetic regression
+        run: python -m unittest discover -s scripts -p 'test_recorder_pnl_attribution.py' -v
+      - name: Recover all 2.5ms official HBT Recorder and fill artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.SOURCE_RUN }}
+          github-token: ${{ github.token }}
+          pattern: recorder-*-2p5ms-50min
+          path: gathered
+          merge-multiple: false
+      - name: Compute fill-time target BBO edge, inventory price PnL, 100ms and 500ms signed markout
+        run: |
+          python scripts/analyze_multivenue_recorder_markout.py \
+            --source gathered --out reports/markout_attribution_2p5ms
+          cat reports/markout_attribution_2p5ms/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload auditable summary and per-fill HBT data with observed markout
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glft-2p5ms-market-venue-pnl-100ms-500ms-markout-analysis
+          path: |
+            reports/markout_attribution_2p5ms/summary.json
+            reports/markout_attribution_2p5ms/report.md
+            reports/markout_attribution_2p5ms/by_market_model.csv
+            reports/markout_attribution_2p5ms/annotated/**/*.npz
+          if-no-files-found: warn
+          retention-days: 90
