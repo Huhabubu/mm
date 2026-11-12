@@ -170,16 +170,16 @@ def markdown(report):
         f"| G标准差 (USDT/SOL) | {signed['std']:.6f} |",
         f"| G中位数 (USDT/SOL) | {signed['p50']:+.6f} |",
         f"| G P05 / P95 (USDT/SOL) | {signed['p05']:+.6f} / {signed['p95']:+.6f} |",
-        f"| \u007cG\u007c均值 (USDT/SOL) | {absolute['mean']:.6f} |",
-        f"| **\u007cG\u007c中位数 (USDT/SOL)** | **{absolute['p50']:.6f}** |",
-        f"| \u007cG\u007c P90 (USDT/SOL) | {absolute['p90']:.6f} |",
-        f"| \u007cG\u007c P99 (USDT/SOL) | {absolute['p99']:.6f} |",
-        f"| \u007cG\u007c最大值 (USDT/SOL) | {absolute['max']:.6f} |",
-        f"| **\u007cG\u007c中位数 (OKX SOL ticks)** | **{ticks['p50']:.3f}** |",
-        f"| \u007cG\u007c P90 (OKX SOL ticks) | {ticks['p90']:.3f} |",
-        f"| **\u007cG\u007c中位数 (bps)** | **{bps['p50']:.6f}** |",
-        f"| \u007cG\u007c P90 (bps) | {bps['p90']:.6f} |",
-        f"| \u007cG\u007c P99 (bps) | {bps['p99']:.6f} |",
+        f"| 绝对G均值 (USDT/SOL) | {absolute['mean']:.6f} |",
+        f"| **绝对G中位数 (USDT/SOL)** | **{absolute['p50']:.6f}** |",
+        f"| 绝对G P90 (USDT/SOL) | {absolute['p90']:.6f} |",
+        f"| 绝对G P99 (USDT/SOL) | {absolute['p99']:.6f} |",
+        f"| 绝对G最大值 (USDT/SOL) | {absolute['max']:.6f} |",
+        f"| **绝对G中位数 (OKX SOL ticks)** | **{ticks['p50']:.3f}** |",
+        f"| 绝对G P90 (OKX SOL ticks) | {ticks['p90']:.3f} |",
+        f"| **绝对G中位数 (bps)** | **{bps['p50']:.6f}** |",
+        f"| 绝对G P90 (bps) | {bps['p90']:.6f} |",
+        f"| 绝对G P99 (bps) | {bps['p99']:.6f} |",
         f"| G>0 / G<0 / G=0 | "
         f"{100*pool['G_positive_fraction']:.2f}% / "
         f"{100*pool['G_negative_fraction']:.2f}% / "
@@ -187,7 +187,7 @@ def markdown(report):
         "",
         "## 逐日统计",
         "",
-        "| 日期 | 有效点 | 有效率 | G均值 (USDT/SOL) | \u007cG\u007c中位数 | \u007cG\u007c P90 | \u007cG\u007c中位数 (bps) |",
+        "| 日期 | 有效点 | 有效率 | G均值 (USDT/SOL) | 绝对G中位数 | 绝对G P90 | 绝对G中位数 (bps) |",
         "|---|---:|---:|---:|---:|---:|---:|"
     ]
     for day in report["days"]:
@@ -197,7 +197,7 @@ def markdown(report):
                  f"| {g['mean']:+.6f} | {a['p50']:.6f} | {a['p90']:.6f} "
                  f"| {day['G_absolute_bps']['p50']:.6f} |")
     z.extend(["", "## 绝对信号幅度阈值覆盖（仅描述，现有策略未启用）", "",
-              "| \u007cG\u007c至少达到 (USDT/SOL) | 按OKX SOL 0.01USDT换算的价格档 | 有效点占比 |",
+              "| 绝对G至少达到 (USDT/SOL) | 按OKX SOL 0.01USDT换算的价格档 | 有效点占比 |",
               "|---:|---:|---:|"])
     for t in THRESHOLDS_USDT:
         z.append(f"| {t:g} | {t/OKX_PRICE_TICK:g} | "
