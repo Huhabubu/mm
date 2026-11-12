@@ -181,7 +181,7 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                           .resample("1s")
                           .stats([Ret, MaxDrawdown, NumberOfTrades, TradingValue,
                                   ReturnOverTrade, MaxPositionValue]))
-                numbers = result.entire.to_dicts()[0]
+                numbers = result.summary().to_dicts()[-1]
                 first = float(data[0]["balance"] + CTVAL * data[0]["position"]
                               * data[0]["price"] - data[0]["fee"])
                 last = float(data[-1]["balance"] + CTVAL * data[-1]["position"]
