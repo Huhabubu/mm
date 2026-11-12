@@ -3,6 +3,9 @@ name: Six-date bounded L2 wall quote postprocessor official HBT
 on:
   push:
     paths:
+      - 'scripts/g0_glft_event_driven.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - 'scripts/test_glft_liquidity_wall.py'
       - '.github/workflows/glft-liquidity-wall-multiday.yml'
   workflow_dispatch:
 
@@ -30,18 +33,20 @@ jobs:
         run: python -m unittest discover -s scripts -p 'test_glft_liquidity_wall.py' -v
       - name: Full 10min pretrade + 50min trading per model, 50 tick scenario
         run: python scripts/run_beta_one_direct_gap.py --day ${{ matrix.day }} --minutes 50 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50
-      - name: Independent paired official fills and PnL
+      - name: Independent paired official gross, fees, net and fills
         if: success()
         run: |
           DAY="${{ matrix.day }}" python - <<'PY'
           import os,json
           d=os.environ["DAY"]
-          r=json.load(open(f"reports/glft_liquidity_wall_{d}_50m.json"))
+          r=json.load(open(f"reports/glft_local_peak_{d}_50m.json"))
           print("DATE",d,"WALL_TICKS",r["wall_search_ticks"],
                 "GLFT_SAME_FIT",r["glft_5sec_calibration_trace_identical"])
           for name,v in r["variants"].items():
               t=v["trading"]
-              print("MODEL",name,"NET",t["end_net_marked_equity_usdt"],
+              print("MODEL",name,
+                    "GROSS",t["end_net_marked_equity_usdt"]+t["fee_usdt"],
+                    "FEES",t["fee_usdt"],"NET",t["end_net_marked_equity_usdt"],
                     "FILLS",t["engine_fills"],"CANCELS",t["cancel_requests"],
                     "SUBMISSIONS",t["submissions"],"FEES",t["fee_usdt"],
                     "MAX_POSITION",t["max_abs_position_contracts"])
@@ -51,6 +56,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: glft-wall-${{ matrix.day }}-50min-50ticks
-          path: reports/glft_liquidity_wall_${{ matrix.day }}_50m.json
+          path: reports/glft_local_peak_${{ matrix.day }}_50m.json
           if-no-files-found: warn
           retention-days: 14
