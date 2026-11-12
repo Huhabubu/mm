@@ -18,7 +18,7 @@ MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
 @njit
 def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
-                          is_bid, search_ticks):
+                          is_bid, search_ticks, tick_size=TICK, contract_value=CTVAL):
     """Anchor to the FIRST strict local notional peak outward from GLFT.
 
     Compare immediate neighboring ticks on the SAME side of visible OKX L2.
@@ -36,14 +36,14 @@ def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
         qty = side_depth[idx]
         if not np.isfinite(qty) or qty <= 0.0:
             continue
-        candidate_notional = price_tick * TICK * qty * CTVAL
+        candidate_notional = price_tick * tick_size * qty * contract_value
         prev_tick = price_tick + 1 if is_bid else price_tick - 1
         next_tick = price_tick - 1 if is_bid else price_tick + 1
         prev_qty = side_depth[prev_tick - roi_lb_tick]
         next_qty = side_depth[next_tick - roi_lb_tick]
-        prev_notional = (prev_tick * TICK * prev_qty * CTVAL
+        prev_notional = (prev_tick * tick_size * prev_qty * contract_value
                          if np.isfinite(prev_qty) and prev_qty > 0.0 else 0.0)
-        next_notional = (next_tick * TICK * next_qty * CTVAL
+        next_notional = (next_tick * tick_size * next_qty * contract_value
                          if np.isfinite(next_qty) and next_qty > 0.0 else 0.0)
         if (candidate_notional > prev_notional + 1e-9 and
                 candidate_notional > next_notional + 1e-9):
@@ -53,7 +53,7 @@ def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
 @njit
 def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
                              okx_native_ns, okx_native_mid, basis_grid_ns,
-                             basis_values):
+                             basis_values, tick_size=TICK):
     """No forward BBO / basis access. Strict past OKX and basis, fresh Binance."""
     if beta == 0.0 or not np.isfinite(binance_mid):
         return 0.0
@@ -66,7 +66,7 @@ def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
     if not np.isfinite(basis_values[gi]):
         return 0.0
     gap_usdt_per_btc = binance_mid - okx_native_mid[oi] - basis_values[gi]
-    return beta * gap_usdt_per_btc / TICK
+    return beta * gap_usdt_per_btc / tick_size
 
 
 @njit
@@ -105,7 +105,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    filter_refresh_change_ticks=10.0,
                    filter_refresh_ns=250_000_000,
                    extra_half_ticks=0.0, probe_ns=None,
-                   wall_search_ticks=0):
+                   wall_search_ticks=0, tick_size=TICK, contract_value=CTVAL,
+                   order_qty=ORDER_QTY, position_cap=POSITION_CAP,
+                   recorder=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -230,7 +232,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             furthest = -np.inf
             if np.isfinite(prev_mid):
                 for tr in engine.last_trades(0):
-                    price_tick = tr.px / TICK
+                    price_tick = tr.px / tick_size
                     if tr.ev & BUY_EVENT == BUY_EVENT:
                         furthest = max(furthest, price_tick - prev_mid)
                     else:
@@ -284,10 +286,10 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             if sample_count > TRAIN:
                 book = engine.depth(0)
                 if book.best_bid_tick > 0 and book.best_ask_tick > book.best_bid_tick:
-                    mid_price = (book.best_bid_tick + book.best_ask_tick) * TICK / 2
+                    mid_price = (book.best_bid_tick + book.best_ask_tick) * tick_size / 2
                     pos = engine.position(0)
                     st = engine.state_values(0)
-                    equity = st.balance + CTVAL * pos * mid_price - st.fee
+                    equity = st.balance + contract_value * pos * mid_price - st.fee
                     if not np.isfinite(first_equity):
                         first_equity = equity
                     min_equity = min(min_equity, equity)
@@ -295,8 +297,10 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     max_position = max(max_position, abs(pos))
                     pos_abs_seconds += abs(pos) * STEP_NS / 1e9
                     pos_sq_seconds += pos * pos * STEP_NS / 1e9
-                    if abs(pos) >= POSITION_CAP - 1e-9:
+                    if abs(pos) >= position_cap - 1e-9:
                         at_cap_seconds += STEP_NS / 1e9
+                    if recorder is not None:
+                        recorder.record(engine)
                     peak_equity = max(peak_equity, equity)
                     max_drawdown = max(max_drawdown, peak_equity - equity)
 
@@ -373,7 +377,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     basis_values is not None):
                 shift_ticks = causal_price_shift_ticks(
                     now, latest_binance_ns, latest_binance, beta,
-                    okx_native_ns, okx_native_mid, basis_grid_ns, basis_values)
+                    okx_native_ns, okx_native_mid, basis_grid_ns, basis_values,
+                    tick_size)
             if filter_enter_ticks > 0.0:
                 held_shift_ticks, last_shift_update_ns = filtered_gap_shift(
                     now, shift_ticks, held_shift_ticks, last_shift_update_ns,
@@ -388,10 +393,10 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 # Bound search to OUTWARD prices, then step one tick in front.
                 want_bid = wall_front_quote_tick(
                     book.bid_depth, book.roi_lb_tick, int(want_bid),
-                    True, wall_search_ticks)
+                    True, wall_search_ticks, tick_size, contract_value)
                 want_ask = wall_front_quote_tick(
                     book.ask_depth, book.roi_lb_tick, int(want_ask),
-                    False, wall_search_ticks)
+                    False, wall_search_ticks, tick_size, contract_value)
                 # Never cross the market or improve beyond GLFT target.
                 want_bid = min(want_bid, bid)
                 want_ask = max(want_ask, ask)
@@ -416,16 +421,16 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                         engine.cancel(0, order.order_id, False)
                         ask_action = now
                         cancels += 1
-            if (not has_bid and pos + ORDER_QTY <= POSITION_CAP + 1e-9 and
+            if (not has_bid and pos + order_qty <= position_cap + 1e-9 and
                     now - bid_action >= MIN_REQUOTE_NS):
                 oid = int(want_bid) * 2
-                engine.submit_buy_order(0, oid, want_bid*TICK, ORDER_QTY, GTX, LIMIT, False)
+                engine.submit_buy_order(0, oid, want_bid*tick_size, order_qty, GTX, LIMIT, False)
                 bid_action = now
                 submits += 1
-            if (not has_ask and pos - ORDER_QTY >= -POSITION_CAP - 1e-9 and
+            if (not has_ask and pos - order_qty >= -position_cap - 1e-9 and
                     now - ask_action >= MIN_REQUOTE_NS):
                 oid = int(want_ask) * 2 + 1
-                engine.submit_sell_order(0, oid, want_ask*TICK, ORDER_QTY, GTX, LIMIT, False)
+                engine.submit_sell_order(0, oid, want_ask*tick_size, order_qty, GTX, LIMIT, False)
                 ask_action = now
                 submits += 1
             decisions += 1
@@ -451,7 +456,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     final = engine.state_values(0)
     book = engine.depth(0)
     final_mid = (book.best_bid + book.best_ask) / 2.0
-    final_equity = final.balance + CTVAL * final.position * final_mid - final.fee
+    final_equity = final.balance + contract_value * final.position * final_mid - final.fee
     max_position = max(max_position, abs(final.position))
     peak_equity = max(peak_equity, final_equity)
     max_drawdown = max(max_drawdown, peak_equity - final_equity)
@@ -468,7 +473,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                  probe_rows))
 
 
-def summarize(raw, minutes, rolling, beta=0.0):
+def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
+              order_qty=ORDER_QTY):
     """Aggregate only; no trades or raw market data leave the runner."""
     (samples, decisions, attempts, rejects, successes, initial_ok, updates,
      submits, cancels, buys, sells, fills, pos, max_pos, balance, fee,
@@ -484,7 +490,7 @@ def summarize(raw, minutes, rolling, beta=0.0):
         raise RuntimeError(f"Truncated market replay, samples={samples}")
     if fills != buys+sells or len(fill_ts) != fills:
         raise RuntimeError(f"Official fills and strategy accounting disagree: {fills} vs {buys+sells}")
-    if max_pos > POSITION_CAP + ORDER_QTY + 1e-9:
+    if max_pos > position_cap + order_qty + 1e-9:
         raise RuntimeError("Inventory hard cap exceeded")
     if not math.isfinite(equity):
         raise RuntimeError("Nonfinite marked equity")
