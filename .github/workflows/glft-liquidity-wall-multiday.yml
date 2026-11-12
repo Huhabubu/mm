@@ -50,6 +50,10 @@ jobs:
                     "FILLS",t["engine_fills"],"CANCELS",t["cancel_requests"],
                     "SUBMISSIONS",t["submissions"],"FEES",t["fee_usdt"],
                     "MAX_POSITION",t["max_abs_position_contracts"])
+          print("HBT_STATS",json.dumps(r["hbt_builtin_stats"],ensure_ascii=False))
+          for n,v in r["hbt_builtin_stats"].items():
+              if abs(v["end_equity_reconciliation_usdt"])>1e-6:
+                  raise RuntimeError(f"Official Recorder final equity mismatch: {n}")
           PY
       - name: Persist aggregate without raw L2
         if: always()

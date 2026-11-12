@@ -194,7 +194,8 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                     "recorded_last_equity_usdt": last,
                     "engine_net_equity_usdt": variants[name]["trading"]["end_net_marked_equity_usdt"],
                     "end_equity_reconciliation_usdt": last - variants[name]["trading"]["end_net_marked_equity_usdt"],
-                    "metrics": {k: (float(v) if v is not None else None)
+                    "metrics": {k: (float(v) if isinstance(v, (int, float))
+                                    else (None if v is None else str(v)))
                                 for k, v in numbers.items()
                                 if k not in ("start", "end")},
                 }
