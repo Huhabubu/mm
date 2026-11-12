@@ -167,10 +167,25 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                 enter, (thresholds["release_ticks"] if enter else 0.0),
                 (thresholds["refresh_min_change_ticks"] if enter else 10.0),
                 250_000_000, extra_half, None,
-                wall_search_ticks if name.endswith("_wall") else 0)
+                wall_search_ticks if name.endswith("_wall") else 0,
+                audit_markout)
             variants[name] = summarize(
                 raw, trade_minutes, True, beta=beta)
             if audit_markout:
+                # Code-level request timestamp peaks (locally sent, not ACKed).
+                # OKX single-order place and cancel limits are independently
+                # 60 requests per rolling 2s per user/instrument.
+                rate = raw[34][5]
+                variants[name]["request_rate_audit"] = {
+                    "window_ms": 2000,
+                    "single_request_rate_limit_per_2s": 60,
+                    "peak_place_requests_rolling_2s": int(rate[0]),
+                    "peak_cancel_requests_rolling_2s": int(rate[1]),
+                    "place_requests_issued_while_over_limit": int(rate[2]),
+                    "cancel_requests_issued_while_over_limit": int(rate[3]),
+                    "clock": "HBT local request dispatch time; not exchange ACK time",
+                    "note": "No simulated rate-limit rejects; real exchange accounting may differ",
+                }
                 # Read-only official maker fills from the SAME engine execution.
                 from run_counterfactual_fill_markout import extract_official_fills
                 fill_traces[name] = extract_official_fills(raw)
