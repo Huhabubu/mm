@@ -16,6 +16,25 @@ from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coeffi
 MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
 
+
+@njit
+def audit_rolling_request_2s(timestamps_ns, head, tail, now_ns,
+                             peak, over_limit_events, limit=60):
+    """Read-only number of actual HBT send/cancel calls in a rolling 2s period."""
+    while head < tail and now_ns - timestamps_ns[head % len(timestamps_ns)] >= 2_000_000_000:
+        head += 1
+    if tail - head >= len(timestamps_ns):
+        raise ValueError("Request audit ring overflow")
+    timestamps_ns[tail % len(timestamps_ns)] = now_ns
+    tail += 1
+    recent = tail - head
+    if recent > peak:
+        peak = recent
+    if recent > limit:
+        over_limit_events += 1
+    return head, tail, peak, over_limit_events
+
+
 @njit
 def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
                           is_bid, search_ticks):
@@ -105,7 +124,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    filter_refresh_change_ticks=10.0,
                    filter_refresh_ns=250_000_000,
                    extra_half_ticks=0.0, probe_ns=None,
-                   wall_search_ticks=0):
+                   wall_search_ticks=0, audit_action_rates=False):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -174,6 +193,11 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     fill_exec_price = np.empty(fill_limit, np.float64)
     fill_exec_qty = np.empty(fill_limit, np.float64)
     n_fills = 0
+    # Read-only telemetry of HBT request sends, separately for submit/cancel.
+    request_sub_ns = np.empty(4096, np.int64)
+    request_cancel_ns = np.empty(4096, np.int64)
+    sub_head = sub_tail = cancel_head = cancel_tail = 0
+    peak_sub_2s = peak_cancel_2s = excess_sub_2s = excess_cancel_2s = 0
     # Optional read-only audit deadlines, never a trading signal/trigger.
     n_probes = 0
     if probe_ns is not None:
@@ -409,6 +433,11 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                         engine.cancel(0, order.order_id, False)
                         bid_action = now
                         cancels += 1
+                        if audit_action_rates:
+                            cancel_head, cancel_tail, peak_cancel_2s, excess_cancel_2s = (
+                                audit_rolling_request_2s(
+                                    request_cancel_ns, cancel_head, cancel_tail,
+                                    now, peak_cancel_2s, excess_cancel_2s))
                 elif order.side == SELL:
                     has_ask = True
                     if (order.cancellable and order.price_tick != want_ask and
@@ -416,18 +445,33 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                         engine.cancel(0, order.order_id, False)
                         ask_action = now
                         cancels += 1
+                        if audit_action_rates:
+                            cancel_head, cancel_tail, peak_cancel_2s, excess_cancel_2s = (
+                                audit_rolling_request_2s(
+                                    request_cancel_ns, cancel_head, cancel_tail,
+                                    now, peak_cancel_2s, excess_cancel_2s))
             if (not has_bid and pos + ORDER_QTY <= POSITION_CAP + 1e-9 and
                     now - bid_action >= MIN_REQUOTE_NS):
                 oid = int(want_bid) * 2
                 engine.submit_buy_order(0, oid, want_bid*TICK, ORDER_QTY, GTX, LIMIT, False)
                 bid_action = now
                 submits += 1
+                if audit_action_rates:
+                    sub_head, sub_tail, peak_sub_2s, excess_sub_2s = (
+                        audit_rolling_request_2s(
+                            request_sub_ns, sub_head, sub_tail,
+                            now, peak_sub_2s, excess_sub_2s))
             if (not has_ask and pos - ORDER_QTY >= -POSITION_CAP - 1e-9 and
                     now - ask_action >= MIN_REQUOTE_NS):
                 oid = int(want_ask) * 2 + 1
                 engine.submit_sell_order(0, oid, want_ask*TICK, ORDER_QTY, GTX, LIMIT, False)
                 ask_action = now
                 submits += 1
+                if audit_action_rates:
+                    sub_head, sub_tail, peak_sub_2s, excess_sub_2s = (
+                        audit_rolling_request_2s(
+                            request_sub_ns, sub_head, sub_tail,
+                            now, peak_sub_2s, excess_sub_2s))
             decisions += 1
 
     # Last event can trigger a fill immediately before the data stream ends.
@@ -465,7 +509,9 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             observed_binance, fill_ts_ns[:n_fills], fill_sides[:n_fills],
             t0, (now, fill_observed_ns[:n_fills],
                  fill_exec_price[:n_fills], fill_exec_qty[:n_fills],
-                 probe_rows))
+                 probe_rows, np.array((peak_sub_2s, peak_cancel_2s,
+                                       excess_sub_2s, excess_cancel_2s),
+                                      dtype=np.int64)))
 
 
 def summarize(raw, minutes, rolling, beta=0.0):
