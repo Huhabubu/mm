@@ -35,6 +35,16 @@ def summarize(rows):
                 max(r["horizons"][name]["max_abs_binance_price_move_bps"].get("max",0) for r in rows),
             "binance_horizon_price_abs_max_when_okx_unchanged_bps":
                 max(r["horizons"][name]["max_abs_when_target_unchanged"].get("max",0) for r in rows),
+            "apparent_unfiltered_ge10bps":sum(r["horizons"][name]["apparent_unfiltered_ge10bps"] for r in rows),
+            "apparent_unfiltered_ge10bps_first_per_okx_segment":sum(
+                r["horizons"][name]["apparent_unfiltered_ge10bps_first_per_okx_segment"] for r in rows),
+            "apparent_ge10bps_with_fresh_source_target_quotes":sum(
+                r["horizons"][name]["apparent_ge10bps_with_fresh_source_target_quotes"] for r in rows),
+            "apparent_ge10bps_with_fresh_source_target_quotes_but_no_basis":sum(
+                r["horizons"][name]["apparent_ge10bps_with_fresh_source_target_quotes_but_no_basis"] for r in rows),
+            "apparent_ge10bps_excluded_by_freshness_or_basis":sum(
+                r["horizons"][name]["apparent_ge10bps_excluded_by_freshness_or_basis"] for r in rows),
+            "apparent_ge10bps_examples":[e for r in rows for e in r["horizons"][name]["apparent_ge10bps_first_examples"]][:12],
             "thresholds":part
         }
     out["total_binance_changed_price_event_batches"]=sum(r["binance_price_change_events"] for r in rows)
@@ -83,6 +93,18 @@ def markdown(s):
                  f"| {a['binance_horizon_price_abs_max_when_okx_unchanged_bps']:.4f} "
                  f"| **{t['raw_binance_price_change_events_with_unmoved_okx']}** "
                  f"| {t['first_event_per_okx_price_stable_interval']} |")
+    z+=["","## 不施加250ms有效性限制时的表面10bps领先信号（不能直接交易）", "",
+        "下表是第二层检查：允许目标交易所原生BBO已过时，仅要求"
+        "读到过一个OKX价位且区间内原生记录没有价格变化。"
+        "必须与上文满足250ms双市场报价新鲜度及历史基差有效的结果区分。",
+        "",
+        "| Binance过去变动窗口 | 仅表面未动的10bps事件条数 | 对应的不同OKX稳定价区间数 | 双所起止BBO都新鲜的候选事件 | 因250ms/基差约束不满足而被排除的事件 |",
+        "|---|---:|---:|---:|---:|"]
+    for h,a in s["horizons"].items():
+        z.append(f"| {h} | {a['apparent_unfiltered_ge10bps']} "
+                 f"| {a['apparent_unfiltered_ge10bps_first_per_okx_segment']} "
+                 f"| {a['apparent_ge10bps_with_fresh_source_target_quotes']} "
+                 f"| {a['apparent_ge10bps_excluded_by_freshness_or_basis']} |")
     z+=["","## 不同强度的Binance领先、OKX未变事件","","| 过去窗口 | ≥1bps | ≥2bps | ≥5bps | ≥10bps |",
         "|---|---:|---:|---:|---:|"]
     for horizon,a in s["horizons"].items():
@@ -160,6 +182,8 @@ def main():
         print("LEAD_HORIZON",h,
               "BIN_MAX",q["binance_horizon_price_abs_max_bps"],
               "UNMOVED_OKX_MAX",q["binance_horizon_price_abs_max_when_okx_unchanged_bps"],
+              "APPARENT_UNFILTERED10",q["apparent_unfiltered_ge10bps"],
+              "APPARENT_FRESH10",q["apparent_ge10bps_with_fresh_source_target_quotes"],
               "THRESHOLD_COUNTS",
               json.dumps({t:q["thresholds"][t]["first_event_per_okx_price_stable_interval"]
                           for t in THRESHOLDS},sort_keys=True),
