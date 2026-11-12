@@ -39,6 +39,7 @@ jobs:
         run: |
           python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
           python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+      # Reader includes a short post-window feed buffer; HBT trade clock remains fixed.
       - name: Official HBT GLFT + Binance + local peak 10min warmup 50min trade
         run: |
           python scripts/run_multivenue_glft.py --day "$DAY" \
