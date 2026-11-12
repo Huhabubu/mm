@@ -20,6 +20,8 @@ jobs:
           github-token: ${{ github.token }}
           name: binance-okx-SOL-Gt-2p5ms-sixdate-descriptive
           path: archived
+      - name: Install numerical dependency for archived NPZ audit
+        run: python -m pip install numpy==2.2.6
       - name: Audit quote units, signed and absolute percentiles, and tick strength
         run: |
           python - <<'PY'
