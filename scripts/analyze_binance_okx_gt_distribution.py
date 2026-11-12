@@ -32,7 +32,8 @@ WARMUP_SECONDS = 600
 
 
 def compute_gt_grid(clock, okx_ns, okx_mid, binance_visible_ns,
-                    binance_mid, basis_ns, basis_value):
+                    binance_mid, basis_ns, basis_value,
+                    tick_size=TICK_USDT_PER_BTC):
     """Mimic causal_price_shift_ticks at equal clock samples, as β=1.
 
     Live event code has already consumed Binance rows at current time t, so
@@ -59,7 +60,7 @@ def compute_gt_grid(clock, okx_ns, okx_mid, binance_visible_ns,
         "valid":valid,
         "G_usdt_per_btc":g,
         "effective_shift_usdt_per_btc":effective,
-        "G_ticks":g/TICK_USDT_PER_BTC,
+        "G_ticks":g/tick_size,
         "basis_usdt_per_btc":np.where(valid,basis_value[gg],np.nan),
         "okx_mid_usdt_per_btc":np.where(valid,okx_mid[oo],np.nan),
         "binance_mid_usdt_per_btc":np.where(valid,binance_mid[bb],np.nan),
