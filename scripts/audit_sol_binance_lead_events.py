@@ -118,8 +118,9 @@ def run_one(day):
     batch_last=np.r_[bt_raw[1:] != bt_raw[:-1], True]
     batch_ids=np.flatnonzero(batch_last)
     batch_changed=np.r_[False, bm[batch_ids[1:]]!=bm[batch_ids[:-1]]]
-    ids=batch_ids[(bt_raw[batch_ids]>=start)&
-                  (bt_raw[batch_ids]<stop)&batch_changed]
+    selected=(bt_raw[batch_ids]>=start)&(bt_raw[batch_ids]<stop)&batch_changed
+    ids=batch_ids[selected]
+    prior_batch_ids=np.r_[batch_ids[0],batch_ids[:-1]][selected]
     if len(ids)==0:
         raise ValueError("No source price-changing events")
     t=bt_raw[ids]
@@ -179,7 +180,7 @@ def run_one(day):
          "raw_G_ge10_then_below10_after_delay":int(np.count_nonzero(
              rawgood&visiblegood&(np.abs(raw_g)>=10.)&(np.abs(visible_g)<10.))),
          "source_price_change_abs_bps":stats(1e4*np.abs(
-             bm[ids]-bm[ids-1])/bm[ids-1]),
+             bm[ids]-bm[prior_batch_ids])/bm[prior_batch_ids]),
          "target_changes_during_binance_2p5ms_delay":int(np.count_nonzero(
              rawgood&visibility_changed)),
          "horizons":{}}
