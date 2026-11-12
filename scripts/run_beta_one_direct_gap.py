@@ -227,9 +227,15 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
             paths, counts = {}, {}
             for kind in SCHEMAS:
                 paths[kind] = root/f"{kind}.csv"
+                if full_day:
+                    print("FULL_DAY_DATA_BEGIN", kind, day, flush=True)
                 counts[kind] = extract_window(
                     kind, day, end_us, paths[kind],
                     max_rows=75_000_000 if full_day else 2_500_000)
+                if full_day:
+                    print("FULL_DAY_DATA_END", kind,
+                          counts[kind]["rows"], "rows",
+                          paths[kind].stat().st_size, "bytes", flush=True)
             npz = root/"fused.npz"
             fused = tardis.convert_fuse(
                 str(paths["trades"]), str(paths["incremental_book_L2"]),
@@ -237,6 +243,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                 output_filename=str(npz),
                 ss_buffer_size=max(1000, counts["incremental_book_L2"]["snapshot_rows"] + 100),
                 snapshot_mode="process")
+            if full_day:
+                print("FULL_DAY_FUSED_READY", len(fused), "events", flush=True)
             validate_event_order(fused)
             n_events = len(fused)
             del fused
@@ -265,6 +273,9 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
             thresholds = (pretrade_gap_thresholds(
                 ot, om, bt, bm, base_t, base, day_start_us*1000)
                 if experiment else None)
+            if full_day:
+                print("FULL_DAY_HBT_BEGIN", "data_size_bytes", npz.stat().st_size,
+                      "variants", "4" if wall_search_ticks else "2", flush=True)
             result = run_pair(
                 npz, low, high, bt, bm, ot, om, base_t, base, minutes,
                 experiment=experiment, thresholds=thresholds,
