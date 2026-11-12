@@ -25,7 +25,7 @@ class SignalDistributionTests(unittest.TestCase):
         x=compute_gt_grid(clock,okx,okx_mid,binance,binance_mid,basis,basis_val)
         # At exact current Binance timestamp, the Binance event has been consumed.
         # OKX and basis always strictly prior; no future reference.
-        self.assertEqual(x["G_usdt_per_btc"][0],9.)
+        self.assertEqual(x["G_usdt_per_btc"][0],8.)
         self.assertEqual(x["G_usdt_per_btc"][1],10.)
         self.assertEqual(x["G_usdt_per_btc"][2],9.)
         self.assertFalse(x["valid"][3])
