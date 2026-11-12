@@ -81,6 +81,59 @@ def build_asset(npz, lo, hi, spec):
             .last_trades_capacity(20_000))
 
 
+def diagnose_uncalibrated_tape(npz, low, high, spec):
+    """Read-only 10min estimator audit on the official HBT market tape."""
+    from hftbacktest import BUY_EVENT, ROIVectorMarketDepthBacktest
+    from g0_glft_rolling import fit_recent_arrivals
+    from numba import njit
+
+    @njit
+    def sample(engine, tick):
+        arrivals = np.full(6000, np.nan)
+        changes = np.full(6000, np.nan)
+        last_mid = np.nan
+        if engine.elapse(0) != 0:
+            raise ValueError("Cannot initialize diagnostic HBT")
+        for i in range(6000):
+            if engine.elapse(100_000_000) != 0:
+                break
+            far = -np.inf
+            if np.isfinite(last_mid):
+                for tr in engine.last_trades(0):
+                    pt = tr.px / tick
+                    if tr.ev & BUY_EVENT == BUY_EVENT:
+                        far = max(far, pt-last_mid)
+                    else:
+                        far = max(far, last_mid-pt)
+            engine.clear_last_trades(0)
+            arrivals[i] = far
+            book = engine.depth(0)
+            bid, ask = book.best_bid_tick, book.best_ask_tick
+            if bid > 0 and ask > bid:
+                mid = (bid+ask)/2.0
+                changes[i] = mid-last_mid if np.isfinite(last_mid) else np.nan
+                last_mid = mid
+            else:
+                last_mid = np.nan
+        return arrivals, changes, fit_recent_arrivals(arrivals, changes)
+
+    engine = ROIVectorMarketDepthBacktest([build_asset(npz, low, high, spec)])
+    try:
+        arrivals, changes, result = sample(engine, spec.tick)
+        qualifying = arrivals[np.isfinite(arrivals) & (arrivals > 0.5)]
+        return {"valid":bool(result[0]), "A":float(result[1]),
+                "k":float(result[2]), "sigma":float(result[3]),
+                "positive_levels":int(result[4]),
+                "crossing_100ms_intervals":int(result[5]),
+                "extreme_crossing_intervals":int(result[6]),
+                "max_crossing_ticks":(float(np.max(qualifying)) if len(qualifying) else None),
+                "crossing_depth_gt_2_5_ticks":int(np.sum(qualifying>2.5)),
+                "crossing_depth_gt_35_ticks":int(np.sum(qualifying>35)),
+                "valid_volatility_samples":int(np.count_nonzero(np.isfinite(changes)))}
+    finally:
+        engine.close()
+
+
 def validate_record(rec, summary):
     if len(rec) < 100:
         raise ValueError("HBT official Recorder captured too few samples")
@@ -177,6 +230,17 @@ def run(day, exchange, coin, minutes=50, delay_ms=25,
                         peak,spec.tick,spec.ctval,
                         scenario["order_qty"],scenario["position_cap"],
                         rec.recorder if rec else None)
+                    if int(raw[5]) != 1:
+                        # Fail closed. All four variants share the same market-only
+                        # calibration; there is no valid GLFT quote to trade.
+                        report["status"] = "no_glft_calibration"
+                        report["calibration_attempts"] = int(raw[2])
+                        report["calibration_rejections"] = int(raw[3])
+                        report["calibration_diagnostic"] = diagnose_uncalibrated_tape(
+                            output,low,high,spec)
+                        print("NO_GLFT_CALIBRATION",exchange,coin,day,
+                              report["calibration_diagnostic"],flush=True)
+                        return report
                     summary = summarize(raw,minutes,True,beta,
                                         scenario["position_cap"],scenario["order_qty"])
                     if capture_recorder:
