@@ -14,10 +14,10 @@ import numpy as np
 from inspect_tardis import BASE_URL
 
 
-def read_binance_bbo(day, end_us, opener=urllib.request.urlopen):
+def read_binance_bbo(day, end_us, opener=urllib.request.urlopen, symbol="BTCUSDT"):
     """Read bounded free Tardis native book_ticker; preserve microsecond row order."""
     yyyy, mm, dd = day.split("-")
-    url = f"{BASE_URL}/binance-futures/book_ticker/{yyyy}/{mm}/{dd}/BTCUSDT.csv.gz"
+    url = f"{BASE_URL}/binance-futures/book_ticker/{yyyy}/{mm}/{dd}/{symbol}.csv.gz"
     ts = array("q")
     mids = array("d")
     previous = -1
