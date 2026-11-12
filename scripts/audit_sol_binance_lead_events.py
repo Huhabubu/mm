@@ -206,14 +206,15 @@ def run_one(day):
         # reliable proof of a real leading market: the target tape may be stale.
         history_available=(ib>=0)&(ostart>=0)&(okx_i>=0)
         unfiltered_delta=np.full(len(ids),np.nan)
-        unfiltered_delta[history_available]=1e4*(
-            bm[ids[history_available]]-bm[bb[history_available]])/
-            bm[bb[history_available]]
+        unfiltered_delta[history_available]=(
+            1e4*(bm[ids[history_available]]-bm[bb[history_available]])
+            /bm[bb[history_available]])
         apparent10=history_available&target_no_move&(
             np.abs(unfiltered_delta)>=10.)
         app_ids=np.flatnonzero(apparent10)
         app_segments=target_segment[app_ids]
-        app_first=app_ids[np.r_[True,app_segments[1:]!=app_segments[:-1]]]
+        app_first=(app_ids[np.r_[True,app_segments[1:]!=app_segments[:-1]]]
+                   if len(app_ids) else app_ids)
         price_delta=np.full(len(ids),np.nan)
         price_delta[valid]=unfiltered_delta[valid]
         intact=valid&target_no_move
