@@ -17,6 +17,40 @@ MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
 
 @njit
+def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
+                          is_bid, search_ticks):
+    """One tick BEFORE the largest notional wall behind the GLFT quote.
+
+    Only live L2 at already-visible HBT time. Search away from the mid:
+    bid lower, ask higher; quote one tick TOWARD mid from selected wall.
+    Notional = price(USDT/BTC) * visible contracts * BTC/contract.
+    If no valid wall, keep GLFT base_tick. Closest wall wins notional ties.
+    """
+    if search_ticks <= 0:
+        return base_tick
+    wall_tick = -1
+    biggest_notional = 0.0
+    for distance in range(1, search_ticks + 1):
+        price_tick = base_tick - distance if is_bid else base_tick + distance
+        idx = price_tick - roi_lb_tick
+        if idx < 0 or idx >= len(side_depth):
+            break
+        if price_tick <= 0:
+            break
+        qty = side_depth[idx]
+        if np.isfinite(qty) and qty > 0.0:
+            notional_usdt = price_tick * TICK * qty * CTVAL
+            # Treat floating-point near-ties (less than 1e-9 USDT) as ties;
+            # the outward scan then consistently keeps the nearer wall.
+            if notional_usdt > biggest_notional + 1e-9:
+                biggest_notional = notional_usdt
+                wall_tick = price_tick
+    if wall_tick < 0:
+        return base_tick
+    return wall_tick + 1 if is_bid else wall_tick - 1
+
+
+@njit
 def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
                              okx_native_ns, okx_native_mid, basis_grid_ns,
                              basis_values):
@@ -70,7 +104,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    filter_enter_ticks=0.0, filter_exit_ticks=0.0,
                    filter_refresh_change_ticks=10.0,
                    filter_refresh_ns=250_000_000,
-                   extra_half_ticks=0.0, probe_ns=None):
+                   extra_half_ticks=0.0, probe_ns=None,
+                   wall_search_ticks=0):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -83,6 +118,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("Invalid gap hysteresis configuration")
     if extra_half_ticks < 0.0 or not np.isfinite(extra_half_ticks):
         raise ValueError("Invalid GLFT no-signal widening")
+    if wall_search_ticks < 0 or wall_search_ticks > 1000:
+        raise ValueError("Wall search must be 0 to 1000 ticks from GLFT price")
     if beta != 0.0:
         if (okx_native_ns is None or okx_native_mid is None or
                 basis_grid_ns is None or basis_values is None):
@@ -342,6 +379,18 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             reservation = mid - skew * pos + shift_ticks
             want_bid = min(round(reservation - half - extra_half_ticks), bid)
             want_ask = max(round(reservation + half + extra_half_ticks), ask)
+            if wall_search_ticks > 0:
+                # Post-process ONLY: keep GLFT A/k/sigma/risk/skew unchanged.
+                # Bound search to OUTWARD prices, then step one tick in front.
+                want_bid = wall_front_quote_tick(
+                    book.bid_depth, book.roi_lb_tick, int(want_bid),
+                    True, wall_search_ticks)
+                want_ask = wall_front_quote_tick(
+                    book.ask_depth, book.roi_lb_tick, int(want_ask),
+                    False, wall_search_ticks)
+                # Never cross the market or improve beyond GLFT target.
+                want_bid = min(want_bid, bid)
+                want_ask = max(want_ask, ask)
 
             # One side may be pending cancellation; no replacement until cleared.
             has_bid = has_ask = False
