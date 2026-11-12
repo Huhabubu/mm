@@ -131,7 +131,8 @@ def pretrade_gap_thresholds(ot, om, bt, bm, basis_t, basis, day_start_ns):
 
 
 def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
-             experiment=False, thresholds=None, wall_search_ticks=0):
+             experiment=False, thresholds=None, wall_search_ticks=0,
+             audit_markout=False):
     from hftbacktest import ROIVectorMarketDepthBacktest
 
     specifications = [("beta_0", 0.0, 0.0, 0.0),
@@ -156,6 +157,7 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
             ("beta_1_wall", 1.0, 0.0, 0.0),
         ])
     variants = {}
+    fill_traces = {}
     for name, beta, enter, extra_half in specifications:
         engine = ROIVectorMarketDepthBacktest([asset_for(npz, low, high)])
         try:
@@ -168,6 +170,12 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                 wall_search_ticks if name.endswith("_wall") else 0)
             variants[name] = summarize(
                 raw, trade_minutes, True, beta=beta)
+            if audit_markout:
+                # Read-only official maker fills from the SAME engine execution.
+                from run_counterfactual_fill_markout import extract_official_fills
+                fill_traces[name] = extract_official_fills(raw)
+                if len(fill_traces[name]) != variants[name]["trading"]["engine_fills"]:
+                    raise RuntimeError(f"Official fill trace discrepancy: {name}")
         finally:
             engine.close()
     base, test = variants["beta_0"], variants["beta_1"]
@@ -185,11 +193,12 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
             raise RuntimeError(f"Changed 100ms observation calendar for {name}")
         if base["calibration_trace"] != candidate["calibration_trace"]:
             raise RuntimeError(f"Changed causal GLFT calibration history for {name}")
-    return variants
+    return (variants, fill_traces) if audit_markout else variants
 
 
 def run(day, minutes=50, delay_ms=25, report_dir="reports",
-        experiment=False, wall_search_ticks=0, convert_chunk_minutes=0):
+        experiment=False, wall_search_ticks=0, convert_chunk_minutes=0,
+        audit_markout=False):
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
     if minutes not in (5, 50, 1430):
@@ -203,8 +212,11 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
     end_us = day_start_us + (600 + minutes*60) * 1_000_000
     if not full_day:
         end_us += 500_000
-    label = ("glft_local_peak" if wall_search_ticks > 0 else
+    label = ("glft_full_day_fill_quality" if audit_markout else
+             "glft_local_peak" if wall_search_ticks > 0 else
              "gap_filter_placebo" if experiment else "beta_one_direct_gap")
+    if audit_markout and (wall_search_ticks <= 0 or experiment):
+        raise ValueError("Full day fill audit requires paired original and local-peak models")
     if wall_search_ticks < 0 or wall_search_ticks > 1000:
         raise ValueError("Wall range must be between 1 and 1000 ticks, or disabled at 0")
     if experiment and wall_search_ticks:
@@ -297,10 +309,20 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                 print("FULL_DAY_HBT_BEGIN", "data_size_bytes", total_npz_bytes,
                       "variants", "4" if wall_search_ticks else "2",
                       "parts", report["hbt_conversion_parts"], flush=True)
-            result = run_pair(
+            paired = run_pair(
                 npz, low, high, bt, bm, ot, om, base_t, base, minutes,
                 experiment=experiment, thresholds=thresholds,
-                wall_search_ticks=wall_search_ticks)
+                wall_search_ticks=wall_search_ticks,
+                audit_markout=audit_markout)
+            result, fill_traces = paired if audit_markout else (paired, None)
+            if audit_markout:
+                from g0_fill_markout import read_exchange_bbo
+                from full_day_fill_quality import evaluate_full_day_fill_quality
+                print("FULL_DAY_MARKOUT_BEGIN", len(result), "variants", flush=True)
+                ex_time, ex_mid = read_exchange_bbo(paths["book_ticker"])
+                report["fill_quality_audit"] = evaluate_full_day_fill_quality(
+                    fill_traces, ex_time, ex_mid)
+                del fill_traces, ex_time, ex_mid
             report.update({
                 "status": "complete",
                 "okx_fused_event_rows": int(n_events),
@@ -321,6 +343,7 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                     result["beta_0"]["trading"]["end_net_marked_equity_usdt"]),
                 "glft_5sec_calibration_trace_identical": True,
                 "pnl_reporting": "gross=net+fee; fee actual HBT; net=marked equity",
+                "fill_quality_readonly_audit": audit_markout,
                 "daily_pnl_utc_interpretation":
                     ("UTC day with initial 10min calibration excluded from trading"
                      if full_day else "historical intraday 50min/5min experiment"),
@@ -346,6 +369,8 @@ def main():
     p.add_argument("--experiment", choices=("base", "placebo_filter", "wall_anchor"), default="base")
     p.add_argument("--wall-search-ticks", type=int, default=0,
                    help="Scenario-specific bounded outward L2 tick range (1..1000); 0 disabled")
+    p.add_argument("--audit-markout", action="store_true",
+                   help="Read-only full-day actual fill markouts, paired beta0/1 and local-peak")
     p.add_argument("--convert-chunk-minutes", type=int, default=0,
                    help="0 means 60m for full day and single file for short runs; "
                         "positive N converts N-minute parts for ONE continuous official HBT engine")
@@ -359,7 +384,8 @@ def main():
     run(a.day, a.minutes, a.extra_binance_delay_ms, a.report_dir,
         experiment=(a.experiment == "placebo_filter"),
         wall_search_ticks=a.wall_search_ticks,
-        convert_chunk_minutes=a.convert_chunk_minutes)
+        convert_chunk_minutes=a.convert_chunk_minutes,
+        audit_markout=a.audit_markout)
 
 
 if __name__ == "__main__":
