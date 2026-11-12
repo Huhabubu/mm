@@ -1,0 +1,68 @@
+name: Describe Binance OKX BTC causal Gt at 2p5ms
+on:
+  push:
+    paths:
+      - '.github/workflows/analyze-binance-okx-gt.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pin existing strategy dependencies for identical signal calculation
+        run: pip install hftbacktest==2.4.4
+      - name: Validate as-of visibility, age bound, and distribution logic
+        run: python -m unittest discover -s scripts -p 'test_binance_okx_gt_distribution.py' -v
+      - name: Compute Tardis native BBO Gt on UTC 00:10–01:00 at 100ms
+        run: |
+          python scripts/analyze_binance_okx_gt_distribution.py \
+            --day ${{ matrix.day }} --extra-binance-delay-ms 2.5 \
+            --out reports/binance_okx_btc_gt_2p5ms
+      - name: Preserve actual sampled Gt time series
+        uses: actions/upload-artifact@v4
+        with:
+          name: gt-${{ matrix.day }}-2p5ms-100ms
+          path: reports/binance_okx_btc_gt_2p5ms/${{ matrix.day }}_100ms_G.npz
+          retention-days: 90
+          if-no-files-found: error
+  aggregate:
+    needs: sample
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact reference dependencies
+        run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gt-*-2p5ms-100ms
+          path: reports/binance_okx_btc_gt_2p5ms
+          merge-multiple: true
+      - name: Aggregate six-date pooled and per-day distribution without re-downloading
+        run: |
+          python scripts/analyze_binance_okx_gt_distribution.py \
+            --extra-binance-delay-ms 2.5 --reuse-saved \
+            --out reports/binance_okx_btc_gt_2p5ms
+          cat reports/binance_okx_btc_gt_2p5ms/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload full distribution summary and observation timeseries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-okx-btc-Gt-2p5ms-sixdate-descriptive
+          path: reports/binance_okx_btc_gt_2p5ms/*
+          retention-days: 90
+          if-no-files-found: error
