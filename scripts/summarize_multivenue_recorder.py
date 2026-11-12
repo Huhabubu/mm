@@ -19,6 +19,7 @@ COINS = ("BTC","SOL")
 def analyse(root):
     items = {}
     statuses = defaultdict(list)
+    delays = set()
     for path in root.rglob("*_50m.json"):
         try:
             r=json.loads(path.read_text(encoding="utf-8"))
@@ -33,6 +34,7 @@ def analyse(root):
             continue
         day=r.get("day")
         key=(venue,coin,day)
+        delays.add(float(r["extra_binance_delay_ms"]))
         if key in items:
             raise ValueError(f"Duplicate venue coin day summary {key}")
         items[key]=r
@@ -107,7 +109,10 @@ def analyse(root):
                     "binance_net_delta":net("glft_binance")-net("glft"),
                     "local_peak_net_delta":net("glft_local_peak")-net("glft"),
                     "binance_with_peak_net_delta":net("glft_binance_local_peak")-net("glft_local_peak")})
-    return {"expected_market_cases":len(VENUES)*len(COINS),
+    if len(delays) != 1:
+        raise ValueError(f"Mixed or absent Binance delays in aggregate: {sorted(delays)}")
+    return {"signal_delay_ms":delays.pop(),
+            "expected_market_cases":len(VENUES)*len(COINS),
             "found_case_dates":len(items),
             "coverage":coverage,
             "common_complete_dates":sorted(common),
@@ -119,6 +124,7 @@ def analyse(root):
 
 def render_markdown(data):
     lines=["# 四市场 × 四模型 GLFT：六个月首日前50分钟官方回测汇总","",
+           f"**Binance 行情额外可见延迟：{data['signal_delay_ms']:g}ms**。", "",
            "**单位：USDT/50分钟。** 每日期前10分钟仅校准，之后50分钟交易；"
            "每个可估计日期等权平均。毛收益为净盯市权益加回模拟手续费。","",
            "## 样本覆盖及可估计性","",
@@ -180,6 +186,7 @@ def main():
             writer=csv.DictWriter(f,fieldnames=list(data["per_day"][0]))
             writer.writeheader()
             writer.writerows(data["per_day"])
+    print("SIGNAL_DELAY_MS",data["signal_delay_ms"])
     print("SUMMARY_COVERAGE",data["coverage"])
     print("COMMON_COMPLETE_DATES",data["common_complete_dates"])
     for row in data["model_means"]:
