@@ -131,7 +131,7 @@ def pretrade_gap_thresholds(ot, om, bt, bm, basis_t, basis, day_start_ns):
 
 
 def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
-             experiment=False, thresholds=None):
+             experiment=False, thresholds=None, wall_search_ticks=0):
     from hftbacktest import ROIVectorMarketDepthBacktest
 
     specifications = [("beta_0", 0.0, 0.0, 0.0),
@@ -148,6 +148,13 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
             ("no_signal_widen_p90", 0.0, 0.0,
              thresholds["widen_control_extra_half_ticks"]),
         ])
+    if wall_search_ticks > 0:
+        # One common L2 post-processor applied to BOTH beta variants.
+        # Zero wall_search_ticks keeps every historical default bit-identical.
+        specifications.extend([
+            ("beta_0_wall", 0.0, 0.0, 0.0),
+            ("beta_1_wall", 1.0, 0.0, 0.0),
+        ])
     variants = {}
     for name, beta, enter, extra_half in specifications:
         engine = ROIVectorMarketDepthBacktest([asset_for(npz, low, high)])
@@ -157,7 +164,8 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                 True, GAMMA, True, beta, ot, om, basis_t, basis,
                 enter, (thresholds["release_ticks"] if enter else 0.0),
                 (thresholds["refresh_min_change_ticks"] if enter else 10.0),
-                250_000_000, extra_half)
+                250_000_000, extra_half, None,
+                wall_search_ticks if name.endswith("_wall") else 0)
             variants[name] = summarize(
                 raw, trade_minutes, True, beta=beta)
         finally:
@@ -180,7 +188,8 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
     return variants
 
 
-def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
+def run(day, minutes=50, delay_ms=25, report_dir="reports",
+        experiment=False, wall_search_ticks=0):
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
     if minutes not in (5, 50):
@@ -188,7 +197,12 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
     day_start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
         tzinfo=timezone.utc).timestamp()) * 1_000_000
     end_us = day_start_us + (600 + minutes*60) * 1_000_000 + 500_000
-    label = "gap_filter_placebo" if experiment else "beta_one_direct_gap"
+    label = ("glft_liquidity_wall" if wall_search_ticks > 0 else
+             "gap_filter_placebo" if experiment else "beta_one_direct_gap")
+    if wall_search_ticks < 0 or wall_search_ticks > 1000:
+        raise ValueError("Wall range must be between 1 and 1000 ticks, or disabled at 0")
+    if experiment and wall_search_ticks:
+        raise ValueError("Keep placebos and L2 wall as separate experiments")
     target = Path(report_dir)/f"{label}_{day}_{minutes}m.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     report = {
@@ -236,7 +250,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
                 if experiment else None)
             result = run_pair(
                 npz, low, high, bt, bm, ot, om, base_t, base, minutes,
-                experiment=experiment, thresholds=thresholds)
+                experiment=experiment, thresholds=thresholds,
+                wall_search_ticks=wall_search_ticks)
             report.update({
                 "status": "complete",
                 "okx_fused_event_rows": int(n_events),
@@ -246,7 +261,10 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports", experiment=False):
                 "gap_visibility_audit_100ms": audit,
                 "variants": result,
                 "pretrade_filter_thresholds": thresholds,
-                "experiment": "placebo_filter" if experiment else "beta_one_direct",
+                "experiment": ("liquidity_wall" if wall_search_ticks > 0 else
+                               "placebo_filter" if experiment else "beta_one_direct"),
+                "wall_search_ticks": wall_search_ticks,
+                "wall_search_width_usdt_per_btc": wall_search_ticks*TICK,
                 "paired_net_difference_beta1_minus_beta0_usdt": (
                     result["beta_1"]["trading"]["end_net_marked_equity_usdt"] -
                     result["beta_0"]["trading"]["end_net_marked_equity_usdt"]),
@@ -269,12 +287,19 @@ def main():
     p.add_argument("--minutes", type=int, default=5, choices=(5, 50))
     p.add_argument("--extra-binance-delay-ms", type=int, default=25)
     p.add_argument("--report-dir", default="reports")
-    p.add_argument("--experiment", choices=("base", "placebo_filter"), default="base")
+    p.add_argument("--experiment", choices=("base", "placebo_filter", "wall_anchor"), default="base")
+    p.add_argument("--wall-search-ticks", type=int, default=0,
+                   help="Scenario-specific bounded outward L2 tick range (1..1000); 0 disabled")
     a = p.parse_args()
     if datetime.strptime(a.day, "%Y-%m-%d").day != 1:
         p.error("Tardis free historical day must be the first of month UTC")
+    if a.experiment == "wall_anchor" and a.wall_search_ticks <= 0:
+        p.error("--wall-search-ticks N (1..1000) required in wall_anchor mode")
+    if a.experiment != "wall_anchor" and a.wall_search_ticks:
+        p.error("--wall-search-ticks can only be used with wall_anchor mode")
     run(a.day, a.minutes, a.extra_binance_delay_ms, a.report_dir,
-        experiment=(a.experiment == "placebo_filter"))
+        experiment=(a.experiment == "placebo_filter"),
+        wall_search_ticks=a.wall_search_ticks)
 
 
 if __name__ == "__main__":
