@@ -1,0 +1,50 @@
+name: Inspect completed Binance OKX BTC Gt descriptive artifact
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect-gt-sixdate-summary.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Recover confirmed six-date 2p5ms data analysis artifact
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43237758690
+          github-token: ${{ github.token }}
+          name: binance-okx-btc-Gt-2p5ms-sixdate-descriptive
+          path: archived
+      - name: Read signed, absolute, threshold and quote-age statistics
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open("archived/summary.json",encoding="utf-8"))
+          p=d["pooled_valid"]
+          print("OBSERVATIONS",d["total_clock_points"],d["total_valid_points"],
+                "FRACTION",d["overall_valid_fraction"])
+          for metric in ("G_signed_USDT","G_absolute_USDT","G_absolute_ticks",
+                         "G_signed_bps","G_absolute_bps",
+                         "effective_including_invalid_zeros_USDT"):
+              print(metric,json.dumps(p[metric],ensure_ascii=False,sort_keys=True))
+          print("SIGN",p["positive_fraction"],p["negative_fraction"],p["zero_fraction"])
+          print("THRESHOLDS",json.dumps(p["absolute_exceeds_USDT"],sort_keys=True))
+          print("OKX_QUOTE_AGE",json.dumps(p["okx_quote_age_ms"],sort_keys=True))
+          print("BINANCE_QUOTE_AGE",json.dumps(p["binance_quote_age_ms"],sort_keys=True))
+          for day in d["days"]:
+              print("DAY",day["day"],
+                    "valid",day["valid_points"],
+                    "G_median",day["G_signed_USDT"]["p50"],
+                    "G_p05",day["G_signed_USDT"]["p05"],
+                    "G_p95",day["G_signed_USDT"]["p95"],
+                    "abs_p50",day["G_absolute_USDT"]["p50"],
+                    "abs_p90",day["G_absolute_USDT"]["p90"],
+                    "abs_p99",day["G_absolute_USDT"]["p99"])
+          PY
+      - name: Show report and preserve source reference
+        run: cat archived/report.md >> "$GITHUB_STEP_SUMMARY"
