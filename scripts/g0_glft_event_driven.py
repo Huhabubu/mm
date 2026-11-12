@@ -40,7 +40,9 @@ def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
         qty = side_depth[idx]
         if np.isfinite(qty) and qty > 0.0:
             notional_usdt = price_tick * TICK * qty * CTVAL
-            if notional_usdt > biggest_notional:
+            # Treat floating-point near-ties (less than 1e-9 USDT) as ties;
+            # the outward scan then consistently keeps the nearer wall.
+            if notional_usdt > biggest_notional + 1e-9:
                 biggest_notional = notional_usdt
                 wall_tick = price_tick
     if wall_tick < 0:
