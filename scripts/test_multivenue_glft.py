@@ -5,6 +5,9 @@ These are unit scenarios, not market outcomes or historical specifications.
 import math
 import unittest
 
+import numpy as np
+
+from cross_venue_event_probe import visible_timestamps
 from run_multivenue_glft import MARKETS, order_scenario, MAX_WALL_TICKS
 
 
@@ -35,6 +38,11 @@ class CrossMarketScaleTests(unittest.TestCase):
             self.assertAlmostEqual(q["position_cap"],20*q["order_qty"],places=10)
         self.assertAlmostEqual(order_scenario(MARKETS[("bitget","BTC")],77500)
                                ["order_qty"],.001,places=7)
+
+    def test_fractional_2_5ms_binance_delay_is_exact(self):
+        clock = np.array([1_000_000_000, 1_000_000_000], dtype=np.int64)
+        actual = visible_timestamps(clock, extra_delay_ms=2.5)
+        np.testing.assert_array_equal(actual - clock, [2_500_001, 2_500_001])
 
     def test_error_when_price_invalid(self):
         with self.assertRaises(ValueError):
