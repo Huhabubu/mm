@@ -1,0 +1,72 @@
+name: Four-market GLFT and Recorder 5min pilot
+on:
+  push:
+    paths:
+      - 'scripts/run_multivenue_glft.py'
+      - '.github/workflows/four-market-recorder-pilot.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recorder-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - exchange: okx
+            coin: BTC
+          - exchange: okx
+            coin: SOL
+          - exchange: bitget
+            coin: BTC
+          - exchange: bitget
+            coin: SOL
+    env:
+      VENUE: ${{ matrix.exchange }}
+      COIN: ${{ matrix.coin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official hftbacktest pinned
+        run: pip install hftbacktest==2.4.4
+      - name: Run 10min calibration and 5min official HBT + Recorder for four GLFT modes
+        run: |
+          python scripts/run_multivenue_glft.py --exchange "$VENUE" --coin "$COIN" \
+            --day 2026-11-01 --minutes 5 --extra-binance-delay-ms 25
+      - name: Print and validate all actual economics
+        run: |
+          python - <<'PY'
+          import json,os,pathlib,numpy as np
+          venue,coin=os.environ["VENUE"],os.environ["COIN"]
+          obj=json.load(open(f"reports/{venue}_{coin}_2026-11-01_5m.json"))
+          assert obj["status"]=="complete"
+          assert len(obj["variants"])==4
+          for name,item in obj["variants"].items():
+              t=item["trading"]
+              rec=item["recorder"]
+              with np.load(rec["file"]) as z:
+                  assert len(z["0"])==rec["samples"]
+                  assert len(z["0"])>100
+              with np.load(rec["fill_file"]) as z:
+                  assert len(z["exec_qty"])==t["engine_fills"]
+              print("RESULT",venue,coin,name,
+                    "GROSS",t["end_net_marked_equity_usdt"]+t["fee_usdt"],
+                    "FEES",t["fee_usdt"],"NET",t["end_net_marked_equity_usdt"],
+                    "FILLS",t["engine_fills"],"CANCELS",t["cancel_requests"],
+                    "RECORDS",rec["samples"])
+          PY
+      - name: Upload native recorder NPZ, fills and JSON summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder-pilot-${{ matrix.exchange }}-${{ matrix.coin }}-2026-11-01
+          path: |
+            reports/${{ matrix.exchange }}_${{ matrix.coin }}_2026-11-01_5m.json
+            reports/recorder/${{ matrix.exchange }}_${{ matrix.coin }}_2026-11-01_5m/*.npz
+          if-no-files-found: warn
+          retention-days: 90
