@@ -21,10 +21,11 @@ SCHEMAS = {
 }
 
 
-def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.request.urlopen):
+def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.request.urlopen,
+                   exchange=EXCHANGE, symbol=SYMBOL):
     """Stream gzip and crop at the start of the day; preserve order and amount units."""
     yyyy, mm, dd = day.split("-")
-    url = f"{BASE_URL}/{EXCHANGE}/{kind}/{yyyy}/{mm}/{dd}/{SYMBOL}.csv.gz"
+    url = f"{BASE_URL}/{exchange}/{kind}/{yyyy}/{mm}/{dd}/{symbol}.csv.gz"
     fields = SCHEMAS[kind]
     stats = {"rows": 0, "snapshot_rows": 0, "initial_snapshot_bid": 0,
              "initial_snapshot_ask": 0, "incremental_rows": 0,
@@ -57,7 +58,7 @@ def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.re
                             stats["first_local_us"] = ts
                         last_ts = ts
                         stats["last_local_us"] = ts
-                        if row["exchange"] != EXCHANGE or row["symbol"] != SYMBOL:
+                        if row["exchange"] != exchange or row["symbol"] != symbol:
                             raise ValueError(f"{kind}: wrong exchange or symbol")
                         if int(row["timestamp"]) <= 0:
                             stats["invalid_rows"] += 1
