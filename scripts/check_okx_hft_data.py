@@ -32,7 +32,8 @@ def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.re
              "local_backwards": 0, "invalid_rows": 0, "same_local_ts": 0,
              "first_local_us": None, "last_local_us": None,
              "first_snapshot": None, "initial_snapshot_complete": False,
-             "skipped_pre_snapshot": 0}
+             "skipped_pre_snapshot": 0, "min_feed_latency_us": None,
+             "negative_feed_latency_rows": 0}
     started_snapshot = False
     left_initial_snapshot = False
     last_ts = None
@@ -97,6 +98,13 @@ def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.re
                             if not all(math.isfinite(x) for x in (b, a, bq, aq)) or not (0 < b < a and bq >= 0 and aq >= 0):
                                 stats["invalid_rows"] += 1
                         writer.writerow({field: row[field] for field in fields})
+                        # Only rows passed to the converter count toward clock checks.
+                        latency_us = ts - int(row["timestamp"])
+                        old_min = stats["min_feed_latency_us"]
+                        stats["min_feed_latency_us"] = (latency_us if old_min is None
+                                                        else min(old_min, latency_us))
+                        if latency_us < 0:
+                            stats["negative_feed_latency_rows"] += 1
                         stats["rows"] += 1
                         if stats["rows"] > max_rows:
                             raise RuntimeError(f"{kind}: bounded sample exceeded {max_rows} rows")
@@ -108,6 +116,19 @@ def extract_window(kind, day, end_us, target, max_rows=500_000, opener=urllib.re
     if not stats["rows"] or stats["local_backwards"] or stats["invalid_rows"]:
         raise ValueError(f"{kind}: empty, nonmonotonic or invalid sample: {stats}")
     return stats
+
+
+def require_unshifted_target_clock(counts):
+    """Reject source clocks that HBT would shift without shifting Binance data."""
+    for kind, stats in counts.items():
+        latency = stats.get("min_feed_latency_us")
+        if latency is None:
+            raise ValueError(f"{kind}: missing raw feed latency audit")
+        if latency < 0 or stats.get("negative_feed_latency_rows", 0):
+            raise ValueError(
+                f"{kind}: target feed has negative local-minus-exchange latency "
+                f"({latency} us); HBT would shift its local clock independently "
+                "of Binance signals; abort paired replay")
 
 
 def probe_converters(paths, counts, tick_size, lot_size, directory):

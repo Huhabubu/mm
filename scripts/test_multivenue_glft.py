@@ -9,6 +9,7 @@ import numpy as np
 
 from cross_venue_event_probe import visible_timestamps
 from run_multivenue_glft import MARKETS, order_scenario, MAX_WALL_TICKS
+from run_beta_one_direct_gap import quote_gap_coverage, NS
 
 
 class CrossMarketScaleTests(unittest.TestCase):
@@ -43,6 +44,24 @@ class CrossMarketScaleTests(unittest.TestCase):
         clock = np.array([1_000_000_000, 1_000_000_000], dtype=np.int64)
         actual = visible_timestamps(clock, extra_delay_ms=2.5)
         np.testing.assert_array_equal(actual - clock, [2_500_001, 2_500_001])
+
+    def test_signal_coverage_uses_market_tick_not_legacy_btc_tick(self):
+        # Synthetic native gap 0.02 USDT per unit: two OKX SOL ticks,
+        # twenty Bitget SOL ticks, and less than one BTC tick.
+        ot = np.arange(11, dtype=np.int64)*100_000_000 + 700*NS
+        bt = ot + 5_000_000
+        basis_ts = np.array([699*NS], dtype=np.int64)
+        basis = np.array([0.])
+        for (venue, coin), spec in MARKETS.items():
+            with self.subTest(venue=venue, coin=coin):
+                report = quote_gap_coverage(
+                    ot, np.full(len(ot), 100.), bt,
+                    np.full(len(bt), 100.02), basis_ts, basis,
+                    700*NS+100_000_000, 700*NS+1_000_000_000,
+                    tick_size=spec.tick)
+                self.assertGreater(report["usable_gap_points"], 0)
+                self.assertEqual(report["fraction_abs_gap_at_least_one_tick"],
+                                 1. if coin == "SOL" else 0.)
 
     def test_error_when_price_invalid(self):
         with self.assertRaises(ValueError):

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from check_okx_hft_data import extract_window
+from check_okx_hft_data import extract_window, require_unshifted_target_clock
 
 DAY = "2026-11-01"
 BASE = 1793491200000000
@@ -70,6 +70,33 @@ class ProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "nonmonotonic"):
                 extract_window("trades", DAY, BASE+2_000_000,
                                Path(folder)/"bad.csv", opener=lambda *a, **k: io.BytesIO(data))
+
+    def test_negative_feed_latency_rejected_before_hbt_shift(self):
+        data = sample([
+            "exchange,symbol,timestamp,local_timestamp,id,side,price,amount",
+            f"okex-swap,BTC-USDT-SWAP,{BASE+5},{BASE},x,buy,100,2",
+        ])
+        with tempfile.TemporaryDirectory() as folder:
+            stats = extract_window("trades", DAY, BASE+2_000_000,
+                                   Path(folder)/"negative.csv",
+                                   opener=lambda *a, **k: io.BytesIO(data))
+            self.assertEqual(stats["min_feed_latency_us"], -5)
+            self.assertEqual(stats["negative_feed_latency_rows"], 1)
+            with self.assertRaisesRegex(ValueError, "HBT would shift"):
+                require_unshifted_target_clock({"trades": stats})
+
+    def test_nonnegative_feed_latency_keeps_original_clock(self):
+        data = sample([
+            "exchange,symbol,timestamp,local_timestamp,id,side,price,amount",
+            f"okex-swap,BTC-USDT-SWAP,{BASE},{BASE+5},x,buy,100,2",
+        ])
+        with tempfile.TemporaryDirectory() as folder:
+            stats = extract_window("trades", DAY, BASE+2_000_000,
+                                   Path(folder)/"nonnegative.csv",
+                                   opener=lambda *a, **k: io.BytesIO(data))
+            self.assertEqual(stats["min_feed_latency_us"], 5)
+            self.assertEqual(stats["negative_feed_latency_rows"], 0)
+            require_unshifted_target_clock({"trades": stats})
 
     def test_contract_amount_not_normalized(self):
         data = sample([

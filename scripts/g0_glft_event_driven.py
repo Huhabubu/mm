@@ -52,10 +52,11 @@ def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
 
 @njit
 def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
-                             okx_native_ns, okx_native_mid, basis_grid_ns,
+                             okx_native_ns, current_target_mid_price, basis_grid_ns,
                              basis_values, tick_size=TICK):
-    """No forward BBO / basis access. Strict past OKX and basis, fresh Binance."""
-    if beta == 0.0 or not np.isfinite(binance_mid):
+    """Use the live HBT target mid; raw past BBO only gates signal freshness."""
+    if (beta == 0.0 or not np.isfinite(binance_mid) or
+            not np.isfinite(current_target_mid_price) or current_target_mid_price <= 0.0):
         return 0.0
     if binance_visible_ns < 0 or now < binance_visible_ns or now-binance_visible_ns > 250_000_000:
         return 0.0
@@ -65,8 +66,8 @@ def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
         return 0.0
     if not np.isfinite(basis_values[gi]):
         return 0.0
-    gap_usdt_per_btc = binance_mid - okx_native_mid[oi] - basis_values[gi]
-    return beta * gap_usdt_per_btc / tick_size
+    gap_usdt = binance_mid - current_target_mid_price - basis_values[gi]
+    return beta * gap_usdt / tick_size
 
 
 @njit
@@ -368,8 +369,8 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 continue
             mid = (bid + ask) / 2.0
             pos = engine.position(0)
-            # Use only last locally visible Binance BBO, strictly older OKX BBO,
-            # and strictly earlier completed-second 60s causal basis.
+            # Use current HBT target mid for both reservation and cross-venue gap.
+            # Strict-past native BBO is only a freshness gate; basis stays causal.
             # Missing or stale quotes -> beta shift 0; no future labels enter.
             shift_ticks = 0.0
             if (beta != 0.0 and okx_native_ns is not None and
@@ -377,7 +378,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     basis_values is not None):
                 shift_ticks = causal_price_shift_ticks(
                     now, latest_binance_ns, latest_binance, beta,
-                    okx_native_ns, okx_native_mid, basis_grid_ns, basis_values,
+                    okx_native_ns, mid * tick_size, basis_grid_ns, basis_values,
                     tick_size)
             if filter_enter_ticks > 0.0:
                 held_shift_ticks, last_shift_update_ns = filtered_gap_shift(

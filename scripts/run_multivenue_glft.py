@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from check_okx_hft_data import SCHEMAS, extract_window
+from check_okx_hft_data import SCHEMAS, extract_window, require_unshifted_target_clock
 from cross_venue_event_probe import read_binance_bbo, visible_timestamps
 from g0_glft_event_driven import run_event_glft, summarize
 from run_beta_one_direct_gap import (
@@ -188,6 +188,8 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
                 counts[kind] = extract_window(
                     kind, day, end_us, paths[kind], max_rows=3_000_000,
                     exchange=spec.exchange, symbol=spec.symbol)
+            # Fail closed before HBT can silently shift only the target feed clock.
+            require_unshifted_target_clock(counts)
             output = root/"fused.npz"
             events = tardis.convert_fuse(
                 str(paths["trades"]), str(paths["incremental_book_L2"]),
@@ -207,7 +209,7 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
             first_trade_ns = start_us*1000+600*NS
             last_trade_ns = first_trade_ns+minutes*60*NS
             audit=quote_gap_coverage(ot,om,bt,bm,basis_ts,basis,
-                                     first_trade_ns,last_trade_ns)
+                                     first_trade_ns,last_trade_ns,tick_size=spec.tick)
             pretrade = om[ot < first_trade_ns]
             if not len(pretrade):
                 raise RuntimeError("Missing pretrade target venue midpoint")

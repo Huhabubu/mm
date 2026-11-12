@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from check_okx_hft_data import SCHEMAS, extract_window
+from check_okx_hft_data import SCHEMAS, extract_window, require_unshifted_target_clock
 from cross_venue_event_probe import read_binance_bbo, visible_timestamps
 from g0_glft_baseline import GAMMA, LOT, TICK, TRAIN
 from g0_glft_rolling import asset_for
@@ -74,8 +74,10 @@ def causal_60s_basis(okx_time, okx_mid, bin_time, bin_mid, basis_seconds=60):
 
 
 def quote_gap_coverage(okx_ts, okx_mid, bin_ts, bin_mid, basis_ts, basis,
-                       first, last):
-    """Audit 100ms decisions only; no future information or return labels."""
+                       first, last, tick_size=TICK):
+    """Audit native 100ms gap in each target market's actual price ticks."""
+    if not np.isfinite(tick_size) or tick_size <= 0:
+        raise ValueError("Invalid target market tick size")
     clock = np.arange(first, last, 100_000_000, dtype=np.int64)
     oo = np.searchsorted(okx_ts, clock, side="left") - 1
     bb = np.searchsorted(bin_ts, clock, side="left") - 1
@@ -93,7 +95,7 @@ def quote_gap_coverage(okx_ts, okx_mid, bin_ts, bin_mid, basis_ts, basis,
         "usable_gap_fraction": float(np.mean(good)),
         "mean_abs_gap_usdt_per_btc": float(np.mean(np.abs(gaps))) if len(gaps) else None,
         "p90_abs_gap_usdt_per_btc": float(np.quantile(np.abs(gaps), .9)) if len(gaps) else None,
-        "fraction_abs_gap_at_least_one_tick": float(np.mean(np.abs(gaps) >= TICK)) if len(gaps) else None,
+        "fraction_abs_gap_at_least_one_tick": float(np.mean(np.abs(gaps) >= tick_size)) if len(gaps) else None,
         "largest_abs_gap_usdt_per_btc": float(np.max(np.abs(gaps))) if len(gaps) else None,
     }
 
@@ -240,6 +242,8 @@ def run(day, minutes=50, delay_ms=25, report_dir="reports",
                     print("FULL_DAY_DATA_END", kind,
                           counts[kind]["rows"], "rows",
                           paths[kind].stat().st_size, "bytes", flush=True)
+            # The HBT converter otherwise shifts only the target feed's local clock.
+            require_unshifted_target_clock(counts)
             if chunk_minutes:
                 from tardis_segmented_hbt import convert_fuse_parts
                 npz, part_details = convert_fuse_parts(

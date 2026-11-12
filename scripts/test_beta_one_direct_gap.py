@@ -18,16 +18,16 @@ class DirectGapTests(unittest.TestCase):
         om = np.array([100., 101., 102.])
         gt = np.array([69*NS, 70*NS, 71*NS])
         bv = np.array([1., 2., 999.])
-        # At exact NOW the OKX new quote 101 cannot enter strict-left.
+        # The HBT book has already consumed the target quote at exact NOW.
         out = causal_price_shift_ticks(
-            now, now-25_000_000, 110., 1., ot, om, gt, bv)
-        self.assertAlmostEqual(out, (110.-100.-2.)/TICK)
+            now, now-25_000_000, 110., 1., ot, 101., gt, bv)
+        self.assertAlmostEqual(out, (110.-101.-2.)/TICK)
         self.assertAlmostEqual(
             causal_price_shift_ticks(
-                now, now-25_000_000, 110., 0., ot, om, gt, bv), 0.)
+                now, now-25_000_000, 110., 0., ot, 101., gt, bv), 0.)
         self.assertAlmostEqual(
             causal_price_shift_ticks(
-                now, now-25_000_000, 110., -1., ot, om, gt, bv), -out)
+                now, now-25_000_000, 110., -1., ot, 101., gt, bv), -out)
 
     def test_future_input_and_stale_bbo_cannot_shift(self):
         now = 70*NS+100_000_000
@@ -36,22 +36,44 @@ class DirectGapTests(unittest.TestCase):
         gt = np.array([70*NS, 71*NS])
         bv = np.array([2., 999.])
         normal = causal_price_shift_ticks(
-            now, now-25_000_000, 110., 1., ot, om, gt, bv)
+            now, now-25_000_000, 110., 1., ot, 100., gt, bv)
         self.assertAlmostEqual(normal, 80.)
         self.assertEqual(causal_price_shift_ticks(
-            now, now-251_000_000, 110., 1., ot, om, gt, bv), 0.)
+            now, now-251_000_000, 110., 1., ot, 100., gt, bv), 0.)
         self.assertEqual(causal_price_shift_ticks(
-            now, now+1, 110., 1., ot, om, gt, bv), 0.)
+            now, now+1, 110., 1., ot, 100., gt, bv), 0.)
         self.assertEqual(causal_price_shift_ticks(
-            now+500_000_000, now+490_000_000, 110., 1., ot, om, gt, bv), 0.)
+            now+500_000_000, now+490_000_000, 110., 1., ot, 100., gt, bv), 0.)
         self.assertEqual(causal_price_shift_ticks(
-            now, now-25_000_000, 110., 1., ot, om, gt,
+            now, now-25_000_000, 110., 1., ot, 100., gt,
             np.array([np.nan, 999.])), 0.)
-        # A future local OKX BBO or a future basis value cannot change shift.
-        om[1] = 150000.
+        # A future basis value cannot change the signal.
         bv[1] = -100000.
         self.assertAlmostEqual(causal_price_shift_ticks(
-            now, now-25_000_000, 110., 1., ot, om, gt, bv), normal)
+            now, now-25_000_000, 110., 1., ot, 100., gt, bv), normal)
+
+    def test_target_catches_up_at_exact_event_timestamp(self):
+        # Synthetic regression: a new HBT target quote is already visible.
+        now = 70*NS + 100_000_000
+        ot = np.array([now-100_000_000, now, now+100_000_000],
+                      dtype=np.int64)
+        grid = np.array([now-NS], dtype=np.int64)
+        basis = np.array([0.])
+        # Earlier native target was 100, but the current HBT midpoint is 110.
+        shifted = causal_price_shift_ticks(
+            now, now-10_000_000, 110., 1., ot, 110., grid, basis)
+        self.assertAlmostEqual(shifted, 0.)
+        self.assertAlmostEqual(110./TICK + shifted, 110./TICK)
+        # Raw BBO can still be older than the fused HBT book; the shift must
+        # continue using the latter, with native timestamps only as a gate.
+        old_native_only = np.array([now-100_000_000], dtype=np.int64)
+        self.assertAlmostEqual(causal_price_shift_ticks(
+            now, now-10_000_000, 110., 1.,
+            old_native_only, 110., grid, basis), 0.)
+        # A genuinely lagging HBT target book still produces a valid shift.
+        self.assertAlmostEqual(causal_price_shift_ticks(
+            now, now-10_000_000, 110., 1.,
+            old_native_only, 100., grid, basis), 10./TICK)
 
     def test_causal_60s_basis_matches_simple_constant_spread(self):
         times = np.arange(7100, dtype=np.int64)*100_000_000 + 10_000_000

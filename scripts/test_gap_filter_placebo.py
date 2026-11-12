@@ -76,9 +76,9 @@ class SignalHysteresisTests(unittest.TestCase):
         basis_t = np.array([now-NS], dtype=np.int64)
         basis = np.array([1.], dtype=np.float64)
         positive = causal_price_shift_ticks(now, now-25_000_000,
-                                            105., 1., ot, om, basis_t, basis)
+                                            105., 1., ot, 100., basis_t, basis)
         negative = causal_price_shift_ticks(now, now-25_000_000,
-                                            105., -1., ot, om, basis_t, basis)
+                                            105., -1., ot, 100., basis_t, basis)
         self.assertEqual(positive, -negative)
         self.assertGreater(positive, 0.)
 
