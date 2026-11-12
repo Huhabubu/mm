@@ -84,11 +84,16 @@ def draw_two_panel(trace, name, day, output, shared_y):
 
     bottom.step(x, trace["inventory"], where="post", linewidth=1.2, label="Inventory")
     bottom.axhline(0, linestyle="--", linewidth=0.9)
-    bottom.axhline(POSITION_CAP, linestyle=":", linewidth=0.8)
-    bottom.axhline(-POSITION_CAP, linestyle=":", linewidth=0.8)
+    # The actual path is within about 0.4 contracts here; plotting
+    # the full +/-2 contract hard cap would obscure inventory movements.
+    # Zoom the inventory axis using measured values, never rescale the data.
+    observed_limit = float(np.nanmax(np.abs(trace["inventory"])))
+    display_limit = min(POSITION_CAP, max(0.5, observed_limit * 1.20))
     bottom.set_ylabel("Inventory (contracts)")
     bottom.set_xlabel("Minutes after trade start (00:10 UTC)")
-    bottom.set_ylim(-POSITION_CAP - 0.15, POSITION_CAP + 0.15)
+    bottom.set_ylim(-display_limit, display_limit)
+    bottom.text(0.99, 0.93, "Hard cap: +/-2 contracts (off-scale)",
+                transform=bottom.transAxes, ha="right", va="top", fontsize=9)
     bottom.set_xlim(0, 50)
     bottom.grid(alpha=0.2)
     fig.text(
