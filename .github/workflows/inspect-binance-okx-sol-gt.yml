@@ -1,0 +1,65 @@
+name: Inspect 2p5ms Binance to OKX SOL Gt distribution and tick thresholds
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect-binance-okx-sol-gt.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load completed SOL-specific 2.5ms statistic and arrays
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43241824083
+          github-token: ${{ github.token }}
+          name: binance-okx-SOL-Gt-2p5ms-sixdate-descriptive
+          path: archived
+      - name: Audit quote units, signed and absolute percentiles, and tick strength
+        run: |
+          python - <<'PY'
+          import json,numpy as np
+          data=json.load(open("archived/summary.json",encoding="utf-8"))
+          p=data["pooled_valid"]
+          assert data["target_symbol"]=="SOL-USDT-SWAP"
+          assert data["source_symbol"]=="SOLUSDT"
+          assert data["target_tick_usdt_per_sol"]==0.01
+          assert data["target_contract_value_sol_per_contract"]==1.0
+          assert data["target_order_step_contracts"]==0.01
+          assert data["total_clock_points"]==180000
+          assert data["total_valid_points"]==80127
+          print("AUDIT_SOL_UNITS",data["price_unit"],data["target_tick_usdt_per_sol"],
+                "SOL/CONTRACT",data["target_contract_value_sol_per_contract"],
+                "CONTRACT_LOT",data["target_order_step_contracts"])
+          for key in ("G_signed_usdt_per_sol","G_absolute_usdt_per_sol",
+                      "G_absolute_okx_ticks","G_signed_bps","G_absolute_bps",
+                      "effective_including_missing_zeros",
+                      "okx_quote_age_ms","binance_quote_age_ms"):
+              print("STAT",key,json.dumps(p[key],ensure_ascii=False,sort_keys=True))
+          print("SIGN",p["G_positive_fraction"],p["G_negative_fraction"],
+                p["G_zero_fraction"])
+          print("THRESHOLDS",json.dumps(p["abs_G_at_least_usdt_per_sol"],sort_keys=True))
+          for day in data["days"]:
+              print("DAY_META",day["day"],"valid",day["valid_points"],
+                    "mean",day["G_signed_usdt_per_sol"]["mean"],
+                    "median_abs",day["G_absolute_usdt_per_sol"]["p50"],
+                    "p90_abs",day["G_absolute_usdt_per_sol"]["p90"],
+                    "p99_abs",day["G_absolute_usdt_per_sol"]["p99"],
+                    "median_abs_ticks",day["G_absolute_okx_ticks"]["p50"],
+                    "median_abs_bps",day["G_absolute_bps"]["p50"])
+          for day in data["days"]:
+              with np.load(f"archived/{day['day']}_100ms_G_SOL.npz") as z:
+                  assert "G_usdt_per_sol" in z and "G_usdt_per_btc" not in z
+                  valid=z["valid"]
+                  assert valid.sum()==day["valid_points"]
+                  assert np.allclose(z["G_okx_sol_ticks"][valid]*.01,
+                                     z["G_usdt_per_sol"][valid],atol=1e-12,rtol=0)
+          print("SOL_SIX_ARCHIVES_PRICE_TICKS_CHECKED",len(data["days"]))
+          PY
+      - name: Append verified distribution report
+        run: cat archived/report.md >> "$GITHUB_STEP_SUMMARY"
