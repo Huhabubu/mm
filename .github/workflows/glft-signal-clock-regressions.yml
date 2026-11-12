@@ -1,0 +1,36 @@
+name: GLFT signal, market tick and target clock regressions
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_event_driven.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - 'scripts/run_multivenue_glft.py'
+      - 'scripts/check_okx_hft_data.py'
+      - 'scripts/test_beta_one_direct_gap.py'
+      - 'scripts/test_gap_filter_placebo.py'
+      - 'scripts/test_multivenue_glft.py'
+      - 'scripts/test_check_okx_hft_data.py'
+      - '.github/workflows/glft-signal-clock-regressions.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official engine
+        run: pip install hftbacktest==2.4.4
+      - name: Run focused deterministic regressions
+        run: |
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_gap_filter_placebo.py' -v
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_check_okx_hft_data.py' -v
