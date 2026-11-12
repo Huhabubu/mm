@@ -1,0 +1,64 @@
+name: Audit Binance SOL lead before OKX at native event time and 2p5ms visibility
+on:
+  push:
+    paths:
+      - '.github/workflows/audit-sol-lead-event-time.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Use reference market-data and numerical dependencies
+        run: pip install hftbacktest==2.4.4
+      - name: Validate market clock and unique OKX price-stable episode accounting
+        run: python -m unittest discover -s scripts -p 'test_sol_binance_lead_events.py' -v
+      - name: Read raw Binance and OKX SOL BBO and audit 10bps leading events
+        run: |
+          python scripts/audit_sol_binance_lead_events.py \
+            --day ${{ matrix.day }} --out reports/sol_lead
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sol-lead-${{ matrix.day }}-event-2p5ms
+          path: reports/sol_lead/${{ matrix.day }}.json
+          if-no-files-found: error
+          retention-days: 90
+  aggregate:
+    needs: sample
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sol-lead-*-event-2p5ms
+          path: gathered
+          merge-multiple: true
+      - name: Aggregate six raw-event dates and publish threshold/latency answer
+        run: |
+          python scripts/summarize_sol_binance_lead_events.py \
+            --source gathered --out reports/sol_lead_summary
+          cat reports/sol_lead_summary/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sol-sixdate-real-event-binance-lead-before-okx
+          path: |
+            reports/sol_lead_summary/*
+            gathered/*.json
+          retention-days: 90
+          if-no-files-found: error
