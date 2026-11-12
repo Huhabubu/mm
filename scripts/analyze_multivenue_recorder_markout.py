@@ -138,7 +138,7 @@ def compute_attribution(rec, fills, trader, ctval, bbo_ns, bbo_mid):
     # Explicit check: the saved fills must reproduce the official HBT ledger.
     signed_qty = side * qty
     pos_from_fills = float(np.sum(signed_qty))
-    balance_from_fills = float(-np.sum(signed_qty * qty * 0 + signed_qty * fill_px * ctval))
+    balance_from_fills = float(-np.sum(signed_qty * fill_px * ctval))
     tol_bal = 3e-7 + abs(float(trader["balance_usdt"])) * 1e-10
     if abs(pos_from_fills - float(trader["end_position_contracts"])) > 2e-7:
         raise ValueError(f"Fill position doesn't reconcile: {pos_from_fills} vs {trader['end_position_contracts']}")
@@ -208,7 +208,7 @@ def compute_attribution(rec, fills, trader, ctval, bbo_ns, bbo_mid):
             "all_valid_n":int(np.count_nonzero(good)),
             "fresh_n":int(np.count_nonzero(fresh)),
             "fresh_weighted_bps":(float(np.sum(dollar_move[fresh]) / notional_fresh * 1e4)
-                                  if notional_fresh == 0 else None),
+                                  if notional_fresh > 0 else None),
             "all_valid_weighted_bps":(float(np.sum(dollar_move[good]) / notional_good * 1e4)
                                        if notional_good else None),
             "fresh_negative_fraction":(float(np.mean(bps[fresh] < 0))
