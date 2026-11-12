@@ -178,6 +178,7 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
             if recorder is not None:
                 data = recorder.get(0)
                 result = (LinearAssetRecord(data).contract_size(CTVAL)
+                          .resample("1ns")
                           .stats([Ret, MaxDrawdown, NumberOfTrades, TradingValue,
                                   ReturnOverTrade, MaxPositionValue]))
                 numbers = result.summary().to_dicts()[-1]
@@ -191,7 +192,7 @@ def run_pair(npz, low, high, bt, bm, ot, om, basis_t, basis, trade_minutes,
                     raise RuntimeError(f"Official HBT Return does not reconcile for {name}")
                 stats_out[name] = {
                     "library": "hftbacktest.stats.LinearAssetRecord",
-                    "resample": "none (native 100ms recorder)", "contract_size_btc_per_contract": CTVAL,
+                    "resample": "1ns (preserve raw timestamp resolution)", "contract_size_btc_per_contract": CTVAL,
                     "record_samples": int(len(data)),
                     "recorded_first_equity_usdt": first,
                     "recorded_last_equity_usdt": last,
