@@ -1,0 +1,71 @@
+name: Full-day real HBT submit cancel rolling two-second limit audit
+
+on:
+  push:
+    paths:
+      - 'scripts/g0_glft_event_driven.py'
+      - 'scripts/test_full_day_fill_quality.py'
+      - 'scripts/run_beta_one_direct_gap.py'
+      - '.github/workflows/full-day-request-rate-pilot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  request-rate-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official hftbacktest
+        run: pip install hftbacktest==2.4.4
+      - name: Verify 2s timestamp boundaries, markout, and legacy GLFT Numba tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_full_day_fill_quality.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+          python -m unittest discover -s scripts -p 'test_counterfactual_fill_markout.py' -v
+      - name: Re-run November UTC full day with read-only per-action 2sec rolling rate counters
+        run: |
+          python -u scripts/run_beta_one_direct_gap.py --day 2026-11-01 --minutes 1430 --extra-binance-delay-ms 25 --experiment wall_anchor --wall-search-ticks 50 --audit-markout --convert-chunk-minutes 60
+      - name: Validate HBT frozen economics and report single-order API threshold exceedance
+        if: success()
+        run: |
+          python - <<'PY'
+          import json,math
+          r=json.load(open("reports/glft_full_day_fill_quality_2026-11-01_1430m.json"))
+          assert r["status"]=="complete" and r["full_utc_day_requested"]
+          assert r["glft_5sec_calibration_trace_identical"]
+          expected={
+              "beta_0":(-57.841130960000015,2413),
+              "beta_1":(-56.41664790000001,2336),
+              "beta_0_wall":(-53.29382949999976,2181),
+              "beta_1_wall":(-53.17475626000015,2214),
+          }
+          for name,(net,fills) in expected.items():
+              v=r["variants"][name]
+              t=v["trading"]
+              q=v["request_rate_audit"]
+              assert t["engine_fills"]==fills
+              assert math.isclose(t["end_net_marked_equity_usdt"],net,abs_tol=.02), name
+              assert q["peak_place_requests_rolling_2s"]>=0
+              assert q["peak_cancel_requests_rolling_2s"]>=0
+              print("REQUEST_RATE",name,"MAX_PLACE_2S",q["peak_place_requests_rolling_2s"],
+                    "MAX_CANCEL_2S",q["peak_cancel_requests_rolling_2s"],
+                    "OVER_LIMIT_PLACE_REQUESTS",q["place_requests_issued_while_over_limit"],
+                    "OVER_LIMIT_CANCEL_REQUESTS",q["cancel_requests_issued_while_over_limit"],
+                    "TOTAL_PLACE",t["submissions"],"TOTAL_CANCEL",t["cancel_requests"],
+                    "GROSS",t["end_net_marked_equity_usdt"]+t["fee_usdt"],
+                    "FEES",t["fee_usdt"],"NET",t["end_net_marked_equity_usdt"])
+          PY
+      - name: Save aggregate execution feasibility stats only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: november-hbt-actual-requests-rolling2s-audit
+          path: reports/glft_full_day_fill_quality_2026-11-01_1430m.json
+          if-no-files-found: warn
+          retention-days: 14
