@@ -69,11 +69,14 @@ def order_scenario(spec, pretrade_mid):
             "gamma_usdt_inv":RISK_AVERSION_USDT, "target_order_notional_usdt":TARGET_ORDER_NOTIONAL_USDT}
 
 
-def build_asset(npz, lo, hi, spec):
+def build_asset(npz, lo, hi, spec, request_latency_ns=1_000_000,
+                response_latency_ns=1_000_000):
     from hftbacktest import BacktestAsset
+    if request_latency_ns < 0 or response_latency_ns < 0:
+        raise ValueError("Order request and response latency must be nonnegative")
     margin = max(1000*spec.tick, .02*(lo+hi)/2.0)
     return (BacktestAsset().data([str(npz)]).linear_asset(spec.ctval)
-            .constant_order_latency(1_000_000, 1_000_000)
+            .constant_order_latency(request_latency_ns, response_latency_ns)
             .power_prob_queue_model(2.0).no_partial_fill_exchange()
             .trading_value_fee_model(spec.maker_fee, spec.taker_fee)
             .tick_size(spec.tick).lot_size(spec.lot)
@@ -150,12 +153,19 @@ def validate_record(rec, summary):
 
 
 def run(day, exchange, coin, minutes=50, delay_ms=2.5,
-        report_dir="reports", capture_recorder=True):
+        report_dir="reports", capture_recorder=True,
+        request_latency_ns=1_000_000, response_latency_ns=1_000_000):
     from hftbacktest import Recorder, ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
 
     spec = MARKETS[(exchange, coin)]
+    if not math.isfinite(delay_ms) or delay_ms < 0:
+        raise ValueError("Extra Binance delay must be nonnegative and finite")
+    if (not isinstance(request_latency_ns, int) or
+            not isinstance(response_latency_ns, int) or
+            request_latency_ns < 0 or response_latency_ns < 0):
+        raise ValueError("Order latency values must be nonnegative integer nanoseconds")
     if minutes not in (5, 50):
         raise ValueError("Pilot supports 5min or 50min after 10min warmup")
     start_us = int(datetime.strptime(day, "%Y-%m-%d").replace(
@@ -173,6 +183,9 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
     report = {"status":"started", "day":day, "market":asdict(spec),
               "minutes":minutes, "warmup_minutes":10,
               "extra_binance_delay_ms":delay_ms,
+              "order_request_latency_ns":request_latency_ns,
+              "order_response_latency_ns":response_latency_ns,
+              "same_side_min_action_interval_ns":20_000_000,
               "model_versions":["glft", "glft_binance", "glft_local_peak",
                                 "glft_binance_local_peak"],
               "preexisting_history_explored":True,
@@ -223,7 +236,10 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
                 ("glft",0.0,0),("glft_binance",1.0,0),
                 ("glft_local_peak",0.0,MAX_WALL_TICKS),
                 ("glft_binance_local_peak",1.0,MAX_WALL_TICKS)):
-                engine = ROIVectorMarketDepthBacktest([build_asset(output,low,high,spec)])
+                engine = ROIVectorMarketDepthBacktest([build_asset(
+                    output, low, high, spec,
+                    request_latency_ns=request_latency_ns,
+                    response_latency_ns=response_latency_ns)])
                 rec = Recorder(engine.num_assets, minutes*600+10) if capture_recorder else None
                 try:
                     raw=run_event_glft(
@@ -301,13 +317,16 @@ def main():
     p.add_argument("--coin",choices=("BTC","SOL"),required=True)
     p.add_argument("--minutes",type=int,choices=(5,50),default=5)
     p.add_argument("--extra-binance-delay-ms",type=float,default=2.5)
+    p.add_argument("--order-request-latency-ns",type=int,default=1_000_000)
+    p.add_argument("--order-response-latency-ns",type=int,default=1_000_000)
     p.add_argument("--report-dir",default="reports")
     p.add_argument("--no-recorder",action="store_true")
     args=p.parse_args()
     if datetime.strptime(args.day,"%Y-%m-%d").day != 1:
         p.error("Tardis free day must be first day of the month")
     run(args.day,args.exchange,args.coin,args.minutes,
-        args.extra_binance_delay_ms,args.report_dir,not args.no_recorder)
+        args.extra_binance_delay_ms,args.report_dir,not args.no_recorder,
+        args.order_request_latency_ns,args.order_response_latency_ns)
 
 
 if __name__ == "__main__":
