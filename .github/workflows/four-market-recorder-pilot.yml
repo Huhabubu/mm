@@ -34,7 +34,7 @@ jobs:
           python-version: '3.11'
       - name: Install official hftbacktest pinned
         run: pip install hftbacktest==2.4.4
-      - name: Run 10min calibration and 5min official HBT + Recorder for four GLFT modes
+      - name: Run 10min calibration and 5min official HBT + Recorder for six GLFT modes
         run: |
           python scripts/run_multivenue_glft.py --exchange "$VENUE" --coin "$COIN" \
             --day 2026-11-01 --minutes 5 --extra-binance-delay-ms 25
@@ -50,7 +50,7 @@ jobs:
               assert obj["calibration_diagnostic"]["valid"] is False
               print("NOT_CALIBRATED",venue,coin,obj["calibration_diagnostic"])
               raise SystemExit(0)
-          assert len(obj["variants"])==4
+          assert len(obj["variants"])==6
           for name,item in obj["variants"].items():
               t=item["trading"]
               rec=item["recorder"]
