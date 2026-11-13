@@ -26,7 +26,7 @@ def metric(report, model):
         "net":net,
         "fills":int(t["engine_fills"]),
         "cancel_requests":int(t["cancel_requests"]),
-        "submit_requests":int(t["submit_requests"]),
+        "submit_requests":int(t["submissions"]),
     }
 
 
