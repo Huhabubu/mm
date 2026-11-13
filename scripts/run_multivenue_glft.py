@@ -187,7 +187,10 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
               "order_response_latency_ns":response_latency_ns,
               "same_side_min_action_interval_ns":20_000_000,
               "model_versions":["glft", "glft_binance", "glft_local_peak",
-                                "glft_binance_local_peak"],
+                                "glft_binance_local_peak",
+                                "glft_binance_defensive",
+                                "glft_binance_defensive_local_peak"],
+              "defensive_alpha":0.0,"defensive_beta":1.0,
               "preexisting_history_explored":True,
               "net_equity_is_mark_to_mid_after_fees":True,
               "funding_and_final_liquidation_not_simulated":True}
@@ -232,10 +235,12 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
                            "signal_rows":len(bt), "signal_coverage":audit,
                            "scenario":scenario, "variants":{}})
 
-            for label_model,beta,peak in (
-                ("glft",0.0,0),("glft_binance",1.0,0),
-                ("glft_local_peak",0.0,MAX_WALL_TICKS),
-                ("glft_binance_local_peak",1.0,MAX_WALL_TICKS)):
+            for label_model,beta,peak,quote_mode in (
+                ("glft",0.0,0,0),("glft_binance",1.0,0,0),
+                ("glft_local_peak",0.0,MAX_WALL_TICKS,0),
+                ("glft_binance_local_peak",1.0,MAX_WALL_TICKS,0),
+                ("glft_binance_defensive",1.0,0,1),
+                ("glft_binance_defensive_local_peak",1.0,MAX_WALL_TICKS,1)):
                 engine = ROIVectorMarketDepthBacktest([build_asset(
                     output, low, high, spec,
                     request_latency_ns=request_latency_ns,
@@ -249,9 +254,9 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
                         0.0,0.0,10.0,250_000_000,0.0,None,
                         peak,spec.tick,spec.ctval,
                         scenario["order_qty"],scenario["position_cap"],
-                        rec.recorder if rec else None)
+                        rec.recorder if rec else None, quote_mode)
                     if int(raw[5]) != 1:
-                        # Fail closed. All four variants share the same market-only
+                        # Fail closed. All six variants share the same market-only
                         # calibration; there is no valid GLFT quote to trade.
                         report["status"] = "no_glft_calibration"
                         report["calibration_attempts"] = int(raw[2])
@@ -263,6 +268,8 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
                         return report
                     summary = summarize(raw,minutes,True,beta,
                                         scenario["position_cap"],scenario["order_qty"])
+                    summary["quote_mode"] = ("defensive_one_sided_alpha0"
+                                             if quote_mode == 1 else "symmetric")
                     if capture_recorder:
                         records=rec.get(0)
                         validate_record(records,summary)
