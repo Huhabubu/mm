@@ -1,0 +1,46 @@
+name: Audit native Binance mid premium against OKX 2026 six dates
+on:
+  push:
+    paths:
+      - '.github/workflows/binance-okx-premium-sixdate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  premium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install numerical dependency
+        run: pip install numpy==2.2.6
+      - name: Recover six-date BTC 100ms native quote time series
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43237758690
+          github-token: ${{ github.token }}
+          name: binance-okx-btc-Gt-2p5ms-sixdate-descriptive
+          path: data/btc
+      - name: Recover six-date SOL 100ms native quote time series
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43241824083
+          github-token: ${{ github.token }}
+          name: binance-okx-SOL-Gt-2p5ms-sixdate-descriptive
+          path: data/sol
+      - name: Report percentage of time Binance BTC and SOL mid exceeds OKX
+        run: |
+          python scripts/audit_binance_okx_premium_sixdate.py \
+            --btc-source data/btc --sol-source data/sol \
+            --out reports/binance_okx_premium
+          cat reports/binance_okx_premium/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-binance-okx-btc-sol-premium-100ms-sixdate
+          path: reports/binance_okx_premium/*
+          retention-days: 90
+          if-no-files-found: error
