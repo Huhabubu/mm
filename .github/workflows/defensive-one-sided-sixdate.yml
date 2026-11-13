@@ -1,0 +1,142 @@
+name: Six-date HBT alpha0 defensive one-sided vs symmetric Binance signal
+on:
+  push:
+    paths:
+      - '.github/workflows/defensive-one-sided-sixdate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01',
+              '2026-09-01','2026-10-01','2026-11-01']
+        case:
+          - {profile: 2p5, venue: okx, coin: BTC, delay: 2.5, order_ns: 1000000}
+          - {profile: 2p5, venue: okx, coin: SOL, delay: 2.5, order_ns: 1000000}
+          - {profile: 2p5, venue: bitget, coin: BTC, delay: 2.5, order_ns: 1000000}
+          - {profile: 2p5, venue: bitget, coin: SOL, delay: 2.5, order_ns: 1000000}
+          - {profile: zero, venue: okx, coin: BTC, delay: 0.0, order_ns: 0}
+          - {profile: zero, venue: okx, coin: SOL, delay: 0.0, order_ns: 0}
+    env:
+      DAY: ${{ matrix.day }}
+      VENUE: ${{ matrix.case.venue }}
+      COIN: ${{ matrix.case.coin }}
+      PROFILE: ${{ matrix.case.profile }}
+      DELAY: ${{ matrix.case.delay }}
+      ORDER_NS: ${{ matrix.case.order_ns }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Use pinned official HBT with original execution/queue models
+        run: pip install hftbacktest==2.4.4
+      - name: Regression old GLFT paths, target tick and defensive sign behavior
+        run: |
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_defensive_one_sided_quotes.py' -v
+      - name: Run six independent models in official HBT 10min warmup plus 50min
+        run: |
+          python scripts/run_multivenue_glft.py \
+            --exchange "$VENUE" --coin "$COIN" --day "$DAY" --minutes 50 \
+            --extra-binance-delay-ms "$DELAY" \
+            --order-request-latency-ns "$ORDER_NS" \
+            --order-response-latency-ns "$ORDER_NS" \
+            --report-dir reports
+      - name: Audit target contract, latency, fee-adjusted PnL and Recorder
+        run: |
+          python - <<'PY'
+          import json,os,shutil
+          from pathlib import Path
+          import numpy as np
+          day,venue,coin,profile,delay,order_ns = [
+              os.environ[k] for k in ("DAY","VENUE","COIN","PROFILE","DELAY","ORDER_NS")]
+          p=Path("reports")/f"{venue}_{coin}_{day}_50m.json"
+          r=json.loads(p.read_text(encoding="utf-8"))
+          assert r["status"] in ("complete","no_glft_calibration"),(r["status"],r.get("error"))
+          assert r["day"]==day and r["minutes"]==50 and r["warmup_minutes"]==10
+          assert r["market"]["exchange"]==("okex-swap" if venue=="okx" else "bitget-futures")
+          assert r["market"]["coin"]==coin
+          assert float(r["extra_binance_delay_ms"])==float(delay)
+          assert r["order_request_latency_ns"]==int(order_ns)
+          assert r["order_response_latency_ns"]==int(order_ns)
+          assert r["same_side_min_action_interval_ns"]==20_000_000
+          assert r["market"]["maker_fee"]==.0002
+          assert r["market"]["taker_fee"]==(.0005 if venue=="okx" else .0006)
+          output=Path("package/cases")/profile/venue/coin
+          output.mkdir(parents=True,exist_ok=True)
+          shutil.copy2(p,output/(day+".json"))
+          if r["status"]=="no_glft_calibration":
+              assert not r["calibration_diagnostic"]["valid"]
+              print("MISSING_CALIBRATION",day,venue,coin,profile)
+          else:
+              names={"glft","glft_binance","glft_local_peak",
+                     "glft_binance_local_peak","glft_binance_defensive",
+                     "glft_binance_defensive_local_peak"}
+              assert set(r["variants"])==names
+              baseline=r["variants"]["glft"]
+              for name,v in r["variants"].items():
+                  assert v["calibration_trace"]==baseline["calibration_trace"]
+                  assert v["samples"]==baseline["samples"]
+                  assert v["time_count"]["binance"]==baseline["time_count"]["binance"]
+                  assert v["recorder"]["samples"]>=29000
+                  if "defensive" in name:
+                      assert v["quote_mode"]=="defensive_one_sided_alpha0"
+                  else:
+                      assert v["quote_mode"]=="symmetric"
+                  t=v["trading"]
+                  assert t["fee_usdt"]>=0
+                  for field in ("file","fill_file"):
+                      src=Path(v["recorder"][field])
+                      assert src.is_file(),src
+                      dst=Path("package/recorders")/profile/venue/coin/day/src.name
+                      dst.parent.mkdir(parents=True,exist_ok=True)
+                      shutil.copy2(src,dst)
+                  with np.load(v["recorder"]["fill_file"]) as z:
+                      assert len(z["exec_qty"])==t["engine_fills"]
+                  print("RESULT",day,venue,coin,profile,name,
+                        "NET",t["end_net_marked_equity_usdt"],
+                        "FEES",t["fee_usdt"],"FILLS",t["engine_fills"],
+                        "CANCELS",t["cancel_requests"])
+          PY
+      - name: Save original official recorder, fills and JSON for repeatable audit
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: defensive-${{ matrix.case.profile }}-${{ matrix.case.venue }}-${{ matrix.case.coin }}-${{ matrix.day }}
+          path: package/
+          retention-days: 90
+          if-no-files-found: warn
+  aggregate:
+    needs: scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: defensive-*
+          path: gathered
+          merge-multiple: true
+      - name: Validate all 36 data scenes and original repaired PnL parity
+        run: |
+          python scripts/summarize_defensive_one_sided_sixdate.py \
+            --root gathered --out reports/defensive_sixdate
+          cat reports/defensive_sixdate/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: defensive-alpha0-sixdate-repaired-hbt-summary
+          path: reports/defensive_sixdate/*
+          retention-days: 90
+          if-no-files-found: error
