@@ -45,15 +45,18 @@ def read_binance_bbo(day, end_us, opener=urllib.request.urlopen, symbol="BTCUSDT
 def visible_timestamps(local_ns, extra_delay_ms=25):
     """Use measured collection time plus an *assumed* signal transport delay.
 
-    One ns after the reported microsecond avoids ambiguous ties with OKX at
-    the same resolution. Original row order, including equal timestamps, stays.
+    For a positive simulated extra delay, one ns after the reported
+    microsecond avoids ambiguous ties with OKX at the same resolution.
+    Zero-delay experiments keep exact local timestamps; when equal, the
+    event loop consumes HBT target events before Binance rows.
+    Original row order, including equal timestamps, stays.
     """
     if extra_delay_ms < 0:
         raise ValueError("negative extra delay")
     local_ns = np.asarray(local_ns, dtype=np.int64)
     if local_ns.ndim != 1 or (len(local_ns) > 1 and np.any(np.diff(local_ns) < 0)):
         raise ValueError("external timestamps must be sorted")
-    return local_ns + int(extra_delay_ms * 1_000_000) + 1
+    return local_ns + int(extra_delay_ms * 1_000_000) + (1 if extra_delay_ms > 0 else 0)
 
 
 def replay_union(engine, binance_ts_ns, binance_mid, stop_ns, on_event, max_events=2_000_000):
