@@ -1,0 +1,47 @@
+name: Inspect six-date Binance above OKX daywise premium
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect-binance-okx-premium-days.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  daywise:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43357410330
+          github-token: ${{ github.token }}
+          name: native-binance-okx-btc-sol-premium-100ms-sixdate
+          path: reports/binance_okx_premium
+      - name: Check original cross-venue price comparison daily rates
+        run: |
+          python - <<'PY'
+          import json,os
+          with open("reports/binance_okx_premium/summary.json",encoding="utf-8") as f:
+              data=json.load(f)
+          rows=[]
+          for coin in ("BTC","SOL"):
+              agg=data[coin]["pooled"]
+              assert agg["valid"]==(133499 if coin=="BTC" else 80127)
+              assert agg["premium_positive"]+agg["premium_negative"]+agg["premium_zero"]==agg["valid"]
+              for d in data[coin]["by_day"]:
+                  n=d["valid"]
+                  row=(coin,d["day"],n,
+                       100*d["premium_positive"]/n,
+                       100*d["premium_negative"]/n,
+                       100*d["premium_zero"]/n,
+                       100*d["g_positive"]/n)
+                  print("PREMIUM_DAY",*row)
+                  rows.append(row)
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a",encoding="utf-8") as f:
+              f.write("| 币种 | 日期 | 有效100ms点 | Binance更高 | OKX更高 | 相等 | G>0 |\n")
+              f.write("|---|---|---:|---:|---:|---:|---:|\n")
+              for coin,day,n,p,neg,e,g in rows:
+                  f.write(f"| {coin} | {day} | {n:,} | {p:.2f}% | {neg:.2f}% | {e:.2f}% | {g:.2f}% |\n")
+          PY
