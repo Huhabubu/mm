@@ -1,0 +1,44 @@
+name: Repaired 2p5ms four-market fill markout and PnL attribution
+on:
+  push:
+    paths:
+      - '.github/workflows/repaired-2p5ms-markout.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  recompute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install numerical dependency
+        run: python -m pip install numpy==2.2.6
+      - name: Regression check the original signed fill and official cash-flow identities
+        run: python -m unittest discover -s scripts -p 'test_recorder_pnl_attribution.py' -v
+      - name: Restore exclusively repaired-code 2.5ms HBT Recorder and fill records
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43352290569
+          github-token: ${{ github.token }}
+          pattern: repaired-2p5-*
+          path: gathered
+          merge-multiple: false
+      - name: Recompute every 100 and 500ms signed markout with HBT cash ledger checks
+        run: |
+          python scripts/audit_repaired_2p5ms_markout.py \
+            --source gathered --out reports/repaired_2p5ms_markout \
+            --source-run-id 43352290569
+          cat reports/repaired_2p5ms_markout/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve new fill annotations and repaired-only attribution
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repaired-2p5ms-four-market-PnL-markout-audit
+          path: reports/repaired_2p5ms_markout/**/*
+          if-no-files-found: warn
+          retention-days: 90
