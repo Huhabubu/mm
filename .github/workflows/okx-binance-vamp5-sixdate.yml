@@ -1,0 +1,130 @@
+name: OKX BTC SOL paired Binance raw VAMP5 vs snapshot-mid six dates
+on:
+  push:
+    paths:
+      - '.github/workflows/okx-binance-vamp5-sixdate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  case:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+        coin: ['BTC','SOL']
+    env:
+      DAY: ${{ matrix.day }}
+      COIN: ${{ matrix.coin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT 2.4.4
+        run: pip install hftbacktest==2.4.4
+      - name: Test raw VAMP, source timestamps, target tick and defensive logic
+        run: |
+          python -m unittest discover -s scripts -p 'test_binance_snapshot5_vamp.py' -v
+          python -m unittest discover -s scripts -p 'test_defensive_one_sided_quotes.py' -v
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+      - name: Rebuild native OKX HBT and download Binance top5 snapshot for one day
+        run: |
+          python scripts/run_multivenue_glft.py \
+            --exchange okx --coin "$COIN" --day "$DAY" \
+            --minutes 50 --binance-source snapshot_5 \
+            --extra-binance-delay-ms 2.5 \
+            --order-request-latency-ns 1000000 \
+            --order-response-latency-ns 1000000 \
+            --report-dir reports
+      - name: Audit official Recorder/fills and prepare exact case output
+        run: |
+          python - <<'PY'
+          import json,os,shutil
+          from pathlib import Path
+          import numpy as np
+          day,coin=os.environ["DAY"],os.environ["COIN"]
+          path=Path(f"reports/okx_{coin}_{day}_50m_snapshot5.json")
+          r=json.loads(path.read_text(encoding="utf-8"))
+          assert r["status"] in ("complete","no_glft_calibration"),r.get("error",r["status"])
+          assert r["day"]==day and r["minutes"]==50 and r["warmup_minutes"]==10
+          assert r["market"]["exchange"]=="okex-swap"
+          assert r["market"]["coin"]==coin
+          assert r["binance_signal_source"]=="snapshot_5"
+          assert r["binance_snapshot5"]["rows"]>100
+          assert r["binance_snapshot5"]["same_event_clock_for_mid_and_vamp"]
+          assert r["extra_binance_delay_ms"]==2.5
+          assert r["order_request_latency_ns"]==1000000
+          assert r["order_response_latency_ns"]==1000000
+          assert r["same_side_min_action_interval_ns"]==20000000
+          assert r["market"]["maker_fee"]==.0002
+          assert r["market"]["taker_fee"]==.0005
+          out=Path("package/cases")/coin
+          out.mkdir(parents=True,exist_ok=True)
+          shutil.copy2(path,out/(day+".json"))
+          if r["status"]=="no_glft_calibration":
+              assert not r["calibration_diagnostic"]["valid"]
+              print("NO_GLFT",day,coin,flush=True)
+          else:
+              models={"glft","glft_binance_defensive_snapshot_mid",
+                      "glft_binance_defensive_vamp5"}
+              assert set(r["variants"])==models
+              glft=r["variants"]["glft"]
+              for model,v in r["variants"].items():
+                  assert v["calibration_trace"]==glft["calibration_trace"]
+                  assert v["samples"]==glft["samples"]
+                  assert v["time_count"]["binance"]==glft["time_count"]["binance"]
+                  assert v["recorder"]["samples"]>=29000
+                  assert v["signal_price_kind"]==("vamp5" if "vamp5" in model else "mid")
+                  t=v["trading"]
+                  assert t["fee_usdt"]>=0
+                  with np.load(v["recorder"]["fill_file"]) as z:
+                      assert len(z["exec_qty"])==t["engine_fills"]
+                  for k in ("file","fill_file"):
+                      src=Path(v["recorder"][k])
+                      assert src.is_file()
+                      dst=Path("package/recorders")/coin/day/src.name
+                      dst.parent.mkdir(parents=True,exist_ok=True)
+                      shutil.copy2(src,dst)
+                  print("OKX_VAMP5_CASE",day,coin,model,
+                        "NET",t["end_net_marked_equity_usdt"],
+                        "FEES",t["fee_usdt"],"FILLS",t["engine_fills"],
+                        "CANCELS",t["cancel_requests"],flush=True)
+          PY
+      - name: Archive official case, native Recorder and complete fills
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: okx-vamp5-${{ matrix.coin }}-${{ matrix.day }}
+          path: package/
+          retention-days: 90
+          if-no-files-found: warn
+  aggregate:
+    needs: case
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: okx-vamp5-*
+          path: gathered
+          merge-multiple: true
+      - name: Compute fair identical-event-clock VAMP versus midpoint comparison
+        run: |
+          python scripts/summarize_okx_binance_vamp5.py \
+            --root gathered --out reports/vamp5_summary
+          cat reports/vamp5_summary/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: okx-binance-five-level-vamp5-sixdate-summary
+          path: reports/vamp5_summary/*
+          retention-days: 90
+          if-no-files-found: error
