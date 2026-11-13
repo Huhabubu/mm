@@ -98,6 +98,24 @@ def filtered_gap_shift(now, raw_shift_ticks, held_shift_ticks, last_update_ns,
 
 
 @njit
+def defensive_one_sided_quotes(reservation, half, extra_half_ticks,
+                               signal_shift_ticks, best_bid_tick, best_ask_tick):
+    """Only move outward on the side at risk; alpha=0 on the other side.
+
+    Positive Binance residual => ask at risk, lift ask, retain GLFT bid.
+    Negative Binance residual => bid at risk, lower bid, retain GLFT ask.
+    All inputs and returned prices are target-exchange ticks.
+    """
+    base_bid = reservation - half - extra_half_ticks
+    base_ask = reservation + half + extra_half_ticks
+    outward_bid = min(signal_shift_ticks, 0.0)
+    outward_ask = max(signal_shift_ticks, 0.0)
+    want_bid = min(round(base_bid + outward_bid), best_bid_tick)
+    want_ask = max(round(base_ask + outward_ask), best_ask_tick)
+    return want_bid, want_ask
+
+
+@njit
 def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    rolling=True, gamma_code=GAMMA, read_binance=False,
                    beta=0.0, okx_native_ns=None, okx_native_mid=None,
@@ -108,7 +126,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    extra_half_ticks=0.0, probe_ns=None,
                    wall_search_ticks=0, tick_size=TICK, contract_value=CTVAL,
                    order_qty=ORDER_QTY, position_cap=POSITION_CAP,
-                   recorder=None):
+                   recorder=None, quote_mode=0):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -119,6 +137,10 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
              filter_exit_ticks >= filter_enter_ticks or
              filter_refresh_change_ticks <= 0.0 or filter_refresh_ns < 0)):
         raise ValueError("Invalid gap hysteresis configuration")
+    if quote_mode != 0 and quote_mode != 1:
+        raise ValueError("quote_mode must be 0 (symmetric) or 1 (one-sided defensive)")
+    if quote_mode == 1 and beta <= 0.0:
+        raise ValueError("Defensive quote mode requires positive beta")
     if extra_half_ticks < 0.0 or not np.isfinite(extra_half_ticks):
         raise ValueError("Invalid GLFT no-signal widening")
     if wall_search_ticks < 0 or wall_search_ticks > 1000:
@@ -386,9 +408,16 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     filter_enter_ticks, filter_exit_ticks,
                     filter_refresh_change_ticks, filter_refresh_ns)
                 shift_ticks = held_shift_ticks
-            reservation = mid - skew * pos + shift_ticks
-            want_bid = min(round(reservation - half - extra_half_ticks), bid)
-            want_ask = max(round(reservation + half + extra_half_ticks), ask)
+            if quote_mode == 1:
+                # Base GLFT skew/spread unchanged; protect ONLY risk-facing side.
+                reservation = mid - skew * pos
+                want_bid, want_ask = defensive_one_sided_quotes(
+                    reservation, half, extra_half_ticks, shift_ticks, bid, ask)
+            else:
+                # Preserve existing two-sided shift bit-for-bit in the baseline.
+                reservation = mid - skew * pos + shift_ticks
+                want_bid = min(round(reservation - half - extra_half_ticks), bid)
+                want_ask = max(round(reservation + half + extra_half_ticks), ask)
             if wall_search_ticks > 0:
                 # Post-process ONLY: keep GLFT A/k/sigma/risk/skew unchanged.
                 # Bound search to OUTWARD prices, then step one tick in front.
