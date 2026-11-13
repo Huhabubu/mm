@@ -1,0 +1,148 @@
+name: Repaired historical four-market GLFT 2p5ms and 25ms baselines
+on:
+  push:
+    paths:
+      - '.github/workflows/repaired-historical-four-market.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+        market:
+          - {exchange: okx, coin: BTC}
+          - {exchange: okx, coin: SOL}
+          - {exchange: bitget, coin: BTC}
+          - {exchange: bitget, coin: SOL}
+        profile:
+          - {id: 2p5, delay_ms: 2.5}
+          - {id: 25, delay_ms: 25.0}
+    env:
+      DAY: ${{ matrix.day }}
+      VENUE: ${{ matrix.market.exchange }}
+      COIN: ${{ matrix.market.coin }}
+      PROFILE: ${{ matrix.profile.id }}
+      DELAY_MS: ${{ matrix.profile.delay_ms }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official hftbacktest
+        run: pip install hftbacktest==2.4.4
+      - name: Regression check repaired quote, signal units and market clock
+        run: |
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_check_okx_hft_data.py' -v
+      - name: Run corrected four model 50 minute official HBT market simulation
+        run: |
+          python scripts/run_multivenue_glft.py --day "$DAY" \
+            --exchange "$VENUE" --coin "$COIN" --minutes 50 \
+            --extra-binance-delay-ms "$DELAY_MS" \
+            --order-request-latency-ns 1000000 \
+            --order-response-latency-ns 1000000
+      - name: Audit complete official Recorder output or explicit calibration failure
+        run: |
+          python - <<'PY'
+          import json,os,shutil
+          from pathlib import Path
+          import numpy as np
+          day,venue,coin,profile,delay = (
+              os.environ[k] for k in ("DAY","VENUE","COIN","PROFILE","DELAY_MS"))
+          original=Path("reports") / f"{venue}_{coin}_{day}_50m.json"
+          r=json.loads(original.read_text(encoding="utf-8"))
+          assert r["status"] in ("complete","no_glft_calibration"),r.get("error",r["status"])
+          assert r["minutes"]==50 and r["warmup_minutes"]==10
+          assert r["market"]["exchange"]==("okex-swap" if venue=="okx" else "bitget-futures")
+          assert r["market"]["coin"]==coin
+          assert float(r["extra_binance_delay_ms"])==float(delay)
+          assert r["order_request_latency_ns"]==1_000_000
+          assert r["order_response_latency_ns"]==1_000_000
+          assert r["same_side_min_action_interval_ns"]==20_000_000
+          assert r["market"]["maker_fee"]==0.0002
+          assert r["market"]["taker_fee"]==(0.0005 if venue=="okx" else 0.0006)
+          out=Path("package")
+          out.mkdir(exist_ok=True)
+          shutil.copy2(original,out/original.name)
+          if r["status"]=="no_glft_calibration":
+              assert not r["calibration_diagnostic"]["valid"]
+              print("UNCALIBRATED",venue,coin,day,profile)
+          else:
+              assert len(r["variants"])==4
+              base=r["variants"]["glft"]
+              for model,item in r["variants"].items():
+                  assert item["calibration_trace"]==base["calibration_trace"]
+                  assert item["time_count"]["binance"]==base["time_count"]["binance"]
+                  t=item["trading"]
+                  assert t["fee_usdt"]>=0
+                  assert item["recorder"]["samples"]>=29000
+                  for k in ("file","fill_file"):
+                      src=Path(item["recorder"][k])
+                      assert src.is_file(),src
+                      dst=out / Path(*src.parts[1:])
+                      dst.parent.mkdir(parents=True,exist_ok=True)
+                      shutil.copy2(src,dst)
+                  with np.load(item["recorder"]["fill_file"]) as z:
+                      assert len(z["exec_qty"])==t["engine_fills"]
+                  print("REPAIRED",venue,coin,day,profile,model,
+                        "NET",t["end_net_marked_equity_usdt"],
+                        "FEES",t["fee_usdt"],"FILLS",t["engine_fills"],
+                        "CANCEL",t["cancel_requests"])
+          PY
+      - name: Archive raw JSON, official HBT Recorder and every fill
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repaired-${{ matrix.profile.id }}-${{ matrix.market.exchange }}-${{ matrix.market.coin }}-${{ matrix.day }}
+          path: package/
+          retention-days: 90
+          if-no-files-found: warn
+  aggregate:
+    needs: scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Restore 2.5ms official HBT reports and Recorder
+        uses: actions/download-artifact@v4
+        with:
+          pattern: repaired-2p5-*
+          path: gathered/2p5
+          merge-multiple: false
+      - name: Restore 25ms official HBT reports and Recorder
+        uses: actions/download-artifact@v4
+        with:
+          pattern: repaired-25-*
+          path: gathered/25
+          merge-multiple: false
+      - name: Aggregate each historical latency profile independently
+        run: |
+          python scripts/summarize_multivenue_recorder.py \
+            --source gathered/2p5 --out reports/repaired_2p5ms
+          python scripts/summarize_multivenue_recorder.py \
+            --source gathered/25 --out reports/repaired_25ms
+      - name: Cross-check 24 cases per profile and compare the rebuilt baselines
+        run: |
+          python scripts/summarize_repaired_historical_matrix.py \
+            --two-five reports/repaired_2p5ms/summary.json \
+            --twenty-five reports/repaired_25ms/summary.json \
+            --out reports/repaired_historical
+          cat reports/repaired_historical/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve all repaired historical sample statistics
+        uses: actions/upload-artifact@v4
+        with:
+          name: repaired-historical-four-market-2p5ms-and-25ms-summary
+          path: reports/repaired_*/**/*
+          retention-days: 90
+          if-no-files-found: error
