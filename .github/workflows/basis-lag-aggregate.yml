@@ -1,0 +1,42 @@
+name: Aggregate native BBO basis lag daily metrics
+on:
+  push:
+    paths:
+      - '.github/workflows/basis-lag-aggregate.yml'
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Completed basis-lag-audit Actions run ID'
+        required: true
+        default: '43449191460'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read twelve completed historical day reports
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.source_run_id || '43449191460' }}
+          github-token: ${{ github.token }}
+          pattern: basis-lag-*
+          path: collected
+          merge-multiple: true
+      - name: Summarize native-BBO paired predictions using independent-day means
+        run: |
+          python scripts/summarize_basis_lag_audit.py --input-dir collected --output-dir reports/basis-lag
+          cat reports/basis-lag/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve complete daily result and report
+        uses: actions/upload-artifact@v4
+        with:
+          name: basis-lag-sixdate-paired-summary
+          path: reports/basis-lag/*
+          retention-days: 90
+          if-no-files-found: error
