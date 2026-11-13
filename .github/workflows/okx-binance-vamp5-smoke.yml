@@ -1,0 +1,74 @@
+name: Smoke OKX Binance five-level raw VAMP vs snapshot midpoint
+on:
+  push:
+    paths:
+      - '.github/workflows/okx-binance-vamp5-smoke.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        coin: ['BTC','SOL']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official matching engine
+        run: pip install hftbacktest==2.4.4
+      - name: Validate all existing and new quote formula regression tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_binance_snapshot5_vamp.py' -v
+          python -m unittest discover -s scripts -p 'test_defensive_one_sided_quotes.py' -v
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+      - name: Run 10min warmup plus 5min real snapshot5 clock against OKX official HBT
+        run: |
+          python scripts/run_multivenue_glft.py \
+            --exchange okx --coin ${{ matrix.coin }} --day 2026-10-01 \
+            --minutes 5 --binance-source snapshot_5 \
+            --extra-binance-delay-ms 2.5 \
+            --order-request-latency-ns 1000000 \
+            --order-response-latency-ns 1000000 \
+            --report-dir reports/smoke --no-recorder
+      - name: Verify independent causal basis and model outputs
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          coin="${{ matrix.coin }}"
+          path=Path(f"reports/smoke/okx_{coin}_2026-10-01_5m_snapshot5.json")
+          r=json.loads(path.read_text(encoding="utf-8"))
+          assert r["status"]=="complete",r.get("error",r["status"])
+          assert r["binance_signal_source"]=="snapshot_5"
+          assert r["binance_snapshot5"]["rows"]>0
+          assert set(r["variants"])=={
+              "glft","glft_binance_defensive_snapshot_mid",
+              "glft_binance_defensive_vamp5"}
+          assert r["same_side_min_action_interval_ns"]==20000000
+          assert r["extra_binance_delay_ms"]==2.5
+          assert r["order_request_latency_ns"]==1000000
+          assert r["order_response_latency_ns"]==1000000
+          for k,v in r["variants"].items():
+              t=v["trading"]
+              assert t["fee_usdt"]>=0.
+              print("TEST",coin,k,"NET",t["end_net_marked_equity_usdt"],
+                    "FEES",t["fee_usdt"],"FILLS",t["engine_fills"],
+                    "CANCELS",t["cancel_requests"])
+          print("SNAP",coin,r["binance_snapshot5"]["rows"],
+                "MIN",r["binance_snapshot5"]["raw_vamp_minus_mid_min_usdt"],
+                "MAX",r["binance_snapshot5"]["raw_vamp_minus_mid_max_usdt"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: okx-vamp5-smoke-${{ matrix.coin }}
+          path: reports/smoke/*
+          retention-days: 90
+          if-no-files-found: warn
