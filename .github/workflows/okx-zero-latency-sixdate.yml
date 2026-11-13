@@ -1,0 +1,135 @@
+name: Repaired GLFT OKX BTC SOL paired exact zero vs 2p5ms latency
+on:
+  push:
+    paths:
+      - '.github/workflows/okx-zero-latency-sixdate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+        coin: ['BTC','SOL']
+        profile: ['zero','legacy_latency']
+    env:
+      DAY: ${{ matrix.day }}
+      COIN: ${{ matrix.coin }}
+      PROFILE: ${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT engine (pinned)
+        run: pip install hftbacktest==2.4.4
+      - name: Verify repaired signal, source-clock, zero timing and unit regressions
+        run: |
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_check_okx_hft_data.py' -v
+      - name: Run official event-driven HBT for 50min plus 10min warmup with Recorder
+        run: |
+          if [ "$PROFILE" = "zero" ]; then
+            DELAY=0
+            REQUEST_NS=0
+            RESPONSE_NS=0
+          else
+            DELAY=2.5
+            REQUEST_NS=1000000
+            RESPONSE_NS=1000000
+          fi
+          python scripts/run_multivenue_glft.py --day "$DAY" \
+            --exchange okx --coin "$COIN" --minutes 50 \
+            --extra-binance-delay-ms "$DELAY" \
+            --order-request-latency-ns "$REQUEST_NS" \
+            --order-response-latency-ns "$RESPONSE_NS"
+      - name: Check scenario, fees, and four Recorder files or calibration absence
+        run: |
+          python - <<'PY'
+          import json,os
+          from pathlib import Path
+          import numpy as np
+          day,coin,profile=[os.environ[k] for k in ("DAY","COIN","PROFILE")]
+          path=Path(f"reports/okx_{coin}_{day}_50m.json")
+          data=json.loads(path.read_text())
+          latency=(0,0,0) if profile=="zero" else (2.5,1_000_000,1_000_000)
+          assert (data["extra_binance_delay_ms"],data["order_request_latency_ns"],
+                  data["order_response_latency_ns"])==latency
+          assert data["same_side_min_action_interval_ns"]==20_000_000
+          assert data["market"]["exchange"]=="okex-swap"
+          assert data["market"]["maker_fee"]==.0002
+          assert data["market"]["taker_fee"]==.0005
+          assert data["status"] in ("complete","no_glft_calibration"),data
+          if data["status"]=="complete":
+              assert len(data["variants"])==4
+              for name,v in data["variants"].items():
+                  t=v["trading"]
+                  assert t["fee_usdt"]>=0
+                  with np.load(v["recorder"]["file"]) as archive:
+                      assert len(archive["0"])>=29_000
+                  with np.load(v["recorder"]["fill_file"]) as archive:
+                      assert len(archive["exec_qty"])==t["engine_fills"]
+                  print("RESULT",day,coin,profile,name,
+                        "GROSS",t["end_net_marked_equity_usdt"]+t["fee_usdt"],
+                        "FEE",t["fee_usdt"],"NET",t["end_net_marked_equity_usdt"],
+                        "FILLS",t["engine_fills"],"CANCEL",t["cancel_requests"],
+                        "SUBMIT",t["submissions"])
+          else:
+              assert not data["calibration_diagnostic"]["valid"]
+              print("NO_CALIBRATION",day,coin,profile)
+          out=Path("cases")/profile/coin
+          out.mkdir(parents=True,exist_ok=True)
+          (out/f"{day}.json").write_text(path.read_text())
+          if data["status"]=="complete":
+              from shutil import copy2
+              target=Path("cases_recorder")/profile/coin/day
+              target.mkdir(parents=True,exist_ok=True)
+              for model,item in data["variants"].items():
+                  copy2(item["recorder"]["file"],target/f"{model}.npz")
+                  copy2(item["recorder"]["fill_file"],target/f"{model}_fills.npz")
+          PY
+      - name: Preserve original HBT case JSON and Recorder/fills
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-scenario-${{ matrix.coin }}-${{ matrix.day }}-${{ matrix.profile }}
+          path: |
+            cases/
+            cases_recorder/
+            reports/okx_${{ matrix.coin }}_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    needs: scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Restore all 24 50min case records and recorder artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: okx-scenario-*
+          path: gathered
+          merge-multiple: true
+      - name: Compare daily paired β1−β0 and delay scenario effect
+        run: |
+          python scripts/summarize_okx_zero_latency.py \
+            --source gathered --out reports/zero_latency_compare
+          cat reports/zero_latency_compare/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve audited tables and daily records
+        uses: actions/upload-artifact@v4
+        with:
+          name: repaired-okx-zero-vs-2p5ms-glft-6date-summary
+          path: reports/zero_latency_compare/*
+          if-no-files-found: error
+          retention-days: 90
