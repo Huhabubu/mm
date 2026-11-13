@@ -16,6 +16,7 @@ import numpy as np
 
 from check_okx_hft_data import SCHEMAS, extract_window, require_unshifted_target_clock
 from cross_venue_event_probe import read_binance_bbo, visible_timestamps
+from binance_snapshot5_vamp import read_binance_snapshot5
 from g0_glft_event_driven import run_event_glft, summarize
 from run_beta_one_direct_gap import (
     NS, causal_60s_basis, quote_gap_coverage, read_local_bbo,
@@ -154,12 +155,17 @@ def validate_record(rec, summary):
 
 def run(day, exchange, coin, minutes=50, delay_ms=2.5,
         report_dir="reports", capture_recorder=True,
-        request_latency_ns=1_000_000, response_latency_ns=1_000_000):
+        request_latency_ns=1_000_000, response_latency_ns=1_000_000,
+        binance_source="book_ticker"):
     from hftbacktest import Recorder, ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
 
     spec = MARKETS[(exchange, coin)]
+    if binance_source not in ("book_ticker", "snapshot_5"):
+        raise ValueError("Unknown Binance signal source")
+    if binance_source == "snapshot_5" and exchange != "okx":
+        raise ValueError("Binance VAMP5 experiment limited to OKX")
     if not math.isfinite(delay_ms) or delay_ms < 0:
         raise ValueError("Extra Binance delay must be nonnegative and finite")
     if (not isinstance(request_latency_ns, int) or
@@ -176,6 +182,8 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
     report_path = Path(report_dir)
     report_path.mkdir(parents=True, exist_ok=True)
     label = f"{exchange}_{coin}_{day}_{minutes}m"
+    if binance_source == "snapshot_5":
+        label += "_snapshot5"
     recorder_dir = report_path/"recorder"/label
     if capture_recorder:
         recorder_dir.mkdir(parents=True, exist_ok=True)
@@ -186,10 +194,15 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
               "order_request_latency_ns":request_latency_ns,
               "order_response_latency_ns":response_latency_ns,
               "same_side_min_action_interval_ns":20_000_000,
-              "model_versions":["glft", "glft_binance", "glft_local_peak",
-                                "glft_binance_local_peak",
-                                "glft_binance_defensive",
-                                "glft_binance_defensive_local_peak"],
+              "binance_signal_source":binance_source,
+              "model_versions":(
+                  ["glft", "glft_binance_defensive_snapshot_mid",
+                   "glft_binance_defensive_vamp5"]
+                  if binance_source == "snapshot_5" else
+                  ["glft", "glft_binance", "glft_local_peak",
+                   "glft_binance_local_peak",
+                   "glft_binance_defensive",
+                   "glft_binance_defensive_local_peak"]),
               "defensive_alpha":0.0,"defensive_beta":1.0,
               "preexisting_history_explored":True,
               "net_equity_is_mark_to_mid_after_fees":True,
@@ -217,15 +230,36 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
             n_events = len(events)
             del events
             ot, om = read_local_bbo(paths["book_ticker"])
-            bt_local, bm = read_binance_bbo(day, end_us, symbol=coin+"USDT")
+            extra_signals = {}
+            if binance_source == "snapshot_5":
+                bt_local, bm, vamp5, snap_audit = read_binance_snapshot5(
+                    day, end_us, symbol=coin+"USDT")
+                extra_signals["vamp5"] = vamp5
+                report["binance_snapshot5"] = snap_audit
+            else:
+                bt_local, bm = read_binance_bbo(day, end_us, symbol=coin+"USDT")
             bt = visible_timestamps(bt_local, delay_ms)
             basis_ts, basis = causal_60s_basis(ot, om, bt, bm)
             if not np.any(np.isfinite(basis)):
                 raise RuntimeError("No valid causal 60s Binance-target basis")
+            extra_bases = {}
+            if binance_source == "snapshot_5":
+                vamp_ts, vamp_baseline = causal_60s_basis(
+                    ot, om, bt, extra_signals["vamp5"])
+                if not np.array_equal(vamp_ts, basis_ts):
+                    raise RuntimeError("VAMP5 and snapshot-mid basis calendars differ")
+                if not np.any(np.isfinite(vamp_baseline)):
+                    raise RuntimeError("No valid causal VAMP5 60s basis")
+                extra_bases["vamp5"] = vamp_baseline
             first_trade_ns = start_us*1000+600*NS
             last_trade_ns = first_trade_ns+minutes*60*NS
             audit=quote_gap_coverage(ot,om,bt,bm,basis_ts,basis,
                                      first_trade_ns,last_trade_ns,tick_size=spec.tick)
+            if binance_source == "snapshot_5":
+                report["vamp5_signal_coverage"] = quote_gap_coverage(
+                    ot, om, bt, extra_signals["vamp5"], basis_ts,
+                    extra_bases["vamp5"], first_trade_ns, last_trade_ns,
+                    tick_size=spec.tick)
             pretrade = om[ot < first_trade_ns]
             if not len(pretrade):
                 raise RuntimeError("Missing pretrade target venue midpoint")
@@ -235,28 +269,41 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
                            "signal_rows":len(bt), "signal_coverage":audit,
                            "scenario":scenario, "variants":{}})
 
-            for label_model,beta,peak,quote_mode in (
-                ("glft",0.0,0,0),("glft_binance",1.0,0,0),
-                ("glft_local_peak",0.0,MAX_WALL_TICKS,0),
-                ("glft_binance_local_peak",1.0,MAX_WALL_TICKS,0),
-                ("glft_binance_defensive",1.0,0,1),
-                ("glft_binance_defensive_local_peak",1.0,MAX_WALL_TICKS,1)):
+            if binance_source == "snapshot_5":
+                model_specs = (
+                    ("glft",0.0,0,0,"mid"),
+                    ("glft_binance_defensive_snapshot_mid",1.0,0,1,"mid"),
+                    ("glft_binance_defensive_vamp5",1.0,0,1,"vamp5"),
+                )
+            else:
+                model_specs = (
+                    ("glft",0.0,0,0,"mid"),("glft_binance",1.0,0,0,"mid"),
+                    ("glft_local_peak",0.0,MAX_WALL_TICKS,0,"mid"),
+                    ("glft_binance_local_peak",1.0,MAX_WALL_TICKS,0,"mid"),
+                    ("glft_binance_defensive",1.0,0,1,"mid"),
+                    ("glft_binance_defensive_local_peak",1.0,MAX_WALL_TICKS,1,"mid"),
+                )
+            for label_model,beta,peak,quote_mode,price_kind in model_specs:
                 engine = ROIVectorMarketDepthBacktest([build_asset(
                     output, low, high, spec,
                     request_latency_ns=request_latency_ns,
                     response_latency_ns=response_latency_ns)])
                 rec = Recorder(engine.num_assets, minutes*600+10) if capture_recorder else None
                 try:
+                    signal_prices = (extra_signals["vamp5"]
+                                     if price_kind == "vamp5" else bm)
+                    signal_basis = (extra_bases["vamp5"]
+                                    if price_kind == "vamp5" else basis)
                     raw=run_event_glft(
-                        engine,bt,bm,minutes*600,
+                        engine,bt,signal_prices,minutes*600,
                         True,scenario["gamma_code"],True,beta,
-                        ot,om,basis_ts,basis,
+                        ot,om,basis_ts,signal_basis,
                         0.0,0.0,10.0,250_000_000,0.0,None,
                         peak,spec.tick,spec.ctval,
                         scenario["order_qty"],scenario["position_cap"],
                         rec.recorder if rec else None, quote_mode)
                     if int(raw[5]) != 1:
-                        # Fail closed. All six variants share the same market-only
+                        # Fail closed. All variants share the same market-only
                         # calibration; there is no valid GLFT quote to trade.
                         report["status"] = "no_glft_calibration"
                         report["calibration_attempts"] = int(raw[2])
@@ -270,6 +317,7 @@ def run(day, exchange, coin, minutes=50, delay_ms=2.5,
                                         scenario["position_cap"],scenario["order_qty"])
                     summary["quote_mode"] = ("defensive_one_sided_alpha0"
                                              if quote_mode == 1 else "symmetric")
+                    summary["signal_price_kind"] = price_kind
                     if capture_recorder:
                         records=rec.get(0)
                         validate_record(records,summary)
@@ -328,12 +376,15 @@ def main():
     p.add_argument("--order-response-latency-ns",type=int,default=1_000_000)
     p.add_argument("--report-dir",default="reports")
     p.add_argument("--no-recorder",action="store_true")
+    p.add_argument("--binance-source",choices=("book_ticker","snapshot_5"),
+                   default="book_ticker")
     args=p.parse_args()
     if datetime.strptime(args.day,"%Y-%m-%d").day != 1:
         p.error("Tardis free day must be first day of the month")
     run(args.day,args.exchange,args.coin,args.minutes,
         args.extra_binance_delay_ms,args.report_dir,not args.no_recorder,
-        args.order_request_latency_ns,args.order_response_latency_ns)
+        args.order_request_latency_ns,args.order_response_latency_ns,
+        args.binance_source)
 
 
 if __name__ == "__main__":
