@@ -1,0 +1,66 @@
+name: Smoke repaired GLFT one-sided defensive signal quotes
+on:
+  push:
+    paths:
+      - '.github/workflows/defensive-one-sided-smoke.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        coin: [BTC, SOL]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official HBT
+        run: pip install hftbacktest==2.4.4
+      - name: Recheck existing repairs and protective-side sign conventions
+        run: |
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_defensive_one_sided_quotes.py' -v
+      - name: Run 5min official HBT, six models, after 10min warmup
+        run: |
+          python scripts/run_multivenue_glft.py --exchange okx \
+            --coin ${{ matrix.coin }} --day 2026-10-01 --minutes 5 \
+            --extra-binance-delay-ms 2.5 \
+            --order-request-latency-ns 1000000 \
+            --order-response-latency-ns 1000000 \
+            --report-dir reports/defensive_smoke --no-recorder
+      - name: Compare untouched GLFT and defensive official HBT fills
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          coin="${{ matrix.coin }}"
+          r=json.loads((Path("reports/defensive_smoke") /
+                        f"okx_{coin}_2026-10-01_5m.json").read_text())
+          assert r["status"]=="complete",r
+          assert len(r["variants"])==6
+          assert r["defensive_alpha"]==0 and r["defensive_beta"]==1
+          assert r["extra_binance_delay_ms"]==2.5
+          assert r["order_request_latency_ns"]==1000000
+          assert r["order_response_latency_ns"]==1000000
+          baseline=r["variants"]["glft"]["calibration_trace"]
+          for name,part in r["variants"].items():
+              assert part["calibration_trace"]==baseline
+              t=part["trading"]
+              assert t["fee_usdt"]>=0
+              print("SMOKE",coin,name,"NET",t["end_net_marked_equity_usdt"],
+                    "FEE",t["fee_usdt"],"FILL",t["engine_fills"],
+                    "CANCEL",t["cancel_requests"])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: defensive-smoke-${{ matrix.coin }}
+          path: reports/defensive_smoke/*.json
+          retention-days: 90
+          if-no-files-found: error
