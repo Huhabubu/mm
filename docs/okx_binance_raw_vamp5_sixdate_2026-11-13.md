@@ -1,14 +1,14 @@
 # Binance原始五档VAMP指导OKX防御型做市：修复后配对实验（2026-11-13）
 
-**已完成、可以复现**。代码从已修复P0报价中心/单边防御分支 \`experiment/defensive-one-sided-20261113\` 的 \`9e2bba0a8e71a80e40ed4fcf7e25617299579dbf\` 派生至独立分支 \`experiment/okx-binance-vamp5-20261113\`，未修改\`main\`。保留原GLFT拟合、库存约束、maker/taker费用和官方HBT队列成交机制。
+**已完成、可以复现**。代码从已修复P0报价中心/单边防御分支 `experiment/defensive-one-sided-20261113` 的 `9e2bba0a8e71a80e40ed4fcf7e25617299579dbf` 派生至独立分支 `experiment/okx-binance-vamp5-20261113`，未修改`main`。保留原GLFT拟合、库存约束、maker/taker费用和官方HBT队列成交机制。
 
 - [原始五档数据与一档中间价两个5min OKX真实历史短测 #43384084009](https://github.com/Huhabubu/mm/actions/runs/43384084009)：BTC/SOL 2/2成功，包含单元测试、严格原始五档VAMP（未截断、未夹紧）的源码检验。
-- [6日期×BTC/SOL=12场景，10min预热+50min官方HBT完整回测 #43384418239](https://github.com/Huhabubu/mm/actions/runs/43384418239)：**12/12场景成功，汇总通过**；逐日期原始JSON、官方Recorder/逐笔fill NPZ和归档\`okx-binance-five-level-vamp5-sixdate-summary\`（含报告、summary.json、daily.csv）均在该Actions产物中。
+- [6日期×BTC/SOL=12场景，10min预热+50min官方HBT完整回测 #43384418239](https://github.com/Huhabubu/mm/actions/runs/43384418239)：**12/12场景成功，汇总通过**；逐日期原始JSON、官方Recorder/逐笔fill NPZ和归档`okx-binance-five-level-vamp5-sixdate-summary`（含报告、summary.json、daily.csv）均在该Actions产物中。
 - 交易时窗为2026-06-01至2026-11-01每月1日UTC00:10—01:00。OKX BTC-USDT-SWAP和SOL-USDT-SWAP，BTC 6/6可辨识GLFT，SOL仅6/1及10/1两日可辨识，4个缺失日期保持缺失，**不填0收益**。
 
 ## 1. 五档信号的定义和因果时钟
 
-数据：Tardis \`binance-futures/book_snapshot_5\`，CSV每行依次包含\`asks[0..4].price/amount\`、\`bids[0..4].price/amount\`、\`local_timestamp\`，先验证5档双侧价格严格排序、数量大于0、盘口未交叉、时间不下降，数据不足即失败。Tardis多档快照来自L2重建，它与原生\`book_ticker\`是不同采集频道。
+数据：Tardis `binance-futures/book_snapshot_5`，CSV每行依次包含`asks[0..4].price/amount`、`bids[0..4].price/amount`、`local_timestamp`，先验证5档双侧价格严格排序、数量大于0、盘口未交叉、时间不下降，数据不足即失败。Tardis多档快照来自L2重建，它与原生`book_ticker`是不同采集频道。
 
 五档原始交叉数量加权价格，单位 USDT/币：
 
@@ -18,11 +18,11 @@ P_t^{VAMP5}
 {\sum_{i=1}^{5}(Q_{t,i}^{b}+Q_{t,i}^{a})}.
 \]
 
-其中\`i\`为自最优价起1—5档，\`P^a/P^b\`为卖/买挂单价格（USDT/币），\`Q^a/Q^b\`为相应挂单数量（币）。原始VAMP5允许超出最优买卖价界，不进行截断、距离衰减或上下限夹紧。对照价格为**同一份五档快照**的第一档买卖价格算术均值 \`(ask[0]+bid[0])/2\`。两个模型共用**相同完整五档snapshot事件时钟及2.5ms+1ns可见延迟**，两模型各自严格按照过去60s可见跨所价差重估因果基差；策略GLFT和信号G使用同一份修复后当前HBT目标盘口中间价。
+其中`i`为自最优价起1—5档，`P^a/P^b`为卖/买挂单价格（USDT/币），`Q^a/Q^b`为相应挂单数量（币）。原始VAMP5允许超出最优买卖价界，不进行截断、距离衰减或上下限夹紧。对照价格为**同一份五档快照**的第一档买卖价格算术均值 `(ask[0]+bid[0])/2`。两个模型共用**相同完整五档snapshot事件时钟及2.5ms+1ns可见延迟**，两模型各自严格按照过去60s可见跨所价差重估因果基差；策略GLFT和信号G使用同一份修复后当前HBT目标盘口中间价。
 
-**旧模型**使用Binance原生\`book_ticker\` BBO触发，和新多档来源的事件次数不同；**新实验内部**五档普通中间价 vs VAMP5的差异才隔离了加权方式，不能把新VAMP5和旧\`book_ticker\`版本的收益差全部归为数量信息。
+**旧模型**使用Binance原生`book_ticker` BBO触发，和新多档来源的事件次数不同；**新实验内部**五档普通中间价 vs VAMP5的差异才隔离了加权方式，不能把新VAMP5和旧`book_ticker`版本的收益差全部归为数量信息。
 
-两种外部信号均应用相同方案B防御性报价（\`alpha=0\`、\`beta=1\`）：G>0仅抬卖价，G<0仅压买价，另一侧维持GLFT。OKX订单请求/回报各1ms，同侧动作门槛20ms，Maker2bps/Taker5bps模拟费用，官方hftbacktest 2.4.4，时间戳因果处理与目标L2/trades/BBO不变。
+两种外部信号均应用相同方案B防御性报价（`alpha=0`、`beta=1`）：G>0仅抬卖价，G<0仅压买价，另一侧维持GLFT。OKX订单请求/回报各1ms，同侧动作门槛20ms，Maker2bps/Taker5bps模拟费用，官方hftbacktest 2.4.4，时间戳因果处理与目标L2/trades/BBO不变。
 
 ## 2. 主要结果，USDT/有效日期50min，**全部含手续费**
 
@@ -40,8 +40,8 @@ P_t^{VAMP5}
 | OKX BTC | 128.67 | 121.17 | 2.083443 | 1.959853 | +0.005718 | +0.129308 |
 | OKX SOL | 98.00 | 83.00 | 1.573458 | 1.332679 | +0.104850 | +0.345629 |
 
-- BTC：\`+0.123590/0.129308≈95.6%\` 的净改善可由**手续费下降**解释。额外毛收益基本为零。
-- SOL：\`+0.240779/0.345629≈69.7%\` 的净改善来自手续费下降，其余约30.3%来自毛持仓/成交损益变化。
+- BTC：`+0.123590/0.129308≈95.6%` 的净改善可由**手续费下降**解释。额外毛收益基本为零。
+- SOL：`+0.240779/0.345629≈69.7%` 的净改善来自手续费下降，其余约30.3%来自毛持仓/成交损益变化。
 - 因成交减少，不能据此确定VAMP5准确避开逆向选择，下一步仍需要相同成交额、持仓风险的无信号控制。
 
 ## 4. 每日期增量（VAMP−同源普通中间价，净收益USDT/50min）
@@ -61,4 +61,4 @@ P_t^{VAMP5}
 2. 样本是6个月首日各50min，OKX SOL两天有效；尚无独立样本外、真正全天延迟检验和统计显著性证据。Tardis采集时间不等于各交易所真实撮合时刻。
 3. 费用始终计入净收益，未计资金费率、期末真实强制平仓滑点及交易所真实请求限频。底层HBT的no-partial-fill/概率排队机制仍可能影响实盘可行性。
 4. **本轮不涉及 Bitget、不做预测模型、不调节β/α、不对深档大单降权或截断**。
-5. 源代码：\`scripts/binance_snapshot5_vamp.py\` 原始5档Tardis解析；\`scripts/run_multivenue_glft.py --binance-source snapshot_5\` 仅在OKX使用；\`scripts/test_binance_snapshot5_vamp.py\` 单元测试；\`scripts/summarize_okx_binance_vamp5.py\` 每日等权聚合。原本默认\`--binance-source book_ticker\`路径保持不变。
+5. 源代码：`scripts/binance_snapshot5_vamp.py` 原始5档Tardis解析；`scripts/run_multivenue_glft.py --binance-source snapshot_5` 仅在OKX使用；`scripts/test_binance_snapshot5_vamp.py` 单元测试；`scripts/summarize_okx_binance_vamp5.py` 每日等权聚合。原本默认`--binance-source book_ticker`路径保持不变。
