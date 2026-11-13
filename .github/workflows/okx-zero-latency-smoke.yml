@@ -1,0 +1,62 @@
+name: Smoke repaired GLFT with exactly zero Binance and OKX order latency
+on:
+  push:
+    paths:
+      - '.github/workflows/okx-zero-latency-smoke.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        coin: [BTC, SOL]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned official hftbacktest
+        run: pip install hftbacktest==2.4.4
+      - name: Verify repaired signals, feed clock and zero latency injection
+        run: |
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+          python -m unittest discover -s scripts -p 'test_check_okx_hft_data.py' -v
+      - name: Official HBT 10min warmup plus 5min zero-latency trial
+        run: |
+          python scripts/run_multivenue_glft.py \
+            --day 2026-10-01 --exchange okx --coin ${{ matrix.coin }} \
+            --minutes 5 --extra-binance-delay-ms 0 \
+            --order-request-latency-ns 0 --order-response-latency-ns 0 \
+            --report-dir reports/zero_smoke --no-recorder
+      - name: Assert recorded true zero timings and checked financial ledger
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          coin="${{ matrix.coin }}"
+          r=json.loads((Path("reports/zero_smoke")/f"okx_{coin}_2026-10-01_5m.json").read_text())
+          assert r["extra_binance_delay_ms"]==0
+          assert r["order_request_latency_ns"]==0
+          assert r["order_response_latency_ns"]==0
+          assert r["same_side_min_action_interval_ns"]==20_000_000
+          assert r["status"]=="complete",r
+          assert len(r["variants"])==4
+          for model,item in r["variants"].items():
+              x=item["trading"]
+              gross=x["end_net_marked_equity_usdt"]+x["fee_usdt"]
+              assert x["fee_usdt"]>=0
+              print("SMOKE",coin,model,"GROSS",gross,"FEE",x["fee_usdt"],"NET",x["end_net_marked_equity_usdt"],"FILLS",x["engine_fills"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: okx-zero-latency-smoke-${{ matrix.coin }}
+          path: reports/zero_smoke/*.json
+          if-no-files-found: warn
+          retention-days: 90
