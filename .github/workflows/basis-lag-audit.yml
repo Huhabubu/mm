@@ -1,0 +1,48 @@
+name: Audit 60s causal cross-venue basis lag
+on:
+  push:
+    paths:
+      - '.github/workflows/basis-lag-audit.yml'
+  workflow_dispatch:
+    inputs:
+      delay_ms:
+        description: 'Additional Binance quote visibility delay in milliseconds'
+        type: choice
+        options: ['2.5', '25']
+        default: '2.5'
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        coin: ['BTC', 'SOL']
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned replay dependency
+        run: python -m pip install hftbacktest==2.4.4
+      - name: Verify basis and future-label isolation
+        run: python -m unittest discover -s scripts -p 'test_audit_cross_venue_basis_lag.py' -v
+      - name: Compare causal 60s, 300s and raw gap using native BBO
+        env:
+          COIN: ${{ matrix.coin }}
+          DAY: ${{ matrix.day }}
+          DELAY: ${{ inputs.delay_ms || '2.5' }}
+        run: |
+          python scripts/audit_cross_venue_basis_lag.py --day "$DAY" --coin "$COIN" --extra-binance-delay-ms "$DELAY"
+      - name: Save non-trade aggregate JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: basis-lag-${{ matrix.coin }}-${{ matrix.day }}
+          path: reports/basis_lag_audit/*.json
+          if-no-files-found: warn
+          retention-days: 90
