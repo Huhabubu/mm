@@ -40,6 +40,34 @@ class CrossMarketScaleTests(unittest.TestCase):
         self.assertAlmostEqual(order_scenario(MARKETS[("bitget","BTC")],77500)
                                ["order_qty"],.001,places=7)
 
+    def test_true_zero_binance_visibility_keeps_exact_timestamp(self):
+        clock = np.array([1_000_000_000, 1_000_000_000,
+                          1_000_001_000], dtype=np.int64)
+        np.testing.assert_array_equal(
+            visible_timestamps(clock, extra_delay_ms=0.0), clock)
+        # Existing positive-delay behavior remains unchanged.
+        np.testing.assert_array_equal(
+            visible_timestamps(clock, extra_delay_ms=1.0)-clock,
+            np.full(3, 1_000_001, dtype=np.int64))
+
+    def test_zero_order_request_response_latency_reaches_official_asset(self):
+        from unittest.mock import patch
+        from run_multivenue_glft import build_asset
+
+        with patch("hftbacktest.BacktestAsset") as asset_type:
+            asset=asset_type.return_value
+            # BacktestAsset fluent methods are mock objects; verify the
+            # boundary call to official HBT rather than a custom matcher.
+            build_asset("dummy.npz", 90.0, 100.0,
+                        MARKETS[("okx", "SOL")],
+                        request_latency_ns=0,response_latency_ns=0)
+            asset.data.return_value.linear_asset.return_value.                constant_order_latency.assert_called_once_with(0,0)
+
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            build_asset("dummy.npz", 90.0, 100.0,
+                        MARKETS[("okx", "SOL")],
+                        request_latency_ns=-1,response_latency_ns=0)
+
     def test_fractional_2_5ms_binance_delay_is_exact(self):
         clock = np.array([1_000_000_000, 1_000_000_000], dtype=np.int64)
         actual = visible_timestamps(clock, extra_delay_ms=2.5)
