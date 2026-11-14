@@ -1,0 +1,42 @@
+name: Research V5 BTC 0-vs-2p5ms lag and strong P80 single-day boundary
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v5-btc-boundary.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: BTC hypothetical zero vs extra 2.5ms, strong P80 source-only candidates
+        run: |
+          python scripts/experiment_source_defense_v5_btc_boundary.py \
+            --out reports/source_defense/v5_btc_boundary
+          cat reports/source_defense/v5_btc_boundary/btc_latency_boundary.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit summary only to branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v5_btc_boundary/btc_latency_boundary.json \
+                     reports/source_defense/v5_btc_boundary/btc_latency_boundary.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'research(data): BTC same-day source visibility extra 0 vs 2.5ms and high P80 ablation'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-defense-v5-btc-boundary-result
+          path: reports/source_defense/v5_btc_boundary/*
+          if-no-files-found: warn
+          retention-days: 90
