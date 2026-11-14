@@ -4,7 +4,9 @@ import numpy as np
 from experiment_source_defense_v6_mechanism import (
     clamp_shift, asof_direct, asof_urgent_tail, groups)
 from experiment_source_defense_v6_clock_microprice import (
-    distribution, microprice, next_same_direction_follow_us)
+    distribution, microprice, next_same_direction_follow_us,
+    signed_nearest_same_direction_ms)
+from experiment_source_defense_v6_matched_exposure import schedule_pair
 
 
 class MechanismInvariants(unittest.TestCase):
@@ -45,6 +47,27 @@ class MechanismInvariants(unittest.TestCase):
                      np.array([2.,1.]),
                      np.array([1.,2.]))
         np.testing.assert_allclose(p,[101+1./3,100+2./3])
+
+    def test_strict_retained_schedule_exposure_count_and_duration(self):
+        t=1_000_000_000
+        src,sh,m=schedule_pair(
+            np.array([10,250],np.int64)*t,
+            np.array([15,255],np.int64)*t,
+            np.array([1,-1]),300*t)
+        self.assertEqual(m["retained_episode_count"],1)
+        self.assertEqual(m["retained_source_active_ns"],m["shifted_active_ns"])
+        self.assertTrue(m["same_episode_count"])
+        self.assertTrue(m["same_total_scheduled_duration"])
+        self.assertEqual(sh[0][0]-src[0][0],60*t)
+
+    def test_signed_clock_nearest_includes_target_before_binance(self):
+        result=signed_nearest_same_direction_ms(
+            (np.array([1000,3000],np.int64),np.array([1,1],np.int8)),
+            (np.array([900,3150],np.int64),np.array([1,1],np.int8)))
+        self.assertEqual(result["n"],2)
+        self.assertEqual(result["binance_before_target_fraction_of_matched"],.5)
+        self.assertEqual(result["binance_after_target_fraction_of_matched"],.5)
+        self.assertAlmostEqual(result["median_ms"],.025)
 
     def test_clock_delta_and_unmatched(self):
         c=distribution(np.array([-1.,0.,2.]))
