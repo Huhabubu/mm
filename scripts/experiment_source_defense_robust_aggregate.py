@@ -9,7 +9,7 @@ import json
 import math
 from pathlib import Path
 
-from experiment_source_defense_robust_fit import chronological_reliability
+from experiment_source_defense_robust_fit import research_fit
 from g0_glft_rolling import glft_coefficients
 
 COINS=("SOL","DOGE","XRP","1000PEPE")
@@ -17,6 +17,37 @@ VENUES=("okex-swap","bitget-futures")
 DAYS=("2026-06-01","2026-07-01","2026-08-01",
       "2026-09-01","2026-10-01","2026-11-01")
 
+
+
+def accepted_chronological_fits(rows,field,variant):
+    """Only an already quote-valid earlier UTC day may supply the next prior."""
+    history_k=None
+    prior_date=None
+    out={}
+    for r in sorted(rows,key=lambda z:z["day"]):
+        day=r["day"]
+        fit=research_fit(r[field],prior_k=history_k)
+        fit["day"]=day
+        fit["variant"]=variant
+        fit["prior_source_day"]=(prior_date if fit.get("causal_prior_used")
+                                  else None)
+        if fit["valid"]:
+            q=r["order_notional_scenario"]
+            half,skew=glft_coefficients(
+                fit["A_per_s"],fit["k_per_tick"],
+                fit["sigma_tick_per_sqrt_s"],
+                q["gamma_code"],q["order_qty"])
+            fit["half_spread_ticks"]=float(half)
+            fit["inventory_skew_ticks_per_contract"]=float(skew)
+            if not (math.isfinite(half) and math.isfinite(skew) and
+                    0<half<=5000 and skew>0):
+                fit["valid"]=False
+                fit["reason"]="invalid_or_extreme_glft_quote_after_research_fit"
+        if fit["valid"]:
+            history_k=fit["k_per_tick"]
+            prior_date=day
+        out[day]=fit
+    return out
 
 def produce(cases,pepe_checks):
     indexed={}
@@ -43,10 +74,8 @@ def produce(cases,pepe_checks):
         group=f"{coin}_{venue}"
         subset=[indexed.get((coin,venue,d)) for d in DAYS]
         valid_rows=[r for r in subset if r is not None and r["status"]=="stats_complete"]
-        stats10=[(r["day"],r["sufficient_stats_10min"]) for r in valid_rows]
-        stats20=[(r["day"],r["sufficient_stats_20min"]) for r in valid_rows]
-        fits10={x["day"]:x for x in chronological_reliability(stats10,"10min")}
-        fits20={x["day"]:x for x in chronological_reliability(stats20,"20min")}
+        fits10=accepted_chronological_fits(valid_rows,"sufficient_stats_10min","10min")
+        fits20=accepted_chronological_fits(valid_rows,"sufficient_stats_20min","20min")
         per_day=[]
         for day,r in zip(DAYS,subset):
             if r is None or r["status"]!="stats_complete":
@@ -59,19 +88,6 @@ def produce(cases,pepe_checks):
             o=r["original_10min_fit"]
             t=fits10[day]
             v=fits20[day]
-            scenario=r["order_notional_scenario"]
-            for which in (t,v):
-                if not which["valid"]:continue
-                half,skew=glft_coefficients(
-                  which["A_per_s"],which["k_per_tick"],
-                  which["sigma_tick_per_sqrt_s"],
-                  scenario["gamma_code"],scenario["order_qty"])
-                which["half_spread_ticks"]=float(half)
-                which["inventory_skew_ticks_per_contract"]=float(skew)
-                if not (math.isfinite(half) and math.isfinite(skew) and
-                        0<half<=5000 and skew>0):
-                    which["valid"]=False
-                    which["reason"]="invalid_or_extreme_glft_quote_after_research_fit"
             per_day.append({"day":day,"status":"stats_complete",
                             "original_valid":bool(o["valid"]),
                             "original_k":o["k"],"n_levels10":o["positive_levels"],
