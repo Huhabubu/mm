@@ -14,7 +14,7 @@ import math
 
 import numpy as np
 from numba import njit
-from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
+from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED, CANCELED
 
 from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TICK, TRAIN
 from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coefficients
@@ -170,6 +170,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    random_pause_seed=1,
                    random_pause_ask_probability=0.5,
                    capture_defense_episodes=False,
+                   capture_order_ack=False,
                    time_shift_starts_ns=None,
                    time_shift_ends_ns=None,
                    time_shift_sides=None):
@@ -313,6 +314,18 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     ep_side=np.empty(ep_capacity,np.int64)
     urgent_at=np.empty(ep_capacity,np.int64)
     urgent_side=np.empty(ep_capacity,np.int64)
+    # Optional order-level evidence: request -> simulated local cancel ACK.
+    # Order IDs are HBT price-derived, so exact cross-run attribution also
+    # requires matching original submit time, price, side and quantity.
+    urgent_oid=np.empty(ep_capacity,np.int64)
+    urgent_price_tick=np.empty(ep_capacity,np.int64)
+    urgent_qty=np.empty(ep_capacity,np.float64)
+    urgent_ack_ns=np.full(ep_capacity,-1,np.int64)
+    submit_capacity=max(2,trade_steps+10) if capture_order_ack else 2
+    submit_oid=np.empty(submit_capacity,np.int64)
+    submit_at_ns=np.empty(submit_capacity,np.int64)
+    submit_qty=np.empty(submit_capacity,np.float64)
+    n_submit=0
     n_ep = n_urgent=0
     open_ep_ns = -1
     last_defense_end_ns = t0 - defense_cooldown_ns
@@ -342,6 +355,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     fill_observed_ns = np.empty(fill_limit, np.int64)
     fill_exec_price = np.empty(fill_limit, np.float64)
     fill_exec_qty = np.empty(fill_limit, np.float64)
+    fill_oid=np.empty(fill_limit,np.int64)
     n_fills = 0
     # Optional read-only audit deadlines, never a trading signal/trigger.
     n_probes = 0
@@ -591,6 +605,14 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             it = orders.values()
             while it.has_next():
                 order = it.get()
+                if capture_order_ack and order.status == CANCELED:
+                    # CANCELED is the status observed after HBT has delivered
+                    # the cancellation response, not the request timestamp.
+                    # Last unmatched request for this ID wins (IDs may recur).
+                    for j in range(n_urgent-1,-1,-1):
+                        if urgent_oid[j]==order.order_id and urgent_ack_ns[j]<0 and now>=urgent_at[j]:
+                            urgent_ack_ns[j]=now
+                            break
                 if order.status == FILLED:
                     if n_fills >= fill_limit:
                         raise ValueError("Exceeded fill trace allocation")
@@ -599,6 +621,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     fill_observed_ns[n_fills] = now
                     fill_exec_price[n_fills] = order.exec_price
                     fill_exec_qty[n_fills] = order.exec_qty
+                    fill_oid[n_fills]=order.order_id
                     n_fills += 1
                     if order.side == BUY:
                         buy_fills += 1
@@ -833,6 +856,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                                     if n_urgent>=ep_capacity:raise ValueError("Urgent trace capacity")
                                     urgent_at[n_urgent]=now
                                     urgent_side[n_urgent]=-1
+                                    urgent_oid[n_urgent]=order.order_id
+                                    urgent_price_tick[n_urgent]=order.price_tick
+                                    urgent_qty[n_urgent]=order.qty
                                     n_urgent+=1
                             else:
                                 ordinary_bid_cancels += 1
@@ -852,6 +878,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                                     if n_urgent>=ep_capacity:raise ValueError("Urgent trace capacity")
                                     urgent_at[n_urgent]=now
                                     urgent_side[n_urgent]=1
+                                    urgent_oid[n_urgent]=order.order_id
+                                    urgent_price_tick[n_urgent]=order.price_tick
+                                    urgent_qty[n_urgent]=order.qty
                                     n_urgent+=1
                             else:
                                 ordinary_ask_cancels += 1
@@ -860,6 +889,12 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     now - bid_action >= MIN_REQUOTE_NS):
                 oid = int(want_bid) * 2
                 engine.submit_buy_order(0, oid, want_bid*tick_size, order_qty, GTX, LIMIT, False)
+                if capture_order_ack:
+                    if n_submit>=submit_capacity:raise ValueError("Order-submit trace capacity exceeded")
+                    submit_oid[n_submit]=oid
+                    submit_at_ns[n_submit]=now
+                    submit_qty[n_submit]=order_qty
+                    n_submit+=1
                 bid_action = now
                 submits += 1
                 sparse_bid_submit += 1
@@ -868,6 +903,12 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     now - ask_action >= MIN_REQUOTE_NS):
                 oid = int(want_ask) * 2 + 1
                 engine.submit_sell_order(0, oid, want_ask*tick_size, order_qty, GTX, LIMIT, False)
+                if capture_order_ack:
+                    if n_submit>=submit_capacity:raise ValueError("Order-submit trace capacity exceeded")
+                    submit_oid[n_submit]=oid
+                    submit_at_ns[n_submit]=now
+                    submit_qty[n_submit]=order_qty
+                    n_submit+=1
                 ask_action = now
                 submits += 1
                 sparse_ask_submit += 1
@@ -892,6 +933,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             fill_observed_ns[n_fills] = now
             fill_exec_price[n_fills] = order.exec_price
             fill_exec_qty[n_fills] = order.exec_qty
+            fill_oid[n_fills]=order.order_id
             n_fills += 1
             if order.side == BUY:
                 buy_fills += 1
@@ -937,7 +979,11 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                       defense_bid_episodes,defense_ask_episodes],
                      dtype=np.float64),
             (ep_start[:n_ep],ep_end[:n_ep],ep_side[:n_ep],
-             urgent_at[:n_urgent],urgent_side[:n_urgent]))
+             urgent_at[:n_urgent],urgent_side[:n_urgent]),
+            (fill_oid[:n_fills],urgent_oid[:n_urgent],
+             urgent_price_tick[:n_urgent],urgent_qty[:n_urgent],
+             urgent_ack_ns[:n_urgent],submit_oid[:n_submit],
+             submit_at_ns[:n_submit],submit_qty[:n_submit]))
 
 
 def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
