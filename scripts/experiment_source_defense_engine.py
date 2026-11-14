@@ -20,7 +20,10 @@ from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TIC
 from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coefficients
 from experiment_source_defense_signal import (
     defend_side_bps, widen_ticks_from_bps, next_defense_state,
+    adaptive_bps_gates, queue_shield_allows,
 )
+from experiment_source_defense_trade_flow import causal_taker_window
+from experiment_source_defense_robust_fit import fit_rolling_research_3level
 
 MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
@@ -150,7 +153,14 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    gap_gate_bps=0.5, impulse_gate_bps=0.2,
                    hysteresis_exit_th_bps=0.1, widen_bps=0.5,
                    defense_hold_ns=75_000_000,
-                   defense_cooldown_ns=75_000_000):
+                   defense_cooldown_ns=75_000_000,
+                   adaptive_z_gap=0., adaptive_z_imp=0.,
+                   use_queue_shield=False, queue_percentile=0.5,
+                   use_trade_flow=False, trade_visible_ns=None,
+                   trade_signed_prefix=None, trade_total_prefix=None,
+                   trade_min_notional_usdt=100., trade_signed_ratio=.35,
+                   train_steps=TRAIN, robust_fit=False,
+                   earlier_day_prior_k=np.nan):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -192,18 +202,47 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 not np.isfinite(widen_bps) or widen_bps<=0 or
                 defense_hold_ns<0 or defense_hold_ns>100_000_000):
             raise ValueError("Invalid sparse protection parameters")
+    if train_steps != TRAIN and train_steps != 12000:
+        raise ValueError("Research train_steps must be 10min or 20min")
+    if robust_fit and train_steps != 12000:
+        raise ValueError("Research 3-level live estimator requires 20min pretrade")
+    if (adaptive_z_gap<0 or adaptive_z_imp<0 or
+            (adaptive_z_gap>0)!=(adaptive_z_imp>0)):
+        raise ValueError("Adaptive z multipliers must be both positive or both zero")
+    if use_queue_shield and not (0.<queue_percentile<=.5):
+        raise ValueError("Queue Shield percentile must be P40/P50 or lower")
+    if use_trade_flow:
+        if (trade_visible_ns is None or trade_signed_prefix is None or
+                trade_total_prefix is None or
+                len(trade_signed_prefix)!=len(trade_visible_ns)+1 or
+                len(trade_total_prefix)!=len(trade_visible_ns)+1):
+            raise ValueError("Trade filter requires valid causal prefixed Binance trades")
+        if trade_signed_ratio<=0 or trade_signed_ratio>=1 or trade_min_notional_usdt<=0:
+            raise ValueError("Invalid Binance taker flow thresholds")
     if engine.elapse(0) != 0:
         raise ValueError("Cannot initialize OKX market replay")
     t0 = engine.current_timestamp
-    t_stop = t0 + (TRAIN + trade_steps) * STEP_NS
+    t_stop = t0 + (train_steps + trade_steps) * STEP_NS
     next_sample = t0 + STEP_NS
     sample_count = 0
     idx = 0
     while idx < len(binance_visible_ns) and binance_visible_ns[idx] < t0:
         idx += 1
 
-    arrivals = np.full(TRAIN, np.nan, np.float64)
-    changes = np.full(TRAIN, np.nan, np.float64)
+    arrivals = np.full(train_steps, np.nan, np.float64)
+    changes = np.full(train_steps, np.nan, np.float64)
+    # Warmup-only target 100ms mid returns and HBT best-side queue volumes.
+    warm_return_count = 0
+    warm_return_sum = warm_return_sq = 0.
+    warm_bid_qty = np.empty(train_steps, np.float64)
+    warm_ask_qty = np.empty(train_steps, np.float64)
+    n_warm_bid = n_warm_ask = 0
+    sigma_100ms_bps = np.nan
+    actual_gap_gate_bps = actual_impulse_gate_bps = np.nan
+    floor_gate_bps = np.nan
+    warm_p_bid = warm_p_ask = np.nan
+    shield_blocked = trades_blocked = 0
+    shield_accepted = trades_accepted = 0
     updates = np.full((1 + trade_steps // UPDATE_EVERY_STEPS + 2, 9), np.nan)
     n_updates = 0
     prev_mid = np.nan
@@ -298,7 +337,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         if now >= next_sample:
             if now != next_sample:
                 raise ValueError("Sample clock skipped an exact 100ms boundary")
-            slot = sample_count % TRAIN
+            slot = sample_count % train_steps
             furthest = -np.inf
             if np.isfinite(prev_mid):
                 for tr in engine.last_trades(0):
@@ -314,6 +353,24 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             if best_bid > 0 and best_ask > best_bid and best_ask < 1_000_000_000:
                 mid_tick = (best_bid + best_ask) / 2.0
                 changes[slot] = mid_tick - prev_mid if np.isfinite(prev_mid) else np.nan
+                if sample_count < train_steps:
+                    if np.isfinite(prev_mid) and prev_mid>0:
+                        rbps=10000.*(mid_tick-prev_mid)/prev_mid
+                        warm_return_count+=1
+                        warm_return_sum+=rbps
+                        warm_return_sq+=rbps*rbps
+                    bidx=best_bid-book.roi_lb_tick
+                    aidx=best_ask-book.roi_lb_tick
+                    if 0<=bidx<len(book.bid_depth):
+                        q=book.bid_depth[bidx]
+                        if np.isfinite(q) and q>0:
+                            warm_bid_qty[n_warm_bid]=q
+                            n_warm_bid+=1
+                    if 0<=aidx<len(book.ask_depth):
+                        q=book.ask_depth[aidx]
+                        if np.isfinite(q) and q>0:
+                            warm_ask_qty[n_warm_ask]=q
+                            n_warm_ask+=1
                 prev_mid = mid_tick
             else:
                 changes[slot] = np.nan
@@ -322,22 +379,45 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             sample_count += 1
             sample_event = True
             next_sample += STEP_NS
-            recalibrate = (sample_count == TRAIN or
-                           (rolling and sample_count > TRAIN and
-                            (sample_count - TRAIN) % UPDATE_EVERY_STEPS == 0))
+            recalibrate = (sample_count == train_steps or
+                           (rolling and sample_count > train_steps and
+                            (sample_count - train_steps) % UPDATE_EVERY_STEPS == 0))
+            if sample_count == train_steps:
+                if warm_return_count < train_steps//2:
+                    raise ValueError("Cannot estimate causal 100ms pretrade volatility")
+                avg=warm_return_sum/warm_return_count
+                sigma_100ms_bps=math.sqrt(max(0.,warm_return_sq/warm_return_count-avg*avg))
+                if adaptive_z_gap>0.:
+                    actual_gap_gate_bps,actual_impulse_gate_bps,floor_gate_bps=(
+                        adaptive_bps_gates(sigma_100ms_bps,
+                            mid_tick*tick_size,tick_size,
+                            adaptive_z_gap,adaptive_z_imp))
+                else:
+                    actual_gap_gate_bps=gap_gate_bps
+                    actual_impulse_gate_bps=impulse_gate_bps
+                    floor_gate_bps=max(.3,10000./mid_tick)
+                if use_queue_shield:
+                    if n_warm_bid<train_steps//2 or n_warm_ask<train_steps//2:
+                        raise ValueError("Insufficient causal HBT BBO quantities for Queue Shield")
+                    bid_sorted=np.sort(warm_bid_qty[:n_warm_bid])
+                    ask_sorted=np.sort(warm_ask_qty[:n_warm_ask])
+                    warm_p_bid=bid_sorted[int((n_warm_bid-1)*queue_percentile)]
+                    warm_p_ask=ask_sorted[int((n_warm_ask-1)*queue_percentile)]
             if recalibrate:
                 attempts += 1
                 valid, new_a, new_k, new_sigma, fit_levels, crossed, extreme = (
-                    fit_recent_arrivals(arrivals, changes))
+                    (fit_rolling_research_3level(arrivals, changes,
+                         earlier_day_prior_k) if robust_fit else
+                     fit_recent_arrivals(arrivals, changes)))
                 if valid:
                     new_half, new_skew = glft_coefficients(new_a, new_k, new_sigma, gamma_code, order_qty)
                     if np.isfinite(new_half) and np.isfinite(new_skew) and new_half > 0 and new_skew > 0:
                         a, k, sigma, half, skew = (
                             new_a, new_k, new_sigma, new_half, new_skew)
                         successes += 1
-                        if sample_count == TRAIN:
+                        if sample_count == train_steps:
                             initial_ok = 1
-                        updates[n_updates, 0] = (sample_count - TRAIN) * STEP_NS / 1e9
+                        updates[n_updates, 0] = (sample_count - train_steps) * STEP_NS / 1e9
                         updates[n_updates, 1] = a
                         updates[n_updates, 2] = k
                         updates[n_updates, 3] = sigma
@@ -353,7 +433,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     rejects += 1
 
             # For fair reporting, inventory/equity are still sampled every 100ms.
-            if sample_count > TRAIN:
+            if sample_count > train_steps:
                 book = engine.depth(0)
                 if book.best_bid_tick > 0 and book.best_ask_tick > book.best_bid_tick:
                     mid_price = (book.best_bid_tick + book.best_ask_tick) * tick_size / 2
@@ -406,7 +486,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 probe_rows[probe_idx, 6] = engine.position(0)
                 probe_idx += 1
 
-        if sample_count > TRAIN and (feed_status == 2 or feed_status == 3 or
+        if sample_count > train_steps and (feed_status == 2 or feed_status == 3 or
                                        signal_event or sample_event):
             # Observe live inventory peaks at every event, not only 100ms samples.
             max_position = max(max_position, abs(engine.position(0)))
@@ -499,13 +579,42 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                         if sparse_mode == 3:
                             candidate_defense_side = defend_side_bps(
                                 gap_bps, 0., impulse_bps, sparse_mode,
-                                gap_gate_bps, impulse_gate_bps)
+                                actual_gap_gate_bps, actual_impulse_gate_bps)
                         else:
                             candidate_defense_side = defend_side_bps(
                                 gap_bps, impulse_bps, 0., sparse_mode,
-                                gap_gate_bps, impulse_gate_bps)
+                                actual_gap_gate_bps, actual_impulse_gate_bps)
                         if candidate_defense_side != 0:
                             sparse_gate_hits += 1
+                            if use_queue_shield:
+                                bq=np.nan
+                                aq=np.nan
+                                bi=bid-book.roi_lb_tick
+                                ai=ask-book.roi_lb_tick
+                                if 0<=bi<len(book.bid_depth):
+                                    bq=book.bid_depth[bi]
+                                if 0<=ai<len(book.ask_depth):
+                                    aq=book.ask_depth[ai]
+                                if not queue_shield_allows(
+                                        candidate_defense_side,gap_bps,
+                                        actual_gap_gate_bps,bq,aq,
+                                        warm_p_bid,warm_p_ask):
+                                    candidate_defense_side=0
+                                    shield_blocked+=1
+                                else:
+                                    shield_accepted+=1
+                            if candidate_defense_side != 0 and use_trade_flow:
+                                signed_direction=1 if gap_bps>0 else -1
+                                ok,ratio,gross,net=causal_taker_window(
+                                    now,trade_visible_ns,trade_signed_prefix,
+                                    trade_total_prefix,impulse_window_ns,
+                                    signed_direction,trade_signed_ratio,
+                                    trade_min_notional_usdt)
+                                if not ok:
+                                    candidate_defense_side=0
+                                    trades_blocked+=1
+                                else:
+                                    trades_accepted+=1
             # A non-renewable <=100ms hold, independent of message frequency.
             # A *both-low* signal removes protection immediately.
             # Local placebo's impulse sign points opposite to gap direction.
@@ -514,7 +623,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 next_defense_state(
                     now, defense_side, defense_started_ns, last_defense_end_ns,
                     candidate_defense_side, gap_bps, effective_impulse,
-                    hysteresis_exit_th_bps, defense_hold_ns, defense_cooldown_ns))
+                    (min(actual_gap_gate_bps,actual_impulse_gate_bps)*.25
+                     if adaptive_z_gap>0 else hysteresis_exit_th_bps),
+                    defense_hold_ns, defense_cooldown_ns))
             if defense_side != 0 and previous_defense_side != defense_side:
                 sparse_activation_count += 1
             reservation = mid - skew * pos + shift_ticks
@@ -652,7 +763,12 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                       sparse_bid_cancel, sparse_ask_cancel,
                       sparse_bid_submit, sparse_ask_submit,
                       urgent_bid_cancels, urgent_ask_cancels,
-                      ordinary_bid_cancels, ordinary_ask_cancels], dtype=np.int64))
+                      ordinary_bid_cancels, ordinary_ask_cancels,
+                      shield_blocked, shield_accepted,
+                      trades_blocked, trades_accepted], dtype=np.int64),
+            np.array([sigma_100ms_bps,actual_gap_gate_bps,
+                      actual_impulse_gate_bps,floor_gate_bps,
+                      warm_p_bid,warm_p_ask],dtype=np.float64))
 
 
 def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
