@@ -1,0 +1,83 @@
+name: Research V5 focused regression 100ms signed P80 PEPE stale EMA random HBT integration
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v5-focused-tests.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Compile and test all focused causal and queue routines
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json,subprocess,re,os
+          files=[
+            'scripts/experiment_source_defense_engine.py',
+            'scripts/experiment_source_defense_trade_flow.py',
+            'scripts/experiment_source_defense_v5_multiday.py',
+            'scripts/experiment_source_defense_v5_aggregate.py',
+            'scripts/experiment_source_defense_v5_btc_boundary.py',
+            'scripts/experiment_source_defense_pepe_g0_buckets.py',
+            'scripts/experiment_source_defense_step1_diagnostic.py',
+          ]
+          subprocess.run(['python','-m','py_compile',*files],check=True)
+          patterns=[
+            'test_experiment_source_defense_emergency_cancel.py',
+            'test_experiment_source_defense_trade_flow.py',
+            'test_experiment_source_defense_signal.py',
+            'test_experiment_source_defense_robust_fit.py',
+            'test_experiment_source_defense_step1_diagnostic.py',
+            'test_experiment_source_defense_v5_pepe_coverage.py'
+          ]
+          results={}
+          for filename in patterns:
+            r=subprocess.run(['python','-m','unittest','discover','-s','scripts',
+                '-p',filename,'-v'],capture_output=True,text=True)
+            print('UNIT_GROUP',filename,'EXIT',r.returncode,flush=True)
+            print(r.stderr,flush=True)
+            n=re.search(r'Ran (\d+) tests?',r.stderr)
+            if r.returncode!=0 or not n or 'OK' not in r.stderr:
+              raise RuntimeError('V5 focused regression failed: '+filename)
+            results[filename]=int(n.group(1))
+          p=Path('reports/source_defense/v5_tests');p.mkdir(parents=True,exist_ok=True)
+          sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          out={'tested_commit':sha,'HBT_pin':'2.4.4','python':'3.11',
+               'total_passed':sum(results.values()),'by_group':results,
+               'unit_2ms_cancel':'test_experiment_source_defense_emergency_cancel.py',
+               'binance_P80_pretrade_causal_test':'test_experiment_source_defense_trade_flow.py',
+               'PEPE_asof_EMA_250ms_strict_test':'test_experiment_source_defense_v5_pepe_coverage.py',
+               'note':'Official HBT full-replay case verification is separate from focused unit tests'}
+          (p/'v5_tests.json').write_text(json.dumps(out,indent=2,ensure_ascii=False))
+          md="# V5聚焦单元测试结果\n\n"+f"Tested SHA: {sha}\n\n"
+          md+=f"成功 {out['total_passed']} 项。\n\n|模块|数量|\n|---|---:|\n"
+          for k,v in results.items():md+=f"|{k}|{v}|\n"
+          (p/'v5_tests.md').write_text(md)
+          print(md)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write(md)
+          PY
+      - name: Commit compact test report only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v5_tests/v5_tests.json \
+                     reports/source_defense/v5_tests/v5_tests.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'research(data): V5 causal P80 and PEPE stale-EMA single-sample regression test proof'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: research-v5-focused-test-evidence
+          path: reports/source_defense/v5_tests/*
+          if-no-files-found: warn
