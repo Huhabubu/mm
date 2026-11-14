@@ -114,7 +114,7 @@ def aggregate(results):
     for market in sorted({(r["venue"],r["coin"]) for r in results}):
         v,c=market
         reports=[x for x in results if (x["venue"],x["coin"])==market]
-        lines.extend([f"## {v} {c}: {len(reports)} 个完整日期（各50分钟）","",
+        lines.extend([f"## {v} {c}: {len(reports)} 个可用样本日（每日期50分钟）","",
                       "| 对照 | 共有成交 | GLFT独有成交 | 对照独有成交 | GLFT独有100ms均值bps | GLFT共有100ms均值bps | 有效日 |",
                       "|---|---:|---:|---:|---:|---:|---:|"])
         out["by_market"][f"{v}_{c}"]={}
