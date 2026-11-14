@@ -52,7 +52,7 @@ def aggregate_rows(rows,model):
         "strict_ACK_confirmed_avoided_by_day":[],
         "source_variant":model
     }
-    if model=="g0":
+    if model in ("g0","g0_gamma75"):
         return out
     for x in z:
         attr=x["order_level"]
