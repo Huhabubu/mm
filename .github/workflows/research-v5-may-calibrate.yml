@@ -1,0 +1,56 @@
+name: Research V5 May-only causal random-pause calibration four admitted markets
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v5-may-calibrate.yml']
+  workflow_dispatch:
+permissions: {contents: read}
+jobs:
+  training:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        market: [SOL_okex-swap,DOGE_okex-swap,1000PEPE_okex-swap,1000PEPE_bitget-futures]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Source-only early-month duty fraction, mean hold, ask/bid ratio
+        run: |
+          market='${{ matrix.market }}'
+          coin="$(echo "$market" | cut -d_ -f1)"
+          venue="$(echo "$market" | cut -d_ -f2)"
+          python -m py_compile scripts/experiment_source_defense_v5_multiday.py \
+            scripts/experiment_source_defense_engine.py
+          python scripts/experiment_source_defense_v5_multiday.py \
+            --purpose calibrate --day 2026-05-01 \
+            --coin "$coin" --venue "$venue" \
+            --out "reports/source_defense/v5_may_$market"
+      - name: Verify May-only random pause calibration
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          f=Path('reports/source_defense/v5_may_${{ matrix.market }}/case.json')
+          x=json.loads(f.read_text())
+          assert x['status']=='complete'
+          assert x['day']=='2026-05-01'
+          assert x['purpose']=='calibrate'
+          p=x['random_pause_preset']
+          assert 0<p['per_slot_probability']<1
+          assert 0<p['ask_duration_fraction']<1
+          assert p['fixed_from_earlier_day_only']
+          print('MAY_PAUSE_PRESET',json.dumps(p))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v5-may-prior-${{ matrix.market }}
+          path: reports/source_defense/v5_may_${{ matrix.market }}/case.json
+          if-no-files-found: error
+          retention-days: 90
