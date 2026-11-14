@@ -18,7 +18,6 @@ from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
 
 from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TICK, TRAIN
 from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coefficients
-from experiment_source_defense_signal import defend_side
 
 MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
@@ -448,9 +447,15 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                         past_idx = np.searchsorted(okx_native_ns, window_start, side="right") - 1
                         if past_idx >= 0 and window_start-okx_native_ns[past_idx] <= 250_000_000:
                             local_ticks = (okx_native_mid[oi]-okx_native_mid[past_idx])/tick_size
-                    candidate_defense_side = defend_side(
-                        g_ticks, leader_ticks, local_ticks, sparse_mode,
-                        gap_gate_ticks, impulse_gate_ticks)
+                    # Pure NumPy/Numba gate: sign(gap) must match the
+                    # source impulse, or be opposite the local placebo move.
+                    impulse_ticks = (-local_ticks if sparse_mode == 3
+                                     else leader_ticks)
+                    if (np.isfinite(g_ticks) and np.isfinite(impulse_ticks) and
+                            abs(g_ticks) >= gap_gate_ticks and
+                            abs(impulse_ticks) >= impulse_gate_ticks and
+                            g_ticks*impulse_ticks > 0):
+                        candidate_defense_side = 1 if g_ticks > 0 else -1
                     if candidate_defense_side != 0:
                         sparse_gate_hits += 1
             # Release promptly when source impulse expires. Cooldown blocks
