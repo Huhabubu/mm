@@ -82,6 +82,26 @@ def unconditional_grid(bn,target,extra_delay_ms=2.5,step_ms=10,horizon_ms=100):
     f=feature[good];y=target_return[good]
     is_buy=f>0;is_sell=f<0
     signed=np.sign(f)*y
+    # Separate short-window BBO quantity-imbalance *change* feature: strictly
+    # prior to grid T and T-50ms. No future Binance midpoint required.
+    past_t=t-50_000
+    pi=np.searchsorted(bt,past_t,side="left")-1
+    ip=np.maximum(pi,0)
+    qty_now=bn["bidqty"][ib]+bn["askqty"][ib]
+    qty_past=bn["bidqty"][ip]+bn["askqty"][ip]
+    imbalance_now=np.divide(
+        bn["bidqty"][ib]-bn["askqty"][ib],qty_now,
+        out=np.zeros(len(t)),where=qty_now>0)
+    imbalance_past=np.divide(
+        bn["bidqty"][ip]-bn["askqty"][ip],qty_past,
+        out=np.zeros(len(t)),where=qty_past>0)
+    change=imbalance_now-imbalance_past
+    valid_change=good & (pi>=0) & (past_t-bt[ip]>=0) & (
+        past_t-bt[ip]<=250_000) & (qty_now>0) & (qty_past>0)
+    d=change[valid_change]
+    future_y=target_return[valid_change]
+    nonzero_d=d!=0
+    signed_qty=np.sign(d[nonzero_d])*future_y[nonzero_d]
     # do not optimize thresholds on test labels; all valid nonzero observations.
     return {
         "fixed_sample_grid_ms":step_ms,
@@ -100,6 +120,13 @@ def unconditional_grid(bn,target,extra_delay_ms=2.5,step_ms=10,horizon_ms=100):
             float(np.mean(signed[f!=0])) if np.any(f!=0) else None,
         "source_signed_target_return_p10_bps":
             float(np.quantile(signed[f!=0],.1)) if np.any(f!=0) else None,
+        "qty_imbalance_change_lookback_ms":50,
+        "qty_imbalance_change_valid_10ms_grid_n":int(np.sum(valid_change)),
+        "qty_imbalance_change_nonzero_n":int(np.sum(nonzero_d)),
+        "qty_imbalance_change_signed_100ms_target_mean_bps":
+            float(np.mean(signed_qty)) if len(signed_qty) else None,
+        "qty_imbalance_change_signed_100ms_target_p10_bps":
+            float(np.quantile(signed_qty,.1)) if len(signed_qty) else None,
         "market_execution_not_modeled":True,
         "overlapping_10ms_future_returns_autocorrelated":True,
         "not_out_of_sample":True}
@@ -132,8 +159,8 @@ def markdown(rows):
          "静态先验10ms网格、严格早于当前的Binance/OKX行情（上限250ms），"
          "与提前5/10/20/50ms的未来Binance跳变条件化样本并列。",
          "未来回报不扣手续费，仅物理BBO研究，不能替代官方HBT盈利分析。","",
-         "|币种|10ms全部有效决策|预报方向对目标未来100ms平均bp|前5ms跳变条件化命中率|前5ms且之前50ms无BN跳变的命中率|无跳变冷静窗样本量|",
-         "|---|---:|---:|---:|---:|---:|"]
+         "|币种|10ms全部有效决策|Microprice方向100ms均值bp|50ms盘口数量失衡变化方向100ms均值bp|前5ms跳变命中率|前5ms且之前50ms无BN跳变命中率|无跳变冷静窗数|",
+         "|---|---:|---:|---:|---:|---:|---:|"]
     for a in rows:
         z=a["all_event_10ms_grid_control"]
         u=a["jump_conditioned_original"]["5ms"]
@@ -143,7 +170,9 @@ def markdown(rows):
         out.append(f"|{a['coin']}|{z['usable_source_and_target_times']:,}|"
                    f"{m:+.4f}|" if m is not None else
                    f"|{a['coin']}|{z['usable_source_and_target_times']:,}|N/A|")
-        out[-1]+=f"{p(u['aligned_fraction_excluding_zeros'])}|{p(q['future_jump_direction_hit_fraction'])}|{q['eligible_jumps_with_strict_quiet']}|"
+        dd=z["qty_imbalance_change_signed_100ms_target_mean_bps"]
+        delta=f"{dd:+.4f}" if dd is not None else "N/A"
+        out[-1]+=f"{delta}|{p(u['aligned_fraction_excluding_zeros'])}|{p(q['future_jump_direction_hit_fraction'])}|{q['eligible_jumps_with_strict_quiet']}|"
     out+=["","数据中对未来Binance跳变做条件筛选会产生显著的选择偏差，"
           "原始跳变条件化命中率高并不自动意味着真实策略能够提前发单。"
           "单日全网格重叠回报具有高自相关，不能用普通IID标准误判断显著性。"]
