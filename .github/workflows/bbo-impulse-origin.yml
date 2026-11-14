@@ -1,0 +1,71 @@
+name: Audit Binance vs OKX 2p5ms native BBO impulse origins
+on:
+  push:
+    paths:
+      - '.github/workflows/bbo-impulse-origin.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        coin: ['BTC','SOL']
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    env:
+      DAY: ${{ matrix.day }}
+      COIN: ${{ matrix.coin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pin numeric engine and assert causal split invariants
+        run: |
+          pip install hftbacktest==2.4.4
+          python -m unittest discover -s scripts -p 'test_audit_bbo_impulse_origin.py' -v
+      - name: Split 2.5ms visible Binance and OKX price-change origins
+        run: |
+          python scripts/audit_bbo_impulse_origin.py --day "$DAY" \
+            --coin "$COIN" --extra-binance-delay-ms 2.5 \
+            --out reports/bbo_impulse_origin
+      - name: Save aggregate outcomes with no raw tick data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbo-origin-${{ matrix.coin }}-${{ matrix.day }}
+          path: reports/bbo_impulse_origin/*.json
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    needs: day
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Retrieve results from all 12 dates and markets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bbo-origin-*
+          merge-multiple: true
+          path: gathered
+      - name: Independent-date directional comparisons
+        run: |
+          python scripts/summarize_bbo_impulse_origin.py \
+            --source gathered --out reports/bbo_impulse_origin_summary
+          cat reports/bbo_impulse_origin_summary/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbo-origin-sixdate-summary
+          path: reports/bbo_impulse_origin_summary/*
+          if-no-files-found: error
+          retention-days: 90
