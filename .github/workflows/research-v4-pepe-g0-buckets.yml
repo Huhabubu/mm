@@ -1,0 +1,48 @@
+name: Research V4 read-only 1000PEPE original G0 conditional bps bins
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v4-pepe-g0-buckets.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  prefill-buckets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43552330145
+          github-token: ${{ github.token }}
+          name: source-defense-v4-1000PEPE-june-2026
+          path: official_pepe
+      - name: Bin 1000PEPE ONLY official HBT G0 fills with lagged normalized Binance BBO
+        run: |
+          python scripts/experiment_source_defense_pepe_g0_buckets.py \
+            --source official_pepe --out reports/source_defense/v4_pepe_g0_buckets
+          cat reports/source_defense/v4_pepe_g0_buckets/pepe_g0_buckets.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit only small JSON MD on research branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v4_pepe_g0_buckets/pepe_g0_buckets.json \
+                     reports/source_defense/v4_pepe_g0_buckets/pepe_g0_buckets.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'research(data): PEPE official G0 conditional Binance bps bucket markouts'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-defense-v4-pepe-G0-bps-bins
+          path: reports/source_defense/v4_pepe_g0_buckets/*
+          if-no-files-found: warn
+          retention-days: 90
