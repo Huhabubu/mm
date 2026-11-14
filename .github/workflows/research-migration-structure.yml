@@ -1,0 +1,159 @@
+name: Research migration structural break six dates and post Tokyo latency probe
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-migration-structure.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  clock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+        coin: [BTC,SOL,DOGE,1000PEPE]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Native source and target timestamp and 50/100ms trigger-response
+        run: |
+          python scripts/experiment_migration_clock.py --mode case \
+            --day '${{ matrix.day }}' --coin '${{ matrix.coin }}' \
+            --out migration_clock/${{ matrix.day }}/${{ matrix.coin }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-clock-${{ matrix.day }}-${{ matrix.coin }}
+          path: migration_clock/${{ matrix.day }}/${{ matrix.coin }}/case.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  mechanism:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+        market: [DOGE_okex-swap,1000PEPE_okex-swap,1000PEPE_bitget-futures]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Complete V6 A/B and source-blind plus 60sec placebo by official HBT
+        run: |
+          coin="$(echo '${{ matrix.market }}' | cut -d_ -f1)"
+          venue="$(echo '${{ matrix.market }}' | cut -d_ -f2)"
+          python scripts/experiment_migration_mechanism.py \
+            --day '${{ matrix.day }}' --coin "$coin" --venue "$venue" \
+            --out migration_mechanism/${{ matrix.market }}/${{ matrix.day }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-mechanism-${{ matrix.market }}-${{ matrix.day }}
+          path: migration_mechanism/${{ matrix.market }}/${{ matrix.day }}/case.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  post-tokyo-delay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        day: ['2026-09-01','2026-10-01','2026-11-01']
+        coin: [SOL,DOGE,1000PEPE]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Three extra Binance delays and Z1 cancel/widen official HBT
+        run: |
+          python scripts/experiment_migration_post_delay.py --mode case \
+            --day '${{ matrix.day }}' --coin '${{ matrix.coin }}' \
+            --out migration_post_delay/${{ matrix.day }}/${{ matrix.coin }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-post-${{ matrix.day }}-${{ matrix.coin }}
+          path: migration_post_delay/${{ matrix.day }}/${{ matrix.coin }}/case.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  aggregate-and-commit:
+    needs: [clock,mechanism,post-tokyo-delay]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: migration-clock-*
+          path: incoming-clock
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: migration-mechanism-*
+          path: incoming-mechanism
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: migration-post-*
+          path: incoming-post
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43554787965
+          github-token: ${{ github.token }}
+          pattern: v5-case-*
+          path: incoming-v5
+      - name: Strict coverage and definitions then compact JSON/MD
+        run: |
+          python scripts/experiment_migration_clock.py --mode aggregate \
+            --source incoming-clock --out reports/source_defense/migration_clock
+          python scripts/experiment_migration_group_aggregate.py \
+            --v5 incoming-v5 --v6-new incoming-mechanism \
+            --out reports/source_defense/migration_v5v6
+          python scripts/experiment_migration_post_delay.py --mode aggregate \
+            --source incoming-post --out reports/source_defense/migration_post_delay
+          cat reports/source_defense/migration_clock/migration_clock.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/source_defense/migration_v5v6/migration_v5v6_groups.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/source_defense/migration_post_delay/migration_tokyo_delay.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit only six compact reports to research branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/migration_clock/migration_clock.json \
+            reports/source_defense/migration_clock/migration_clock.md \
+            reports/source_defense/migration_v5v6/migration_v5v6_groups.json \
+            reports/source_defense/migration_v5v6/migration_v5v6_groups.md \
+            reports/source_defense/migration_post_delay/migration_tokyo_delay.json \
+            reports/source_defense/migration_post_delay/migration_tokyo_delay.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): compare migration 3+3 clocks V5/V6 group and pure Tokyo delays'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-sixdate-compact-reports
+          path: reports/source_defense/migration_*/migration_*
+          retention-days: 90
+          if-no-files-found: warn
