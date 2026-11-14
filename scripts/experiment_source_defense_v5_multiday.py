@@ -43,10 +43,10 @@ DELAY_MS=2.5
 
 
 def market(coin,venue):
-    if (coin,venue) not in MARKET_KEYS:
-        raise ValueError("Only preregistered admitted market pairs")
-    if coin=="SOL":
-        spec=MARKETS[("okx","SOL")]
+    if (coin,venue) not in MARKET_KEYS and (coin,venue)!=("BTC","okex-swap"):
+        raise ValueError("Only registered admitted markets or BTC boundary diagnostic")
+    if coin in ("BTC","SOL"):
+        spec=MARKETS[("okx",coin)]
     else:
         spec,_=contract(coin,venue)  # WARNING current live spec, no historical archive.
     return spec,("1000PEPEUSDT" if coin=="1000PEPE" else coin+"USDT"), (
@@ -270,7 +270,7 @@ def calibration_from_may(row):
     return {
         "training_day":"2026-05-01",
         "training_models":"source defense z1_cancel_qs, no June/other test data",
-        "training_trade_window_utc":"00:20–01:10" if tr["engine_fills"]>=0 else None,
+        "training_trade_window_utc":"see parent report pretrade_minutes and trade_window_utc",
         "pretrade_defense_occupancy_fraction":active,
         "pretrade_episode_count":episodes,
         "mean_episode_duration_ns":mean,
