@@ -200,15 +200,18 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("Sparse mode must be 0 G0,1 widen,2 cancel,3 local,4 random,5 lagged episodes")
     if sparse_mode == 5:
         if (time_shift_starts_ns is None or time_shift_ends_ns is None or
-                time_shift_sides is None or
-                len(time_shift_starts_ns)!=len(time_shift_ends_ns) or
-                len(time_shift_starts_ns)!=len(time_shift_sides)):
+                time_shift_sides is None):
             raise ValueError("Time shift requires complete precomputed episodes")
-        for ii in range(len(time_shift_starts_ns)):
-            if (time_shift_starts_ns[ii]>=time_shift_ends_ns[ii] or
-                    time_shift_sides[ii] not in (-1,1) or
-                    (ii and time_shift_ends_ns[ii-1]>time_shift_starts_ns[ii])):
-                raise ValueError("Time shift episodes overlap, reverse or have invalid side")
+        else:
+            # Branch eliminates omitted None arguments at Numba compile time.
+            if (len(time_shift_starts_ns)!=len(time_shift_ends_ns) or
+                    len(time_shift_starts_ns)!=len(time_shift_sides)):
+                raise ValueError("Time shift episode arrays disagree")
+            for ii in range(len(time_shift_starts_ns)):
+                if (time_shift_starts_ns[ii]>=time_shift_ends_ns[ii] or
+                        time_shift_sides[ii] not in (-1,1) or
+                        (ii and time_shift_ends_ns[ii-1]>time_shift_starts_ns[ii])):
+                    raise ValueError("Time shift episodes overlap, reverse or have invalid side")
         if beta!=0. or use_queue_shield or use_trade_flow:
             raise ValueError("Time shift must not consume current Binance source or depth signal")
     if sparse_mode==4:
@@ -717,7 +720,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             # Local placebo's impulse sign points opposite to gap direction.
             effective_impulse = -impulse_bps if sparse_mode == 3 else impulse_bps
             if sparse_mode==5:
-                if shifted_index<len(time_shift_starts_ns):
+                if time_shift_starts_ns is not None and shifted_index<len(time_shift_starts_ns):
                     if (defense_side!=0 and
                             now>=time_shift_ends_ns[shifted_index]):
                         defense_side=0
