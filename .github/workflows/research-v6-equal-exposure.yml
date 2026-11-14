@@ -1,0 +1,92 @@
+name: Research V6.1 SOL six days equal retained duty +60s placebo
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v6-equal-exposure.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43580989724
+          github-token: ${{ github.token }}
+          name: v6-mechanism-SOL-${{ matrix.day }}
+          path: earlier_source
+      - name: Exact retained episode schedule vs +60s time shifted by same window, real HBT
+        run: |
+          python scripts/experiment_source_defense_v6_matched_exposure.py \
+            --day '${{ matrix.day }}' \
+            --original-case earlier_source/case.json \
+            --original-artifact earlier_source/fill_groups_CI_only.npz \
+            --out reports/source_defense/v6_matched_exposure/${{ matrix.day }}
+      - name: Verify equal scheduled and actual HBT protection episode count and duration
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          x=json.loads(Path('reports/source_defense/v6_matched_exposure/${{ matrix.day }}/case.json').read_text())
+          q=x['schedule_control']
+          assert q['same_episode_count']
+          assert q['same_total_scheduled_duration']
+          assert x['source_schedule_no_current_Binance_input']['source_clock']=='source-free'
+          assert x['shift_60s_schedule_no_current_Binance_input']['source_clock']=='source-free'
+          print('EQUAL_60_SECOND_EPISODE',x['day'],q['retained_fraction_of_original'],
+                x['actual_HBT_episode_count_and_duration_equal'],flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v6-matched-exposure-${{ matrix.day }}
+          path: reports/source_defense/v6_matched_exposure/${{ matrix.day }}/*
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    needs: replay
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with: {pattern: v6-matched-exposure-*, path: incoming}
+      - name: Strict six-day paired mean and pooled P10 exact exposure report
+        run: |
+          python scripts/experiment_source_defense_v6_matched_exposure_aggregate.py \
+            --source incoming \
+            --out reports/source_defense/v6_matched_exposure_summary
+          cat reports/source_defense/v6_matched_exposure_summary/matched_exposure_shift60.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit compact JSON MD and per-day summaries only, no NPZ
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v6_matched_exposure_summary/matched_exposure_shift60.json \
+                     reports/source_defense/v6_matched_exposure_summary/matched_exposure_shift60.md
+          for f in incoming/v6-matched-exposure-*/case.json; do
+            day="$(echo "$f" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)"
+            mkdir -p "reports/source_defense/v6_matched_exposure/$day"
+            cp "$f" "reports/source_defense/v6_matched_exposure/$day/case.json"
+            git add -f "reports/source_defense/v6_matched_exposure/$day/case.json"
+          done
+          git commit -m 'research(data): SOL six-day same-count same-time source pulse vs +60s placebo with symmetric last-minute trimming'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
