@@ -78,18 +78,22 @@ def case(day, coin):
     if day not in DAYS or coin not in COINS:
         raise ValueError("Out of fixed six-day/four-coin audit scope")
     sources = MARKETS[coin]
-    bn = last_timestamp_rows(read_native(day, *sources[0]))
+    bn_raw = read_native(day, *sources[0])
+    bn = last_timestamp_rows(bn_raw)
     recs = []
     for venue, symbol, div in sources[1:]:
-        target = last_timestamp_rows(read_native(day, venue, symbol, div))
+        target_raw = read_native(day, venue, symbol, div)
+        target = last_timestamp_rows(target_raw)
         recs.append({
             "date": day, "coin": coin, "venue": venue, "symbol": symbol,
             "binance_book_ticker": sources[0][1],
-            "binance_collector_lag": clock_report(bn),
-            "target_collector_lag": clock_report(target),
+            "binance_collector_lag": clock_report(bn_raw),
+            "target_collector_lag": clock_report(target_raw),
+            "clock_sample_population": "raw_all_native_rows",
+            "response_event_population": "last_state_of_each_local_microsecond_batch",
             "signed_nearest_100ms": {
                 clock: signed_nearest_same_direction_ms(
-                    change_events(bn, clock), change_events(target, clock))
+                    change_events(bn_raw, clock), change_events(target_raw, clock))
                 for clock in ("exchange", "local")
             },
             "response": {
@@ -112,6 +116,8 @@ def aggregate(root):
         for row in json.loads(path.read_text())["targets"]:
             cases.append(row)
     cases.sort(key=lambda r: (r["coin"], r["venue"], r["date"]))
+    if any(r.get("clock_sample_population") != "raw_all_native_rows" for r in cases):
+        raise ValueError("Clock source must retain ALL native rows for identical original V6 lag quantiles; redo older de-duplicated cases")
     unique = {(r["date"], r["coin"], r["venue"]) for r in cases}
     if len(cases) != 30 or len(unique) != 30:
         raise ValueError(f"Expected 30 unique coin/venue/day cases; got {len(unique)}")
