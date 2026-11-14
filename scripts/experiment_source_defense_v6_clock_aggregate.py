@@ -46,6 +46,19 @@ def markdown(result):
                      f"{r['binance_vs_target_median_ms_difference']:+.3f}|"
                      f"{fmt(a['local']['median_ms'])}|"
                      f"{fmt(a['exchange']['median_ms'])}|")
+    lines+=["","## 双时钟最近同方向跳变的有符号相对时差","",
+            "定义Δ=t_target−t_Binance，正值表示按所选时钟Binance行先出现，"
+            "负值表示目标所行先出现；同方向最近事件可被重复配对，"
+            "交易所时间戳未校时且collector时差存在，均非真实传播因果。",
+            "",
+            "|日期|币种|目标所|Local Δ P10/P50/均值/P90 ms|Local BN先出现比例|Exchange Δ P10/P50/均值/P90 ms|Exchange BN先出现比例|",
+            "|---|---|---|---|---:|---|---:|"]
+    for r in result["cases"]:
+        q=r["signed_nearest_event_lag_by_clock"]
+        lo=q["local"];ex=q["exchange"]
+        lines.append(f"|{r['date']}|{r['coin']}|{r['source_venue']}|"
+                     f"{g(lo)}|{lo['binance_before_target_fraction_of_matched']:.1%}|"
+                     f"{g(ex)}|{ex['binance_before_target_fraction_of_matched']:.1%}|")
     lines+=["","## June BTC / SOL：Binance mid跳变前5–50ms的Microprice代理","",
             "Microprice用Binance一档买卖挂单量对bid/ask加权，"
             "预跳偏离符号与随后Binance BBO跳变符号对比；仅条件化于未来确实发生跳变的事件，"
