@@ -1,0 +1,38 @@
+name: Research Step3 8-case 2026-06-01 robust GLFT admission pilot
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-step3-robust-pilot.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        coin: [SOL,DOGE,XRP,1000PEPE]
+        venue: [okex-swap,bitget-futures]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Verify robust 3-level regression and strict historical prior rules
+        run: python -m unittest discover -s scripts -p 'test_experiment_source_defense_robust_fit.py' -v
+      - name: Read only 10min/20min official HBT sufficient counts and 50min target trades
+        run: |
+          python scripts/experiment_source_defense_robust_admission.py \
+            --coin "${{ matrix.coin }}" --venue "${{ matrix.venue }}" --day 2026-06-01 \
+            --out reports/source_defense/step3_pilot
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: robust-fit-pilot-${{ matrix.coin }}-${{ matrix.venue }}
+          path: reports/source_defense/step3_pilot/*.json
+          if-no-files-found: warn
+          retention-days: 90
