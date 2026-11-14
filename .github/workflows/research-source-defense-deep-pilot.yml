@@ -1,0 +1,37 @@
+name: Research sparse source defense - DOGE XRP 1-day deep fit pilot
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-source-defense-deep-pilot.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  one-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        coin: ['DOGE','XRP']
+        venue: ['okex-swap','bitget-futures']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Run only official HBT 10min calibration and inspect 50min raw trade count
+        run: |
+          python scripts/experiment_source_defense_deep_admission.py \
+            --coin "${{ matrix.coin }}" --venue "${{ matrix.venue }}" --day 2026-06-01
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-defense-deep-pilot-${{ matrix.coin }}-${{ matrix.venue }}
+          path: reports/source_defense/deep_admission/*.json
+          if-no-files-found: warn
+          retention-days: 90
