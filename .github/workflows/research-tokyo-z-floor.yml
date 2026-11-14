@@ -1,0 +1,50 @@
+name: Research Tokyo SOL Z0.75 gate-floor same warmup diagnosis
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-tokyo-z-floor.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43554787965
+          github-token: ${{ github.token }}
+          name: v5-case-SOL_okex-swap-2026-09-01
+          path: input/2026-09-01
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43554787965
+          github-token: ${{ github.token }}
+          name: v5-case-SOL_okex-swap-2026-10-01
+          path: input/2026-10-01
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43554787965
+          github-token: ${{ github.token }}
+          name: v5-case-SOL_okex-swap-2026-11-01
+          path: input/2026-11-01
+      - name: Compare exact 20min sigma gate floor Z1 and Z075
+        run: |
+          python scripts/audit_tokyo_z_floor.py --source input \
+            --out reports/source_defense/tokyo_z075_floor
+          cat reports/source_defense/tokyo_z075_floor/tokyo_z075_effective_gates.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit two small effective-gate reports
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/tokyo_z075_floor/tokyo_z075_effective_gates.json \
+            reports/source_defense/tokyo_z075_floor/tokyo_z075_effective_gates.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): confirm Z1 and Z0.75 effective pretrade gate floors'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
