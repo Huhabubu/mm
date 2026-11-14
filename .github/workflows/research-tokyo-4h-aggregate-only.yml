@@ -1,0 +1,64 @@
+name: Research replay-free aggregation of 21 finished Tokyo four-hour HBT cases
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-tokyo-4h-aggregate-only.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Focused 4h and Aug15 leakage tests
+        run: |
+          python scripts/test_tokyo_4h_ack.py
+          python scripts/test_tokyo_equal_volume.py
+          python -m py_compile scripts/aggregate_tokyo_4h.py
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43595912778
+          github-token: ${{ github.token }}
+          pattern: tokyo4h-core-*
+          path: input_core
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43595912778
+          github-token: ${{ github.token }}
+          pattern: tokyo4h-delay-*
+          path: input_delay
+      - name: Require all 12+9 independent 4h official cases
+        run: |
+          python scripts/aggregate_tokyo_4h.py \
+            --stage core --source input_core \
+            --out reports/source_defense/tokyo_4h_core
+          python scripts/aggregate_tokyo_4h.py \
+            --stage delay --source input_delay \
+            --out reports/source_defense/tokyo_4h_delay
+          cat reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit only four compact JSON MD reports
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.json \
+            reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md \
+            reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.json \
+            reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): 4h Tokyo 3day HBT cancel ACK and gamma summaries'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tokyo4h-summary-compact
+          path: reports/source_defense/tokyo_4h_*/*
+          retention-days: 90
+          if-no-files-found: warn
