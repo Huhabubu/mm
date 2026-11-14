@@ -1,0 +1,92 @@
+name: Research sparse source defense - bounded altcoin admission prescreen
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-source-defense-admission.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prescreen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        coin: ['DOGE','SUI','XRP','AVAX','ENA','1000PEPE']
+        venue: ['okex-swap','bitget-futures']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run read-only precision and historical availability tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_admission.py' -v
+      - name: Inspect actual historical BBO and current contract tick
+        run: |
+          python scripts/experiment_source_defense_admission.py \
+            --day 2026-06-01 --coin "${{ matrix.coin }}" --venue "${{ matrix.venue }}" \
+            --seconds 75 --out reports/source_defense/admission
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-defense-admission-${{ matrix.coin }}-${{ matrix.venue }}
+          path: reports/source_defense/admission/*.json
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    needs: prescreen
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: source-defense-admission-*
+          path: gathered
+          merge-multiple: true
+      - name: Print objective filter and unverified next stages
+        run: |
+          python - <<'PY'
+          import glob,json
+          from collections import Counter
+          from pathlib import Path
+          files=glob.glob('gathered/*.json')
+          if len(files)!=12:
+            raise RuntimeError(f'Expected 12 prescreen reports; got {len(files)}')
+          data=[json.loads(Path(f).read_text(encoding='utf8')) for f in files]
+          data.sort(key=lambda x:(x['coin'],x['venue']))
+          lines=['# 新币种第一层准入：历史BBO+当前价格精度（75秒预检）','',
+                 '|币种|交易所|历史BBO行数|相对tick(bps)|初筛|',
+                 '|---|---|---:|---:|---|']
+          for d in data:
+            b=d['bbo_sample']
+            t=d['relative_tick_bps_live_spec_over_historical_mid']
+            lines.append(f"| {d['coin']} | {d['venue']} | {b.get('rows',0)} | {t:.6f} | {d['verdict']} |" if t is not None else
+                         f"| {d['coin']} | {d['venue']} | {b.get('rows',0)} | N/A | {d['verdict']} |")
+          lines.extend(['','资格限制：live公开tick不能自动当作2026-06-01历史tick；观察到的盘口跳价不是官方最小价格档。',
+                        '本轮只判定当前规格对应历史价格的相对档宽和75秒行情存在性。',
+                        '**下一关必须用官方HBT检验六日期10min训练拟合和50min交易活跃性，再进行来源脉冲回报诊断。**',
+                        '1000PEPE必须先统一Binance和目标所的标的价格与合约计量，不能直接相减。'])
+          out=Path('reports/source_defense/admission_summary')
+          out.mkdir(parents=True,exist_ok=True)
+          (out/'summary.json').write_text(json.dumps(data,indent=2,ensure_ascii=False),encoding='utf8')
+          report='\n'.join(lines)+'\n'
+          (out/'report.md').write_text(report,encoding='utf8')
+          print(report)
+          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write(report)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-defense-admission-prescreen-summary
+          path: reports/source_defense/admission_summary/*
+          if-no-files-found: error
+          retention-days: 90
