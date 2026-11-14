@@ -1,0 +1,40 @@
+name: Research sparse defense - 2026-06-01 fill selectivity and fee bridge
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-sparse-defense-aggregate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Recover BTC SOL original official HBT fill and quote-diagnostic files
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43545643507
+          github-token: ${{ github.token }}
+          pattern: sparse-defense-pilot-*
+          merge-multiple: false
+          path: gathered
+      - name: Build day-level exact PnL, 4-horizon markout and selection bootstrap
+        run: |
+          python scripts/experiment_source_defense_aggregate.py \
+            --source gathered --out reports/source_defense/pilot_aggregate
+          cat reports/source_defense/pilot_aggregate/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sparse-defense-pilot-aggregate
+          path: reports/source_defense/pilot_aggregate/*
+          if-no-files-found: error
+          retention-days: 90
