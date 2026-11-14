@@ -1,0 +1,23 @@
+name: Research sparse defense 1s 2s EMA causal unit tests
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-sparse-signal-tests.yml'
+      - 'scripts/experiment_source_defense_signal.py'
+      - 'scripts/test_experiment_source_defense_signal.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy==2.2.6
+      - run: python -m unittest discover -s scripts -p 'test_experiment_source_defense_signal.py' -v
