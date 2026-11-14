@@ -131,7 +131,7 @@ def trial(day,coin,venue):
     orig=fit_recent_arrivals(arrivals[:6000],changes[:6000])
     prelim10=research_fit(stat10,None)
     prelim20=research_fit(stat20,None)
-    mid=float(np.median(om[ot < us*1000 +600*100_000_000]))
+    mid=float(np.median(om[ot < us*1000 +600*1_000_000_000]))
     scenario=order_scenario(market,mid)
     try:
         activity=trade_activity(venue,market.symbol,day)
