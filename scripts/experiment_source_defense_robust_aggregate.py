@@ -55,7 +55,7 @@ def produce(cases,pepe_checks):
         key=(r["coin"],r["venue"],r["day"])
         if key in indexed:raise ValueError("Duplicate coin/venue/day")
         indexed[key]=r
-    outputs={"cases":cases,"groups":{},"pepe_unit_checks":pepe_checks,
+    outputs={"groups":{},"pepe_unit_checks":pepe_checks,
              "limits":["Live contract specs are not historical contract spec records",
                        "20min warmup shifts proposed start to UTC00:20",
                        "All month-first dates previously explored",
