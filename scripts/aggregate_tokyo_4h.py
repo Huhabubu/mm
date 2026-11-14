@@ -99,6 +99,10 @@ def aggregate_core(root):
         info["g0_gamma75"]["gamma_matched_retention"]=1.0
         info["z1_gamma75"]["gamma_matched_G0_fills"]=g75
         info["z1_gamma75"]["gamma_matched_retention"]=z75/g75 if g75 else None
+        info["g0_gamma75"]["gamma_matched_cancel_delta_vs_G0"]=0
+        info["z1_gamma75"]["gamma_matched_cancel_delta_vs_G0"]=sum(
+            r["variants"]["z1_gamma75"]["cancel_requests"]-
+            r["variants"]["g0_gamma75"]["cancel_requests"] for r in rows)
         info["z1_gamma75"]["gamma_matched_mean_net_delta_usdt"]=(
             info["z1_gamma75"]["mean_daily_net_after_fee_usdt"]-
             info["g0_gamma75"]["mean_daily_net_after_fee_usdt"])
@@ -157,7 +161,7 @@ def aggregate_delay(root):
 def md_core(x):
     s=["# 纯东京 4 小时：G0/Z1/P80 与 γ 稳健性",
        "", "三个已探索日期，每日20min预热+240min交易，统一HBT Maker 2bps。毛收益仅机制诊断，最终经济收益以净权益为准。", "",
-       "|市场|模型|3日同γ G0成交|3日模型成交|同γ保留率|激活时间%|3日撤单差vs标准γG0|日均净USDT|日均毛USDT|ACK严格匹配笔数|",
+       "|市场|模型|3日同γ G0成交|3日模型成交|同γ保留率|激活时间%|3日撤单差vs同γG0|日均净USDT|日均毛USDT|ACK严格匹配笔数|",
        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for market,d in x["markets"].items():
         for model in ("g0","z1","z1_p80","g0_gamma75","z1_gamma75"):
@@ -165,7 +169,8 @@ def md_core(x):
             high_gamma=model in ("g0_gamma75","z1_gamma75")
             rt=v["gamma_matched_retention"] if high_gamma else v["pooled_retention"]
             ref=v["gamma_matched_G0_fills"] if high_gamma else v["G0_total_fills"]
-            s.append(f"|{market}|{model}|{ref}|{v['total_fills']}|{rt:.1%}|{100*v['mean_daily_duty_fraction']:.3f}%|{v['total_cancel_delta_vs_G0']:+d}|{v['mean_daily_net_after_fee_usdt']:+.4f}|{v['mean_daily_gross_marked_usdt']:+.4f}|{v['strict_ACK_confirmed_avoided_total']}|")
+            canc=v["gamma_matched_cancel_delta_vs_G0"] if high_gamma else v["total_cancel_delta_vs_G0"]
+            s.append(f"|{market}|{model}|{ref}|{v['total_fills']}|{rt:.1%}|{100*v['mean_daily_duty_fraction']:.3f}%|{canc:+d}|{v['mean_daily_net_after_fee_usdt']:+.4f}|{v['mean_daily_gross_marked_usdt']:+.4f}|{v['strict_ACK_confirmed_avoided_total']}|")
     s.extend(["","## Group A / Kept / Group B 500ms Markout、整体按日等权选择性",
               "单位bps，按日等权用于核心结论；ACK严格计数只是一组可证明匹配的保守下界。",
               "|市场|模型|Group A pooled|Kept pooled|Group B pooled|100ms Lift 日等权|500ms Lift 日等权|",
