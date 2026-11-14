@@ -1,0 +1,38 @@
+name: Research Aug15-only calibration access and source-blind admission tests
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-tokyo-0815-access.yml']
+permissions:
+  contents: write
+jobs:
+  access:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - name: Verify strict no-Binance controller and day scope
+        run: |
+          python scripts/test_tokyo_equal_volume.py
+          python -m py_compile scripts/check_tokyo_0815_access.py \
+            scripts/check_tokyo_equal_volume.py
+      - name: Read at most 256 bytes only for allowed Aug15, do not access other dates
+        env:
+          TARDIS_API_KEY: ${{ secrets.TARDIS_API_KEY }}
+        run: |
+          python scripts/check_tokyo_0815_access.py \
+            --out reports/source_defense/tokyo_calibration_access
+          cat reports/source_defense/tokyo_calibration_access/tokyo_calibration_access.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit compact access report
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/tokyo_calibration_access/tokyo_calibration_access.json \
+            reports/source_defense/tokyo_calibration_access/tokyo_calibration_access.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): Aug15 pure Tokyo calibration access preflight'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
