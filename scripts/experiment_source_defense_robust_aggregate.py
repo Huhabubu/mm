@@ -129,6 +129,20 @@ def produce(cases,pepe_checks):
     return outputs,"\n".join(lines)+"\n"
 
 
+
+def json_finite_or_null(value):
+    """Use strict JSON: failed-fit nonfinite parameters are explicit null."""
+    if isinstance(value,float) and not math.isfinite(value):
+        return None
+    if isinstance(value,dict):
+        return {k:json_finite_or_null(v) for k,v in value.items()}
+    if isinstance(value,list):
+        return [json_finite_or_null(v) for v in value]
+    if isinstance(value,tuple):
+        return [json_finite_or_null(v) for v in value]
+    return value
+
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--source",required=True)
@@ -146,7 +160,7 @@ def main():
     data,md=produce(cases,checks)
     out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
     (out/"step3_fit_admission.json").write_text(
-        json.dumps(data,indent=2,ensure_ascii=False),encoding="utf8")
+        json.dumps(json_finite_or_null(data),indent=2,ensure_ascii=False,allow_nan=False),encoding="utf8")
     (out/"step3_fit_admission.md").write_text(md,encoding="utf8")
     print(md)
 
