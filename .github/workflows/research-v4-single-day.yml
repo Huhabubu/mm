@@ -1,0 +1,67 @@
+name: Research V4 three coin June-only adaptive defense ablation
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v4-single-day.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  one-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        coin: [BTC,SOL,1000PEPE]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Unit and source contract tests before replay
+        run: |
+          python -m py_compile scripts/experiment_source_defense_v4_pilot.py \
+            scripts/experiment_source_defense_engine.py \
+            scripts/experiment_source_defense_trade_flow.py \
+            scripts/experiment_source_defense_robust_fit.py
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_emergency_cancel.py' -v
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_trade_flow.py' -v
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_signal.py' -v
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_robust_fit.py' -v
+      - name: Real Tardis 2026-06-01 HBT fixed volatility-z and microstructure ablation
+        run: |
+          python scripts/experiment_source_defense_v4_pilot.py --coin '${{ matrix.coin }}' \
+            --out reports/source_defense/v4
+      - name: Guard official net ledger and common-fit comparability
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          coin='${{ matrix.coin }}'
+          p=Path(f'reports/source_defense/v4/2026-06-01_okx_{coin}/summary.json')
+          d=json.loads(p.read_text())
+          assert len(d['scenarios'])==17, len(d['scenarios'])
+          assert d['all_model_pretrade_GLFT_identical']
+          assert d['binance_trade_loader_qa']['trade_rows']>0
+          for name,row in d['scenarios'].items():
+            assert row['status']=='complete'
+            assert row['trading']['fee_usdt']>=0
+            if name!='g0':
+              assert row['counters'][3]==0
+              assert len(row['counters'])==16
+            print('AUDIT',coin,name,'NET_AFTER_2BPS_FEE',
+                  row['trading']['end_net_marked_equity_usdt'],
+                  'FILL',row['trading']['engine_fills'],
+                  'CANCEL',row['trading']['cancel_requests'],
+                  'GATE',row['sampled_thresholds'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-defense-v4-${{ matrix.coin }}-june-2026
+          path: reports/source_defense/v4/**
+          if-no-files-found: warn
+          retention-days: 90
