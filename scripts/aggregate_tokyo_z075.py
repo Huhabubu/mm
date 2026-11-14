@@ -5,7 +5,7 @@ from pathlib import Path
 from experiment_tokyo_4h import DAYS
 
 
-def aggregate(root):
+def aggregate(root,core_json=None):
     days={}
     for p in Path(root).rglob("case.json"):
         x=json.loads(p.read_text())
@@ -39,7 +39,28 @@ def aggregate(root):
         d=group["Dropped_all"][h]["daily_mean_bps"]
         v=[a-b for a,b in zip(k,d) if a is not None and b is not None]
         day_lift[h]={"valid_days":len(v),"equal_day_mean_bps":sum(v)/len(v) if v else None}
+    compared_to_Z1=None
+    if core_json is not None:
+        allcore=json.loads(Path(core_json).read_text())["markets"]["SOL_okex-swap"]
+        ref=allcore["z1"]
+        same_by_day=[]
+        for i,(g,z) in enumerate(zip(base,test)):
+            same=(g["fills"]==allcore["g0"]["daily_fills"][i] and
+                  z["fills"]==ref["daily_fills"][i] and
+                  abs(z["defense_duty_fraction"]-ref["daily_duty_fraction"][i])<1e-10 and
+                  abs(z["net_after_2bps_usdt"]-ref["daily_net_after_fee_usdt"][i])<1e-6 and
+                  z["cancel_requests"]-g["cancel_requests"]==
+                     ref["daily_cancel_delta_vs_G0"][i] and
+                  z["order_level"]["strict_same_submit_order_id_cancel_ACK_before_G0_fill"]["count"]==
+                     ref["strict_ACK_confirmed_avoided_by_day"][i])
+            same_by_day.append(bool(same))
+        compared_to_Z1={
+            "same_daily_fills_duty_net_cancels_and_ACK":same_by_day,
+            "all_three_dates_execution_metrics_identical":all(same_by_day),
+            "reduced_z_might_bind_to_floor_or_leave_discrete_action_unchanged":True,
+            "cannot_assert_different_effective_threshold_without_raw_gate_values":True}
     return {
+        "Z075_vs_Z1":compared_to_Z1,
         "scope":"Only SOL OKX, three previously explored pure Tokyo 4h days",
         "dates":list(DAYS),
         "precommitted_gate":"Z1 duty <0.25% AND pooled retention >95% on the same 3 4h explored days",
@@ -74,6 +95,8 @@ def markdown(x):
             f"按日等权100/500ms Selectivity Lift："
             f"{f(x['selectivity_lift']['100ms']['equal_day_mean_bps'])}/"
             f"{f(x['selectivity_lift']['500ms']['equal_day_mean_bps'])} bps。\n\n"
+            f"与Z1同日执行指标完全相同：{x['Z075_vs_Z1']['all_three_dates_execution_metrics_identical'] if x['Z075_vs_Z1'] else '未复核'}；" +
+            "若完全相同，可能与阈值下限或离散订单动作有关，尚需门槛值审计。\\n\\n"
             "仅这一个额外预设档位，不以效果好坏调第三次参数。"
             "所有日期均为历史探索，不能宣称新的样本外证据。\n")
 
@@ -81,10 +104,11 @@ def markdown(x):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--source",required=True)
+    p.add_argument("--core-json",default=None)
     p.add_argument("--out",required=True)
     a=p.parse_args()
     out=Path(a.out);out.mkdir(parents=True,exist_ok=True)
-    x=aggregate(a.source)
+    x=aggregate(a.source,a.core_json)
     (out/"tokyo_four_hour_z075.json").write_text(json.dumps(x,ensure_ascii=False,indent=2,allow_nan=False))
     (out/"tokyo_four_hour_z075.md").write_text(markdown(x))
     print(markdown(x))
