@@ -8,6 +8,7 @@ strategy start from 00:10 to 00:20 UTC; it never reads the future test tape.
 import math
 
 import numpy as np
+from numba import njit
 
 from g0_glft_rolling import FIT_BINS, FIT_STEP_TICKS, MIN_CROSSING_INTERVALS
 
@@ -126,3 +127,67 @@ def chronological_reliability(rows,variant="10min"):
             last_prior_day=day
         out.append(fit)
     return out
+
+
+
+@njit
+def fit_rolling_research_3level(arrivals, changes, prior_k=np.nan):
+    """Numba live-time counterpart of research_fit (10min or 20min).
+
+    Returns compatible original GLFT fitting tuple, but with a *variable*
+    denominator equal to observed window length and 3-level research gate.
+    Crucially 3–4 levels require an externally supplied strictly earlier-day
+    prior; absent prior => fail closed. Called only on historical 100ms data.
+    """
+    counts=np.zeros(FIT_BINS,dtype=np.float64)
+    crossed=0
+    extreme=0
+    for depth in arrivals:
+        if not np.isfinite(depth):
+            continue
+        if depth>FIT_BINS*FIT_STEP_TICKS+1.e-7:
+            extreme+=1
+        if depth<=FIT_STEP_TICKS+1.e-7:
+            continue
+        crossed+=1
+        for i in range(FIT_BINS):
+            if depth>(i+1)*FIT_STEP_TICKS+1.e-7:
+                counts[i]+=1.
+            else:
+                break
+    n=0
+    sx=sy=sxx=sxy=0.
+    window_s=len(arrivals)*SAMPLE_SECONDS
+    for i in range(FIT_BINS):
+        if counts[i]<=0:continue
+        px=(i+1)*FIT_STEP_TICKS
+        log_rate=math.log(counts[i]/window_s)
+        n+=1
+        sx+=px;sy+=log_rate;sxx+=px*px;sxy+=px*log_rate
+    vcount=0
+    total=squared=0.
+    for d in changes:
+        if np.isfinite(d):
+            vcount+=1;total+=d;squared+=d*d
+    if n<3 or crossed<MIN_CROSSING_INTERVALS or vcount<len(arrivals)//2:
+        return 0,np.nan,np.nan,np.nan,n,crossed,extreme
+    denom=n*sxx-sx*sx
+    if denom<=0:
+        return 0,np.nan,np.nan,np.nan,n,crossed,extreme
+    raw_k=-(n*sxy-sx*sy)/denom
+    if not np.isfinite(raw_k) or raw_k<=0:
+        return 0,np.nan,raw_k,np.nan,n,crossed,extreme
+    if n<5:
+        if not np.isfinite(prior_k) or prior_k<K_MIN or prior_k>K_MAX:
+            return 0,np.nan,raw_k,np.nan,n,crossed,extreme
+        k=(n*raw_k+SHRINK_LEVEL_EQUIVALENT*prior_k)/(n+SHRINK_LEVEL_EQUIVALENT)
+    else:
+        k=raw_k
+    intercept=(sy+k*sx)/n
+    a=math.exp(intercept) if -600.<intercept<600. else np.inf
+    var=max(0.,squared/vcount-(total/vcount)**2)
+    sigma=math.sqrt(var/SAMPLE_SECONDS)
+    if not (K_MIN<=k<=K_MAX and np.isfinite(a) and
+            1.e-8<a<=1.e4 and np.isfinite(sigma) and 0.<sigma<=1.e6):
+        return 0,a,k,sigma,n,crossed,extreme
+    return 1,a,k,sigma,n,crossed,extreme
