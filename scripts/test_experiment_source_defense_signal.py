@@ -4,7 +4,8 @@ import numpy as np
 
 from experiment_source_defense_signal import (
     past_grid_time_ema, defend_side_bps, source_gate_bps,
-    widen_ticks_from_bps, next_defense_state
+    widen_ticks_from_bps, next_defense_state, adaptive_bps_gates,
+    queue_shield_allows
 )
 
 
@@ -57,6 +58,23 @@ class SparseSignalTests(unittest.TestCase):
         side,start,end=next_defense_state(260_000_000,0,-1,180_000_000,
                                           1,.8,.8,.2,75_000_000,75_000_000)
         self.assertEqual(side,1)
+
+    def test_pretrade_volatility_respects_tick_and_point_three_floor(self):
+        # BTC 0.1 USDT tick / 80k mid -> ~0.0125bps; floor is 0.3bps.
+        self.assertEqual(adaptive_bps_gates(.1,80000.,.1,2.,1.5),
+                         (.3,.3,.3))
+        # SOL one price tick ~1bps and higher 100ms SD.
+        a,b,f=adaptive_bps_gates(1.,100.,.01,2.,1.5)
+        self.assertAlmostEqual(a,2.)
+        self.assertAlmostEqual(b,1.5)
+        self.assertAlmostEqual(f,1.)
+
+    def test_queue_shield_targets_dangerous_side(self):
+        self.assertFalse(queue_shield_allows(1,1.,1.,100.,200.,40.,50.))
+        self.assertTrue(queue_shield_allows(1,1.,1.,100.,20.,40.,50.))
+        self.assertTrue(queue_shield_allows(-1,-1.,1.,20.,200.,40.,50.))
+        self.assertTrue(queue_shield_allows(1,2.5,1.,100.,200.,40.,50.))
+        self.assertFalse(queue_shield_allows(-1,-1.,1.,100.,20.,40.,50.))
 
     def test_event_density_invariance_for_bbo_sampling(self):
         ts=np.arange(1,501,dtype=np.int64)*10_000_000
