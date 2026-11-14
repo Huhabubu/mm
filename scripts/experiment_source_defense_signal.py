@@ -62,24 +62,69 @@ def past_grid_time_ema(okx_time, okx_mid, bin_time, bin_mid,
     return grid,basis
 
 
-def source_gate(gap_ticks, impulse_ticks, gap_threshold_ticks=1.0,
-                impulse_threshold_ticks=1.0):
-    """Dimensionless simple same-direction gate; no price data or clocks read."""
-    return (math.isfinite(gap_ticks) and math.isfinite(impulse_ticks) and
-            abs(gap_ticks)>=gap_threshold_ticks and
-            abs(impulse_ticks)>=impulse_threshold_ticks and
-            gap_ticks*impulse_ticks>0)
+
+# All active research decisions below use bps (1 bp = 1e-4 of target mid).
+# Mid/tick prices are always in USDT per target base coin.
+from numba import njit
 
 
-def defend_side(gap_ticks, leader_impulse_ticks, local_impulse_ticks, mode,
-                gap_threshold_ticks=1.0, impulse_threshold_ticks=1.0):
-    """Return +1=ask danger, -1=bid danger, 0=no defense.
+@njit
+def source_gate_bps(gap_bps, impulse_bps, gap_threshold_bps,
+                    impulse_threshold_bps):
+    """Require strictly causal same-direction price impulse and residual gap."""
+    return (np.isfinite(gap_bps) and np.isfinite(impulse_bps) and
+            abs(gap_bps) >= gap_threshold_bps and
+            abs(impulse_bps) >= impulse_threshold_bps and
+            gap_bps * impulse_bps > 0.)
 
-    mode=1/2 uses Binance same-sign recent impulse. mode=3 replaces source
-    with opposite-sign OKX local impulse (OKX-triggered placebo).
-    """
-    if mode not in (1,2,3):return 0
-    impulse=(-local_impulse_ticks if mode==3 else leader_impulse_ticks)
-    if source_gate(gap_ticks,impulse,gap_threshold_ticks,impulse_threshold_ticks):
-        return 1 if gap_ticks>0 else -1
+
+@njit
+def defend_side_bps(gap_bps, leader_impulse_bps, local_impulse_bps, mode,
+                    gap_threshold_bps, impulse_threshold_bps):
+    """+1=ask danger, -1=bid danger, 0=no danger; mode3 is OKX placebo."""
+    if mode != 1 and mode != 2 and mode != 3:
+        return 0
+    impulse = -local_impulse_bps if mode == 3 else leader_impulse_bps
+    if source_gate_bps(gap_bps, impulse, gap_threshold_bps,
+                       impulse_threshold_bps):
+        return 1 if gap_bps > 0 else -1
     return 0
+
+
+@njit
+def widen_ticks_from_bps(mid_usdt, tick_usdt, widen_bps):
+    """Convert target-mid-relative bps action into one or more price ticks."""
+    if (not np.isfinite(mid_usdt) or mid_usdt <= 0. or
+            not np.isfinite(tick_usdt) or tick_usdt <= 0. or
+            not np.isfinite(widen_bps) or widen_bps <= 0.):
+        raise ValueError("Invalid bps quote action")
+    count = int(round(mid_usdt * widen_bps * 1.e-4 / tick_usdt))
+    return max(1, count)
+
+
+@njit
+def next_defense_state(now_ns, active_side, active_since_ns, last_end_ns,
+                       candidate_side, gap_bps, impulse_bps,
+                       hysteresis_exit_th_bps, hold_window_ns, cooldown_ns):
+    """Bound hold to one activation; both-low signals release immediately.
+
+    A *continuously valid* same-direction fresh impulse can remain active;
+    once it vanishes the nonrenewable hold expires after hold_window_ns.
+    Never forward-shift active_since_ns on each trigger.
+    """
+    if active_side == 0:
+        if candidate_side != 0 and now_ns - last_end_ns >= cooldown_ns:
+            return candidate_side, now_ns, last_end_ns
+        return 0, active_since_ns, last_end_ns
+
+    if candidate_side == active_side:
+        return active_side, active_since_ns, last_end_ns
+    if candidate_side != 0 and candidate_side != active_side:
+        return 0, active_since_ns, now_ns
+
+    both_low = (np.isfinite(gap_bps) and np.isfinite(impulse_bps) and
+                abs(gap_bps) <= hysteresis_exit_th_bps and
+                abs(impulse_bps) <= hysteresis_exit_th_bps)
+    if both_low or now_ns - active_since_ns >= hold_window_ns:
+        return 0, active_since_ns, now_ns
+    return active_side, active_since_ns, last_end_ns
