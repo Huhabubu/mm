@@ -455,3 +455,14 @@
 - [x] 六日合计原GLFT/β1官方成交与三组拆分：OKX BTC **1590/916**，共有398、原独有1192、β1独有518；OKX SOL **314/280**，共有157、原独有157、β1独有123；Bitget BTC **788/604**，共有391、原独有397、β1独有213；Bitget SOL **1913/1901**，共有1476、原独有437、β1独有425。禁止把“净成交数减少”当作“成功取消的逐笔订单”。
 - [x] [所有市场×四模型价差与持仓损益分解、手续费、两期限markout、逐笔分类及局限](docs/post_p0_markout_fill_opportunity_results_2026-11-14.md)；已探索历史月首六日**不属于完整自然日或严格盲测**。
 - [ ] **下一步集中检验信号改造**：优先在正式GLFT报价决策点测试Binance短期价格主动推进×未闭合异常价差的双门控，与β1原始、β0纯目标所、事件触发但无方向的对照做严格相同撮合与延迟；等成交强度的无Binance方向对照仍未完成，需预先在训练期设定控制参数以免使用测试期未来成交总数调参。并将新增未经探索日期/币种作为后续正式样本外。暂不调EMA半衰期、gamma或局部峰窗口追逐旧样本最优亏损。
+
+
+## 2026-11-14 研究分支：纯东京期4小时机制定型（已完成，Equal-Volume受限）
+
+- [x] 锁定研究分支 `research/sparse-source-defense-20261114`；正式 `main` 固定 `619294c`。纯东京已探索日 **2026-09-01 / 10-01 / 11-01** 四市场均完成20min预热+240min交易：12组核心HBT和9组Binance额外0/1/2.5ms延迟回放成功。完整已审核归档：[研究定型报告](docs/tokyo_four_hour_review_2026-11-14.md)、[事前参数范围协议](docs/tokyo_four_hour_protocol_2026-11-14.md)。
+- [x] 增加HBT内部合成订单ID/下单时间、撤单请求与观测到 `CANCELED` 状态的ACK时间戳，要求与G0同一订单提交谱系、同价同量且ACK严格早于G0成交，形成较保守的严格订单级匹配下界。Z1主策略三日SOL/DOGE/PEPE OKX/PEPE Bitget严格ACK对应分别 **27/40/326/82** 笔，另有较多Dropped与Added未能归因；未宣称实盘ACK或全部队列损失的因果识别。[核心JSON](reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.json)。
+- [x] Z1三日总成交保留率 SOL **96.3%**、DOGE **94.7%**、PEPE OKX **83.0%**、PEPE Bitget **84.7%**。四个市场100/500ms按日等权整体Selectivity Lift均为负；四市场所有主模型费前毛权益与扣2bps手续费净权益均仍负。减亏不得写作正选择性Alpha。完整 [核心MD](reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md)。
+- [x] 预设最多第三档Z0.75仅SOL符合门槛并实际重跑；与Z1三日订单、成交和PnL完全相同。已查明三日原20min预热波动门槛均被一目标tick的下限钳住，两组实效门槛完全相同，停止继续降Z或硬下限。[门槛审计](reports/source_defense/tokyo_z075_floor/tokyo_z075_effective_gates.md)。
+- [x] P80在PEPE OKX将防御占比3.001%→1.716%，撤单增幅+3835→+1081，但日均含费净亏−33.0859→−34.9993 USDT，仍无整体正选择性。γ=50/75同一γ下独立G0配对，四市场γ75整体500ms Lift仍负。0/1/2.5ms延迟较小时防御ACK匹配数提升，但实盘物理延迟未测量。[延迟报告](reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.md)。
+- [x] 2026-08-15独立校准日单端点无凭据Tardis读取实际HTTP **401**，[access报告](reports/source_defense/tokyo_calibration_access/tokyo_calibration_access.json)；5月旧架构随机停报对照退出合格Equal-Volume身份。已添加8月15日唯一校准日期、无Binance信号、固定参数及每日期成交数/手续费≤3%双约束的测试和准入脚本，**真实Equal-Volume因历史数据权限暂未完成**。没有读取任何其它预留样本外日，不得用9–11月倒拟合。
+- [ ] 下一阶段：如获8月15日合法Tardis访问，先完成独立源盲控制校准及≤3%逐日验证；固定既定Z1+QS/P80消融、γ与延迟后才开展全新独立东京日期盲测。本轮各日均历史探索，不能当严格新样本外。
