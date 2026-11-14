@@ -23,7 +23,7 @@ from cross_venue_event_probe import read_binance_bbo, visible_timestamps
 from run_beta_one_direct_gap import NS, causal_60s_basis, read_local_bbo
 from run_multivenue_glft import MARKETS, build_asset, order_scenario, validate_record
 from g0_glft_event_driven import run_event_glft, summarize
-from experiment_source_defense_engine import run_sparse_glft
+from experiment_source_defense_engine_legacy import run_sparse_glft
 from experiment_source_defense_signal import past_grid_time_ema
 
 HORIZONS_MS=(100,500,1000,5000)
