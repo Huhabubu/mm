@@ -1,0 +1,20 @@
+name: Research emergency cancel t=2ms focused regression
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-emergency-cancel-test.yml',
+            'scripts/test_experiment_source_defense_emergency_cancel.py',
+            'scripts/experiment_source_defense_engine.py']
+  workflow_dispatch:
+permissions: {contents: read}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - run: python -m unittest discover -s scripts -p 'test_experiment_source_defense_emergency_cancel.py' -v
+      - run: python -m unittest discover -s scripts -p 'test_experiment_source_defense_signal.py' -v
