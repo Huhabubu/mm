@@ -1,0 +1,92 @@
+name: Research Step3 four-coin two-venue six-date robust GLFT admission
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-step3-robust-sixdate.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  dated-fit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        coin: [SOL,DOGE,XRP,1000PEPE]
+        venue: [okex-swap,bitget-futures]
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Deterministic strictly earlier-prior and no-fake-bins checks
+        run: |
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_robust_fit.py' -v
+      - name: Extract native target BBO and official HBT pretrade 10/20min fit sufficient stats
+        run: |
+          python scripts/experiment_source_defense_robust_admission.py \
+            --day "${{ matrix.day }}" --coin "${{ matrix.coin }}" --venue "${{ matrix.venue }}" \
+            --out reports/source_defense/step3_cases
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: robust-fit-case-${{ matrix.coin }}-${{ matrix.venue }}-${{ matrix.day }}
+          path: reports/source_defense/step3_cases/*.json
+          if-no-files-found: error
+          retention-days: 90
+  chronological-aggregate:
+    needs: dated-fit
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: robust-fit-case-*
+          merge-multiple: true
+          path: cases
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43548782639
+          github-token: ${{ github.token }}
+          pattern: sparse-defense-pepe-unit-*
+          merge-multiple: true
+          path: pepe_units
+      - name: Strict chronological 3-level shrinkage and 20min-only alternate initial fit
+        run: |
+          python scripts/experiment_source_defense_robust_aggregate.py \
+            --source cases --pepe-units pepe_units \
+            --out reports/source_defense/step3_fit
+          cat reports/source_defense/step3_fit/step3_fit_admission.md \
+             >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive compact JSON/MD only, never original HBT tape or NPZ
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/step3_fit/step3_fit_admission.json \
+                     reports/source_defense/step3_fit/step3_fit_admission.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'research(data): archive chronological 10/20min 3-level six-date admission results'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sparse-defense-step3-fourcoin-sixdate-summary
+          path: reports/source_defense/step3_fit/*
+          if-no-files-found: warn
+          retention-days: 90
