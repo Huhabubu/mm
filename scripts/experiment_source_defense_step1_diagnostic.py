@@ -94,7 +94,8 @@ def position_valuation_proxy(fills, ot, om, contract_value, report_end_ns):
 
 
 def prefill_binance_gap_buckets(g0, ot, om, bt, bm, grid, ema, tick,
-                                freshness_ns=250_000_000):
+                                freshness_ns=250_000_000,
+                                asof_ema=False, ema_max_age_ns=250_000_000):
     """Classify *G0* original fills using only states visible before fill.
 
     Binance midprice movement window 100ms, same direction as fast residual
@@ -113,10 +114,22 @@ def prefill_binance_gap_buckets(g0, ot, om, bt, bm, grid, ema, tick,
     valid &= (t-bt[bidx]>=0)&(t-bt[bidx]<=freshness_ns)
     valid &= (t-ot[oidx]>=0)&(t-ot[oidx]<=freshness_ns)
     valid &= (window-bt[widx]>=0)&(window-bt[widx]<=freshness_ns)
-    valid &= np.isfinite(ema[gidx])
+    if asof_ema:
+        # Step1-only causal as-of: the latest EMA grid point can be NaN
+        # while a strictly older finite EMA is still fresh.
+        latest_valid=np.maximum.accumulate(
+            np.where(np.isfinite(ema),np.arange(len(ema)),-1))
+        causal_idx=latest_valid[gidx]
+        safe=np.maximum(causal_idx,0)
+        valid&=(causal_idx>=0)&(t-grid[safe]>0)&(
+            t-grid[safe]<=ema_max_age_ns)
+        ema_at_t=ema[safe]
+    else:
+        valid &= np.isfinite(ema[gidx])
+        ema_at_t=ema[gidx]
     target=om[oidx]
     valid &= target>0
-    g_bps=1.e4*(bm[bidx]-target-ema[gidx])/np.maximum(target,1.e-12)
+    g_bps=1.e4*(bm[bidx]-target-ema_at_t)/np.maximum(target,1.e-12)
     imp_bps=1.e4*(bm[bidx]-bm[widx])/np.maximum(target,1.e-12)
     imp_ticks=(bm[bidx]-bm[widx])/tick
     gate=(valid & (np.sign(g_bps)==np.sign(imp_bps)) &
@@ -132,6 +145,8 @@ def prefill_binance_gap_buckets(g0, ot, om, bt, bm, grid, ema, tick,
     result={"asof_clock":"exchange_fill_timestamp_minus_1ms; NOT original order decision",
             "proxy":"native target BBO, visible delayed Binance mid, strictly prior EMA",
             "max_allowed_quote_age_ns":int(freshness_ns),
+            "causal_asof_finite_ema":bool(asof_ema),
+            "max_allowed_ema_age_ns":int(ema_max_age_ns),
             "binance_impulse_definition":"100ms Binance BBO mid movement >= 1 target tick, sign(gap)==sign(impulse)",
             "buckets":[]}
     order=("unavailable","未触发")+BIN_LABELS
