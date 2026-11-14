@@ -1,0 +1,70 @@
+name: Research migration V5V6 independent-day selectivity recalc
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-migration-equal-day.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43588336725
+          github-token: ${{ github.token }}
+          pattern: migration-mechanism-*
+          path: incoming-mechanism
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43554787965
+          github-token: ${{ github.token }}
+          pattern: v5-case-*
+          path: incoming-v5
+      - name: Regenerate 3+3 daily equally weighted and pooled results
+        run: |
+          python scripts/experiment_migration_group_aggregate.py \
+            --v5 incoming-v5 --v6-new incoming-mechanism \
+            --out reports/source_defense/migration_v5v6
+          python - <<'PY'
+          import json,math
+          p='reports/source_defense/migration_v5v6/migration_v5v6_groups.json'
+          z=json.load(open(p))
+          assert len(z['markets'])==4
+          for market,groups in z['markets'].items():
+              assert set(groups)=={'pre','post'}
+              for period,report in groups.items():
+                  assert len(report['days'])==3
+                  for h in ('100ms','500ms'):
+                      metrics=report['selectivity_lift'][h]
+                      daily=[x for x in metrics['daily_lift_bps'] if x is not None]
+                      assert metrics['valid_days_for_equal_day_lift']==len(daily)
+                      assert daily
+                      assert math.isclose(metrics['equal_day_mean_lift_bps'],sum(daily)/len(daily),abs_tol=1e-12)
+          print('EQUAL_DAY_AND_POOLED_PASS: 4 markets x 2 periods x 2 horizons')
+          PY
+          cat reports/source_defense/migration_v5v6/migration_v5v6_groups.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit only compact amended summary
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/migration_v5v6/migration_v5v6_groups.json \
+            reports/source_defense/migration_v5v6/migration_v5v6_groups.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): migration day-equal and pooled markout comparison'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-equal-day-v5v6-compact
+          path: reports/source_defense/migration_v5v6/*
+          retention-days: 90
+          if-no-files-found: warn
