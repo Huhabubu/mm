@@ -2,10 +2,37 @@
 import unittest
 import numpy as np
 
-from experiment_source_defense_trade_flow import causal_taker_window
+from experiment_source_defense_trade_flow import (
+    causal_taker_window, causal_pretrade_directional_p80,
+)
 
 
 class TakerFlowTests(unittest.TestCase):
+    def test_high_intensity_P80_uses_only_strict_warmup_data(self):
+        step=100_000_000
+        # 40 positive buy and 40 negative sell 100ms bins, 81 timestamps.
+        stamps=np.arange(1,82,dtype=np.int64)*step
+        amounts=np.array([float(i+1)*10. if i%2==0 else -float(i+1)*10.
+                          for i in range(81)])
+        pref=np.concatenate(([0.],np.cumsum(amounts)))
+        gross=np.concatenate(([0.],np.cumsum(np.abs(amounts))))
+        qb,qs,nb,ns,n=causal_pretrade_directional_p80(
+            stamps,pref,gross,0,82*step,100_000_000,step,.8)
+        self.assertGreaterEqual(nb,20)
+        self.assertGreaterEqual(ns,20)
+        self.assertGreater(qb,0.)
+        self.assertGreater(qs,0.)
+        # Mutating a strictly later trade does not alter the warmup quantile.
+        tt=np.append(stamps,83*step)
+        pp=np.append(pref,pref[-1]+1.e10)
+        gg=np.append(gross,gross[-1]+1.e10)
+        qb2,qs2,*_=causal_pretrade_directional_p80(
+            tt,pp,gg,0,82*step,100_000_000,step,.8)
+        self.assertEqual(qb,qb2)
+        self.assertEqual(qs,qs2)
+        self.assertFalse(causal_taker_window(
+            82*step,stamps,pref,gross,step,1,.1,1.,1.e12)[0])
+
     def test_later_trades_cannot_leak_into_now(self):
         visible=np.array([1_000_000,2_000_000,3_000_000],np.int64)
         cumulative_signed=np.array([0.,100.,200.,-800.])
