@@ -148,13 +148,14 @@ def extra_shift_data(d):
 
 
 def model_run(data,mode,prior_k=np.nan,gamma_scale=1.,
-              source_clock=None,lagged=None):
+              source_clock=None,lagged=None,trade_steps=30000,
+              order_trace_sink=None):
     spec=data["spec"]
     train_steps=data["pretrade_s"]*10
     scenario=data["scenario"]
     e=ROIVectorMarketDepthBacktest([build_asset(
         data["tape"],data["low"],data["high"],spec)])
-    rec=Recorder(e.num_assets,30010)
+    rec=Recorder(e.num_assets,trade_steps+10)
     options={
         "rolling":True,"gamma_code":scenario["gamma_code"]*gamma_scale,
         "read_binance":mode not in ("g0","shift60"),
@@ -169,6 +170,7 @@ def model_run(data,mode,prior_k=np.nan,gamma_scale=1.,
         "trade_visible_ns":data["tt"],
         "trade_signed_prefix":data["ss"],"trade_total_prefix":data["vv"],
         "capture_defense_episodes":True,
+        "capture_order_ack":order_trace_sink is not None,
         "time_shift_starts_ns":EMPTY,"time_shift_ends_ns":EMPTY,
         "time_shift_sides":EMPTY}
     if mode=="g0":
@@ -177,6 +179,16 @@ def model_run(data,mode,prior_k=np.nan,gamma_scale=1.,
         opts,_=fixed_model_options("z1_cancel_qs",None)
         opts.pop("ema_grid_ns",None)
         opts.pop("ema_values",None)
+        options.update(opts)
+    elif mode in ("source_p80","source_z075"):
+        opts,_=fixed_model_options(
+            "z1_cancel_qs_tf_p80" if mode=="source_p80" else "z1_cancel_qs",None)
+        opts.pop("ema_grid_ns",None)
+        opts.pop("ema_values",None)
+        if mode=="source_z075":
+            # One predeclared weaker adaptive threshold, same 1.5:1 gate ratio.
+            opts["adaptive_z_gap"]=1.125
+            opts["adaptive_z_imp"]=.75
         options.update(opts)
     elif mode=="widen":
         # The same fixed V5 Z1/P50/75ms gate; only action changes.
@@ -207,9 +219,9 @@ def model_run(data,mode,prior_k=np.nan,gamma_scale=1.,
     if not clock:
         options["read_binance"]=False
     try:
-        raw=run_sparse_glft(e,bt,bm,30000,**options)
+        raw=run_sparse_glft(e,bt,bm,trade_steps,**options)
         if int(raw[5])!=1:raise ValueError("G0 initial calibration failed")
-        r=research_summary(raw,50,scenario,train_steps)
+        r=research_summary(raw,trade_steps/600,scenario,train_steps)
         validate_record(rec.get(0),r)
         fills=annotate_fills(raw,data["ot"],data["om"],spec.tick,spec.ctval)
         trace=raw[38]
@@ -221,6 +233,8 @@ def model_run(data,mode,prior_k=np.nan,gamma_scale=1.,
         if (abs(r["trading"]["fee_usdt"]-r["trading"]["trading_value_usdt"]*.0002)>
                 max(1e-6,r["trading"]["trading_value_usdt"]*1e-9)):
             raise AssertionError("Maker ledger mismatch")
+        if order_trace_sink is not None:
+            order_trace_sink.append(raw[39])
         return r,fills,trace
     finally:
         e.close()
