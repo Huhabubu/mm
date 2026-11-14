@@ -128,3 +128,38 @@ def next_defense_state(now_ns, active_side, active_since_ns, last_end_ns,
     if both_low or now_ns - active_since_ns >= hold_window_ns:
         return 0, active_since_ns, now_ns
     return active_side, active_since_ns, last_end_ns
+
+
+
+@njit
+def adaptive_bps_gates(sigma_100ms_bps, mid_usdt, tick_usdt,
+                       z_gap=2.0, z_impulse=1.5):
+    """Pretrade 100ms return SD only; gate floor >= max(0.3bp, 1 price tick)."""
+    if (not np.isfinite(sigma_100ms_bps) or sigma_100ms_bps<0 or
+            not np.isfinite(mid_usdt) or mid_usdt<=0 or
+            not np.isfinite(tick_usdt) or tick_usdt<=0 or
+            z_gap<=0 or z_impulse<=0):
+        raise ValueError("Invalid historical-volatility adaptive threshold")
+    floor=max(.3,10000.*tick_usdt/mid_usdt)
+    return (max(floor,z_gap*sigma_100ms_bps),
+            max(floor,z_impulse*sigma_100ms_bps),floor)
+
+
+@njit
+def queue_shield_allows(side, gap_bps, gap_threshold_bps,
+                        bid_qty, ask_qty, bid_quantile, ask_quantile,
+                        extreme_multiplier=2.0):
+    """Only the dangerous side's own best-quote liquidity matters.
+
+    Inactive/invalid reference depth fails closed, never invents a deep wall.
+    A >=2x gap impulse is predeclared extreme and bypasses the shield.
+    """
+    if side==0:
+        return False
+    if np.isfinite(gap_bps) and abs(gap_bps)>=extreme_multiplier*gap_threshold_bps:
+        return True
+    qty=ask_qty if side==1 else bid_qty
+    quant=ask_quantile if side==1 else bid_quantile
+    return bool(np.isfinite(qty) and qty>=0 and
+                np.isfinite(quant) and quant>0 and
+                qty<=quant)
