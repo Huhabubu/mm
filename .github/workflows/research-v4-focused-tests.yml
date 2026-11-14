@@ -1,0 +1,77 @@
+name: Research V4 focused causal, emergency, and fitting regressions with archived proof
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v4-focused-tests.yml']
+permissions: {contents: write}
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Run and capture deterministic regression test results
+        run: |
+          python - <<'PY'
+          import json,re,subprocess,os
+          from pathlib import Path
+          patterns=(
+            'test_experiment_source_defense_emergency_cancel.py',
+            'test_experiment_source_defense_trade_flow.py',
+            'test_experiment_source_defense_signal.py',
+            'test_experiment_source_defense_robust_fit.py',
+            'test_experiment_source_defense_step1_diagnostic.py',
+            'test_experiment_source_defense_pilot.py')
+          results={}
+          for p in patterns:
+            argv=['python','-m','unittest','discover','-s','scripts','-p',p,'-v']
+            x=subprocess.run(argv,text=True,capture_output=True)
+            print('FOCUSED_TEST',p,'EXIT',x.returncode,'\n',x.stdout,x.stderr,flush=True)
+            m=re.search(r'Ran (\d+) tests?',x.stderr)
+            if not m or x.returncode!=0 or 'OK' not in x.stderr:
+              raise RuntimeError('Focused regression failed: '+p)
+            results[p]={'passed':True,'test_count':int(m.group(1)),
+                        'returncode':x.returncode}
+          sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          dest=Path('reports/source_defense/v4_tests')
+          dest.mkdir(parents=True,exist_ok=True)
+          data={'tested_commit':sha,'python':'3.11','official_hftbacktest_pin':'2.4.4',
+                'checks':results,'all_pass':all(x['passed'] for x in results.values()),
+                'total_unit_tests':sum(x['test_count'] for x in results.values()),
+                'scope_note':'Emergency test exercises actual engine helper cancel() command with controllable mock time; official HBT realistic cancellation latency separately audited via June replay.'}
+          (dest/'unit_tests.json').write_text(json.dumps(data,indent=2,ensure_ascii=False),encoding='utf8')
+          lines=['# V4 focused deterministic unit test proof','',
+                 f"Testing revision: \`{sha}\`",
+                 f"Total: {data['total_unit_tests']} tests, all passed.",
+                 '',
+                 '|Test module|Passed cases|Status|','|---|---:|---|']
+          for name,x in results.items():
+            lines.append(f"|{name}|{x['test_count']}|PASS|")
+          lines+=['','Emergency 2ms regression uses the SAME engine cancel helper and a controllable fake HBT order state. Official exchange-ack delay remains simulated in full HBT run.']
+          md='\n'.join(lines)+'\n'
+          (dest/'unit_tests.md').write_text(md,encoding='utf8')
+          print(md)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write(md)
+          PY
+      - name: Commit focused test JSON/MD only to research branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v4_tests/unit_tests.json \
+                     reports/source_defense/v4_tests/unit_tests.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'research(data): tested SHA focused emergency/taker/fit causal regression evidence'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-defense-v4-focused-tests
+          path: reports/source_defense/v4_tests/*
+          if-no-files-found: warn
+          retention-days: 90
