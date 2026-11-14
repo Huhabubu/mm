@@ -195,6 +195,9 @@ def run(coin,report_root):
                     order_qty=scenario["order_qty"],
                     position_cap=scenario["position_cap"],
                     recorder=recorder.recorder,sparse_mode=mode,
+                    # Numba compiles both branch types at G0: arrays must not
+                    # be None even when sparse_mode==0 (read-only unused).
+                    ema_grid_ns=emas[1][0],ema_values=emas[1][1],
                     train_steps=train_steps,
                     robust_fit=(coin=="SOL"),
                     earlier_day_prior_k=np.nan,
