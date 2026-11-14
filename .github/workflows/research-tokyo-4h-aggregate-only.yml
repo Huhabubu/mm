@@ -41,6 +41,16 @@ jobs:
           python scripts/aggregate_tokyo_4h.py \
             --stage delay --source input_delay \
             --out reports/source_defense/tokyo_4h_delay
+          python - <<'PY'
+          import json
+          z=json.load(open('reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.json'))
+          for market,v in z['markets'].items():
+              g=v['g0_gamma75'];s=v['z1_gamma75']
+              assert s['gamma_matched_G0_fills']==g['total_fills']
+              assert abs(s['gamma_matched_retention']-s['total_fills']/g['total_fills'])<1e-12
+              assert g['gamma_matched_retention']==1.0
+          print('GAMMA_MATCHED_DENOMINATOR_PASS')
+          PY
           cat reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md >> "$GITHUB_STEP_SUMMARY"
           cat reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.md >> "$GITHUB_STEP_SUMMARY"
       - name: Commit only four compact JSON MD reports
