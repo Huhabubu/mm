@@ -12,53 +12,53 @@
     "asof_clock": "exchange_fill_timestamp_minus_1ms; NOT original order decision",
     "proxy": "native target BBO, visible delayed Binance mid, strictly prior EMA",
     "max_allowed_quote_age_ns": 2000000000,
-    "causal_asof_finite_ema": false,
+    "causal_asof_finite_ema": true,
     "max_allowed_ema_age_ns": 250000000,
     "binance_impulse_definition": "100ms Binance BBO mid movement >= 1 target tick, sign(gap)==sign(impulse)",
     "buckets": [
       {
         "bin": "unavailable",
-        "fills": 39,
-        "fraction_all_g0_fills": 0.203125,
+        "fills": 28,
+        "fraction_all_g0_fills": 0.14583333333333334,
         "mean_abs_gap_bps": null,
         "by_horizon": {
           "100ms": {
-            "fresh_count": 14,
-            "mean_markout_bps": -2.493995040555521,
-            "p10_markout_bps": -2.914177473408349
+            "fresh_count": 3,
+            "mean_markout_bps": -2.909378993439726,
+            "p10_markout_bps": -2.9133294659955
           },
           "500ms": {
-            "fresh_count": 14,
-            "mean_markout_bps": -2.2864443462985213,
-            "p10_markout_bps": -2.914177473408349
+            "fresh_count": 3,
+            "mean_markout_bps": -2.909378993439726,
+            "p10_markout_bps": -2.9133294659955
           },
           "1000ms": {
-            "fresh_count": 12,
-            "mean_markout_bps": -2.667518404014942,
-            "p10_markout_bps": -2.914177473408349
+            "fresh_count": 3,
+            "mean_markout_bps": -2.909378993439726,
+            "p10_markout_bps": -2.9133294659955
           }
         }
       },
       {
         "bin": "未触发",
-        "fills": 35,
-        "fraction_all_g0_fills": 0.18229166666666666,
-        "mean_abs_gap_bps": 0.5849090326988975,
+        "fills": 41,
+        "fraction_all_g0_fills": 0.21354166666666666,
+        "mean_abs_gap_bps": 0.5719480848836186,
         "by_horizon": {
           "100ms": {
-            "fresh_count": 35,
-            "mean_markout_bps": -2.4096221802178563,
-            "p10_markout_bps": -2.913159271931968
+            "fresh_count": 41,
+            "mean_markout_bps": -2.3411804187457155,
+            "p10_markout_bps": -2.914177473408349
           },
           "500ms": {
-            "fresh_count": 35,
-            "mean_markout_bps": -2.742139027377127,
+            "fresh_count": 41,
+            "mean_markout_bps": -2.625036263881678,
             "p10_markout_bps": -5.801305293690287
           },
           "1000ms": {
-            "fresh_count": 32,
-            "mean_markout_bps": -2.9072232177530375,
-            "p10_markout_bps": -5.81564518770712
+            "fresh_count": 36,
+            "mean_markout_bps": -2.9078545508068485,
+            "p10_markout_bps": -5.812266944786582
           }
         }
       },
@@ -110,47 +110,47 @@
       },
       {
         "bin": "0.5~1.0",
-        "fills": 27,
-        "fraction_all_g0_fills": 0.140625,
-        "mean_abs_gap_bps": 0.7616645543267412,
+        "fills": 28,
+        "fraction_all_g0_fills": 0.14583333333333334,
+        "mean_abs_gap_bps": 0.7654563307365135,
         "by_horizon": {
           "100ms": {
-            "fresh_count": 27,
-            "mean_markout_bps": -2.909193067665725,
+            "fresh_count": 28,
+            "mean_markout_bps": -2.9089181105900854,
             "p10_markout_bps": -2.9175784099212216
           },
           "500ms": {
-            "fresh_count": 27,
-            "mean_markout_bps": -2.3714724362577653,
-            "p10_markout_bps": -2.917918999842123
+            "fresh_count": 28,
+            "mean_markout_bps": -2.3904017874466956,
+            "p10_markout_bps": -2.917833852361898
           },
           "1000ms": {
-            "fresh_count": 24,
-            "mean_markout_bps": -1.9410169346196209,
-            "p10_markout_bps": -2.918174442282799
+            "fresh_count": 25,
+            "mean_markout_bps": -1.9794360280167478,
+            "p10_markout_bps": -2.9180892948025736
           }
         }
       },
       {
         "bin": "1.0~2.0",
-        "fills": 66,
-        "fraction_all_g0_fills": 0.34375,
-        "mean_abs_gap_bps": 1.5016988992309348,
+        "fills": 70,
+        "fraction_all_g0_fills": 0.3645833333333333,
+        "mean_abs_gap_bps": 1.4983449162253035,
         "by_horizon": {
           "100ms": {
-            "fresh_count": 66,
-            "mean_markout_bps": -2.8229484554652586,
+            "fresh_count": 70,
+            "mean_markout_bps": -2.8278468073952583,
             "p10_markout_bps": -2.919281856662244
           },
           "500ms": {
-            "fresh_count": 66,
-            "mean_markout_bps": -2.470150484879001,
-            "p10_markout_bps": -2.9192821054507307
+            "fresh_count": 70,
+            "mean_markout_bps": -2.4536985819911,
+            "p10_markout_bps": -2.9186003288689264
           },
           "1000ms": {
-            "fresh_count": 59,
-            "mean_markout_bps": -2.664750839269401,
-            "p10_markout_bps": -2.9203049196832405
+            "fresh_count": 63,
+            "mean_markout_bps": -2.6341153691151997,
+            "p10_markout_bps": -2.9197934378870847
           }
         }
       },
@@ -350,12 +350,184 @@
       }
     ]
   },
+  "repaired_250ms_causal_asof_ema_table": {
+    "asof_clock": "exchange_fill_timestamp_minus_1ms; NOT original order decision",
+    "proxy": "native target BBO, visible delayed Binance mid, strictly prior EMA",
+    "max_allowed_quote_age_ns": 250000000,
+    "causal_asof_finite_ema": true,
+    "max_allowed_ema_age_ns": 250000000,
+    "binance_impulse_definition": "100ms Binance BBO mid movement >= 1 target tick, sign(gap)==sign(impulse)",
+    "buckets": [
+      {
+        "bin": "unavailable",
+        "fills": 50,
+        "fraction_all_g0_fills": 0.2604166666666667,
+        "mean_abs_gap_bps": null,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 25,
+            "mean_markout_bps": -2.4435394259904957,
+            "p10_markout_bps": -2.9138378751599388
+          },
+          "500ms": {
+            "fresh_count": 25,
+            "mean_markout_bps": -2.327311037206576,
+            "p10_markout_bps": -2.9138378751599388
+          },
+          "1000ms": {
+            "fresh_count": 23,
+            "mean_markout_bps": -2.5296859100071476,
+            "p10_markout_bps": -2.914007674284144
+          }
+        }
+      },
+      {
+        "bin": "未触发",
+        "fills": 31,
+        "fraction_all_g0_fills": 0.16145833333333334,
+        "mean_abs_gap_bps": 0.5987061124440468,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 31,
+            "mean_markout_bps": -2.4393703519131735,
+            "p10_markout_bps": -2.9141774734071153
+          },
+          "500ms": {
+            "fresh_count": 31,
+            "mean_markout_bps": -2.8147925987058984,
+            "p10_markout_bps": -5.801305293690287
+          },
+          "1000ms": {
+            "fresh_count": 28,
+            "mean_markout_bps": -3.011244556063594,
+            "p10_markout_bps": -5.820049307951088
+          }
+        }
+      },
+      {
+        "bin": "0~0.2",
+        "fills": 0,
+        "fraction_all_g0_fills": 0.0,
+        "mean_abs_gap_bps": null,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 0,
+            "mean_markout_bps": null,
+            "p10_markout_bps": null
+          },
+          "500ms": {
+            "fresh_count": 0,
+            "mean_markout_bps": null,
+            "p10_markout_bps": null
+          },
+          "1000ms": {
+            "fresh_count": 0,
+            "mean_markout_bps": null,
+            "p10_markout_bps": null
+          }
+        }
+      },
+      {
+        "bin": "0.2~0.5",
+        "fills": 5,
+        "fraction_all_g0_fills": 0.026041666666666668,
+        "mean_abs_gap_bps": 0.4261421161306097,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 5,
+            "mean_markout_bps": -2.9094377942768004,
+            "p10_markout_bps": -2.915026963999636
+          },
+          "500ms": {
+            "fresh_count": 5,
+            "mean_markout_bps": -2.3289705181196956,
+            "p10_markout_bps": -2.915026963999636
+          },
+          "1000ms": {
+            "fresh_count": 5,
+            "mean_markout_bps": -2.3289705181196956,
+            "p10_markout_bps": -2.915026963999636
+          }
+        }
+      },
+      {
+        "bin": "0.5~1.0",
+        "fills": 26,
+        "fraction_all_g0_fills": 0.13541666666666666,
+        "mean_abs_gap_bps": 0.7632576662709685,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 26,
+            "mean_markout_bps": -2.909196996841719,
+            "p10_markout_bps": -2.9175784099212216
+          },
+          "500ms": {
+            "fresh_count": 26,
+            "mean_markout_bps": -2.350794802687299,
+            "p10_markout_bps": -2.9180041473223484
+          },
+          "1000ms": {
+            "fresh_count": 23,
+            "mean_markout_bps": -1.8989267618165653,
+            "p10_markout_bps": -2.9182595897630246
+          }
+        }
+      },
+      {
+        "bin": "1.0~2.0",
+        "fills": 60,
+        "fraction_all_g0_fills": 0.3125,
+        "mean_abs_gap_bps": 1.5257016166495012,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 60,
+            "mean_markout_bps": -2.8627904881021418,
+            "p10_markout_bps": -2.9192818566624914
+          },
+          "500ms": {
+            "fresh_count": 60,
+            "mean_markout_bps": -2.4747127204572568,
+            "p10_markout_bps": -2.9202196229306137
+          },
+          "1000ms": {
+            "fresh_count": 53,
+            "mean_markout_bps": -2.6919458630625663,
+            "p10_markout_bps": -2.920816700199001
+          }
+        }
+      },
+      {
+        "bin": ">2.0",
+        "fills": 20,
+        "fraction_all_g0_fills": 0.10416666666666667,
+        "mean_abs_gap_bps": 2.5896054753845195,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 20,
+            "mean_markout_bps": -3.05476733065143,
+            "p10_markout_bps": -2.9155377002174707
+          },
+          "500ms": {
+            "fresh_count": 20,
+            "mean_markout_bps": -3.054683143954257,
+            "p10_markout_bps": -3.2082514229292167
+          },
+          "1000ms": {
+            "fresh_count": 20,
+            "mean_markout_bps": -2.9095664227069915,
+            "p10_markout_bps": -5.809396618304438
+          }
+        }
+      }
+    ]
+  },
   "coverage_reasons_250ms": {
     "max_age_ms": 250.0,
     "reason_counts_exclusive": {
       "fully_evaluable": 142,
       "binance_100ms_window_prior_bbo_stale": 11,
-      "ema_not_finite": 39
+      "ema_grid_nan_but_prior_finite_within_250ms": 11,
+      "ema_grid_nan_no_fresh_prior_finite": 28
     },
     "missing_total": 50,
     "missing_age_ms_samples": [
@@ -375,70 +547,70 @@
       },
       {
         "exchange_fill_timestamp_ns": 1780273018688000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 215.563999,
         "okx_now_ms": 336.404,
         "bn_window_ms": 115.563999
       },
       {
         "exchange_fill_timestamp_ns": 1780273018692000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 219.563999,
         "okx_now_ms": 340.404,
         "bn_window_ms": 119.563999
       },
       {
         "exchange_fill_timestamp_ns": 1780273027092000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.964999,
         "okx_now_ms": 330.275,
         "bn_window_ms": 472.686999
       },
       {
         "exchange_fill_timestamp_ns": 1780273041012000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.726999,
         "okx_now_ms": 850.345,
         "bn_window_ms": 311.253999
       },
       {
         "exchange_fill_timestamp_ns": 1780273048142000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 72.586999,
         "okx_now_ms": 350.229,
         "bn_window_ms": 26.061999
       },
       {
         "exchange_fill_timestamp_ns": 1780273074222000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 781.247999,
         "okx_now_ms": 780.227,
         "bn_window_ms": 681.247999
       },
       {
         "exchange_fill_timestamp_ns": 1780273089621000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.549999,
         "okx_now_ms": 1888.179,
         "bn_window_ms": 2.073999
       },
       {
         "exchange_fill_timestamp_ns": 1780273089625000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 4.549999,
         "okx_now_ms": 1892.179,
         "bn_window_ms": 6.073999
       },
       {
         "exchange_fill_timestamp_ns": 1780273184204000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 6.721999,
         "okx_now_ms": 712.119,
         "bn_window_ms": 506.418999
       },
       {
         "exchange_fill_timestamp_ns": 1780273232194000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 3.515999,
         "okx_now_ms": 1311.661,
         "bn_window_ms": 787.624999
@@ -455,90 +627,91 @@
     "max_age_ms": 1000.0,
     "reason_counts_exclusive": {
       "fully_evaluable": 153,
-      "ema_not_finite": 39
+      "ema_grid_nan_but_prior_finite_within_250ms": 11,
+      "ema_grid_nan_no_fresh_prior_finite": 28
     },
     "missing_total": 39,
     "missing_age_ms_samples": [
       {
         "exchange_fill_timestamp_ns": 1780273018688000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 215.563999,
         "okx_now_ms": 336.404,
         "bn_window_ms": 115.563999
       },
       {
         "exchange_fill_timestamp_ns": 1780273018692000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 219.563999,
         "okx_now_ms": 340.404,
         "bn_window_ms": 119.563999
       },
       {
         "exchange_fill_timestamp_ns": 1780273027092000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.964999,
         "okx_now_ms": 330.275,
         "bn_window_ms": 472.686999
       },
       {
         "exchange_fill_timestamp_ns": 1780273041012000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.726999,
         "okx_now_ms": 850.345,
         "bn_window_ms": 311.253999
       },
       {
         "exchange_fill_timestamp_ns": 1780273048142000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 72.586999,
         "okx_now_ms": 350.229,
         "bn_window_ms": 26.061999
       },
       {
         "exchange_fill_timestamp_ns": 1780273074222000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 781.247999,
         "okx_now_ms": 780.227,
         "bn_window_ms": 681.247999
       },
       {
         "exchange_fill_timestamp_ns": 1780273089621000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.549999,
         "okx_now_ms": 1888.179,
         "bn_window_ms": 2.073999
       },
       {
         "exchange_fill_timestamp_ns": 1780273089625000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 4.549999,
         "okx_now_ms": 1892.179,
         "bn_window_ms": 6.073999
       },
       {
         "exchange_fill_timestamp_ns": 1780273184204000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 6.721999,
         "okx_now_ms": 712.119,
         "bn_window_ms": 506.418999
       },
       {
         "exchange_fill_timestamp_ns": 1780273232194000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 3.515999,
         "okx_now_ms": 1311.661,
         "bn_window_ms": 787.624999
       },
       {
         "exchange_fill_timestamp_ns": 1780273243072000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 12.168999,
         "okx_now_ms": 529.964,
         "bn_window_ms": 463.337999
       },
       {
         "exchange_fill_timestamp_ns": 1780273531592000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 6.720999,
         "okx_now_ms": 1003.562,
         "bn_window_ms": 128.756999
@@ -555,90 +728,91 @@
     "max_age_ms": 2000.0,
     "reason_counts_exclusive": {
       "fully_evaluable": 153,
-      "ema_not_finite": 39
+      "ema_grid_nan_but_prior_finite_within_250ms": 11,
+      "ema_grid_nan_no_fresh_prior_finite": 28
     },
     "missing_total": 39,
     "missing_age_ms_samples": [
       {
         "exchange_fill_timestamp_ns": 1780273018688000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 215.563999,
         "okx_now_ms": 336.404,
         "bn_window_ms": 115.563999
       },
       {
         "exchange_fill_timestamp_ns": 1780273018692000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 219.563999,
         "okx_now_ms": 340.404,
         "bn_window_ms": 119.563999
       },
       {
         "exchange_fill_timestamp_ns": 1780273027092000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.964999,
         "okx_now_ms": 330.275,
         "bn_window_ms": 472.686999
       },
       {
         "exchange_fill_timestamp_ns": 1780273041012000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.726999,
         "okx_now_ms": 850.345,
         "bn_window_ms": 311.253999
       },
       {
         "exchange_fill_timestamp_ns": 1780273048142000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_but_prior_finite_within_250ms",
         "bn_now_ms": 72.586999,
         "okx_now_ms": 350.229,
         "bn_window_ms": 26.061999
       },
       {
         "exchange_fill_timestamp_ns": 1780273074222000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 781.247999,
         "okx_now_ms": 780.227,
         "bn_window_ms": 681.247999
       },
       {
         "exchange_fill_timestamp_ns": 1780273089621000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 0.549999,
         "okx_now_ms": 1888.179,
         "bn_window_ms": 2.073999
       },
       {
         "exchange_fill_timestamp_ns": 1780273089625000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 4.549999,
         "okx_now_ms": 1892.179,
         "bn_window_ms": 6.073999
       },
       {
         "exchange_fill_timestamp_ns": 1780273184204000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 6.721999,
         "okx_now_ms": 712.119,
         "bn_window_ms": 506.418999
       },
       {
         "exchange_fill_timestamp_ns": 1780273232194000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 3.515999,
         "okx_now_ms": 1311.661,
         "bn_window_ms": 787.624999
       },
       {
         "exchange_fill_timestamp_ns": 1780273243072000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 12.168999,
         "okx_now_ms": 529.964,
         "bn_window_ms": 463.337999
       },
       {
         "exchange_fill_timestamp_ns": 1780273531592000000,
-        "reason": "ema_not_finite",
+        "reason": "ema_grid_nan_no_fresh_prior_finite",
         "bn_now_ms": 6.720999,
         "okx_now_ms": 1003.562,
         "bn_window_ms": 128.756999
