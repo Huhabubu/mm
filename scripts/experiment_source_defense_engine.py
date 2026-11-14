@@ -22,7 +22,9 @@ from experiment_source_defense_signal import (
     defend_side_bps, widen_ticks_from_bps, next_defense_state,
     adaptive_bps_gates, queue_shield_allows,
 )
-from experiment_source_defense_trade_flow import causal_taker_window
+from experiment_source_defense_trade_flow import (
+    causal_taker_window, causal_pretrade_directional_p80,
+)
 from experiment_source_defense_robust_fit import fit_rolling_research_3level
 
 MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
@@ -160,7 +162,12 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    trade_signed_prefix=None, trade_total_prefix=None,
                    trade_min_notional_usdt=100., trade_signed_ratio=.35,
                    train_steps=TRAIN, robust_fit=False,
-                   earlier_day_prior_k=np.nan):
+                   earlier_day_prior_k=np.nan,
+                   trade_intensity_quantile=0.,
+                   random_pause_probability=0.,
+                   random_pause_hold_ns=75_000_000,
+                   random_pause_slot_ns=50_000_000,
+                   random_pause_seed=1):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -184,8 +191,14 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             raise ValueError("BBO and basis shapes differ")
         if not np.isfinite(beta):
             raise ValueError("Nonfinite beta")
-    if sparse_mode not in (0,1,2,3):
-        raise ValueError("Sparse mode must be 0(standard),1(widen),2(cancel),3(local-placebo)")
+    if sparse_mode not in (0,1,2,3,4):
+        raise ValueError("Sparse mode must be 0 G0, 1 widen, 2 cancel, 3 local placebo, 4 random-pause")
+    if sparse_mode==4:
+        if (not 0.<random_pause_probability<1. or random_pause_hold_ns<=0 or
+                random_pause_slot_ns<=0 or random_pause_seed<=0):
+            raise ValueError("Random pause must have fixed valid seed, slot and holding duration")
+        if use_trade_flow or use_queue_shield or beta!=0.:
+            raise ValueError("Random pause must not read source-dependent direction or state")
     if sparse_mode:
         if (okx_native_ns is None or okx_native_mid is None or
                 ema_grid_ns is None or ema_values is None):
@@ -219,6 +232,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             raise ValueError("Trade filter requires valid causal prefixed Binance trades")
         if trade_signed_ratio<=0 or trade_signed_ratio>=1 or trade_min_notional_usdt<=0:
             raise ValueError("Invalid Binance taker flow thresholds")
+        if trade_intensity_quantile!=0. and not (.5<=trade_intensity_quantile<=.9):
+            raise ValueError("Trade-intensity quantile must be predeclared P50-P90")
     if engine.elapse(0) != 0:
         raise ValueError("Cannot initialize OKX market replay")
     t0 = engine.current_timestamp
@@ -243,6 +258,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     warm_p_bid = warm_p_ask = np.nan
     shield_blocked = trades_blocked = 0
     shield_accepted = trades_accepted = 0
+    high_taker_buy_usdt = high_taker_sell_usdt = np.nan
+    taker_buy_training_windows = taker_sell_training_windows = 0
     updates = np.full((1 + trade_steps // UPDATE_EVERY_STEPS + 2, 9), np.nan)
     n_updates = 0
     prev_mid = np.nan
@@ -257,6 +274,13 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     latest_binance_ns = -1
     defense_side = 0
     defense_started_ns = -1
+    last_accounting_ns = t0
+    last_accounting_side = 0
+    defense_active_ns = 0
+    defense_episode_count = 0
+    random_rng = int(random_pause_seed)
+    random_next_ns = t0+(train_steps+1)*STEP_NS
+    random_pause_end_ns = t_stop+1
     last_defense_end_ns = t0 - defense_cooldown_ns
     sparse_gate_checks = sparse_gate_hits = sparse_activation_count = 0
     sparse_binance_only_safe_side_cancel = 0
@@ -301,6 +325,10 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         if idx < len(binance_visible_ns):
             next_binance = binance_visible_ns[idx]
         due = min(t_stop, next_sample, next_binance)
+        if sparse_mode==4:
+            due=min(due,random_next_ns)
+            if defense_side!=0:
+                due=min(due,random_pause_end_ns)
         if probe_ns is not None and probe_idx < n_probes:
             if probe_ns[probe_idx] >= now:
                 due = min(due, probe_ns[probe_idx])
@@ -319,6 +347,15 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 order_reply_events += 1
             elif feed_status != 0:
                 raise ValueError("Unexpected HBT event status")
+        # Integrate exact active time between two distinct observable deadlines.
+        if now>last_accounting_ns:
+            if last_accounting_side!=0 and last_accounting_ns>=t0+train_steps*STEP_NS:
+                defense_active_ns+=now-last_accounting_ns
+            last_accounting_ns=now
+        random_tick=False
+        if sparse_mode==4 and now>=random_next_ns:
+            random_tick=True
+            random_next_ns+=random_pause_slot_ns
 
         # HBT has already consumed all its events at this timestamp.
         # External rows at same timestamp are consumed IN ORIGINAL ROW ORDER.
@@ -396,6 +433,13 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     actual_gap_gate_bps=gap_gate_bps
                     actual_impulse_gate_bps=impulse_gate_bps
                     floor_gate_bps=max(.3,10000./mid_tick)
+                if use_trade_flow and trade_intensity_quantile>0.:
+                    (high_taker_buy_usdt,high_taker_sell_usdt,
+                     taker_buy_training_windows,taker_sell_training_windows,
+                     training_windows)=causal_pretrade_directional_p80(
+                         trade_visible_ns,trade_signed_prefix,trade_total_prefix,
+                         t0,t0+train_steps*STEP_NS,impulse_window_ns,
+                         STEP_NS,trade_intensity_quantile)
                 if use_queue_shield:
                     if n_warm_bid<train_steps//2 or n_warm_ask<train_steps//2:
                         raise ValueError("Insufficient causal HBT BBO quantities for Queue Shield")
@@ -487,7 +531,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 probe_idx += 1
 
         if sample_count > train_steps and (feed_status == 2 or feed_status == 3 or
-                                       signal_event or sample_event):
+                                       signal_event or sample_event or random_tick or
+                                       (sparse_mode==4 and defense_side!=0 and
+                                        now>=random_pause_end_ns)):
             # Observe live inventory peaks at every event, not only 100ms samples.
             max_position = max(max_position, abs(engine.position(0)))
             # Always collect fills BEFORE discarding inactive orders.
@@ -541,7 +587,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             candidate_defense_side = 0
             gap_bps = np.nan
             impulse_bps = np.nan
-            if sparse_mode:
+            if sparse_mode in (1,2,3):
                 sparse_gate_checks += 1
                 oi = np.searchsorted(okx_native_ns, now, side="left") - 1
                 gi = np.searchsorted(ema_grid_ns, now, side="left") - 1
@@ -605,11 +651,15 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                                     shield_accepted+=1
                             if candidate_defense_side != 0 and use_trade_flow:
                                 signed_direction=1 if gap_bps>0 else -1
+                                directional_min=0.
+                                if trade_intensity_quantile>0.:
+                                    directional_min=(high_taker_buy_usdt if signed_direction>0
+                                                     else high_taker_sell_usdt)
                                 ok,ratio,gross,net=causal_taker_window(
                                     now,trade_visible_ns,trade_signed_prefix,
                                     trade_total_prefix,impulse_window_ns,
                                     signed_direction,trade_signed_ratio,
-                                    trade_min_notional_usdt)
+                                    trade_min_notional_usdt,directional_min)
                                 if not ok:
                                     candidate_defense_side=0
                                     trades_blocked+=1
@@ -619,8 +669,21 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             # A *both-low* signal removes protection immediately.
             # Local placebo's impulse sign points opposite to gap direction.
             effective_impulse = -impulse_bps if sparse_mode == 3 else impulse_bps
-            defense_side, defense_started_ns, last_defense_end_ns = (
-                next_defense_state(
+            if sparse_mode==4:
+                if defense_side!=0 and now>=random_pause_end_ns:
+                    defense_side=0
+                    last_defense_end_ns=now
+                if random_tick and defense_side==0 and (
+                        now-last_defense_end_ns>=defense_cooldown_ns):
+                    random_rng=(random_rng*1103515245+12345)%2147483647
+                    if random_rng/2147483647. < random_pause_probability:
+                        random_rng=(random_rng*1103515245+12345)%2147483647
+                        defense_side=1 if random_rng%2 else -1
+                        defense_started_ns=now
+                        random_pause_end_ns=now+random_pause_hold_ns
+            else:
+                defense_side, defense_started_ns, last_defense_end_ns = (
+                    next_defense_state(
                     now, defense_side, defense_started_ns, last_defense_end_ns,
                     candidate_defense_side, gap_bps, effective_impulse,
                     (min(actual_gap_gate_bps,actual_impulse_gate_bps)*.25
@@ -628,6 +691,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     defense_hold_ns, defense_cooldown_ns))
             if defense_side != 0 and previous_defense_side != defense_side:
                 sparse_activation_count += 1
+                defense_episode_count+=1
+            last_accounting_side=defense_side
             reservation = mid - skew * pos + shift_ticks
             want_bid = min(round(reservation - half - extra_half_ticks), bid)
             want_ask = max(round(reservation + half + extra_half_ticks), ask)
@@ -646,7 +711,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
 
             # Sparse price action is one-sided. A Binance-only timestamp may
             # alter the dangerous side, but never price/replace the safe side.
-            if defense_side != 0 and sparse_mode != 2:
+            if defense_side != 0 and sparse_mode not in (2,4):
                 width = widen_ticks_from_bps(mid*tick_size, tick_size, widen_bps)
                 if defense_side == 1:
                     want_ask += width
@@ -657,7 +722,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             want_ask = max(want_ask, ask)
             if want_bid >= ask or want_ask <= bid:
                 raise ValueError("Experimental quote crossed target best opposite")
-            binance_only = (sparse_mode != 0 and signal_event and
+            binance_only = (sparse_mode in (1,2,3) and signal_event and
                             feed_status == 0 and not sample_event)
             # When one side is defended, NEVER recompute/cancel/replace the
             # opposite-side resting quote, even on local OKX market events.
@@ -667,8 +732,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             allow_ask = ((not binance_only or
                           defense_side == 1 or previous_defense_side == 1)
                          and defense_side != -1)
-            suppress_bid = (sparse_mode == 2 and defense_side == -1)
-            suppress_ask = (sparse_mode == 2 and defense_side == 1)
+            suppress_bid = (sparse_mode in (2,4) and defense_side == -1)
+            suppress_ask = (sparse_mode in (2,4) and defense_side == 1)
             # One side may be pending cancellation; no replacement until cleared.
             has_bid = has_ask = False
             orders = engine.orders(0)
@@ -765,10 +830,17 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                       urgent_bid_cancels, urgent_ask_cancels,
                       ordinary_bid_cancels, ordinary_ask_cancels,
                       shield_blocked, shield_accepted,
-                      trades_blocked, trades_accepted], dtype=np.int64),
+                      trades_blocked, trades_accepted,
+                      taker_buy_training_windows,taker_sell_training_windows
+                      ], dtype=np.int64),
             np.array([sigma_100ms_bps,actual_gap_gate_bps,
                       actual_impulse_gate_bps,floor_gate_bps,
-                      warm_p_bid,warm_p_ask],dtype=np.float64))
+                      warm_p_bid,warm_p_ask,
+                      high_taker_buy_usdt,high_taker_sell_usdt],dtype=np.float64),
+            np.array([defense_active_ns,defense_episode_count,
+                      defense_active_ns/max(1.,(trade_steps*STEP_NS)),
+                      defense_active_ns/max(1,defense_episode_count)],
+                     dtype=np.float64))
 
 
 def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
