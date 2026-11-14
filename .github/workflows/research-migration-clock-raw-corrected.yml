@@ -1,0 +1,107 @@
+name: Research corrected raw V6 clock six dates and migration 3+3 completion
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-migration-clock-raw-corrected.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  clock-raw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+        coin: [BTC,SOL,DOGE,1000PEPE]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Raw full-row lag population with batch-collapsed response
+        run: |
+          python scripts/experiment_migration_clock.py --mode case \
+            --day '${{ matrix.day }}' --coin '${{ matrix.coin }}' \
+            --out raw_clock/${{ matrix.day }}/${{ matrix.coin }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-clock-raw-${{ matrix.day }}-${{ matrix.coin }}
+          path: raw_clock/${{ matrix.day }}/${{ matrix.coin }}/case.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  audited-combined-aggregate:
+    needs: clock-raw
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: migration-clock-raw-*
+          path: incoming-clock
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43588336725
+          github-token: ${{ github.token }}
+          pattern: migration-mechanism-*
+          path: incoming-mechanism
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43588336725
+          github-token: ${{ github.token }}
+          pattern: migration-post-*
+          path: incoming-post
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43554787965
+          github-token: ${{ github.token }}
+          pattern: v5-case-*
+          path: incoming-v5
+      - name: Enforce raw-row clocks, 30/24/9 cases and strict V5/V6 matching
+        run: |
+          python -m py_compile scripts/experiment_migration_clock.py \
+            scripts/experiment_migration_group_aggregate.py \
+            scripts/experiment_migration_mechanism.py \
+            scripts/experiment_migration_post_delay.py
+          python scripts/experiment_migration_clock.py --mode aggregate \
+            --source incoming-clock --out reports/source_defense/migration_clock
+          python scripts/experiment_migration_group_aggregate.py \
+            --v5 incoming-v5 --v6-new incoming-mechanism \
+            --out reports/source_defense/migration_v5v6
+          python scripts/experiment_migration_post_delay.py --mode aggregate \
+            --source incoming-post --out reports/source_defense/migration_post_delay
+          cat reports/source_defense/migration_clock/migration_clock.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/source_defense/migration_v5v6/migration_v5v6_groups.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/source_defense/migration_post_delay/migration_tokyo_delay.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit small verified JSON/MD only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/migration_clock/migration_clock.json \
+            reports/source_defense/migration_clock/migration_clock.md \
+            reports/source_defense/migration_v5v6/migration_v5v6_groups.json \
+            reports/source_defense/migration_v5v6/migration_v5v6_groups.md \
+            reports/source_defense/migration_post_delay/migration_tokyo_delay.json \
+            reports/source_defense/migration_post_delay/migration_tokyo_delay.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): raw-row clock and pre/post migration HBT results'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: migration-raw-corrected-compact-reports
+          path: reports/source_defense/migration_*/migration_*
+          retention-days: 90
+          if-no-files-found: warn
