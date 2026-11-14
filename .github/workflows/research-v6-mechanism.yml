@@ -1,0 +1,125 @@
+name: Research V6 exact defense activation and SOL six-day +60s placebo
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v6-mechanism.yml']
+permissions:
+  contents: write
+jobs:
+  focused-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Compile new scripts and test +60s exact membership and native microprice
+        run: |
+          python -m py_compile scripts/experiment_source_defense_engine.py \
+            scripts/experiment_source_defense_v6_mechanism.py \
+            scripts/experiment_source_defense_v6_mechanism_aggregate.py \
+            scripts/experiment_source_defense_v6_clock_microprice.py \
+            scripts/experiment_source_defense_v6_clock_aggregate.py
+          python -m unittest discover -s scripts \
+            -p 'test_experiment_source_defense_v6_mechanism.py' -v
+  replay:
+    needs: focused-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - {coin: SOL, day: '2026-06-01'}
+          - {coin: SOL, day: '2026-07-01'}
+          - {coin: SOL, day: '2026-08-01'}
+          - {coin: SOL, day: '2026-09-01'}
+          - {coin: SOL, day: '2026-10-01'}
+          - {coin: SOL, day: '2026-11-01'}
+          - {coin: BTC, day: '2026-06-01'}
+          - {coin: DOGE, day: '2026-06-01'}
+          - {coin: 1000PEPE, day: '2026-06-01'}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Official HBT G0+source and time shift local send/activation trace
+        run: |
+          python scripts/experiment_source_defense_v6_mechanism.py \
+            --day '${{ matrix.day }}' --coin '${{ matrix.coin }}' \
+            --out reports/source_defense/v6_mechanism_cases/${{ matrix.coin }}/${{ matrix.day }}
+      - name: Validate direct A+B versus Dropped, reported actual episode duty and official fees
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          f=Path('reports/source_defense/v6_mechanism_cases/${{ matrix.coin }}/${{ matrix.day }}/case.json')
+          x=json.loads(f.read_text())
+          assert x['HBT_official'] and x['maker_fee_bps']==2.0
+          assert x['source_vs_G0_fill_groups_exchange_clock']['A_plus_B_equals_Dropped']
+          assert all(x['G0_and_source_first_A_k_sigma_equal'].values())
+          if x['coin']=='SOL':
+            assert x['time_shift_60s']['strategy']['defense_episode_count']>=0
+            assert x['time_shift_60s']['source_vs_G0_fill_groups_exchange_clock']['A_plus_B_equals_Dropped']
+          print('V6_DEFENSE_GROUP_PASS',x['day'],x['coin'],
+                'A',x['source_vs_G0_fill_groups_exchange_clock']['Group_A_active_or_200ms_post_cancel']['count'],
+                'B',x['source_vs_G0_fill_groups_exchange_clock']['Group_B_no_local_defense_or_cancel_tail']['count'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v6-mechanism-${{ matrix.coin }}-${{ matrix.day }}
+          path: reports/source_defense/v6_mechanism_cases/${{ matrix.coin }}/${{ matrix.day }}/*
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    if: always()
+    needs: replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v6-mechanism-*
+          path: incoming
+      - name: Validate nine cases and aggregate exact A/B plus shift clipped tail
+        run: |
+          python scripts/experiment_source_defense_v6_mechanism_aggregate.py \
+            --source incoming \
+            --out reports/source_defense/v6_mechanism
+          cat reports/source_defense/v6_mechanism/mechanism_shift60_summary.md \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive compact JSON and MD only (never CI-only NPZ)
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v6_mechanism/mechanism_shift60_summary.json \
+                     reports/source_defense/v6_mechanism/mechanism_shift60_summary.md
+          for f in incoming/v6-mechanism-*/case.json; do
+            file="$(basename "$(dirname "$f")")"
+            coin="$(echo "$file" | sed -E 's/^v6-mechanism-(.*)-[0-9]{4}-[0-9]{2}-[0-9]{2}$/\1/')"
+            day="$(echo "$file" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}$')"
+            mkdir -p "reports/source_defense/v6_mechanism_cases/$coin/$day"
+            cp "$f" "reports/source_defense/v6_mechanism_cases/$coin/$day/case.json"
+            git add -f "reports/source_defense/v6_mechanism_cases/$coin/$day/case.json"
+          done
+          git commit -m 'research(data): six SOL +60s source-blind mechanism, June clock and gamma with official HBT fill membership'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v6-sixday-mechanism-summary-only
+          path: reports/source_defense/v6_mechanism/*
+          if-no-files-found: warn
+          retention-days: 90
