@@ -1,0 +1,32 @@
+name: Research Step3 PEPE contract unit verification before six-date admission
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-step3-pepe-units.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        venue: [okex-swap,bitget-futures]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - run: |
+          python scripts/experiment_source_defense_pepe_units.py \
+            --day 2026-06-01 --venue "${{ matrix.venue }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sparse-defense-pepe-unit-${{ matrix.venue }}
+          path: reports/source_defense/pepe_units/*
+          if-no-files-found: warn
+          retention-days: 90
