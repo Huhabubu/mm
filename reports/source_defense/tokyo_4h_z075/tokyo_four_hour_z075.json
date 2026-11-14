@@ -1,0 +1,126 @@
+{
+  "Z075_vs_Z1": {
+    "same_daily_fills_duty_net_cancels_and_ACK": [
+      true,
+      true,
+      true
+    ],
+    "all_three_dates_execution_metrics_identical": true,
+    "reduced_z_might_bind_to_floor_or_leave_discrete_action_unchanged": true,
+    "cannot_assert_different_effective_threshold_without_raw_gate_values": true
+  },
+  "scope": "Only SOL OKX, three previously explored pure Tokyo 4h days",
+  "dates": [
+    "2026-09-01",
+    "2026-10-01",
+    "2026-11-01"
+  ],
+  "precommitted_gate": "Z1 duty <0.25% AND pooled retention >95% on the same 3 4h explored days",
+  "chosen_z_multiplier": 0.75,
+  "fixed_adaptive_z_gap": 1.125,
+  "fixed_adaptive_z_imp": 0.75,
+  "G0_fills": 1309,
+  "z075_fills": 1261,
+  "retention": 0.9633307868601986,
+  "duty_equal_day_mean": 0.0018704377011805554,
+  "ACK_strict_total": 27,
+  "cancel_request_delta": 75,
+  "mean_daily_gross_usdt_G0": -3.4414000000000224,
+  "mean_daily_gross_usdt_Z075": -3.3759333333333337,
+  "mean_daily_net_2bps_usdt_G0": -10.455250453333354,
+  "mean_daily_net_2bps_usdt_Z075": -10.132416106666668,
+  "groups": {
+    "Group_A_active_or_200ms_post_cancel": {
+      "100ms": {
+        "n": 37,
+        "pooled_mean_bps": -2.1953401852763523,
+        "daily_mean_bps": [
+          -2.4216761549039676,
+          -2.216343465342214,
+          -1.744602088999813
+        ]
+      },
+      "500ms": {
+        "n": 37,
+        "pooled_mean_bps": -2.1466321158698154,
+        "daily_mean_bps": [
+          -2.3241337598299605,
+          -2.176973245470699,
+          -1.744602088999813
+        ]
+      }
+    },
+    "Kept": {
+      "100ms": {
+        "n": 1211,
+        "pooled_mean_bps": -1.7473587575215517,
+        "daily_mean_bps": [
+          -2.6189165135476444,
+          -1.4680931581968744,
+          -1.9720413523368385
+        ]
+      },
+      "500ms": {
+        "n": 1211,
+        "pooled_mean_bps": -1.8413859144751548,
+        "daily_mean_bps": [
+          -2.697958761628491,
+          -1.5781173357474176,
+          -1.994629541567558
+        ]
+      }
+    },
+    "Group_B_no_local_defense_or_cancel_tail": {
+      "100ms": {
+        "n": 55,
+        "pooled_mean_bps": -1.1533240713950623,
+        "daily_mean_bps": [
+          -1.1712750045899578,
+          -0.9881535438804242,
+          -1.922332087184418
+        ]
+      },
+      "500ms": {
+        "n": 55,
+        "pooled_mean_bps": -1.247946484684633,
+        "daily_mean_bps": [
+          -1.2227298499700079,
+          -1.1290398995039388,
+          -1.922332087184418
+        ]
+      }
+    },
+    "Dropped_all": {
+      "100ms": {
+        "n": 92,
+        "pooled_mean_bps": -1.5723957693690596,
+        "daily_mean_bps": [
+          -1.6024478150430645,
+          -1.4938788056588082,
+          -1.8334670880921156
+        ]
+      },
+      "500ms": {
+        "n": 92,
+        "pooled_mean_bps": -1.609374401574326,
+        "daily_mean_bps": [
+          -1.6025243016458537,
+          -1.560541865490252,
+          -1.8334670880921156
+        ]
+      }
+    }
+  },
+  "selectivity_lift": {
+    "100ms": {
+      "valid_days": 3,
+      "equal_day_mean_bps": -0.3764191050957897
+    },
+    "500ms": {
+      "valid_days": 3,
+      "equal_day_mean_bps": -0.4247241279050817
+    }
+  },
+  "no_further_threshold_search": true,
+  "not_untouched_sample_out": true
+}
