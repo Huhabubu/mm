@@ -1,0 +1,42 @@
+name: Research Step1 read-only G0 prefill bps and Added inventory diagnosis
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-step1-readonly.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnosis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Deterministic attribution unit tests (no trading)
+        run: |
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_step1_diagnostic.py' -v
+      - name: Read prior BTC SOL official fills from frozen original June pilot
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43545643507
+          github-token: ${{ github.token }}
+          pattern: sparse-defense-pilot-*-2026-06-01
+          merge-multiple: false
+          path: original_pilot
+      - name: Read only historical BBO and existing official fill records
+        run: |
+          python scripts/experiment_source_defense_step1_diagnostic.py \
+            --source original_pilot --out reports/source_defense/step1
+          cat reports/source_defense/step1/step1_diagnostics.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sparse-defense-step1-readonly-buckets-added-inventory
+          path: reports/source_defense/step1/*
+          if-no-files-found: error
+          retention-days: 90
