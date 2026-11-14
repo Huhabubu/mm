@@ -361,8 +361,11 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             if defense_side!=0:
                 due=min(due,random_pause_end_ns)
         if sparse_mode==5 and time_shift_starts_ns is not None and shifted_index<len(time_shift_starts_ns):
-            due=min(due,time_shift_starts_ns[shifted_index])
-            if defense_side!=0:
+            if defense_side==0:
+                due=min(due,time_shift_starts_ns[shifted_index])
+            else:
+                # Once episode begins, its START is in the past; only END
+                # is a future deadline. Prevents zero-duration spin loop.
                 due=min(due,time_shift_ends_ns[shifted_index])
         if probe_ns is not None and probe_idx < n_probes:
             if probe_ns[probe_idx] >= now:
