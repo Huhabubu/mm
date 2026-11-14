@@ -1,0 +1,69 @@
+name: Research V6 collector clocks June July 4 coins and Microprice read-only
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v6-clock-microprice.yml']
+permissions:
+  contents: write
+jobs:
+  native-clock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        day: ['2026-06-01','2026-07-01']
+        coin: [BTC,SOL,DOGE,1000PEPE]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Native Tardis Binance/OKX/Bitget local−exchange clock and pre-jump BBO quantity
+        run: |
+          python scripts/experiment_source_defense_v6_clock_microprice.py \
+            --day '${{ matrix.day }}' --coin '${{ matrix.coin }}' \
+            --out reports/source_defense/v6_clock_cases/${{ matrix.day }}/${{ matrix.coin }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v6-native-clock-${{ matrix.day }}-${{ matrix.coin }}
+          path: reports/source_defense/v6_clock_cases/${{ matrix.day }}/${{ matrix.coin }}/*.json
+          if-no-files-found: warn
+  aggregate:
+    runs-on: ubuntu-latest
+    needs: native-clock
+    if: always()
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v6-native-clock-*
+          path: clock_input
+      - name: Eight-case strict completeness and descriptive collector-skew report
+        run: |
+          python scripts/experiment_source_defense_v6_clock_aggregate.py \
+            --source clock_input --out reports/source_defense/v6_clock
+          cat reports/source_defense/v6_clock/clock_microprice_summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit compact clock research report only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v6_clock/clock_microprice_summary.json \
+                     reports/source_defense/v6_clock/clock_microprice_summary.md
+          git commit -m 'research(data): native Tardis clock offset and early Microprice read-only event study'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v6-native-clock-aggregate-report
+          path: reports/source_defense/v6_clock/*
+          if-no-files-found: warn
