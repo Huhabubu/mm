@@ -57,11 +57,14 @@ def source_events(source_t, source_mid, other_t, other_mid,
     ix = np.flatnonzero(candidate)
     times = source_t[ix]
     oi = past_indices(other_t, times)
+    last_including_t = past_indices(other_t, times, include_equal=True)
+    exact_tie = (last_including_t >= 0) & (
+        other_t[np.maximum(last_including_t, 0)] == times)
     gi = past_indices(basis_t, times)
     osafe, gsafe = np.maximum(oi, 0), np.maximum(gi, 0)
     # Both sources must have current quotes <=250ms old.
     other_age = times - other_t[osafe]
-    good = (oi >= 0) & (gi >= 0) & (other_age <= MAX_AGE_NS) & (other_age >= 0)
+    good = (oi >= 0) & (gi >= 0) & (~exact_tie) & (other_age <= MAX_AGE_NS) & (other_age >= 0)
     good &= np.isfinite(basis[gsafe])
     # Source price and other price must be on a comparable, valid market.
     if source == "binance":
@@ -84,6 +87,7 @@ def source_events(source_t, source_mid, other_t, other_mid,
         "gap": gap[good],
         "source_price_change": delta[ix][good],
         "source_name": source,
+        "tick_size": tick,
         "source_events_with_price_change": int(candidate.sum()),
         "eligible_after_causal_gates": int(good.sum()),
     }
@@ -138,7 +142,8 @@ def summarize_event_class(events, okx_t, okx_mid, end_ns):
         "eligible_events_before_20ms_dedup": events["eligible_after_causal_gates"],
         "eligible_events_after_20ms_dedup": len(t),
         "bucket_width_ms": DEDUP_BUCKET_NS // 1_000_000,
-        "mean_abs_gap_target_ticks": float(np.mean(np.abs(gap))) if len(gap) else None,
+        "mean_abs_gap_target_ticks": (float(np.mean(np.abs(gap)) / events["tick_size"])
+                                      if len(gap) else None),
         "future_okx_toward_binance": table,
     }
 
