@@ -1,0 +1,42 @@
+name: Research sparse source defense - prespecified 1tick widen followup
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-sparse-defense-1tick.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  one-day-50min:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        coin: ['BTC','SOL']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Recheck sparse source and fill attribution tests
+        run: |
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_signal.py' -v
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_pilot.py' -v
+      - name: One tick defensive price action, same official HBT 2.5ms tape
+        run: |
+          python scripts/experiment_source_defense_pilot.py \
+            --day 2026-06-01 --coin "${{ matrix.coin }}" --widen-ticks 1 \
+            --out reports/source_defense/pilot_1tick
+      - name: Preserve separate outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sparse-defense-1tick-${{ matrix.coin }}-2026-06-01
+          path: reports/source_defense/pilot_1tick/**
+          if-no-files-found: warn
+          retention-days: 90
