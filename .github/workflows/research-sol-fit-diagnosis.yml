@@ -1,0 +1,38 @@
+name: Research sparse source defense - SOL historical fit root cause
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-sol-fit-diagnosis.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  read-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download only six corrected official HBT OKX SOL pretrade reports
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43540086088
+          github-token: ${{ github.token }}
+          pattern: postp0-okx-SOL-*
+          path: gathered
+      - name: Classify initial-fit rejection strictly from historical pretrade data
+        run: |
+          python scripts/experiment_sol_fit_diagnosis.py \
+            --source gathered --out reports/source_defense/sol_fit_diagnosis
+          cat reports/source_defense/sol_fit_diagnosis/diagnosis.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-defense-sol-fit-diagnosis
+          path: reports/source_defense/sol_fit_diagnosis/*
+          if-no-files-found: error
+          retention-days: 90
