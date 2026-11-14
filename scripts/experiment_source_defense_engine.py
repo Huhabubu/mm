@@ -18,6 +18,9 @@ from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
 
 from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TICK, TRAIN
 from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coefficients
+from experiment_source_defense_signal import (
+    defend_side_bps, widen_ticks_from_bps, next_defense_state,
+)
 
 MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
@@ -117,9 +120,10 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    recorder=None, sparse_mode=0,
                    ema_grid_ns=None, ema_values=None,
                    impulse_window_ns=100_000_000,
-                   gap_gate_ticks=1.0, impulse_gate_ticks=1.0,
-                   defense_widen_ticks=2,
-                   defense_cooldown_ns=100_000_000):
+                   gap_gate_bps=0.5, impulse_gate_bps=0.2,
+                   hysteresis_exit_th_bps=0.1, widen_bps=0.5,
+                   defense_hold_ns=75_000_000,
+                   defense_cooldown_ns=75_000_000):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -153,8 +157,13 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 len(ema_grid_ns) != len(ema_values)):
             raise ValueError("Sparse array lengths disagree")
         if (impulse_window_ns<=0 or defense_cooldown_ns<0 or
-                gap_gate_ticks<=0 or impulse_gate_ticks<=0 or
-                defense_widen_ticks<1):
+                not np.isfinite(gap_gate_bps) or gap_gate_bps<=0 or
+                not np.isfinite(impulse_gate_bps) or impulse_gate_bps<=0 or
+                not np.isfinite(hysteresis_exit_th_bps) or
+                hysteresis_exit_th_bps<0 or
+                hysteresis_exit_th_bps>=min(gap_gate_bps,impulse_gate_bps) or
+                not np.isfinite(widen_bps) or widen_bps<=0 or
+                defense_hold_ns<0 or defense_hold_ns>100_000_000):
             raise ValueError("Invalid sparse protection parameters")
     if engine.elapse(0) != 0:
         raise ValueError("Cannot initialize OKX market replay")
@@ -181,6 +190,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     latest_binance = np.nan
     latest_binance_ns = -1
     defense_side = 0
+    defense_started_ns = -1
     last_defense_end_ns = t0 - defense_cooldown_ns
     sparse_gate_checks = sparse_gate_hits = sparse_activation_count = 0
     sparse_binance_only_safe_side_cancel = 0
@@ -416,10 +426,12 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     filter_enter_ticks, filter_exit_ticks,
                     filter_refresh_change_ticks, filter_refresh_ns)
                 shift_ticks = held_shift_ticks
-            # Isolated sparse experiment: source-aware dual gate, strictly
-            # historical fast basis and strictly visible 100ms source impulse.
+            # Step2: strictly causal target-mid-relative bps gates.
+            # BBO midpoint movement is a price impulse, not signed trade flow.
             previous_defense_side = defense_side
             candidate_defense_side = 0
+            gap_bps = np.nan
+            impulse_bps = np.nan
             if sparse_mode:
                 sparse_gate_checks += 1
                 oi = np.searchsorted(okx_native_ns, now, side="left") - 1
@@ -433,44 +445,49 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     now - okx_native_ns[oi] <= 250_000_000 and
                     np.isfinite(ema_values[gi]))
                 if valid:
-                    g_ticks = (
-                        latest_binance - mid*tick_size - ema_values[gi]
-                    ) / tick_size
-                    leader_ticks = 0.0
-                    local_ticks = 0.0
+                    mid_price = mid * tick_size
+                    gap_bps = 1.e4 * (
+                        latest_binance - mid_price - ema_values[gi]
+                    ) / mid_price
                     window_start = now - impulse_window_ns
                     if sparse_mode in (1, 2):
-                        past_idx = np.searchsorted(binance_visible_ns, window_start, side="right") - 1
-                        if past_idx >= 0 and window_start-binance_visible_ns[past_idx] <= 250_000_000:
-                            leader_ticks = (latest_binance-binance_mid[past_idx])/tick_size
+                        past_idx = np.searchsorted(
+                            binance_visible_ns, window_start, side="right") - 1
+                        if (past_idx >= 0 and
+                                window_start >= binance_visible_ns[past_idx] and
+                                window_start-binance_visible_ns[past_idx] <= 250_000_000):
+                            impulse_bps = 1.e4 * (
+                                latest_binance-binance_mid[past_idx]) / mid_price
                     else:
-                        past_idx = np.searchsorted(okx_native_ns, window_start, side="right") - 1
-                        if past_idx >= 0 and window_start-okx_native_ns[past_idx] <= 250_000_000:
-                            local_ticks = (okx_native_mid[oi]-okx_native_mid[past_idx])/tick_size
-                    # Pure NumPy/Numba gate: sign(gap) must match the
-                    # source impulse, or be opposite the local placebo move.
-                    impulse_ticks = (-local_ticks if sparse_mode == 3
-                                     else leader_ticks)
-                    if (np.isfinite(g_ticks) and np.isfinite(impulse_ticks) and
-                            abs(g_ticks) >= gap_gate_ticks and
-                            abs(impulse_ticks) >= impulse_gate_ticks and
-                            g_ticks*impulse_ticks > 0):
-                        candidate_defense_side = 1 if g_ticks > 0 else -1
-                    if candidate_defense_side != 0:
-                        sparse_gate_hits += 1
-            # Release promptly when source impulse expires. Cooldown blocks
-            # rapid re-entry after a release, without holding stale danger.
-            if candidate_defense_side == 0 and defense_side != 0:
-                last_defense_end_ns = now
-                defense_side = 0
-            elif candidate_defense_side != defense_side:
-                if defense_side != 0:
-                    last_defense_end_ns = now
-                    defense_side = 0
-                if now - last_defense_end_ns >= defense_cooldown_ns:
-                    defense_side = candidate_defense_side
-                    if defense_side != 0:
-                        sparse_activation_count += 1
+                        past_idx = np.searchsorted(
+                            okx_native_ns, window_start, side="right") - 1
+                        if (past_idx >= 0 and
+                                window_start >= okx_native_ns[past_idx] and
+                                window_start-okx_native_ns[past_idx] <= 250_000_000):
+                            impulse_bps = 1.e4 * (
+                                okx_native_mid[oi]-okx_native_mid[past_idx]) / mid_price
+                    if np.isfinite(impulse_bps):
+                        if sparse_mode == 3:
+                            candidate_defense_side = defend_side_bps(
+                                gap_bps, 0., impulse_bps, sparse_mode,
+                                gap_gate_bps, impulse_gate_bps)
+                        else:
+                            candidate_defense_side = defend_side_bps(
+                                gap_bps, impulse_bps, 0., sparse_mode,
+                                gap_gate_bps, impulse_gate_bps)
+                        if candidate_defense_side != 0:
+                            sparse_gate_hits += 1
+            # A non-renewable <=100ms hold, independent of message frequency.
+            # A *both-low* signal removes protection immediately.
+            # Local placebo's impulse sign points opposite to gap direction.
+            effective_impulse = -impulse_bps if sparse_mode == 3 else impulse_bps
+            defense_side, defense_started_ns, last_defense_end_ns = (
+                next_defense_state(
+                    now, defense_side, defense_started_ns, last_defense_end_ns,
+                    candidate_defense_side, gap_bps, effective_impulse,
+                    hysteresis_exit_th_bps, defense_hold_ns, defense_cooldown_ns))
+            if defense_side != 0 and previous_defense_side != defense_side:
+                sparse_activation_count += 1
             reservation = mid - skew * pos + shift_ticks
             want_bid = min(round(reservation - half - extra_half_ticks), bid)
             want_ask = max(round(reservation + half + extra_half_ticks), ask)
@@ -489,10 +506,12 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
 
             # Sparse price action is one-sided. A Binance-only timestamp may
             # alter the dangerous side, but never price/replace the safe side.
-            if defense_side == 1 and sparse_mode != 2:
-                want_ask += defense_widen_ticks
-            elif defense_side == -1 and sparse_mode != 2:
-                want_bid -= defense_widen_ticks
+            if defense_side != 0 and sparse_mode != 2:
+                width = widen_ticks_from_bps(mid*tick_size, tick_size, widen_bps)
+                if defense_side == 1:
+                    want_ask += width
+                else:
+                    want_bid -= width
             # Reapply post-only clamp after every experimental quote branch.
             want_bid = min(want_bid, bid)
             want_ask = max(want_ask, ask)
@@ -500,10 +519,14 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 raise ValueError("Experimental quote crossed target best opposite")
             binance_only = (sparse_mode != 0 and signal_event and
                             feed_status == 0 and not sample_event)
-            allow_bid = (not binance_only or
-                         defense_side == -1 or previous_defense_side == -1)
-            allow_ask = (not binance_only or
-                         defense_side == 1 or previous_defense_side == 1)
+            # When one side is defended, NEVER recompute/cancel/replace the
+            # opposite-side resting quote, even on local OKX market events.
+            allow_bid = ((not binance_only or
+                          defense_side == -1 or previous_defense_side == -1)
+                         and defense_side != 1)
+            allow_ask = ((not binance_only or
+                          defense_side == 1 or previous_defense_side == 1)
+                         and defense_side != -1)
             suppress_bid = (sparse_mode == 2 and defense_side == -1)
             suppress_ask = (sparse_mode == 2 and defense_side == 1)
             # One side may be pending cancellation; no replacement until cleared.
