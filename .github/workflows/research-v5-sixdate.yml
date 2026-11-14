@@ -1,0 +1,115 @@
+name: Research V5 six-date SOL DOGE PEPE OKX Bitget source-defense and random-pause
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v5-sixdate.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  hbt-case:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        market: [SOL_okex-swap,DOGE_okex-swap,1000PEPE_okex-swap,1000PEPE_bitget-futures]
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43554528277
+          github-token: ${{ github.token }}
+          name: v5-may-prior-${{ matrix.market }}
+          path: may_prior
+      - name: Causal source-only G0 / z1 cancel QS / z1+high-intensity P80 / local placebo / 5 pre-May-fixed random seeds
+        run: |
+          market='${{ matrix.market }}'
+          coin="$(echo "$market" | cut -d_ -f1)"
+          venue="$(echo "$market" | cut -d_ -f2)"
+          python -m py_compile scripts/experiment_source_defense_engine.py \
+            scripts/experiment_source_defense_trade_flow.py \
+            scripts/experiment_source_defense_v5_multiday.py
+          python scripts/experiment_source_defense_v5_multiday.py \
+            --day '${{ matrix.day }}' --coin "$coin" --venue "$venue" --purpose day \
+            --admission-json reports/source_defense/step3_fit/step3_fit_admission.json \
+            --may-pause-json may_prior/case.json \
+            --out "reports/source_defense/v5_cases/$market/${{ matrix.day }}"
+      - name: Check true official HBT fee ledger and strict date/window provenance
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('reports/source_defense/v5_cases/${{ matrix.market }}/${{ matrix.day }}/case.json')
+          x=json.loads(p.read_text())
+          assert x['status']=='complete' and x['day']=='${{ matrix.day }}'
+          assert x['all_models_glft_fit_identical']
+          assert x['may_random_pause_preset']['training_day']=='2026-05-01'
+          assert len(x['variants'])==10
+          assert x['binance_taker_trade_qa']['trade_rows']>0
+          for name,z in x['variants'].items():
+            tr=z['trading']
+            assert tr['fee_usdt']>=0
+            assert abs(tr['fee_usdt']-0.0002*tr['trading_value_usdt'])<max(1e-5,tr['trading_value_usdt']*1e-8)
+            assert z['status']=='complete'
+            assert tr['engine_fills']>=0
+          assert x['variants']['z1_cancel_qs_tf_p80']['thresholds']['binance_buy_net_P80_usdt']>0
+          assert x['variants']['z1_cancel_qs_tf_p80']['thresholds']['binance_sell_net_P80_usdt']>0
+          print('SIXDATE_PASS',x['day'],x['coin'],x['venue'],
+                x['high_intensity_P80_effect_check'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v5-case-${{ matrix.market }}-${{ matrix.day }}
+          path: reports/source_defense/v5_cases/${{ matrix.market }}/${{ matrix.day }}/*
+          if-no-files-found: warn
+          retention-days: 90
+  sixday-aggregate:
+    needs: hbt-case
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v5-case-*
+          path: incoming
+          merge-multiple: false
+      - name: Six independent days, 30s within-day blocks, 5-seed random pause, fee sensitivity
+        run: |
+          python scripts/experiment_source_defense_v5_aggregate.py \
+            --source incoming \
+            --out reports/source_defense/v5_sixdate
+          cat reports/source_defense/v5_sixdate/v5_sixdate_summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit small JSON/MD only; no NPZ, no baseline modifications
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v5_sixdate/v5_sixdate_summary.json \
+                     reports/source_defense/v5_sixdate/v5_sixdate_summary.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'research(data): six independent days combined HBT net and conditional selection with 5-seed random-pause placebo'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v5-sixday-combined-bootstrapped-report
+          path: reports/source_defense/v5_sixdate/*
+          if-no-files-found: warn
+          retention-days: 90
