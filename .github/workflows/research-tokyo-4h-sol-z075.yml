@@ -1,0 +1,65 @@
+name: Research SOL-only predetermined Z0.75 Tokyo four-hour gate
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-tokyo-4h-sol-z075.yml']
+permissions:
+  contents: write
+jobs:
+  cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Exact only precommitted SOL Z0.75, no further search
+        run: |
+          python scripts/experiment_tokyo_4h.py \
+            --day '${{ matrix.day }}' --coin SOL --venue okex-swap \
+            --stage z075 \
+            --out tokyo_z075/${{ matrix.day }}/SOL
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tokyo4h-z075-SOL-${{ matrix.day }}
+          path: tokyo_z075/${{ matrix.day }}/SOL/case.json
+          retention-days: 90
+          if-no-files-found: warn
+  aggregate:
+    needs: cases
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tokyo4h-z075-SOL-*
+          path: incoming
+      - name: Validate strictly 3 SOL-only days
+        run: |
+          python scripts/aggregate_tokyo_z075.py \
+            --source incoming --out reports/source_defense/tokyo_4h_z075
+          cat reports/source_defense/tokyo_4h_z075/tokyo_four_hour_z075.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit compact result
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/tokyo_4h_z075/tokyo_four_hour_z075.json \
+            reports/source_defense/tokyo_4h_z075/tokyo_four_hour_z075.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): fixed Z0.75 SOL four-hour true-ACK probe'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
