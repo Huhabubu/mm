@@ -27,8 +27,9 @@ jobs:
           test -s reports/source_defense/step1/step1_diagnostics.md
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add reports/source_defense/step1/step1_diagnostics.json \
+          git add -f reports/source_defense/step1/step1_diagnostics.json \
                   reports/source_defense/step1/step1_diagnostics.md
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "research(data): archive verified June-1 Step1 G0 bps buckets and added inventory"
+          git pull --rebase origin research/sparse-source-defense-20261114
           git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
