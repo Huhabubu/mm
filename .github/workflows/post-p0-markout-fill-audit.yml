@@ -1,0 +1,62 @@
+name: Post-P0 2p5ms official fills markout and paired opportunity audit
+on:
+  workflow_run:
+    workflows:
+      - "Post-P0 repaired 2p5ms four-market six-date GLFT rerun"
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Corrected P0 2.5ms 24-case run id'
+        required: true
+        default: '43540086088'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  attribute:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SOURCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.event.workflow_run.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install numeric dependency
+        run: pip install numpy==2.2.6
+      - name: Test exact account reconciliation and paired fill attribution
+        run: |
+          python -m unittest discover -s scripts -p 'test_recorder_pnl_attribution.py' -v
+          python -m unittest discover -s scripts -p 'test_audit_post_p0_fill_opportunity.py' -v
+      - name: Download corrected P0 four-market replay and official fills
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ env.SOURCE_RUN }}
+          github-token: ${{ github.token }}
+          pattern: postp0-*-2p5ms-50min
+          path: gathered
+          merge-multiple: false
+      - name: Recompute independent markout and fully reconcile official HBT PnL
+        run: |
+          python scripts/analyze_multivenue_recorder_markout.py \
+            --source gathered --out reports/postp0_markout
+      - name: Audit original-only, shared and guided-only official fill opportunities
+        run: |
+          python scripts/audit_post_p0_fill_opportunity.py \
+            --annotated reports/postp0_markout/annotated \
+            --out reports/postp0_fill_opportunity
+          cat reports/postp0_fill_opportunity/report.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/postp0_markout/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Save full day-split aggregate and annotated official fills
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postp0-2p5ms-markout-and-fill-opportunities
+          path: |
+            reports/postp0_markout/*
+            reports/postp0_fill_opportunity/*
+          if-no-files-found: warn
+          retention-days: 90
