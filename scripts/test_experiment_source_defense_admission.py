@@ -17,11 +17,11 @@ class AdmissionTests(unittest.TestCase):
     @patch("experiment_source_defense_admission.scan_bbo")
     @patch("experiment_source_defense_admission.current_spec")
     def test_tick_acceptance_and_history_disclaimer(self,spec,bbo):
-        spec.return_value={"tickSz":".0001"}
+        spec.return_value={"tickSz":".00001"}
         bbo.return_value={"mid_price":2., "rows":250,"bad_rows":0}
         result=inspect("2026-06-01","DOGE","okex-swap")
         self.assertEqual(result["verdict"],"reject_tick_range")
-        spec.return_value={"tickSz":".0002"}
+        spec.return_value={"tickSz":".0001"}
         result=inspect("2026-06-01","DOGE","okex-swap")
         self.assertEqual(result["verdict"],"eligible_tick_only")
         self.assertIn("6/6 GLFT fit",result["not_proven"])
