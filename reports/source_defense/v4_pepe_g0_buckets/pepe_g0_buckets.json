@@ -12,6 +12,8 @@
     "asof_clock": "exchange_fill_timestamp_minus_1ms; NOT original order decision",
     "proxy": "native target BBO, visible delayed Binance mid, strictly prior EMA",
     "max_allowed_quote_age_ns": 2000000000,
+    "causal_asof_finite_ema": false,
+    "max_allowed_ema_age_ns": 250000000,
     "binance_impulse_definition": "100ms Binance BBO mid movement >= 1 target tick, sign(gap)==sign(impulse)",
     "buckets": [
       {
@@ -181,6 +183,8 @@
     "asof_clock": "exchange_fill_timestamp_minus_1ms; NOT original order decision",
     "proxy": "native target BBO, visible delayed Binance mid, strictly prior EMA",
     "max_allowed_quote_age_ns": 250000000,
+    "causal_asof_finite_ema": false,
+    "max_allowed_ema_age_ns": 250000000,
     "binance_impulse_definition": "100ms Binance BBO mid movement >= 1 target tick, sign(gap)==sign(impulse)",
     "buckets": [
       {
