@@ -1,0 +1,51 @@
+name: Research pure Tokyo four-hour SOL smoke and ACK verification
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-tokyo-4h-smoke.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - name: Install frozen official execution engine
+        run: pip install hftbacktest==2.4.4
+      - name: Deterministic order-lineage and scope tests
+        run: |
+          python -m py_compile scripts/experiment_source_defense_engine.py \
+            scripts/experiment_source_defense_v6_mechanism.py \
+            scripts/experiment_tokyo_4h.py
+          python scripts/test_tokyo_4h_ack.py
+      - name: First truly four-hour official HBT paired experiment
+        run: |
+          python scripts/experiment_tokyo_4h.py \
+            --day 2026-09-01 --coin SOL --venue okex-swap --stage core \
+            --out tokyo_4h/SOL/2026-09-01/core
+      - name: Publish compact diagnosis only
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('tokyo_4h/SOL/2026-09-01/core/case.json')
+          a=json.loads(p.read_text())
+          assert a['trade_steps']==144000 and a['pretrade_minutes']==20
+          assert set(a['variants'])=={'g0','z1','z1_p80','g0_gamma75','z1_gamma75'}
+          for v in a['variants'].values():
+              assert v['fee_usdt']>=0
+              assert abs(v['net_after_2bps_usdt']+v['fee_usdt']-v['gross_marked_usdt'])<1e-6
+          print('TOKYO_4H_SMOKE_PASS',[(k,v['fills'],v['defense_duty_fraction']) for k,v in a['variants'].items()])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tokyo-4h-sol-smoke-2026-09-01
+          path: tokyo_4h/SOL/2026-09-01/core/case.json
+          retention-days: 90
+          if-no-files-found: warn
