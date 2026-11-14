@@ -210,6 +210,7 @@ def run(day,coin,venue,out,admission,stage="core"):
         base,bf,be=model_run(d,"g0",prior,trade_steps=TRADE_STEPS,
                                order_trace_sink=baseline_trace)
         bf["tick_size"]=d["spec"].tick
+        high_gamma_baseline=None
         result["variants"]["g0"]=compact(base,be)
         if stage=="core":
             cases=(("z1","source",1.),
@@ -235,11 +236,20 @@ def run(day,coin,venue,out,admission,stage="core"):
             comp["retention_vs_standard_g0"]=comp["fills"]/max(result["variants"]["g0"]["fills"],1)
             comp["cancel_delta_vs_standard_g0"]=comp["cancel_requests"]-result["variants"]["g0"]["cancel_requests"]
             comp["gross_delta_vs_standard_g0_usdt"]=comp["gross_marked_usdt"]-result["variants"]["g0"]["gross_marked_usdt"]
-            comp["group_window_observational"]=groups(bf,ff,episode,"exchange")
-            comp["order_level"]=exact_ack_attribution(bf,ff,baseline_trace[0],order_trace[0],episode)
+            comparator_fills=bf
+            comparator_trace=baseline_trace[0]
+            if name=="g0_gamma75":
+                high_gamma_baseline=(ff,order_trace[0])
+            if name=="z1_gamma75":
+                if high_gamma_baseline is None:
+                    raise AssertionError("Gamma75 source must follow matched gamma75 G0")
+                comparator_fills,comparator_trace=high_gamma_baseline
             if mode=="g0":
                 comp["group_window_observational"]=None
                 comp["order_level"]=None
+            else:
+                comp["group_window_observational"]=groups(comparator_fills,ff,episode,"exchange")
+                comp["order_level"]=exact_ack_attribution(comparator_fills,ff,comparator_trace,order_trace[0],episode)
             if gamma_scale==1 and any(stat["initial_parameters"][k]!=base["initial_parameters"][k]
                                      for k in ("A_per_second","k_per_tick","sigma_tick_per_sqrt_second")):
                 raise AssertionError("G0 vs source A/k/sigma mismatch")
