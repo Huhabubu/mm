@@ -3,23 +3,60 @@ import unittest
 import numpy as np
 
 from experiment_source_defense_signal import (
-    past_grid_time_ema, defend_side, source_gate
+    past_grid_time_ema, defend_side_bps, source_gate_bps,
+    widen_ticks_from_bps, next_defense_state
 )
 
 
 class SparseSignalTests(unittest.TestCase):
     def test_gap_sign_and_attributed_source(self):
-        self.assertEqual(defend_side(5,2,0,1),1)
-        self.assertEqual(defend_side(-5,-2,0,2),-1)
-        self.assertEqual(defend_side(5,0,-2,3),1)
-        self.assertEqual(defend_side(5,0,2,3),0)
-        self.assertEqual(defend_side(5,-2,0,1),0)
-        self.assertEqual(defend_side(0,2,-2,1),0)
+        self.assertEqual(defend_side_bps(5.,2.,0.,1,.5,.2),1)
+        self.assertEqual(defend_side_bps(-5.,-2.,0.,2,.5,.2),-1)
+        self.assertEqual(defend_side_bps(5.,0.,-2.,3,.5,.2),1)
+        self.assertEqual(defend_side_bps(5.,0.,2.,3,.5,.2),0)
+        self.assertEqual(defend_side_bps(5.,-2.,0.,1,.5,.2),0)
+        self.assertEqual(defend_side_bps(0.,2.,-2.,1,.5,.2),0)
 
     def test_magnitude_gate(self):
-        self.assertFalse(source_gate(.5,2,1,1))
-        self.assertFalse(source_gate(1,.5,1,1))
-        self.assertTrue(source_gate(1,1,1,1))
+        self.assertFalse(source_gate_bps(.5,2.,1.,1.))
+        self.assertFalse(source_gate_bps(1.,.5,1.,1.))
+        self.assertTrue(source_gate_bps(1.,1.,1.,1.))
+
+    def test_bps_width_changes_with_mid_price_and_tick(self):
+        self.assertEqual(widen_ticks_from_bps(80000.,.1,.5),40)
+        self.assertEqual(widen_ticks_from_bps(100.,.01,.5),1)
+        self.assertEqual(widen_ticks_from_bps(3000.,.1,1.),3)
+
+    def test_both_low_releases_before_hold_expiry(self):
+        side,start,end=next_defense_state(100_000_000,0,-1,-1_000_000_000,
+                                          1,.7,.8,.2,100_000_000,75_000_000)
+        self.assertEqual(side,1)
+        nextside,_,last=next_defense_state(110_000_000,side,start,end,
+                                          0,.1,.1,.2,100_000_000,75_000_000)
+        self.assertEqual(nextside,0)
+        self.assertEqual(last,110_000_000)
+
+    def test_hold_does_not_refresh_indefinitely(self):
+        side,start,end=next_defense_state(100_000_000,0,-1,-1_000_000_000,
+                                          1,.7,.8,.2,75_000_000,75_000_000)
+        self.assertEqual(side,1)
+        for now in (120_000_000,140_000_000,160_000_000):
+            side,started,end=next_defense_state(now,side,start,end,
+                                               0,.4,.1,.2,75_000_000,75_000_000)
+            self.assertEqual(side,1)
+            self.assertEqual(started,start)
+        side,_,end=next_defense_state(180_000_000,side,start,end,
+                                         0,.4,.1,.2,75_000_000,75_000_000)
+        self.assertEqual(side,0)
+        self.assertEqual(end,180_000_000)
+
+    def test_reactivation_respects_cooldown(self):
+        side,start,end=next_defense_state(200_000_000,0,-1,180_000_000,
+                                          1,.8,.8,.2,75_000_000,75_000_000)
+        self.assertEqual(side,0)
+        side,start,end=next_defense_state(260_000_000,0,-1,180_000_000,
+                                          1,.8,.8,.2,75_000_000,75_000_000)
+        self.assertEqual(side,1)
 
     def test_event_density_invariance_for_bbo_sampling(self):
         ts=np.arange(1,501,dtype=np.int64)*10_000_000
