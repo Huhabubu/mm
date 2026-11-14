@@ -1,0 +1,63 @@
+name: Research Step2 BTC SOL fixed bps single-day asymmetric defense
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-step2-bps-pilot.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  one-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        coin: [BTC,SOL]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pin official HBT
+        run: pip install hftbacktest==2.4.4
+      - name: Focused source and fill tests; compile research engine
+        run: |
+          python -m py_compile scripts/experiment_source_defense_signal.py \
+            scripts/experiment_source_defense_engine.py \
+            scripts/experiment_source_defense_bps_pilot.py
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_signal.py' -v
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_pilot.py' -v
+      - name: Real 10min prep + 50min official HBT for 3 predeclared bps settings
+        run: |
+          python scripts/experiment_source_defense_bps_pilot.py \
+            --coin "${{ matrix.coin }}" --day 2026-06-01 \
+            --out reports/source_defense/step2_bps
+      - name: Guard source, ledger, fill and refusal consistency
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          coin="${{ matrix.coin }}"
+          p=Path(f'reports/source_defense/step2_bps/2026-06-01_okx_{coin}/summary.json')
+          d=json.loads(p.read_text(encoding='utf8'))
+          assert len(d['variants'])==11, len(d['variants'])
+          base=d['variants']['glft']['calibration_trace']
+          for n,v in d['variants'].items():
+            assert v['calibration_trace']==base
+            assert v['status']=='complete'
+            print('BPS',coin,n,'FILLS',v['trading']['engine_fills'],
+                  'CANCELS',v['trading']['cancel_requests'],
+                  'NET_INCLUDING_2BPS_FEES',v['trading']['end_net_marked_equity_usdt'],
+                  'SPARSE_COUNTERS',v['sparse_counters'])
+            if v['sparse_counters'] is not None:
+              assert v['sparse_counters'][3]==0, "Safe-side quote was modified during defense"
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sparse-defense-bps-${{ matrix.coin }}-2026-06-01
+          path: reports/source_defense/step2_bps/**
+          if-no-files-found: warn
+          retention-days: 90
