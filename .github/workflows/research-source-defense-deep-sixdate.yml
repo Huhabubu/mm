@@ -1,0 +1,87 @@
+name: Research sparse source defense - DOGE XRP six-date GLFT fit admission
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-source-defense-deep-sixdate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  target-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        coin: ['DOGE','XRP']
+        venue: ['okex-swap','bitget-futures']
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - name: Six-date official HBT initial fit and 50min market trades (no strategy)
+        run: |
+          python scripts/experiment_source_defense_deep_admission.py \
+            --coin "${{ matrix.coin }}" --venue "${{ matrix.venue }}" --day "${{ matrix.day }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-defense-deep-${{ matrix.coin }}-${{ matrix.venue }}-${{ matrix.day }}
+          path: reports/source_defense/deep_admission/*.json
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    needs: target-day
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: source-defense-deep-*
+          merge-multiple: true
+          path: gathered
+      - name: Report six-day coverage without filling missing as zero
+        run: |
+          python - <<'PY'
+          import json,glob
+          from pathlib import Path
+          files=glob.glob('gathered/*.json')
+          d=[json.loads(Path(f).read_text(encoding='utf8')) for f in files]
+          print('REPORTED_DATE_MARKETS',len(d),'out of 24')
+          lines=['# DOGE/XRP 6日期×OKX/Bitget的初始GLFT拟合及50min活跃度','',
+                 '|币种|市场|报告天数|GLFT 10min拟合成功天数|50min成交合计|最小单日成交数|',
+                 '|---|---|---:|---:|---:|---:|']
+          for coin in ('DOGE','XRP'):
+            for venue in ('okex-swap','bitget-futures'):
+              rows=[x for x in d if x['coin']==coin and x['exchange']==venue]
+              n=sum(bool(x['official_hbt_10min_glft_initial_fit']['valid']) for x in rows)
+              counts=[x['trade_activity']['trades_50min'] for x in rows]
+              lines.append(f'|{coin}|{venue}|{len(rows)}/6|{n}/6|{sum(counts):,}|{min(counts) if counts else "N/A"}|')
+          lines+=['','任何未上传报告或拟合未通过均计入不合格，不视为补齐。',
+                  '这只核查原始GLFT可识别性和实际交易所成交活动，不是做市策略盈利或Binance增量价值。',
+                  '所有价格档依据当前实时公开规格，历史精度变更仍需独立核验。']
+          out=Path('reports/source_defense/deep_sixdate_summary')
+          out.mkdir(parents=True,exist_ok=True)
+          (out/'summary.json').write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf8')
+          md='\n'.join(lines)+'\n'
+          (out/'report.md').write_text(md,encoding='utf8')
+          print(md)
+          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write(md)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-defense-deep-sixdate-summary
+          path: reports/source_defense/deep_sixdate_summary/*
+          if-no-files-found: error
+          retention-days: 90
