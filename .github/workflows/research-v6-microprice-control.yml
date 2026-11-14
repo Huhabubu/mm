@@ -1,0 +1,71 @@
+name: Research V6 June BTC SOL Microprice unconditional-grid and pre-jump quiet controls
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v6-microprice-control.yml']
+permissions: {contents: write}
+jobs:
+  grid:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: {coin: [BTC,SOL]}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Strict causal 10ms ALL-event BBO microprice and 50ms no-earlier-jump control
+        run: |
+          python scripts/experiment_source_defense_v6_microprice_control.py \
+            --coin '${{ matrix.coin }}' \
+            --out reports/source_defense/v6_microprice_control/${{ matrix.coin }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v6-microprice-control-${{ matrix.coin }}
+          path: reports/source_defense/v6_microprice_control/${{ matrix.coin }}/*.json
+          if-no-files-found: error
+  aggregate:
+    needs: grid
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - uses: actions/download-artifact@v4
+        with: {pattern: v6-microprice-control-*, path: incoming}
+      - name: Two-coin complete independent microprice control report
+        run: |
+          python - <<'PY'
+          import json,sys
+          from pathlib import Path
+          sys.path.insert(0,'scripts')
+          from experiment_source_defense_v6_microprice_control import markdown
+          data=[]
+          for f in Path('incoming').rglob('microprice_opportunity_control.json'):
+            data.append(json.loads(f.read_text()))
+          if len(data)!=2 or set(x['coin'] for x in data)!={'BTC','SOL'}:
+            raise ValueError('Incomplete microprice control pair')
+          data.sort(key=lambda x:x['coin'])
+          out=Path('reports/source_defense/v6_microprice_control')
+          out.mkdir(parents=True,exist_ok=True)
+          (out/'microprice_unconditional_summary.json').write_text(
+            json.dumps({'cases':data},ensure_ascii=False,indent=2,allow_nan=False))
+          md=markdown(data)
+          (out/'microprice_unconditional_summary.md').write_text(md)
+          print(md)
+          PY
+      - name: Commit compact control JSON/MD, no BBO originals
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v6_microprice_control/microprice_unconditional_summary.json \
+                     reports/source_defense/v6_microprice_control/microprice_unconditional_summary.md
+          git commit -m 'research(data): true unconditional 10ms-grid Microprice warning against future-selected jump hit rate'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
