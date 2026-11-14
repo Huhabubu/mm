@@ -1,0 +1,112 @@
+name: Research Step3 historical sixdate 1000PEPE target unit and price scaling
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-step3-pepe-units-sixdate.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        venue: [okex-swap,bitget-futures]
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install hftbacktest==2.4.4
+      - run: |
+          python scripts/experiment_source_defense_pepe_units.py \
+            --day '${{ matrix.day }}' --venue '${{ matrix.venue }}' \
+            --out reports/source_defense/pepe_units_sixdate
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: research-pepe-sixdate-${{ matrix.venue }}-${{ matrix.day }}
+          path: reports/source_defense/pepe_units_sixdate/*.json
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    needs: check
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/sparse-source-defense-20261114
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: research-pepe-sixdate-*
+          path: incoming
+          merge-multiple: true
+      - name: Aggregate explicitly checked six-date price and lot units
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          paths=list(Path('incoming').glob('*.json'))
+          if len(paths)!=12:raise RuntimeError(f'Expected 12 unit QA reports got {len(paths)}')
+          data=[json.loads(p.read_text()) for p in paths]
+          data.sort(key=lambda x:(x['venue'],x['day']))
+          result=[]
+          lines=['# 1000PEPE六日历史价格比例与当前合约单位对照','',
+                 'Binance原始1000PEPEUSDT价格除1000；目标交易所PEPE价格原币单位。',
+                 '注意：2026-11当前公开tick/lot/ctVal仍不能替代各历史日期交易规则档案。',
+                 '',
+                 '|日期|目标所|归一化价格相差%|目标tick|lot|ctVal|80USDT订单名义误差%|价格比通过|',
+                 '|---|---|---:|---:|---:|---:|---:|---|']
+          for x in data:
+            delta=x['crossvenue_normalized_median_fraction_gap']
+            requested=x['example_requested_notional_usdt']
+            nominal=x['example_order_notional_usdt']
+            r={
+              'day':x['day'],'venue':x['venue'],
+              'price_gap_fraction':delta,'tick_usdt_per_pepe':x['tick_usdt_per_pepe'],
+              'lot_raw':x['lot_size_raw_target_qty'],
+              'contract_value_pepe':x['contract_value_pepe_per_contract'],
+              'order_pepe_qty':x['example_order_base_pepe_qty'],
+              'order_notional_usdt':nominal,
+              'normalization_pass':x['normalization_scale_check_pass_lt_5pct'],
+              'historical_spec_unverified':x['historical_spec_unverified']}
+            result.append(r)
+            lines.append(f"|{x['day']}|{x['venue']}|{delta*100:.4f}|"
+                         f"{r['tick_usdt_per_pepe']}|{r['lot_raw']}|{r['contract_value_pepe']}|"
+                         f"{(nominal/requested-1)*100:+.3f}|{r['normalization_pass']}|")
+          lines+=['','Price normalization pass in all twelve cases: '+
+                   str(all(z['normalization_pass'] for z in result)),
+                  '历史规格仍需使用历史instrument元数据独立核对。',
+                  '只进行了历史75秒BBO与实时合约规格的无交易核对。']
+          dest=Path('reports/source_defense/step3_pepe_units')
+          dest.mkdir(parents=True,exist_ok=True)
+          (dest/'step3_pepe_units.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
+          md='\n'.join(lines)+'\n'
+          (dest/'step3_pepe_units.md').write_text(md)
+          print(md)
+          with open(__import__('os').environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write(md)
+          PY
+      - name: Commit only small QA summary to research branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/step3_pepe_units/step3_pepe_units.json \
+                     reports/source_defense/step3_pepe_units/step3_pepe_units.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'research(data): six-date PEPE/1000PEPE unit normalization QA'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sparse-defense-pepe-sixdate-unit-summary
+          path: reports/source_defense/step3_pepe_units/*
+          if-no-files-found: error
+          retention-days: 90
