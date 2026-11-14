@@ -239,17 +239,11 @@ def compact(r,episode,coin,as_of_coin):
         "first_8_episodes_observed_ns":[{
             "start":int(a),"end":int(b),"side":int(c)}
             for a,b,c in zip(st[:8],en[:8],side[:8])],
-        "source_clock":"source-free" if as_of_coin else "Binance local+extra lag",
-        "strategy_markout":{
-            str(h)+"ms":summarize_mask(as_of_coin if isinstance(as_of_coin,dict) else
-                     {},np.empty(0,bool)) if False else None
-            for h in ()
-        }}
+        "source_clock":"source-free" if as_of_coin else "Binance local+extra lag"}
 
 
 def short_metrics(r,fill,episode,sourceblind):
     z=compact(r,episode,"","source-free" if sourceblind else "")
-    z.pop("strategy_markout",None)
     z["fill_mechanism"] =summarize_mask(fill,np.ones(len(fill["side_sign"]),bool))
     return z
 
@@ -363,6 +357,33 @@ def run(day,coin,venue,out,admission_json):
                 "defense_activation_and_urgent_cancel_shift":
                     nearest_episode_difference_ms(he0,he25),
                 "explanation_limit":"The same exchange fills can occur despite shifted cancel requests, because orders, ACKs and queue paths are discrete; real propagation latency not identified"}
+        # Tiny per-fill mechanism artifact kept only in CI, never committed.
+        # Exact six-day pooled P10 requires actual fill observations, not the
+        # average of six daily P10 statistics.
+        packed={}
+        fill_sources={"g0":bf,"source":sf}
+        if coin=="SOL":
+            fill_sources["shift60"]=xf
+        for name,fill in fill_sources.items():
+            for key in ("exchange_timestamp_ns","local_observed_ns","side_sign",
+                        "spread_capture_bps"):
+                packed[name+"__"+key]=np.asarray(fill[key])
+            for h in HORIZONS:
+                for key in (f"markout_{h}ms_bps",f"fresh_{h}ms",
+                            f"gross_edge_{h}ms_bps"):
+                    packed[name+"__"+key]=np.asarray(fill[key])
+        if coin=="SOL":
+            packed["source__episode_start"]=se[0]
+            packed["source__episode_end"]=se[1]
+            packed["source__episode_side"]=se[2]
+            packed["source__urgent_time"]=se[3]
+            packed["source__urgent_side"]=se[4]
+            packed["shift60__episode_start"]=xe[0]
+            packed["shift60__episode_end"]=xe[1]
+            packed["shift60__episode_side"]=xe[2]
+            packed["shift60__urgent_time"]=xe[3]
+            packed["shift60__urgent_side"]=xe[4]
+        np.savez_compressed(out/"fill_groups_CI_only.npz",**packed)
         filename=out/"case.json"
         filename.write_text(json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False),encoding="utf8")
         print("V6_MECHANISM",day,coin,
