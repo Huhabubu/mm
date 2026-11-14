@@ -26,6 +26,33 @@ MIN_REQUOTE_NS = 20_000_000  # Per side, at most one order action per 20ms.
 
 
 @njit
+def cancel_if_needed(engine, order, now, last_side_action_ns, want_price_tick,
+                     dangerous_side, suppress):
+    """Submit emergency evacuation immediately once the order is cancellable.
+
+    Return 2 emergency, 1 normal requote, 0 no action. Only OUTWARD
+    evacuation or full cancel overrides the usual 20ms per-side throttle.
+    Pending/not-cancellable orders are never re-cancelled.
+    """
+    if not order.cancellable:
+        return 0
+    if dangerous_side:
+        outward = (order.price_tick > want_price_tick if order.side == BUY
+                   else order.price_tick < want_price_tick)
+        if suppress or outward:
+            engine.cancel(0, order.order_id, False)
+            return 2
+        # During active defense, never pull a protected order inward.
+        return 0
+    if (order.price_tick != want_price_tick and
+            now - last_side_action_ns >= MIN_REQUOTE_NS):
+        engine.cancel(0, order.order_id, False)
+        return 1
+    return 0
+
+
+
+@njit
 def wall_front_quote_tick(side_depth, roi_lb_tick, base_tick,
                           is_bid, search_ticks, tick_size=TICK, contract_value=CTVAL):
     """Anchor to the FIRST strict local notional peak outward from GLFT.
@@ -196,6 +223,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     sparse_binance_only_safe_side_cancel = 0
     sparse_bid_cancel = sparse_ask_cancel = 0
     sparse_bid_submit = sparse_ask_submit = 0
+    urgent_bid_cancels = urgent_ask_cancels = 0
+    ordinary_bid_cancels = ordinary_ask_cancels = 0
     held_shift_ticks = 0.0
     last_shift_update_ns = t0 - filter_refresh_ns
     initial_trade_count = engine.state_values(0).num_trades
@@ -537,22 +566,32 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 order = it.get()
                 if order.side == BUY:
                     has_bid = True
-                    if (allow_bid and order.cancellable and
-                            (order.price_tick != want_bid or suppress_bid) and
-                            now - bid_action >= MIN_REQUOTE_NS):
-                        engine.cancel(0, order.order_id, False)
-                        bid_action = now
-                        cancels += 1
-                        sparse_bid_cancel += 1
+                    if allow_bid:
+                        disposition = cancel_if_needed(
+                            engine, order, now, bid_action, want_bid,
+                            defense_side == -1, suppress_bid)
+                        if disposition != 0:
+                            bid_action = now
+                            cancels += 1
+                            sparse_bid_cancel += 1
+                            if disposition == 2:
+                                urgent_bid_cancels += 1
+                            else:
+                                ordinary_bid_cancels += 1
                 elif order.side == SELL:
                     has_ask = True
-                    if (allow_ask and order.cancellable and
-                            (order.price_tick != want_ask or suppress_ask) and
-                            now - ask_action >= MIN_REQUOTE_NS):
-                        engine.cancel(0, order.order_id, False)
-                        ask_action = now
-                        cancels += 1
-                        sparse_ask_cancel += 1
+                    if allow_ask:
+                        disposition = cancel_if_needed(
+                            engine, order, now, ask_action, want_ask,
+                            defense_side == 1, suppress_ask)
+                        if disposition != 0:
+                            ask_action = now
+                            cancels += 1
+                            sparse_ask_cancel += 1
+                            if disposition == 2:
+                                urgent_ask_cancels += 1
+                            else:
+                                ordinary_ask_cancels += 1
             if (allow_bid and not suppress_bid and
                     not has_bid and pos + order_qty <= position_cap + 1e-9 and
                     now - bid_action >= MIN_REQUOTE_NS):
@@ -611,7 +650,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                       sparse_activation_count,
                       sparse_binance_only_safe_side_cancel,
                       sparse_bid_cancel, sparse_ask_cancel,
-                      sparse_bid_submit, sparse_ask_submit], dtype=np.int64))
+                      sparse_bid_submit, sparse_ask_submit,
+                      urgent_bid_cancels, urgent_ask_cancels,
+                      ordinary_bid_cancels, ordinary_ask_cancels], dtype=np.int64))
 
 
 def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
