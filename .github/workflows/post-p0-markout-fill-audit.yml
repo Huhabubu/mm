@@ -1,5 +1,8 @@
 name: Post-P0 2p5ms official fills markout and paired opportunity audit
 on:
+  push:
+    paths:
+      - '.github/workflows/post-p0-markout-fill-audit.yml'
   workflow_run:
     workflows:
       - "Post-P0 repaired 2p5ms four-market six-date GLFT rerun"
@@ -15,11 +18,11 @@ permissions:
   actions: read
 jobs:
   attribute:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      SOURCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || github.event.workflow_run.id }}
+      SOURCE_RUN: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.source_run_id || '43540086088' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,6 +42,19 @@ jobs:
           pattern: postp0-*-2p5ms-50min
           path: gathered
           merge-multiple: false
+      - name: Map corrected artifact names to existing attribution reader
+        run: |
+          shopt -s nullglob
+          cases=(gathered/postp0-*-2p5ms-50min)
+          if [ "${#cases[@]}" -ne 24 ]; then
+            echo "Expected 24 corrected source artifacts, found ${#cases[@]}"
+            exit 1
+          fi
+          for case_dir in "${cases[@]}"; do
+            name="${case_dir##*/}"
+            mv "$case_dir" "gathered/recorder-${name#postp0-}"
+          done
+          echo "Mapped ${#cases[@]} corrected P0 artifacts without altering their data"
       - name: Recompute independent markout and fully reconcile official HBT PnL
         run: |
           python scripts/analyze_multivenue_recorder_markout.py \
