@@ -1,0 +1,94 @@
+name: Research final Tokyo 4h combined summaries ACK gamma Z075 no new market reads
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-tokyo-4h-final-combine.yml']
+permissions:
+  contents: write
+  actions: read
+jobs:
+  combined:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Focused no-lookahead no-crossdate and ACK tests
+        run: |
+          python scripts/test_tokyo_4h_ack.py
+          python scripts/test_tokyo_equal_volume.py
+          python -m py_compile scripts/aggregate_tokyo_4h.py scripts/aggregate_tokyo_z075.py
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43595912778
+          github-token: ${{ github.token }}
+          pattern: tokyo4h-core-*
+          path: source-core
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43595912778
+          github-token: ${{ github.token }}
+          pattern: tokyo4h-delay-*
+          path: source-delay
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 43596403404
+          github-token: ${{ github.token }}
+          pattern: tokyo4h-z075-SOL-*
+          path: source-z075
+      - name: Build four-market 3day results and confirm Z0.75 against Z1
+        run: |
+          python scripts/aggregate_tokyo_4h.py --stage core --source source-core \
+            --out reports/source_defense/tokyo_4h_core
+          python scripts/aggregate_tokyo_4h.py --stage delay --source source-delay \
+            --out reports/source_defense/tokyo_4h_delay
+          python scripts/aggregate_tokyo_z075.py --source source-z075 \
+            --core-json reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.json \
+            --out reports/source_defense/tokyo_4h_z075
+          python - <<'PY'
+          import json
+          core=json.load(open('reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.json'))
+          z=json.load(open('reports/source_defense/tokyo_4h_z075/tokyo_four_hour_z075.json'))
+          assert len(core['markets'])==4
+          assert core['markets']['SOL_okex-swap']['decision_flags']['sol_doge_z075_eligible']
+          assert not core['markets']['DOGE_okex-swap']['decision_flags']['sol_doge_z075_eligible']
+          for market,d in core['markets'].items():
+              for name in ('z1','z1_p80','z1_gamma75'):
+                  g=d[name]
+                  groups=g['order_level_subgroups']
+                  assert (groups['ACK_lineage_confirmed']['total_count']+
+                          groups['G0_only_unattributed']['total_count'] ==
+                          sum(x for x in
+                              [groups['ACK_lineage_confirmed']['total_count'],
+                               groups['G0_only_unattributed']['total_count']]))
+              gamma_g=d['g0_gamma75'];gamma_source=d['z1_gamma75']
+              assert gamma_source['gamma_matched_G0_fills']==gamma_g['total_fills']
+          assert z['Z075_vs_Z1'] is not None
+          print('FINAL_TOKYO_FOUR_HOUR_CASES_AND_ACK_PARTITIONS_PASS',z['Z075_vs_Z1'])
+          PY
+          cat reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/source_defense/tokyo_4h_z075/tokyo_four_hour_z075.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Atomic commit six small checked reports research branch only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.json \
+            reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md \
+            reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.json \
+            reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.md \
+            reports/source_defense/tokyo_4h_z075/tokyo_four_hour_z075.json \
+            reports/source_defense/tokyo_4h_z075/tokyo_four_hour_z075.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): finalize Tokyo 4h exact ACK groups gamma and single Z0.75 probe'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tokyo4h-final-reviewed-reports
+          path: reports/source_defense/tokyo_4h_*/*
+          retention-days: 90
+          if-no-files-found: warn
