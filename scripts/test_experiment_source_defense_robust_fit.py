@@ -4,7 +4,8 @@ import unittest
 import numpy as np
 
 from experiment_source_defense_robust_fit import (
-    sufficient_stats, research_fit, chronological_reliability
+    sufficient_stats, research_fit, chronological_reliability,
+    fit_rolling_research_3level
 )
 
 
@@ -28,6 +29,20 @@ class ResearchRobustFitTests(unittest.TestCase):
         self.assertTrue(b["valid"])
         self.assertEqual(b["method"],"sparse_causal_prior_shrinkage")
         self.assertTrue(0<b["k_per_tick"]<5)
+
+    def test_live_numba_20min_three_levels_requires_prior(self):
+        arrivals=np.full(12000,np.nan)
+        arrivals[:10]=2.0
+        arrivals[10:30]=1.0
+        change=np.sin(np.linspace(0,50,12000))
+        missing=fit_rolling_research_3level(arrivals,change,np.nan)
+        prior=fit_rolling_research_3level(arrivals,change,.5)
+        self.assertEqual(missing[0],0)
+        self.assertEqual(prior[0],1)
+        self.assertEqual(prior[4],3)
+        self.assertGreater(prior[1],0.)
+        self.assertGreater(prior[2],0.)
+        self.assertGreater(prior[3],0.)
 
     def test_no_future_prior_can_rescue_earliest_day(self):
         z=three_level_stats()
