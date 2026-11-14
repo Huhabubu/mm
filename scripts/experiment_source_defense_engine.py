@@ -167,7 +167,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    random_pause_probability=0.,
                    random_pause_hold_ns=75_000_000,
                    random_pause_slot_ns=50_000_000,
-                   random_pause_seed=1):
+                   random_pause_seed=1,
+                   random_pause_ask_probability=0.5):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -195,7 +196,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("Sparse mode must be 0 G0, 1 widen, 2 cancel, 3 local placebo, 4 random-pause")
     if sparse_mode==4:
         if (not 0.<random_pause_probability<1. or random_pause_hold_ns<=0 or
-                random_pause_slot_ns<=0 or random_pause_seed<=0):
+                random_pause_slot_ns<=0 or random_pause_seed<=0 or
+                not 0.<=random_pause_ask_probability<=1.):
             raise ValueError("Random pause must have fixed valid seed, slot and holding duration")
         if use_trade_flow or use_queue_shield or beta!=0.:
             raise ValueError("Random pause must not read source-dependent direction or state")
@@ -277,7 +279,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     last_accounting_ns = t0
     last_accounting_side = 0
     defense_active_ns = 0
+    defense_active_bid_ns = defense_active_ask_ns = 0
     defense_episode_count = 0
+    defense_bid_episodes = defense_ask_episodes = 0
     random_rng = int(random_pause_seed)
     random_next_ns = t0+(train_steps+1)*STEP_NS
     random_pause_end_ns = t_stop+1
@@ -351,6 +355,10 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         if now>last_accounting_ns:
             if last_accounting_side!=0 and last_accounting_ns>=t0+train_steps*STEP_NS:
                 defense_active_ns+=now-last_accounting_ns
+                if last_accounting_side==1:
+                    defense_active_ask_ns+=now-last_accounting_ns
+                else:
+                    defense_active_bid_ns+=now-last_accounting_ns
             last_accounting_ns=now
         random_tick=False
         if sparse_mode==4 and now>=random_next_ns:
@@ -678,7 +686,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     random_rng=(random_rng*1103515245+12345)%2147483647
                     if random_rng/2147483647. < random_pause_probability:
                         random_rng=(random_rng*1103515245+12345)%2147483647
-                        defense_side=1 if random_rng%2 else -1
+                        defense_side=1 if (random_rng/2147483647.)<random_pause_ask_probability else -1
                         defense_started_ns=now
                         random_pause_end_ns=now+random_pause_hold_ns
             else:
@@ -692,6 +700,10 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             if defense_side != 0 and previous_defense_side != defense_side:
                 sparse_activation_count += 1
                 defense_episode_count+=1
+                if defense_side==1:
+                    defense_ask_episodes+=1
+                else:
+                    defense_bid_episodes+=1
             last_accounting_side=defense_side
             reservation = mid - skew * pos + shift_ticks
             want_bid = min(round(reservation - half - extra_half_ticks), bid)
@@ -839,7 +851,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                       high_taker_buy_usdt,high_taker_sell_usdt],dtype=np.float64),
             np.array([defense_active_ns,defense_episode_count,
                       defense_active_ns/max(1.,(trade_steps*STEP_NS)),
-                      defense_active_ns/max(1,defense_episode_count)],
+                      defense_active_ns/max(1,defense_episode_count),
+                      defense_active_bid_ns,defense_active_ask_ns,
+                      defense_bid_episodes,defense_ask_episodes],
                      dtype=np.float64))
 
 
