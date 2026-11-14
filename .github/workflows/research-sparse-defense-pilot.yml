@@ -1,0 +1,66 @@
+name: Research sparse source defense - isolated BTC SOL 2026-06-01 pilot
+on:
+  push:
+    branches:
+      - research/sparse-source-defense-20261114
+    paths:
+      - '.github/workflows/research-sparse-defense-pilot.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  one-day-50min:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        coin: ['BTC','SOL']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pin official HBT execution engine
+        run: pip install hftbacktest==2.4.4
+      - name: Compile and run synthetic causal and fill-accounting tests
+        run: |
+          python -m py_compile scripts/experiment_source_defense_signal.py \
+             scripts/experiment_source_defense_engine.py \
+             scripts/experiment_source_defense_pilot.py
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_signal.py' -v
+          python -m unittest discover -s scripts -p 'test_experiment_source_defense_pilot.py' -v
+          python -m unittest discover -s scripts -p 'test_beta_one_direct_gap.py' -v
+      - name: Full official HBT 10min warmup and isolated 50min strategy pilot
+        run: |
+          python scripts/experiment_source_defense_pilot.py \
+            --day 2026-06-01 --coin "${{ matrix.coin }}" --out reports/source_defense/pilot
+      - name: Check absolute net PnL, guard against misreporting acceptance
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          coin="${{ matrix.coin }}"
+          p=Path(f"reports/source_defense/pilot/2026-06-01_okx_{coin}/summary.json")
+          d=json.loads(p.read_text(encoding='utf8'))
+          assert set(d["variants"])=={"glft","beta1","sparse_1s_widen","sparse_1s_cancel",
+                                     "sparse_1s_local_placebo","sparse_2s_widen","sparse_2s_cancel"}
+          first=d["variants"]["glft"]["calibration_trace"]
+          for name,r in d["variants"].items():
+            assert r["calibration_trace"]==first
+            assert r["status"]=="complete"
+            print("PILOT_VALID",coin,name,
+                  "NET_INCLUDING_FEES",r["trading"]["end_net_marked_equity_usdt"],
+                  "FILL_COUNT",r["trading"]["engine_fills"],
+                  "CANCEL",r["trading"]["cancel_requests"])
+            if "pilot_acceptance_descriptive_only" in r:
+              print("REDLINES",coin,name,r["pilot_acceptance_descriptive_only"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sparse-defense-pilot-${{ matrix.coin }}-2026-06-01
+          path: reports/source_defense/pilot/**
+          if-no-files-found: warn
+          retention-days: 90
