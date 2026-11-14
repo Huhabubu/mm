@@ -146,9 +146,11 @@ def attribution_of_paired_fills(baseline, test):
     return res
 
 
-def run(day,coin,minutes=50,out_dir="reports/source_defense/pilot"):
+def run(day,coin,minutes=50,out_dir="reports/source_defense/pilot",widen_ticks=2):
     if day!="2026-06-01" or coin not in ("BTC","SOL") or minutes!=50:
         raise ValueError("Research pilot is preregistered for 2026-06-01 BTC/SOL 50min")
+    if widen_ticks not in (1,2):
+        raise ValueError("Only preregistered 1tick/2tick widen actions allowed")
     spec=MARKETS[("okx",coin)]
     start=int(datetime.strptime(day,"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1e6)
     end=start+(600+minutes*60)*1_000_000+5_000_000
@@ -161,7 +163,7 @@ def run(day,coin,minutes=50,out_dir="reports/source_defense/pilot"):
             "hbt_queue":"power_prob_2.0_no_partial_fill",
             "sparse_params":{"ema_half_lives_s":[1,2],"ema_grid_ms":10,
                  "impulse_window_ms":100,"gap_threshold_ticks":1.,
-                 "impulse_threshold_ticks":1.,"widen_ticks":2,
+                 "impulse_threshold_ticks":1.,"widen_ticks":widen_ticks,
                  "cooldown_after_release_ms":100},
             "variants":{}}
     with tempfile.TemporaryDirectory(prefix="sparse_pilot_") as tmp:
@@ -213,7 +215,7 @@ def run(day,coin,minutes=50,out_dir="reports/source_defense/pilot"):
                             sparse_mode=mode,ema_grid_ns=grid,ema_values=values,
                             impulse_window_ns=100_000_000,
                             gap_gate_ticks=1.,impulse_gate_ticks=1.,
-                            defense_widen_ticks=2,
+                            defense_widen_ticks=widen_ticks,
                             defense_cooldown_ns=100_000_000)
                 if int(raw[5])!=1:
                     report["variants"][name]={"status":"no_initial_fit"}
@@ -290,8 +292,9 @@ def main():
     p.add_argument("--day",default="2026-06-01")
     p.add_argument("--coin",required=True,choices=["BTC","SOL"])
     p.add_argument("--out",default="reports/source_defense/pilot")
+    p.add_argument("--widen-ticks",type=int,choices=(1,2),default=2)
     a=p.parse_args()
-    run(a.day,a.coin,50,a.out)
+    run(a.day,a.coin,50,a.out,a.widen_ticks)
 
 
 if __name__=="__main__":
