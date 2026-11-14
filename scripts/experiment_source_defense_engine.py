@@ -360,7 +360,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             due=min(due,random_next_ns)
             if defense_side!=0:
                 due=min(due,random_pause_end_ns)
-        if sparse_mode==5 and shifted_index<len(time_shift_starts_ns):
+        if sparse_mode==5 and time_shift_starts_ns is not None and shifted_index<len(time_shift_starts_ns):
             due=min(due,time_shift_starts_ns[shifted_index])
             if defense_side!=0:
                 due=min(due,time_shift_ends_ns[shifted_index])
@@ -391,6 +391,10 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 else:
                     defense_active_bid_ns+=now-last_accounting_ns
             last_accounting_ns=now
+        shift_tick=False
+        if sparse_mode==5 and time_shift_starts_ns is not None and shifted_index<len(time_shift_starts_ns):
+            if now>=time_shift_starts_ns[shifted_index]:
+                shift_tick=True
         random_tick=False
         if sparse_mode==4 and now>=random_next_ns:
             random_tick=True
@@ -571,6 +575,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
 
         if sample_count > train_steps and (feed_status == 2 or feed_status == 3 or
                                        signal_event or sample_event or random_tick or
+                                       shift_tick or
                                        (sparse_mode==4 and defense_side!=0 and
                                         now>=random_pause_end_ns)):
             # Observe live inventory peaks at every event, not only 100ms samples.
