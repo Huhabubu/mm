@@ -168,7 +168,11 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    random_pause_hold_ns=75_000_000,
                    random_pause_slot_ns=50_000_000,
                    random_pause_seed=1,
-                   random_pause_ask_probability=0.5):
+                   random_pause_ask_probability=0.5,
+                   capture_defense_episodes=False,
+                   time_shift_starts_ns=None,
+                   time_shift_ends_ns=None,
+                   time_shift_sides=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -192,8 +196,21 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             raise ValueError("BBO and basis shapes differ")
         if not np.isfinite(beta):
             raise ValueError("Nonfinite beta")
-    if sparse_mode not in (0,1,2,3,4):
-        raise ValueError("Sparse mode must be 0 G0, 1 widen, 2 cancel, 3 local placebo, 4 random-pause")
+    if sparse_mode not in (0,1,2,3,4,5):
+        raise ValueError("Sparse mode must be 0 G0,1 widen,2 cancel,3 local,4 random,5 lagged episodes")
+    if sparse_mode == 5:
+        if (time_shift_starts_ns is None or time_shift_ends_ns is None or
+                time_shift_sides is None or
+                len(time_shift_starts_ns)!=len(time_shift_ends_ns) or
+                len(time_shift_starts_ns)!=len(time_shift_sides)):
+            raise ValueError("Time shift requires complete precomputed episodes")
+        for ii in range(len(time_shift_starts_ns)):
+            if (time_shift_starts_ns[ii]>=time_shift_ends_ns[ii] or
+                    time_shift_sides[ii] not in (-1,1) or
+                    (ii and time_shift_ends_ns[ii-1]>time_shift_starts_ns[ii])):
+                raise ValueError("Time shift episodes overlap, reverse or have invalid side")
+        if beta!=0. or use_queue_shield or use_trade_flow:
+            raise ValueError("Time shift must not consume current Binance source or depth signal")
     if sparse_mode==4:
         if (not 0.<random_pause_probability<1. or random_pause_hold_ns<=0 or
                 random_pause_slot_ns<=0 or random_pause_seed<=0 or
@@ -285,6 +302,16 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     random_rng = int(random_pause_seed)
     random_next_ns = t0+(train_steps+1)*STEP_NS
     random_pause_end_ns = t_stop+1
+    shifted_index = 0
+    # Disabled by default. Historical V5 raw indices 0..37 are unchanged.
+    ep_capacity = max(2,trade_steps*STEP_NS//MIN_REQUOTE_NS+10) if capture_defense_episodes else 2
+    ep_start=np.empty(ep_capacity,np.int64)
+    ep_end=np.empty(ep_capacity,np.int64)
+    ep_side=np.empty(ep_capacity,np.int64)
+    urgent_at=np.empty(ep_capacity,np.int64)
+    urgent_side=np.empty(ep_capacity,np.int64)
+    n_ep = n_urgent=0
+    open_ep_ns = -1
     last_defense_end_ns = t0 - defense_cooldown_ns
     sparse_gate_checks = sparse_gate_hits = sparse_activation_count = 0
     sparse_binance_only_safe_side_cancel = 0
@@ -333,6 +360,10 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             due=min(due,random_next_ns)
             if defense_side!=0:
                 due=min(due,random_pause_end_ns)
+        if sparse_mode==5 and shifted_index<len(time_shift_starts_ns):
+            due=min(due,time_shift_starts_ns[shifted_index])
+            if defense_side!=0:
+                due=min(due,time_shift_ends_ns[shifted_index])
         if probe_ns is not None and probe_idx < n_probes:
             if probe_ns[probe_idx] >= now:
                 due = min(due, probe_ns[probe_idx])
@@ -677,7 +708,20 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             # A *both-low* signal removes protection immediately.
             # Local placebo's impulse sign points opposite to gap direction.
             effective_impulse = -impulse_bps if sparse_mode == 3 else impulse_bps
-            if sparse_mode==4:
+            if sparse_mode==5:
+                if shifted_index<len(time_shift_starts_ns):
+                    if (defense_side!=0 and
+                            now>=time_shift_ends_ns[shifted_index]):
+                        defense_side=0
+                        shifted_index+=1
+                    if (defense_side==0 and
+                            shifted_index<len(time_shift_starts_ns) and
+                            now>=time_shift_starts_ns[shifted_index]):
+                        defense_side=time_shift_sides[shifted_index]
+                        defense_started_ns=now
+                # Source episode times are precomputed from earlier data by +60s.
+                # No Binance signal, basis or tick is used in this mode.
+            elif sparse_mode==4:
                 if defense_side!=0 and now>=random_pause_end_ns:
                     defense_side=0
                     last_defense_end_ns=now
@@ -697,6 +741,16 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     (min(actual_gap_gate_bps,actual_impulse_gate_bps)*.25
                      if adaptive_z_gap>0 else hysteresis_exit_th_bps),
                     defense_hold_ns, defense_cooldown_ns))
+            if capture_defense_episodes and previous_defense_side != defense_side:
+                if previous_defense_side != 0:
+                    if n_ep>=ep_capacity:raise ValueError("Defense episode trace capacity")
+                    ep_start[n_ep]=open_ep_ns
+                    ep_end[n_ep]=now
+                    ep_side[n_ep]=previous_defense_side
+                    n_ep+=1
+                    open_ep_ns=-1
+                if defense_side != 0:
+                    open_ep_ns=now
             if defense_side != 0 and previous_defense_side != defense_side:
                 sparse_activation_count += 1
                 defense_episode_count+=1
@@ -723,7 +777,7 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
 
             # Sparse price action is one-sided. A Binance-only timestamp may
             # alter the dangerous side, but never price/replace the safe side.
-            if defense_side != 0 and sparse_mode not in (2,4):
+            if defense_side != 0 and sparse_mode not in (2,4,5):
                 width = widen_ticks_from_bps(mid*tick_size, tick_size, widen_bps)
                 if defense_side == 1:
                     want_ask += width
@@ -744,8 +798,8 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             allow_ask = ((not binance_only or
                           defense_side == 1 or previous_defense_side == 1)
                          and defense_side != -1)
-            suppress_bid = (sparse_mode in (2,4) and defense_side == -1)
-            suppress_ask = (sparse_mode in (2,4) and defense_side == 1)
+            suppress_bid = (sparse_mode in (2,4,5) and defense_side == -1)
+            suppress_ask = (sparse_mode in (2,4,5) and defense_side == 1)
             # One side may be pending cancellation; no replacement until cleared.
             has_bid = has_ask = False
             orders = engine.orders(0)
@@ -764,6 +818,11 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                             sparse_bid_cancel += 1
                             if disposition == 2:
                                 urgent_bid_cancels += 1
+                                if capture_defense_episodes:
+                                    if n_urgent>=ep_capacity:raise ValueError("Urgent trace capacity")
+                                    urgent_at[n_urgent]=now
+                                    urgent_side[n_urgent]=-1
+                                    n_urgent+=1
                             else:
                                 ordinary_bid_cancels += 1
                 elif order.side == SELL:
@@ -778,6 +837,11 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                             sparse_ask_cancel += 1
                             if disposition == 2:
                                 urgent_ask_cancels += 1
+                                if capture_defense_episodes:
+                                    if n_urgent>=ep_capacity:raise ValueError("Urgent trace capacity")
+                                    urgent_at[n_urgent]=now
+                                    urgent_side[n_urgent]=1
+                                    n_urgent+=1
                             else:
                                 ordinary_ask_cancels += 1
             if (allow_bid and not suppress_bid and
@@ -798,6 +862,12 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 sparse_ask_submit += 1
             decisions += 1
 
+    if capture_defense_episodes and open_ep_ns>=0:
+        if n_ep>=ep_capacity:raise ValueError("Final episode trace capacity")
+        ep_start[n_ep]=open_ep_ns
+        ep_end[n_ep]=now
+        ep_side[n_ep]=defense_side
+        n_ep+=1
     # Last event can trigger a fill immediately before the data stream ends.
     orders = engine.orders(0)
     it = orders.values()
@@ -854,7 +924,9 @@ def run_sparse_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                       defense_active_ns/max(1,defense_episode_count),
                       defense_active_bid_ns,defense_active_ask_ns,
                       defense_bid_episodes,defense_ask_episodes],
-                     dtype=np.float64))
+                     dtype=np.float64),
+            (ep_start[:n_ep],ep_end[:n_ep],ep_side[:n_ep],
+             urgent_at[:n_urgent],urgent_side[:n_urgent]))
 
 
 def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
