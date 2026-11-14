@@ -59,8 +59,33 @@ def aggregate(root):
             s[k]["pooled_mean_markout_bps"]-t[k]["pooled_mean_markout_bps"])
         delta[k]["pooled_p10_difference_bps"]=(
             s[k]["pooled_p10_markout_bps"]-t[k]["pooled_p10_markout_bps"])
+    fees_src=sum(v["fee_usdt"] for v in a)
+    fees_shift=sum(v["fee_usdt"] for v in b)
+    turnover_src=sum(v["turnover_usdt"] for v in a)
+    turnover_shift=sum(v["turnover_usdt"] for v in b)
+    net_src=sum(v["fee_included_net_usdt"] for v in a)
+    net_shift=sum(v["fee_included_net_usdt"] for v in b)
+    gross_src=net_src+fees_src
+    gross_shift=net_shift+fees_shift
+    ratio=turnover_src/turnover_shift
+    scale=gross_shift*(ratio-1)
+    residual=gross_src-ratio*gross_shift
+    fee_saved=fees_shift-fees_src
+    if abs(net_src-net_shift-(fee_saved+scale+residual))>1e-6:
+        raise ValueError("Matched exposure HBT accounting identity fails")
     result={
         "scope":"SOL OKX 6 days, research 20min warmup UTC 00:20–01:10",
+        "accounting_bridge_source_minus_shift":{
+            "delta_net_after_2bps_USDT":net_src-net_shift,
+            "fee_saved_USDT":fee_saved,
+            "volume_scaled_shift_gross_USDT":scale,
+            "residual_gross_USDT":residual,
+            "delta_gross_before_fee_USDT":gross_src-gross_shift,
+            "source_fee_USDT":fees_src,
+            "shift_fee_USDT":fees_shift,
+            "source_turnover_USDT":turnover_src,
+            "shift_turnover_USDT":turnover_shift,
+            "residual_not_pure_selection_alpha":True},
         "days":DAYS,"test_assumptions":"official HBT 2.4.4, 1ms send +1ms ACK and Maker 2bps",
         "actual_held_exposure_all_six_equal":all(act),
         "actual_equal_by_day":act,
@@ -129,6 +154,17 @@ def markdown(x):
                      f"{pm['pooled_mean_markout_bps']:+.4f}|"
                      f"{d['mean_equal_day_delta']:+.4f}|"
                      f"{ci}|{d['pooled_p10_difference_bps']:+.4f}|")
+    z=x["accounting_bridge_source_minus_shift"]
+    lines+=["","## 等防御时长下的净收益会计分解","",
+            "|六日Source − +60s Shift|USDT|",
+            "|---|---:|",
+            f"|扣费净收益差|{z['delta_net_after_2bps_USDT']:+.4f}|",
+            f"|模拟Maker手续费节省|{z['fee_saved_USDT']:+.4f}|",
+            f"|按成交额缩放的Shift毛结果差|{z['volume_scaled_shift_gross_USDT']:+.4f}|",
+            f"|剩余费前毛差（含库存、执行、队列）|{z['residual_gross_USDT']:+.4f}|",
+            "",
+            "即使两个实验组危险侧停报时长完全相同，最终成交量仍可能差很多，"
+            "原因是脉冲与实际冲击流的时间对应不同。账面净收益差不能当纯Selection Alpha。"]
     lines+=["","## 必须保留的局限","",
             "1. 本对照等同的是危险侧防御时间簇，不保证相同成交笔数、手续费、未平仓库存或队列位置。",
             "2. 删除最后60秒不能平移的防御事件，两个实验组都删除相同片段，"
