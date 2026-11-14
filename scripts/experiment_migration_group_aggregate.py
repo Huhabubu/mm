@@ -39,7 +39,11 @@ def pooled_horizon(rows, group, h):
               r["source_vs_G0_fill_groups_exchange_clock"][GROUPS[group]][f"{h}ms"]["markout_mean_bps"])
              for r in rows]
     n = sum(v[0] for v in pairs)
-    return {"fresh_n": n, "pooled_mean_bps": sum(i*m for i, m in pairs if m is not None)/n if n else None}
+    daily = [m for _, m in pairs if m is not None]
+    return {"fresh_n": n,
+            "pooled_mean_bps": sum(i*m for i, m in pairs if m is not None)/n if n else None,
+            "equal_day_mean_bps": float(np.mean(daily)) if daily else None,
+            "valid_days_for_equal_day": len(daily)}
 
 
 def by_period(rows):
@@ -102,6 +106,11 @@ def by_period(rows):
                     r["source_vs_G0_fill_groups_exchange_clock"]["Dropped_all"][f"{h}ms"]["markout_mean_bps"] is not None)
                 else None for r in v6]
         }
+    for h in HORIZONS:
+        entry = selectivity[f"{h}ms"]
+        daily_valid = [v for v in entry["daily_lift_bps"] if v is not None]
+        entry["equal_day_mean_lift_bps"] = float(np.mean(daily_valid)) if daily_valid else None
+        entry["valid_days_for_equal_day_lift"] = len(daily_valid)
     shifted = [r["time_shift_60s"]["strategy"] for r in v6]
     metrics["shift60_observational"] = {
         "source_total_fills": sum(r["source"]["fills"] for r in v6),
@@ -155,9 +164,10 @@ def markdown(x):
             e=r["economics"]; g=e["g0"]; z=e["z1_cancel_qs"]
             L.append(f"|{m}|{name}|{g['total_fills']}|{g['gross_marked_USDT_daily_equal_mean']:+.4f}|{g['net_after_2bps_USDT_daily_equal_mean']:+.4f}|{e['defense_active_fraction_equal_day_mean']:.2%}|{e['fill_retention_total_ratio']:.2%}|{z['cancel_requests_total']-g['cancel_requests_total']:+d}|")
     L.extend(["", "## Group A（窗内）／Kept／Group B（窗外）Markout", "",
-              "单位bps，负值越大代表成交后价格越不利。计数为新策略相对于原G0的严格相同成交时间与方向配对后的观察分组。Group A按本地防御/撤单时间窗分类，未证实交易所撤单确认。", "",
-              "|市场|时期|A笔数/100ms/500ms|Kept笔数/100ms/500ms|B笔数/100ms/500ms|Overall Lift 100/500ms|",
-              "|---|---|---|---|---|---|"])
+              "单位bps，负值越大代表成交后价格越不利。Group A/Kept/B 三组Markout先展示按合格成交笔数加权的pooled结果；另同时保留按日期等权的group Markout在JSON中。",
+              "成交时间和方向一对一配对是观察性分组，Group A按本地防御/撤单时间窗分类，未证实交易所撤单确认。", "",
+              "|市场|时期|A笔数/100ms/500ms pooled|Kept笔数/100ms/500ms pooled|B笔数/100ms/500ms pooled|Overall Lift pooled100/500ms|Overall Lift 按日等权100/500ms|",
+              "|---|---|---|---|---|---|---|"])
     def f(group,h):
         t=group[f"{h}ms"]["pooled_mean_bps"]
         return "NA" if t is None else f"{t:+.3f}"
@@ -169,7 +179,10 @@ def markdown(x):
             def lift(h):
                 v=sl[f"{h}ms"]["pooled_kept_minus_all_dropped_bps"]
                 return "NA" if v is None else f"{v:+.3f}"
-            L.append(f"|{m}|{name}|{cell('Group_A')}|{cell('Kept')}|{cell('Group_B')}|{lift(100)}/{lift(500)}|")
+            def lift_equal(h):
+                v=sl[f"{h}ms"]["equal_day_mean_lift_bps"]
+                return "NA" if v is None else f"{v:+.3f}"
+            L.append(f"|{m}|{name}|{cell('Group_A')}|{cell('Kept')}|{cell('Group_B')}|{lift(100)}/{lift(500)}|{lift_equal(100)}/{lift_equal(500)}|")
     L.extend(["", "## +60s 回顾性时移对照", "",
               "同一防御脉冲后移60秒、不循环回绕，末一分钟可能损失部分脉冲；Source与Shift成交规模可能不同。", "",
               "|市场|时期|Source成交/Shift成交|Source净USDT/3日|Shift净USDT/3日|计划曝光全相等|",
@@ -180,7 +193,8 @@ def markdown(x):
             L.append(f"|{m}|{name}|{s['source_total_fills']}/{s['shift_total_fills']}|{s['source_total_net_after_2bps_USDT']:+.4f}|{s['shift_total_net_after_2bps_USDT']:+.4f}|{'是' if s['shift_is_strict_equal_exposure'] else '否'}|")
     L.extend(["", "### 解释边界", "",
               "这是前后各三个已被探索的月首日描述性对照，无法独立识别8月4日迁移的因果效应；少成交、省费用、队列重置和后续库存路径必须单独区分。",
-              "Selectivity Lift = Kept均值−全部Dropped均值，不能只拿窗内Group A与Kept比较后声称整体获益。"])
+              "Selectivity Lift = Kept均值−全部Dropped均值。pooled先在各组按合格成交数量加权后做差；按日等权先做每日期Kept−Dropped差，再对日期做算术平均。不同加权产生的符号变化必须同时呈现。",
+              "不能只拿窗内Group A与Kept比较后声称整体获益。"])
     return "\n".join(L)+"\n"
 
 
