@@ -96,7 +96,7 @@ def markdown(x):
             f"{f(x['selectivity_lift']['100ms']['equal_day_mean_bps'])}/"
             f"{f(x['selectivity_lift']['500ms']['equal_day_mean_bps'])} bps。\n\n"
             f"与Z1同日执行指标完全相同：{x['Z075_vs_Z1']['all_three_dates_execution_metrics_identical'] if x['Z075_vs_Z1'] else '未复核'}；" +
-            "若完全相同，可能与阈值下限或离散订单动作有关，尚需门槛值审计。\\n\\n"
+            "若完全相同，可能与阈值下限或离散订单动作有关，尚需门槛值审计。\n\n"
             "仅这一个额外预设档位，不以效果好坏调第三次参数。"
             "所有日期均为历史探索，不能宣称新的样本外证据。\n")
 
