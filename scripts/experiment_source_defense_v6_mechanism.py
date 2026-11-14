@@ -178,6 +178,13 @@ def model_run(data,mode,prior_k=np.nan,gamma_scale=1.,
         opts.pop("ema_grid_ns",None)
         opts.pop("ema_values",None)
         options.update(opts)
+    elif mode=="widen":
+        # The same fixed V5 Z1/P50/75ms gate; only action changes.
+        opts,_=fixed_model_options("z1_cancel_qs",None)
+        opts["sparse_mode"]=1
+        opts.pop("ema_grid_ns",None)
+        opts.pop("ema_values",None)
+        options.update(opts)
     elif mode=="high08":
         options.update({
             "sparse_mode":2,
