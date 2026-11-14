@@ -1,0 +1,121 @@
+name: Research pure Tokyo 4h three explored dates four markets core and latency
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-tokyo-4h-locked.yml']
+permissions:
+  contents: write
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        day: ['2026-09-01','2026-10-01','2026-11-01']
+        market: [SOL_okex-swap,DOGE_okex-swap,1000PEPE_okex-swap,1000PEPE_bitget-futures]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Official HBT frozen G0 Z1 P80 and gamma50/75 over 240min
+        run: |
+          coin="$(echo '${{ matrix.market }}' | cut -d_ -f1)"
+          venue="$(echo '${{ matrix.market }}' | cut -d_ -f2)"
+          python scripts/experiment_tokyo_4h.py \
+            --day '${{ matrix.day }}' --coin "$coin" --venue "$venue" \
+            --stage core --out cases/${{ matrix.market }}/${{ matrix.day }}/core
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tokyo4h-core-${{ matrix.market }}-${{ matrix.day }}
+          path: cases/${{ matrix.market }}/${{ matrix.day }}/core/case.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  delay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        day: ['2026-09-01','2026-10-01','2026-11-01']
+        coin: [SOL,DOGE,1000PEPE]
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Same 4h target tape, 0ms 1ms 2.5ms extra Binance delay, official ACK
+        run: |
+          python scripts/experiment_tokyo_4h.py \
+            --day '${{ matrix.day }}' --coin '${{ matrix.coin }}' \
+            --venue okex-swap --stage delay \
+            --out cases/${{ matrix.coin }}_okex-swap/${{ matrix.day }}/delay
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tokyo4h-delay-${{ matrix.coin }}-${{ matrix.day }}
+          path: cases/${{ matrix.coin }}_okex-swap/${{ matrix.day }}/delay/case.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  aggregate:
+    needs: [core,delay]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Focused ACK and strict-date regression suite
+        run: |
+          python scripts/test_tokyo_4h_ack.py
+          python -m py_compile scripts/experiment_tokyo_4h.py \
+            scripts/aggregate_tokyo_4h.py \
+            scripts/check_tokyo_equal_volume.py
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tokyo4h-core-*
+          path: input_core
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tokyo4h-delay-*
+          path: input_delay
+      - name: Fail on missing 4h market, inconsistent fees or gamma comparisons
+        run: |
+          python scripts/aggregate_tokyo_4h.py \
+            --stage core --source input_core \
+            --out reports/source_defense/tokyo_4h_core
+          python scripts/aggregate_tokyo_4h.py \
+            --stage delay --source input_delay \
+            --out reports/source_defense/tokyo_4h_delay
+          cat reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md >> "$GITHUB_STEP_SUMMARY"
+          cat reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit compact JSON/MD only to research ref
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.json \
+            reports/source_defense/tokyo_4h_core/tokyo_four_hour_core.md \
+            reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.json \
+            reports/source_defense/tokyo_4h_delay/tokyo_four_hour_delay.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'research(data): 4h pure-Tokyo official HBT baseline, ACK lineage, P80 and gamma'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tokyo4h-core-and-delay-compact-report
+          path: reports/source_defense/tokyo_4h_*/*.json
+          retention-days: 90
+          if-no-files-found: warn
