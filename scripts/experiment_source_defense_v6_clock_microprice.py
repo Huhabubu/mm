@@ -127,6 +127,45 @@ def next_same_direction_follow_us(source,target,max_ms=100):
     return out
 
 
+
+def signed_nearest_same_direction_ms(source,target,max_ms=100):
+    """For each source move, nearest same-sign target move in ±100ms.
+
+    Signed lag = target timestamp minus Binance timestamp; positive suggests
+    source precedes the *matched* target row, negative suggests source follows.
+    Nonunique matches, clock synchronization and event-frequency bias mean
+    neither direction identifies physical propagation or true causality.
+    """
+    a,sg=source
+    b,bs=target
+    diffs=[]
+    for sign in (-1,1):
+        src=a[sg==sign]
+        tgt=b[bs==sign]
+        if not len(src) or not len(tgt):continue
+        ii=np.searchsorted(tgt,src,side="left")
+        before=np.maximum(ii-1,0)
+        after=np.minimum(ii,len(tgt)-1)
+        diff_before=tgt[before]-src
+        diff_after=tgt[after]-src
+        choose_before=np.abs(diff_before)<=np.abs(diff_after)
+        ds=np.where(choose_before,diff_before,diff_after)
+        diffs.extend(ds[np.abs(ds)<=max_ms*1000].tolist())
+    x=np.asarray(diffs,float)/1000
+    out=distribution(x)
+    out.update({
+        "source_move_count":int(len(a)),
+        "matched_source_fraction":float(len(x)/len(a)) if len(a) else 0.,
+        "binance_before_target_fraction_of_matched":float(np.mean(x>0)) if len(x) else None,
+        "binance_after_target_fraction_of_matched":float(np.mean(x<0)) if len(x) else None,
+        "exact_timestamp_tie_fraction":float(np.mean(x==0)) if len(x) else None,
+        "lag_sign":"target_time minus Binance_time; positive=B first",
+        "same_target_can_match_multiple_source_moves":True,
+        "max_absolute_lag_ms":max_ms,
+        "collector_clock_offsets_not_corrected":True})
+    return out
+
+
 def microprice(bid,ask,bidq,askq):
     """Weighted mid = (ask*bidqty + bid*askqty)/(bidqty+askqty)."""
     den=bidq+askq
@@ -214,6 +253,10 @@ def case(day,coin):
             "event_link_by_clock":{
                 clock:next_same_direction_follow_us(change_events(bn,clock),
                                                     change_events(x,clock))
+                for clock in ("local","exchange")},
+            "signed_nearest_event_lag_by_clock":{
+                clock:signed_nearest_same_direction_ms(change_events(bn,clock),
+                                                       change_events(x,clock))
                 for clock in ("local","exchange")},
             "native_BBO_clocks_not_physical_propagation":True,
             "binance_native_quote_price_divisor":sources[0][2]
