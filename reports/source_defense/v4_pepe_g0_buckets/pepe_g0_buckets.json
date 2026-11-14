@@ -1,0 +1,184 @@
+{
+  "market": "OKX PEPE-USDT-SWAP",
+  "binance_symbol": "1000PEPEUSDT",
+  "Binance_price_divisor": 1000.0,
+  "date": "2026-06-01",
+  "G0_original_fill_count": 192,
+  "baseline_uses_official_hftbacktest": true,
+  "basis_kind": "causal 1s EMA on previsible normalized price gap",
+  "asof": "1ms before exchange execution; not the actual quote decision",
+  "trade_confirmation": "none in this Step1 table, BBO impulse only",
+  "conditional_table": {
+    "asof_clock": "exchange_fill_timestamp_minus_1ms; NOT original order decision",
+    "proxy": "native target BBO, visible delayed Binance mid, strictly prior EMA",
+    "binance_impulse_definition": "100ms Binance BBO mid movement >= 1 target tick, sign(gap)==sign(impulse)",
+    "buckets": [
+      {
+        "bin": "unavailable",
+        "fills": 50,
+        "fraction_all_g0_fills": 0.2604166666666667,
+        "mean_abs_gap_bps": null,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 25,
+            "mean_markout_bps": -2.4435394259904957,
+            "p10_markout_bps": -2.9138378751599388
+          },
+          "500ms": {
+            "fresh_count": 25,
+            "mean_markout_bps": -2.327311037206576,
+            "p10_markout_bps": -2.9138378751599388
+          },
+          "1000ms": {
+            "fresh_count": 23,
+            "mean_markout_bps": -2.5296859100071476,
+            "p10_markout_bps": -2.914007674284144
+          }
+        }
+      },
+      {
+        "bin": "未触发",
+        "fills": 31,
+        "fraction_all_g0_fills": 0.16145833333333334,
+        "mean_abs_gap_bps": 0.5987061124440468,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 31,
+            "mean_markout_bps": -2.4393703519131735,
+            "p10_markout_bps": -2.9141774734071153
+          },
+          "500ms": {
+            "fresh_count": 31,
+            "mean_markout_bps": -2.8147925987058984,
+            "p10_markout_bps": -5.801305293690287
+          },
+          "1000ms": {
+            "fresh_count": 28,
+            "mean_markout_bps": -3.011244556063594,
+            "p10_markout_bps": -5.820049307951088
+          }
+        }
+      },
+      {
+        "bin": "0~0.2",
+        "fills": 0,
+        "fraction_all_g0_fills": 0.0,
+        "mean_abs_gap_bps": null,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 0,
+            "mean_markout_bps": null,
+            "p10_markout_bps": null
+          },
+          "500ms": {
+            "fresh_count": 0,
+            "mean_markout_bps": null,
+            "p10_markout_bps": null
+          },
+          "1000ms": {
+            "fresh_count": 0,
+            "mean_markout_bps": null,
+            "p10_markout_bps": null
+          }
+        }
+      },
+      {
+        "bin": "0.2~0.5",
+        "fills": 5,
+        "fraction_all_g0_fills": 0.026041666666666668,
+        "mean_abs_gap_bps": 0.4261421161306097,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 5,
+            "mean_markout_bps": -2.9094377942768004,
+            "p10_markout_bps": -2.915026963999636
+          },
+          "500ms": {
+            "fresh_count": 5,
+            "mean_markout_bps": -2.3289705181196956,
+            "p10_markout_bps": -2.915026963999636
+          },
+          "1000ms": {
+            "fresh_count": 5,
+            "mean_markout_bps": -2.3289705181196956,
+            "p10_markout_bps": -2.915026963999636
+          }
+        }
+      },
+      {
+        "bin": "0.5~1.0",
+        "fills": 26,
+        "fraction_all_g0_fills": 0.13541666666666666,
+        "mean_abs_gap_bps": 0.7632576662709685,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 26,
+            "mean_markout_bps": -2.909196996841719,
+            "p10_markout_bps": -2.9175784099212216
+          },
+          "500ms": {
+            "fresh_count": 26,
+            "mean_markout_bps": -2.350794802687299,
+            "p10_markout_bps": -2.9180041473223484
+          },
+          "1000ms": {
+            "fresh_count": 23,
+            "mean_markout_bps": -1.8989267618165653,
+            "p10_markout_bps": -2.9182595897630246
+          }
+        }
+      },
+      {
+        "bin": "1.0~2.0",
+        "fills": 60,
+        "fraction_all_g0_fills": 0.3125,
+        "mean_abs_gap_bps": 1.5257016166495012,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 60,
+            "mean_markout_bps": -2.8627904881021418,
+            "p10_markout_bps": -2.9192818566624914
+          },
+          "500ms": {
+            "fresh_count": 60,
+            "mean_markout_bps": -2.4747127204572568,
+            "p10_markout_bps": -2.9202196229306137
+          },
+          "1000ms": {
+            "fresh_count": 53,
+            "mean_markout_bps": -2.6919458630625663,
+            "p10_markout_bps": -2.920816700199001
+          }
+        }
+      },
+      {
+        "bin": ">2.0",
+        "fills": 20,
+        "fraction_all_g0_fills": 0.10416666666666667,
+        "mean_abs_gap_bps": 2.5896054753845195,
+        "by_horizon": {
+          "100ms": {
+            "fresh_count": 20,
+            "mean_markout_bps": -3.05476733065143,
+            "p10_markout_bps": -2.9155377002174707
+          },
+          "500ms": {
+            "fresh_count": 20,
+            "mean_markout_bps": -3.054683143954257,
+            "p10_markout_bps": -3.2082514229292167
+          },
+          "1000ms": {
+            "fresh_count": 20,
+            "mean_markout_bps": -2.9095664227069915,
+            "p10_markout_bps": -5.809396618304438
+          }
+        }
+      }
+    ]
+  },
+  "caveats": [
+    "No causal source of price movement proven by BBO-only table",
+    "Small buckets are descriptive, do not optimize thresholds",
+    "Historical PEPE instrument specification unverified"
+  ]
+}
