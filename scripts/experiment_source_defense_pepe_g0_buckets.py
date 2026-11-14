@@ -31,6 +31,7 @@ def visibility_reasons(g0,ot,om,bt,bm,grid,ema,stale_ns):
     w=np.searchsorted(bt,window,side="right")-1
     labels=[]
     ages=[]
+    finite_prev=np.maximum.accumulate(np.where(np.isfinite(ema),np.arange(len(ema)),-1))
     for i in range(len(t)):
         age={"bn_now_ms":(t[i]-bt[b[i]])/1e6 if b[i]>=0 else None,
              "okx_now_ms":(t[i]-ot[o[i]])/1e6 if o[i]>=0 else None,
@@ -40,7 +41,12 @@ def visibility_reasons(g0,ot,om,bt,bm,grid,ema,stale_ns):
         elif o[i]<0: reason="no_prior_okx_asof_now"
         elif g[i]<0: reason="no_prior_causal_ema_grid"
         elif w[i]<0: reason="no_prior_binance_asof_100ms"
-        elif not np.isfinite(ema[g[i]]):reason="ema_not_finite"
+        elif not np.isfinite(ema[g[i]]):
+            older=finite_prev[g[i]]
+            if older>=0 and 0<t[i]-grid[older]<=250_000_000:
+                reason="ema_grid_nan_but_prior_finite_within_250ms"
+            else:
+                reason="ema_grid_nan_no_fresh_prior_finite"
         elif not np.isfinite(om[o[i]]) or om[o[i]]<=0:reason="target_mid_invalid"
         elif age["bn_now_ms"]<0 or age["bn_now_ms"]*1e6>stale_ns:
             reason="binance_latest_bbo_stale"
@@ -97,7 +103,11 @@ def audit(folder,day="2026-06-01"):
         # engine's 250ms signal freshness gate is deliberately unchanged.
         table=prefill_binance_gap_buckets(
             g0,ot,om,bt,bm,grid,basis,summary["tick_size_usdt"],
-            freshness_ns=2_000_000_000)
+            freshness_ns=2_000_000_000,
+            asof_ema=True,ema_max_age_ns=250_000_000)
+        repaired_250ms=prefill_binance_gap_buckets(
+            g0,ot,om,bt,bm,grid,basis,summary["tick_size_usdt"],
+            asof_ema=True,ema_max_age_ns=250_000_000)
     return {
         "market":"OKX PEPE-USDT-SWAP","binance_symbol":"1000PEPEUSDT",
         "Binance_price_divisor":1000.,
@@ -108,6 +118,7 @@ def audit(folder,day="2026-06-01"):
         "trade_confirmation":"none in this Step1 table, BBO impulse only",
         "conditional_table":table,
         "original_250ms_table":original,
+        "repaired_250ms_causal_asof_ema_table":repaired_250ms,
         "coverage_reasons_250ms":qa250,
         "coverage_reasons_1000ms":qa1000,
         "coverage_reasons_2000ms":qa2000,
@@ -123,7 +134,8 @@ def render(d):
           "全部成交来自此前V4正式HBT的原G0回放，不重新运行策略。",
           "Binance触发定义为成交前1ms已可见中间价过去100ms同方向移动≥1个目标价格档。",
           "该触发是BBO价格位移代理，非逐笔主动吃单确认。",
-          "诊断：原250ms vs 扩至2s的严格过去 as-of 价格敏感性；策略防御仍使用原250ms时效门。",
+          "诊断：原250ms vs 在250ms内最近有效EMA的严格过去as-of vs 2s原生BBO的敏感性；策略防御仍使用原250ms时效门。",
+          "" ,
           "",
           "|信号状态与绝对价差bps|成交|占比|100ms均值/P10 bps|500ms均值/P10 bps|1s均值/P10 bps|",
           "|---|---:|---:|---|---|---|"]
@@ -134,7 +146,19 @@ def render(d):
             return f"{a:+.4f}/{b:+.4f}" if a is not None and b is not None else "N/A"
         rows.append(f"|{z['bin']}|{z['fills']}|{z['fraction_all_g0_fills']:.1%}|"
                     f"{fmt(100)}|{fmt(500)}|{fmt(1000)}|")
-    rows+=["", "## 缺失标签根因（互斥归类）", "",
+    rows+=["", "## 原口径与修复口径有效标签覆盖率", "",
+            "|方法|可评估|无法评估|",
+            "|---|---:|---:|",
+            f"|原始250ms、最后EMA网格必须有效|"
+            f"{sum(x['fills'] for x in d['original_250ms_table']['buckets'] if x['bin']!='unavailable')}|"
+            f"{next(x['fills'] for x in d['original_250ms_table']['buckets'] if x['bin']=='unavailable')}|",
+            f"|修复250ms、最近有效EMA严格过去|"
+            f"{sum(x['fills'] for x in d['repaired_250ms_causal_asof_ema_table']['buckets'] if x['bin']!='unavailable')}|"
+            f"{next(x['fills'] for x in d['repaired_250ms_causal_asof_ema_table']['buckets'] if x['bin']=='unavailable')}|",
+            f"|2s BBO且最近有效EMA仍不超过250ms|"
+            f"{sum(x['fills'] for x in d['conditional_table']['buckets'] if x['bin']!='unavailable')}|"
+            f"{next(x['fills'] for x in d['conditional_table']['buckets'] if x['bin']=='unavailable')}|",
+            "", "## 缺失标签根因（互斥归类）", "",
             "|原因|原250ms人数|2s严格过去As-Of人数|",
             "|---|---:|---:|"]
     all_reasons=sorted(set(d["coverage_reasons_250ms"]["reason_counts_exclusive"])|
