@@ -59,6 +59,27 @@ def aggregate_rows(rows,model):
         out["strict_ACK_confirmed_avoided_by_day"].append(
             attr["strict_same_submit_order_id_cancel_ACK_before_G0_fill"]["count"])
     out["strict_ACK_confirmed_avoided_total"]=sum(out["strict_ACK_confirmed_avoided_by_day"])
+    out["order_level_subgroups"]={}
+    for label,field in (
+        ("ACK_lineage_confirmed","strict_same_submit_order_id_cancel_ACK_before_G0_fill"),
+        ("G0_only_unattributed","G0_only_not_strictly_attributed"),
+        ("Source_only_added","new_strategy_added")):
+        block=[x["order_level"][field] for x in z]
+        out["order_level_subgroups"][label]={
+            "total_count":sum(x["count"] for x in block),
+            "by_day_count":[x["count"] for x in block]}
+        for horizon in HORIZONS:
+            raw=[x[horizon] for x in block]
+            valid=[(y["fresh_n"],y["markout_mean_bps"]) for y in raw
+                   if y["markout_mean_bps"] is not None]
+            nvalid=sum(n for n,_ in valid)
+            out["order_level_subgroups"][label][horizon]={
+                "fresh_n":nvalid,
+                "pooled_markout_bps":sum(n*m for n,m in valid)/nvalid if nvalid else None}
+    if (out["order_level_subgroups"]["ACK_lineage_confirmed"]["total_count"]+
+        out["order_level_subgroups"]["G0_only_unattributed"]["total_count"]!=
+        sum(x["group_window_observational"]["Dropped_all"]["count"] for x in z)):
+        raise AssertionError("Strict ACK and unattributed do not partition G0-only fills")
     for k in GROUPS:
         out[k]={}
         for horizon in HORIZONS:
@@ -185,6 +206,18 @@ def md_core(x):
                 z=v["selectivity_lift_daily_equal"][h]["mean_bps"]
                 return f"{z:+.3f}" if z is not None else "NA"
             s.append(f"|{market}|{model}|{fmt('Group_A_active_or_200ms_post_cancel')}|{fmt('Kept')}|{fmt('Group_B_no_local_defense_or_cancel_tail')}|{lift('100ms')}|{lift('500ms')}|")
+    s.extend(["","## 订单提交谱系+模拟撤单ACK：严格对应数与剩余无法归因的漏单", "",
+              "三组：严格匹配ACK对应的G0独有成交（较保守下界）、其它未严格确认的G0独有成交、Source独有Added；均不能当成实盘网络生效计数。",
+              "|市场|模式|严格ACK笔数/500ms markout|其余漏单笔数/500ms markout|Added笔数/500ms markout|",
+              "|---|---|---|---|---|"])
+    for market,d in x["markets"].items():
+        for model in ("z1","z1_p80","z1_gamma75"):
+            groups=d[model]["order_level_subgroups"]
+            def text_group(key):
+                k=groups[key]
+                v=k["500ms"]["pooled_markout_bps"]
+                return f"{k['total_count']}/{v:+.3f}" if v is not None else f"{k['total_count']}/NA"
+            s.append(f"|{market}|{model}|{text_group('ACK_lineage_confirmed')}|{text_group('G0_only_unattributed')}|{text_group('Source_only_added')}|")
     s.extend(["","## 预设 Z0.75 启用门槛",
               "仅当SOL/DOGE原Z1在三个4h日期的平均激活占比低于0.25%且总成交保留率大于95%，才启动Z0.75。PEPE的P80为原始预定对照，不基于本轮重新优化。",""])
     for m,d in x["markets"].items():
