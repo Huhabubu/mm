@@ -1,0 +1,390 @@
+{
+  "cases": [
+    {
+      "date": "2026-06-01",
+      "coin": "BTC",
+      "source": "native Binance book_ticker",
+      "target": "native OKX book_ticker",
+      "assumed_external_visible_lag_ms": 2.5,
+      "all_event_10ms_grid_control": {
+        "fixed_sample_grid_ms": 10,
+        "target_future_horizon_ms": 100,
+        "strict_asof_max_age_ms": 250,
+        "all_grid_times": 420383,
+        "usable_source_and_target_times": 353484,
+        "nonzero_feature_n": 353480,
+        "positive_microprice_fraction": 0.5026535854522411,
+        "negative_microprice_fraction": 0.49733509861832503,
+        "target_100ms_return_mean_given_positive_microprice_bps": 0.022157164346566928,
+        "target_100ms_return_mean_given_negative_microprice_bps": -0.022904347094696957,
+        "source_signed_target_return_mean_all_nonzero_bps": 0.022528768757343377,
+        "source_signed_target_return_p10_bps": 0.0,
+        "market_execution_not_modeled": true,
+        "overlapping_10ms_future_returns_autocorrelated": true,
+        "not_out_of_sample": true
+      },
+      "strict_quiet_history_before_future_jump": {
+        "5ms": {
+          "lag_before_Binance_jump_ms": 5,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 1725,
+          "nonzero_signal_n": 1725,
+          "future_jump_direction_hit_fraction": 0.96,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        },
+        "10ms": {
+          "lag_before_Binance_jump_ms": 10,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 1840,
+          "nonzero_signal_n": 1840,
+          "future_jump_direction_hit_fraction": 0.9472826086956522,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        },
+        "20ms": {
+          "lag_before_Binance_jump_ms": 20,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 2083,
+          "nonzero_signal_n": 2083,
+          "future_jump_direction_hit_fraction": 0.9342294767162747,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        },
+        "50ms": {
+          "lag_before_Binance_jump_ms": 50,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 2553,
+          "nonzero_signal_n": 2553,
+          "future_jump_direction_hit_fraction": 0.9087348217783,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        }
+      },
+      "jump_conditioned_original": {
+        "5ms": {
+          "lag_prior_to_source_jump_ms": 5,
+          "sample_count": 3507,
+          "microprice_zero_fraction": 0.00028514399771884804,
+          "prior_microprice_abs_bps": {
+            "n": 3507,
+            "p10_ms": 0.004594203875205437,
+            "median_ms": 0.006675822289650946,
+            "mean_ms": 0.008608645803069572,
+            "p90_ms": 0.006779619677589353,
+            "minimum_ms": 0.0,
+            "maximum_ms": 0.5848299791791599,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 3507,
+            "p10_ms": 0.663582172958231,
+            "median_ms": 0.9831547739370662,
+            "mean_ms": 0.8930813421877707,
+            "p90_ms": 0.9996104322140408,
+            "minimum_ms": 0.0,
+            "maximum_ms": 0.9999639711048262,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 3408,
+          "opposed_count": 98,
+          "aligned_fraction_excluding_zeros": 0.9720479178551056,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.485225968340945,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 0.42754435411246833,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        },
+        "10ms": {
+          "lag_prior_to_source_jump_ms": 10,
+          "sample_count": 3506,
+          "microprice_zero_fraction": 0.0,
+          "prior_microprice_abs_bps": {
+            "n": 3506,
+            "p10_ms": 0.004054249474795879,
+            "median_ms": 0.006630763533382536,
+            "mean_ms": 0.008228743402158201,
+            "p90_ms": 0.0067765818132498185,
+            "minimum_ms": 6.54683958054858e-05,
+            "maximum_ms": 0.39481722489833826,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 3506,
+            "p10_ms": 0.5903401434509113,
+            "median_ms": 0.9759408089894857,
+            "mean_ms": 0.8756110473535607,
+            "p90_ms": 0.999425080821283,
+            "minimum_ms": 0.009667266187050293,
+            "maximum_ms": 0.9999599735825646,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 3383,
+          "opposed_count": 123,
+          "aligned_fraction_excluding_zeros": 0.9649172846548774,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.4852273306208542,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 0.43923079120823105,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        },
+        "20ms": {
+          "lag_prior_to_source_jump_ms": 20,
+          "sample_count": 3501,
+          "microprice_zero_fraction": 0.0,
+          "prior_microprice_abs_bps": {
+            "n": 3501,
+            "p10_ms": 0.003444048529744891,
+            "median_ms": 0.00653874072644813,
+            "mean_ms": 0.008224473542192448,
+            "p90_ms": 0.006772407584726026,
+            "minimum_ms": 4.605552095761733e-05,
+            "maximum_ms": 0.7434311139208859,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 3501,
+            "p10_ms": 0.49847480803618394,
+            "median_ms": 0.9621162638798172,
+            "mean_ms": 0.8472288502590865,
+            "p90_ms": 0.9991001124859392,
+            "minimum_ms": 0.0067793773016404015,
+            "maximum_ms": 0.9999552982722784,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 3332,
+          "opposed_count": 169,
+          "aligned_fraction_excluding_zeros": 0.951728077692088,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.48450568977560005,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 0.46446446654173823,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        },
+        "50ms": {
+          "lag_prior_to_source_jump_ms": 50,
+          "sample_count": 3495,
+          "microprice_zero_fraction": 0.0,
+          "prior_microprice_abs_bps": {
+            "n": 3495,
+            "p10_ms": 0.0021984209182135364,
+            "median_ms": 0.006175486434239979,
+            "mean_ms": 0.006907326604871713,
+            "p90_ms": 0.006758043588977413,
+            "minimum_ms": 6.414851929347648e-07,
+            "maximum_ms": 0.529978738115343,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 3495,
+            "p10_ms": 0.32019479531273787,
+            "median_ms": 0.9068896756602777,
+            "mean_ms": 0.7807839743629221,
+            "p90_ms": 0.996848339576786,
+            "minimum_ms": 9.475978394772423e-05,
+            "maximum_ms": 0.9999512135626297,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 3227,
+          "opposed_count": 268,
+          "aligned_fraction_excluding_zeros": 0.9233190271816881,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.4790773465814248,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 0.5431101019884044,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        }
+      },
+      "warning": "A 97percent hit among *selected future jump events* can be event-conditioned selection bias; all fixed-time decisions are primary"
+    },
+    {
+      "date": "2026-06-01",
+      "coin": "SOL",
+      "source": "native Binance book_ticker",
+      "target": "native OKX book_ticker",
+      "assumed_external_visible_lag_ms": 2.5,
+      "all_event_10ms_grid_control": {
+        "fixed_sample_grid_ms": 10,
+        "target_future_horizon_ms": 100,
+        "strict_asof_max_age_ms": 250,
+        "all_grid_times": 420378,
+        "usable_source_and_target_times": 332825,
+        "nonzero_feature_n": 332825,
+        "positive_microprice_fraction": 0.46031097423570944,
+        "negative_microprice_fraction": 0.5396890257642906,
+        "target_100ms_return_mean_given_positive_microprice_bps": 0.03727728025610329,
+        "target_100ms_return_mean_given_negative_microprice_bps": -0.03245174043606492,
+        "source_signed_target_return_mean_all_nonzero_bps": 0.034672989371840005,
+        "source_signed_target_return_p10_bps": 0.0,
+        "market_execution_not_modeled": true,
+        "overlapping_10ms_future_returns_autocorrelated": true,
+        "not_out_of_sample": true
+      },
+      "strict_quiet_history_before_future_jump": {
+        "5ms": {
+          "lag_before_Binance_jump_ms": 5,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 1443,
+          "nonzero_signal_n": 1443,
+          "future_jump_direction_hit_fraction": 0.9778239778239778,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        },
+        "10ms": {
+          "lag_before_Binance_jump_ms": 10,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 1432,
+          "nonzero_signal_n": 1432,
+          "future_jump_direction_hit_fraction": 0.965782122905028,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        },
+        "20ms": {
+          "lag_before_Binance_jump_ms": 20,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 1417,
+          "nonzero_signal_n": 1417,
+          "future_jump_direction_hit_fraction": 0.9498941425546931,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        },
+        "50ms": {
+          "lag_before_Binance_jump_ms": 50,
+          "previous_BN_jump_quiet_ms": 50,
+          "eligible_jumps_with_strict_quiet": 1408,
+          "nonzero_signal_n": 1408,
+          "future_jump_direction_hit_fraction": 0.9147727272727273,
+          "future_event_conditioned": true,
+          "may_be_sparse_or_zero_when_BN_BBO_updates_fast": true
+        }
+      },
+      "jump_conditioned_original": {
+        "5ms": {
+          "lag_prior_to_source_jump_ms": 5,
+          "sample_count": 1517,
+          "microprice_zero_fraction": 0.0,
+          "prior_microprice_abs_bps": {
+            "n": 1517,
+            "p10_ms": 0.29550006359108066,
+            "median_ms": 0.5497990197829854,
+            "mean_ms": 0.4968919455658435,
+            "p90_ms": 0.5933252471344407,
+            "minimum_ms": 0.0010683191437597544,
+            "maximum_ms": 1.1005146269140165,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 1517,
+            "p10_ms": 0.48361404550425624,
+            "median_ms": 0.9097037665752967,
+            "mean_ms": 0.8211563725354529,
+            "p90_ms": 0.9818438960050547,
+            "minimum_ms": 0.0017609104460751229,
+            "maximum_ms": 0.9997654219235403,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 1478,
+          "opposed_count": 39,
+          "aligned_fraction_excluding_zeros": 0.974291364535267,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.738722872333159,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 1.254553259771834,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        },
+        "10ms": {
+          "lag_prior_to_source_jump_ms": 10,
+          "sample_count": 1517,
+          "microprice_zero_fraction": 0.0,
+          "prior_microprice_abs_bps": {
+            "n": 1517,
+            "p10_ms": 0.2538492250518062,
+            "median_ms": 0.5366761268608645,
+            "mean_ms": 0.4785436172955746,
+            "p90_ms": 0.5911191870100306,
+            "minimum_ms": 0.0010683191437597544,
+            "maximum_ms": 0.6043073400776037,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 1517,
+            "p10_ms": 0.415963506597839,
+            "median_ms": 0.8891973988793258,
+            "mean_ms": 0.7914686251253299,
+            "p90_ms": 0.978489060787568,
+            "minimum_ms": 0.0017609104460751229,
+            "maximum_ms": 0.9992296049850693,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 1461,
+          "opposed_count": 56,
+          "aligned_fraction_excluding_zeros": 0.9630850362557679,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.7307857759178087,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 1.3050350682784317,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        },
+        "20ms": {
+          "lag_prior_to_source_jump_ms": 20,
+          "sample_count": 1515,
+          "microprice_zero_fraction": 0.0,
+          "prior_microprice_abs_bps": {
+            "n": 1515,
+            "p10_ms": 0.1859653418167827,
+            "median_ms": 0.5055823944770551,
+            "mean_ms": 0.44519283768422613,
+            "p90_ms": 0.5836929733372042,
+            "minimum_ms": 6.957379127308446e-05,
+            "maximum_ms": 0.6043090486933623,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 1515,
+            "p10_ms": 0.30758973870514694,
+            "median_ms": 0.8361941273852052,
+            "mean_ms": 0.7364693780237433,
+            "p90_ms": 0.9657614160425246,
+            "minimum_ms": 0.0001153881312067923,
+            "maximum_ms": 0.9992296049850693,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 1432,
+          "opposed_count": 83,
+          "aligned_fraction_excluding_zeros": 0.9452145214521452,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.7194059162066844,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 1.3176042764238332,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        },
+        "50ms": {
+          "lag_prior_to_source_jump_ms": 50,
+          "sample_count": 1512,
+          "microprice_zero_fraction": 0.0,
+          "prior_microprice_abs_bps": {
+            "n": 1512,
+            "p10_ms": 0.12332531418227173,
+            "median_ms": 0.4382405207071452,
+            "mean_ms": 0.38862668424137936,
+            "p90_ms": 0.5666987215127478,
+            "minimum_ms": 8.003254741077201e-05,
+            "maximum_ms": 0.604298070904248,
+            "negative_fraction": 0.0
+          },
+          "prior_qty_imbalance_abs": {
+            "n": 1512,
+            "p10_ms": 0.20408992467800524,
+            "median_ms": 0.7252640117812653,
+            "mean_ms": 0.6431552643644265,
+            "p90_ms": 0.9370733845530138,
+            "minimum_ms": 0.000132685956911511,
+            "maximum_ms": 0.9958227910385531,
+            "negative_fraction": 0.0
+          },
+          "aligned_count": 1380,
+          "opposed_count": 132,
+          "aligned_fraction_excluding_zeros": 0.9126984126984127,
+          "100ms_target_signed_markout_mean_when_aligned_bps": 0.7141499140777565,
+          "100ms_target_signed_markout_mean_when_opposed_bps": 1.1576839162726265,
+          "target_label_relative_to_future_Binance_jump": true,
+          "claim_limit": "conditioned on a future Binance jump; predictive validity requires all-event independent test"
+        }
+      },
+      "warning": "A 97percent hit among *selected future jump events* can be event-conditioned selection bias; all fixed-time decisions are primary"
+    }
+  ]
+}
