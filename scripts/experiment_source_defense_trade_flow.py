@@ -91,7 +91,8 @@ def read_binance_taker_trades(day, end_us, symbol,
 @njit
 def causal_taker_window(now_ns, visible_ns, signed_prefix, notional_prefix,
                         lookback_ns, direction, min_signed_ratio=.35,
-                        min_total_notional_usdt=100.):
+                        min_total_notional_usdt=100.,
+                        min_directional_net_notional_usdt=0.):
     """Return accepted, signed_ratio, gross_notional and net_notional.
 
     Strictly earlier visible trades only; no future trade labels.
@@ -111,5 +112,53 @@ def causal_taker_window(now_ns, visible_ns, signed_prefix, notional_prefix,
         return False,0.,gross,net
     signed_ratio=net/gross
     accept=(gross>=min_total_notional_usdt and
-            signed_ratio*direction>=min_signed_ratio)
+            signed_ratio*direction>=min_signed_ratio and
+            net*direction>=min_directional_net_notional_usdt)
     return accept,signed_ratio,gross,net
+
+
+
+@njit
+def causal_pretrade_directional_p80(visible_ns,signed_prefix,notional_prefix,
+                                   start_ns,stop_ns,lookback_ns=100_000_000,
+                                   sample_ns=100_000_000,quantile=.8):
+    """Calibrate positive directional net taker notional *only* in warmup.
+
+    Each sample at its own strictly past-visible 100ms end; separate positive
+    buy/sell net-dollar values. Quantile on positive windows avoids zero-P80
+    degeneracy when a quiet symbol has few signed trades; report sample sizes.
+    Return threshold for buy/sell, counts, and all warmup grid observations.
+    """
+    if not (0<quantile<1 and lookback_ns>0 and sample_ns>0 and
+            stop_ns>start_ns+lookback_ns):
+        raise ValueError("Bad strictly causal taker training window")
+    n=int((stop_ns-start_ns)//sample_ns)
+    buys=np.empty(n,np.float64)
+    sells=np.empty(n,np.float64)
+    count_b=count_s=valid=0
+    for j in range(1,n+1):
+        t=start_ns+j*sample_ns
+        if t>stop_ns:
+            break
+        hi=np.searchsorted(visible_ns,t,side="left")
+        lo=np.searchsorted(visible_ns,t-lookback_ns,side="left")
+        net=signed_prefix[hi]-signed_prefix[lo]
+        gross=notional_prefix[hi]-notional_prefix[lo]
+        if gross<=0:
+            continue
+        valid+=1
+        if net>0:
+            buys[count_b]=net
+            count_b+=1
+        elif net<0:
+            sells[count_s]=-net
+            count_s+=1
+    if count_b<20 or count_s<20:
+        raise ValueError("Too few independent pretrade directional taker windows")
+    b=np.sort(buys[:count_b])
+    ss=np.sort(sells[:count_s])
+    qb=b[int(quantile*(count_b-1))]
+    qs=ss[int(quantile*(count_s-1))]
+    if qb<=0 or qs<=0:
+        raise ValueError("Nonpositive high-intensity taker threshold")
+    return qb,qs,count_b,count_s,valid
