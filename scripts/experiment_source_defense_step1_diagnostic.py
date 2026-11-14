@@ -1,4 +1,159 @@
+"""Step 1 read-only diagnostics from June-1 official HBT fill artifacts.
 
+No strategy execution, fitting, tuning or source branch mutation. Binance
+'active impulse' means a visible Binance BBO midpoint movement, NOT confirmed
+aggressive trade flow. Classification at exchange fill time -1ms is an
+*as-of pre-fill proxy*, never asserted as the order's original decision time.
+"""
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+from cross_venue_event_probe import read_binance_bbo, visible_timestamps
+from check_okx_hft_data import extract_window
+from run_beta_one_direct_gap import read_local_bbo
+from experiment_source_defense_signal import past_grid_time_ema
+from experiment_source_defense_pilot import classify_opportunities, HORIZONS_MS
+
+GAP_BINS = (0., .2, .5, 1., 2., float("inf"))
+BIN_LABELS = ("0~0.2", "0.2~0.5", "0.5~1.0", "1.0~2.0", ">2.0")
+
+
+def load_fills(folder, model):
+    with np.load(folder/f"{model}_fill_diagnostics.npz") as z:
+        return {k:z[k].copy() for k in z.files}
+
+
+def fill_group_summary(fills, mask, contract_value):
+    sel=np.flatnonzero(mask)
+    amounts=fills["exec_qty"][sel]*fills["exec_price"][sel]*contract_value
+    result={"fill_count":len(sel),"notional_usdt":float(amounts.sum()),
+            "mean_notional_usdt":float(amounts.mean()) if len(sel) else None,
+            "by_horizon":{}}
+    for h in HORIZONS_MS:
+        fresh=mask & fills[f"fresh_{h}ms"].astype(bool)
+        mark=fills[f"markout_{h}ms_bps"][fresh]
+        notional=(fills["exec_qty"][fresh]*fills["exec_price"][fresh]*
+                  contract_value)
+        clean=np.isfinite(mark)&np.isfinite(notional)&(notional>0)
+        mark=mark[clean];notional=notional[clean]
+        result["by_horizon"][str(h)+"ms"]={
+            "fresh_count":len(mark),
+            "mean_markout_bps":float(mark.mean()) if len(mark) else None,
+            "notional_weighted_markout_bps":(
+                float(np.average(mark,weights=notional)) if len(mark) else None),
+            "markout_dollar_exposure_proxy":(
+                float(np.sum(mark*notional/10000.)) if len(mark) else None),
+            "p10_markout_bps":float(np.quantile(mark,.1)) if len(mark) else None,
+            "p05_markout_bps":float(np.quantile(mark,.05)) if len(mark) else None,
+            "fraction_markout_below_minus2bps":(
+                float(np.mean(mark < -2)) if len(mark) else None),
+            "fresh_notional_usdt":float(notional.sum())}
+    return result
+
+
+def position_valuation_proxy(fills, ot, om, contract_value, report_end_ns):
+    """Noncausal descriptive inventory MTM on native BBO, exchange fill clock.
+
+    This is NOT official HBT PnL. Integrate inventory before each BBO mid
+    change, taking each fill as effective at its exchange timestamp.
+    """
+    if not len(ot):raise ValueError("Missing market BBO history")
+    ts=np.asarray(fills["exchange_timestamp_ns"],dtype=np.int64)
+    side=np.asarray(fills["side_sign"],dtype=np.float64)
+    qty=np.asarray(fills["exec_qty"],dtype=np.float64)
+    ordered=np.argsort(ts,kind="stable")
+    ts,inc=ts[ordered],(side*qty)[ordered]
+    end=int(report_end_ns)
+    start=int(ts[0]) if len(ts) else int(ot[0])
+    from_idx=np.searchsorted(ot,start,side="right")-1
+    to_idx=np.searchsorted(ot,end,side="right")-1
+    if from_idx<0 or to_idx<=from_idx:
+        return {"status":"insufficient_native_bbo_for_holding_proxy"}
+    t=ot[from_idx:to_idx+1];m=om[from_idx:to_idx+1]
+    # q prior to each mid change, including all exchange executions up to
+    # the earlier BBO timestamp. Same-clock events may have unknown order.
+    at=np.searchsorted(ts,t[:-1],side="right")
+    c=np.r_[0.,np.cumsum(inc)]
+    pre_q=c[at]
+    changes=np.diff(m)
+    pnl=float(np.dot(pre_q,changes)*contract_value)
+    gross_price_variation_usdt=float(
+        np.dot(np.abs(pre_q),np.abs(changes))*contract_value)
+    terminal_q=float(np.sum(inc))
+    terminal_marked_inventory_usdt=terminal_q*float(m[-1])*contract_value
+    return {"status":"native_bbo_mid_holding_proxy",
+            "first_fill_ns":start,"last_available_mid_ns":int(t[-1]),
+            "terminal_inventory_contracts":terminal_q,
+            "terminal_inventory_signed_usdt":terminal_marked_inventory_usdt,
+            "inventory_holding_mtm_drift_usdt_proxy":pnl,
+            "abs_position_weighted_abs_mid_changes_usdt":gross_price_variation_usdt,
+            "note":"Standalone holding exposure proxy. Different from official HBT fused-mid gross PnL; use official net ledger for total returns."}
+
+
+def prefill_binance_gap_buckets(g0, ot, om, bt, bm, grid, ema, tick,
+                                freshness_ns=250_000_000):
+    """Classify *G0* original fills using only states visible before fill.
+
+    Binance midprice movement window 100ms, same direction as fast residual
+    gap. Native target BBO is substituted for unavailable HBT decision mid.
+    """
+    fill_ts=np.asarray(g0["exchange_timestamp_ns"],np.int64)
+    t=fill_ts-1_000_000 # use strictly pre-exchange fill instant -1ms
+    bi=np.searchsorted(bt,t,side="left")-1
+    oi=np.searchsorted(ot,t,side="left")-1
+    gi=np.searchsorted(grid,t,side="left")-1
+    window=t-100_000_000
+    wi=np.searchsorted(bt,window,side="right")-1
+    bidx=np.maximum(bi,0);oidx=np.maximum(oi,0);gidx=np.maximum(gi,0)
+    widx=np.maximum(wi,0)
+    valid=(bi>=0)&(oi>=0)&(gi>=0)&(wi>=0)
+    valid &= (t-bt[bidx]>=0)&(t-bt[bidx]<=freshness_ns)
+    valid &= (t-ot[oidx]>=0)&(t-ot[oidx]<=freshness_ns)
+    valid &= (window-bt[widx]>=0)&(window-bt[widx]<=freshness_ns)
+    valid &= np.isfinite(ema[gidx])
+    target=om[oidx]
+    valid &= target>0
+    g_bps=1.e4*(bm[bidx]-target-ema[gidx])/np.maximum(target,1.e-12)
+    imp_bps=1.e4*(bm[bidx]-bm[widx])/np.maximum(target,1.e-12)
+    imp_ticks=(bm[bidx]-bm[widx])/tick
+    gate=(valid & (np.sign(g_bps)==np.sign(imp_bps)) &
+          (np.abs(imp_ticks)>=1.0-1.e-10)&(np.abs(g_bps)>0))
+    labels=np.empty(len(t),dtype=object)
+    labels[:]="unavailable"
+    labels[valid&~gate]="未触发"
+    labels[gate]=">2.0"
+    abs_gap=np.abs(g_bps)
+    for k,label in enumerate(BIN_LABELS):
+        hit=gate & (abs_gap>=GAP_BINS[k]) & (abs_gap<GAP_BINS[k+1])
+        labels[hit]=label
+    result={"asof_clock":"exchange_fill_timestamp_minus_1ms; NOT original order decision",
+            "proxy":"native target BBO, visible delayed Binance mid, strictly prior EMA",
+            "max_allowed_quote_age_ns":int(freshness_ns),
+            "binance_impulse_definition":"100ms Binance BBO mid movement >= 1 target tick, sign(gap)==sign(impulse)",
+            "buckets":[]}
+    order=("unavailable","未触发")+BIN_LABELS
+    for label in order:
+        selected=(labels==label)
+        count=int(selected.sum())
+        row={"bin":label,"fills":count,
+             "fraction_all_g0_fills":count/len(t) if len(t) else None,
+             "mean_abs_gap_bps":float(np.mean(abs_gap[selected])) if count and label!="unavailable" else None,
+             "by_horizon":{}}
+        for h in (100,500,1000):
+            v=selected & g0[f"fresh_{h}ms"].astype(bool)
+            marks=g0[f"markout_{h}ms_bps"][v]
+            marks=marks[np.isfinite(marks)]
+            row["by_horizon"][f"{h}ms"]={
+                "fresh_count":len(marks),
+                "mean_markout_bps":float(np.mean(marks)) if len(marks) else None,
+                "p10_markout_bps":float(np.quantile(marks,.1)) if len(marks) else None}
+        result["buckets"].append(row)
+    if sum(row["fills"] for row in result["buckets"])!=len(t):
+        raise AssertionError("G0 bucket partition not exhaustive")
+    return result
 
 
 def audit_case(folder,coin):
