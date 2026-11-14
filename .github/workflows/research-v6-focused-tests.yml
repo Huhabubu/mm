@@ -1,0 +1,75 @@
+name: Research V6 focused clock pulse causality and HBT helper regressions
+on:
+  push:
+    branches: [research/sparse-source-defense-20261114]
+    paths: ['.github/workflows/research-v6-focused-tests.yml']
+permissions: {contents: write}
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: research/sparse-source-defense-20261114}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install hftbacktest==2.4.4
+      - name: Python compile, strict 60s shift and signed clock tests
+        run: |
+          python - <<'PY'
+          import json,re,subprocess
+          from pathlib import Path
+          scripts=[
+              'experiment_source_defense_engine.py',
+              'experiment_source_defense_v6_clock_microprice.py',
+              'experiment_source_defense_v6_clock_aggregate.py',
+              'experiment_source_defense_v6_microprice_control.py',
+              'experiment_source_defense_v6_mechanism.py',
+              'experiment_source_defense_v6_mechanism_aggregate.py',
+              'experiment_source_defense_v6_matched_exposure.py',
+              'experiment_source_defense_v6_matched_exposure_aggregate.py',
+          ]
+          subprocess.run(['python','-m','py_compile']+
+              ['scripts/'+x for x in scripts],check=True)
+          tests=[
+            'test_experiment_source_defense_v6_mechanism.py',
+            'test_experiment_source_defense_emergency_cancel.py',
+            'test_experiment_source_defense_trade_flow.py',
+            'test_experiment_source_defense_signal.py',
+            'test_experiment_source_defense_v5_pepe_coverage.py',
+          ]
+          counted={}
+          for x in tests:
+              run=subprocess.run(['python','-m','unittest','discover',
+                  '-s','scripts','-p',x,'-v'],capture_output=True,text=True)
+              print('V6_TEST_GROUP',x,'EXIT',run.returncode,run.stderr,flush=True)
+              m=re.search(r'Ran (\d+) tests?',run.stderr)
+              if run.returncode or not m or 'OK' not in run.stderr:
+                  raise RuntimeError('Fail V6 regression '+x)
+              counted[x]=int(m.group(1))
+          out=Path('reports/source_defense/v6_tests')
+          out.mkdir(parents=True,exist_ok=True)
+          d={'tested_commit':'__SHA__','python':'3.11',
+             'official_HBT_pin':'2.4.4',
+             'new_scripts_compiled':scripts,
+             'tests':counted,'passed_count':sum(counted.values()),
+             'all_passed':True,
+             'limits':'Unit tests validate schedule, causality and commands; actual HBT timing measured in separate workflows'}
+          (out/'v6_unit_tests.json').write_text(json.dumps(d,ensure_ascii=False,indent=2))
+          md="# V6研究集中单元测试\n\n"
+          md+=f"全部通过 {sum(counted.values())} 项；使用HBT 2.4.4。\n\n"
+          md+="|模块|数量|\n|---|---:|\n"
+          for k,n in counted.items():md+=f"|{k}|{n}|\n"
+          md+="\n测试包含双时钟有符号领先/滞后、+60秒严格等时长时序与未越时窗口、2ms立即危险侧撤单等逻辑；HBT交易执行另有真实回放。\n"
+          (out/'v6_unit_tests.md').write_text(md)
+          print(md)
+          PY
+      - name: Commit compact test results
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/source_defense/v6_tests/v6_unit_tests.json \
+                     reports/source_defense/v6_tests/v6_unit_tests.md
+          git commit -m 'research(data): V6 focused signed-clock, microprice, equal-episode and emergency-cancel regression proof'
+          git pull --rebase origin research/sparse-source-defense-20261114
+          git push origin HEAD:refs/heads/research/sparse-source-defense-20261114
