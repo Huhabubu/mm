@@ -118,7 +118,7 @@
 
 [聚焦单元测试源码：主动成交P80](../scripts/test_experiment_source_defense_trade_flow.py)、[EMA严格过去重读测试](../scripts/test_experiment_source_defense_v5_pepe_coverage.py)；[聚焦33项测试全部通过JSON](../reports/source_defense/v5_tests/v5_tests.json)、[MD](../reports/source_defense/v5_tests/v5_tests.md)、[工作流记录](https://github.com/Huhabubu/mm/actions/runs/43555125020)。单元测试仅验证边界逻辑，真实撮合与数值汇总由HBT及单独工作流验证。
 
-[六日期完整金额、各四期限Markout、P5/P10、两层Bootstrap、随机种子误差、G0/本地安慰剂/返佣敏感性JSON](../reports/source_defense/v5_sixdate/v5_sixdate_summary.json)和[研究表格MD](../reports/source_defense/v5_sixdate/v5_sixdate_summary.md)。
+[六日期完整金额、各四期限Markout、P10、两层Bootstrap、随机种子误差、G0/本地安慰剂/返佣敏感性JSON](../reports/source_defense/v5_sixdate/v5_sixdate_summary.json)和[研究表格MD](../reports/source_defense/v5_sixdate/v5_sixdate_summary.md)。
 
 - 已完成六日期测试，但统计结果不支持“显著跨所净选择性Alpha”，且四个市场随机等量均未达标。
 - 仅有PEPE OKX的有效500ms Dropped组超过200笔，说明扩大天数仍未必能解决所有市场的统计功效。
