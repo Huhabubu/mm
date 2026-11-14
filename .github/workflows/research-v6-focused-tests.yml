@@ -49,7 +49,8 @@ jobs:
               counted[x]=int(m.group(1))
           out=Path('reports/source_defense/v6_tests')
           out.mkdir(parents=True,exist_ok=True)
-          d={'tested_commit':'__SHA__','python':'3.11',
+          sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          d={'tested_commit':sha,'python':'3.11',
              'official_HBT_pin':'2.4.4',
              'new_scripts_compiled':scripts,
              'tests':counted,'passed_count':sum(counted.values()),
