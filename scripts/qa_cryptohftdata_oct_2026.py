@@ -96,7 +96,7 @@ def scan(path, venue, kind, day, hour):
         rows=0, events=0, snapshot_events=0,
         missing_expected_columns=sorted(set(expected) - available),
         received_backwards=0, received_outside_hour=0,
-        invalid_price_or_quantity=0, max_receive_gap_s=0.,
+        invalid_price_or_quantity=0, non_market_na_count=0, max_receive_gap_s=0.,
         receive_gaps_over_1s=0, receive_gaps_over_10s=0,
         receive_gaps_over_60s=0, sequence_pairs_checked=0,
         sequence_gap_candidates=0, binance_trade_id_gap_candidates=0,
@@ -153,6 +153,11 @@ def scan(path, venue, kind, day, hour):
             prices = b["price"].to_numpy(zero_copy_only=False).astype(np.float64)
             quantities = b["quantity"].to_numpy(zero_copy_only=False).astype(np.float64)
             valid = np.isfinite(prices) & np.isfinite(quantities) & (prices > 0) & (quantities >= 0)
+            if kind == "trades" and venue == "binance_futures" and "order_type" in b:
+                types = np.asarray(b["order_type"].to_pylist(), dtype=object)
+                na_mask = (types == "NA") & (prices == 0) & (quantities == 0)
+                valid |= na_mask
+                result["non_market_na_count"] += int(np.count_nonzero(na_mask))
             if kind == "orderbook" and "side" in b:
                 sides = np.asarray(b["side"].to_pylist(), dtype=object)
                 valid |= (sides == "noop")
