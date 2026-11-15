@@ -70,7 +70,8 @@ def audit_book(path):
     events = []
     signature_prev = None
     prev_final = None
-    checked = broken = snapshot_count = back_count = 0
+    previous_was_snapshot = False
+    checked = broken = snapshot_count = back_count = snapshot_bridges = 0
     broken_examples = []
     adjacent_gap_max = (0, None)
     last_t = None
@@ -80,6 +81,7 @@ def audit_book(path):
         t = data["received_time"].to_numpy(zero_copy_only=False)
         ty = np.asarray(data["event_type"].to_pylist(), dtype=object)
         fseq = pc.fill_null(data["final_update_id"], -1).to_numpy(zero_copy_only=False)
+        firstseq = pc.fill_null(data["first_update_id"], -1).to_numpy(zero_copy_only=False)
         pu = pc.fill_null(data["prev_final_update_id"], -1).to_numpy(zero_copy_only=False)
         if len(t) == 0:
             continue
@@ -107,14 +109,18 @@ def audit_book(path):
             prev = int(pu[i])
             if abs(timestamp - FOCUS_NS) <= 16_000_000_000 and len(events) < 5000:
                 events.append({"t": iso(timestamp), "received_ns": timestamp,
-                               "type": etype, "final": seq, "prev": prev})
+                               "type": etype, "first": int(firstseq[i]), "final": seq, "prev": prev})
             if etype == "snapshot":
                 snapshot_count += 1
                 prev_final = seq
+                previous_was_snapshot = True
             elif etype == "update":
                 if prev_final is not None and prev != -1:
                     checked += 1
-                    if prev != prev_final:
+                    bridge = previous_was_snapshot and int(firstseq[i]) <= prev_final <= seq
+                    if bridge and prev != prev_final:
+                        snapshot_bridges += 1
+                    elif prev != prev_final:
                         broken += 1
                         if len(broken_examples) < 16:
                             broken_examples.append({
@@ -124,12 +130,14 @@ def audit_book(path):
                                 "current_final": seq,
                             })
                 prev_final = seq
+                previous_was_snapshot = False
         k = int(indices[-1])
         signature_prev = (int(t[k]), ty[k], int(fseq[k]), int(pu[k]))
 
     gap_start, gap_end = adjacent_gap_max[1] if adjacent_gap_max[1] else (None, None)
     return dict(rows=f.metadata.num_rows, snapshots=snapshot_count,
                 chain_pairs_checked=checked, chain_breaks=broken,
+                valid_snapshot_bridges=snapshot_bridges,
                 chain_break_examples=broken_examples,
                 received_backwards=back_count,
                 largest_receive_gap_seconds=round(adjacent_gap_max[0] / 1e9, 6),
