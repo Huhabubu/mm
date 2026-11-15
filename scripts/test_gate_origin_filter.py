@@ -4,6 +4,7 @@ import numpy as np
 from gate_basis_weighted_moments import NS, exact_moments_5s
 from gate_origin_glft_strategy import gate_origin_filter
 from run_gate_btc_origin_glft import variants,scenario
+from gate_l2_snapshot_adapter import normalized_gate_l2_rows
 
 
 def run():
@@ -66,6 +67,28 @@ def run():
     assert c["qty"]==10 and c["position_cap"]==200
     assert abs(c["gamma_code"]-.0005)<1e-12
     assert c["maker_fee_rate"]<0
+    def level(ts,side,price,amount,snapshot):
+        return {"local_timestamp":str(ts),"timestamp":str(ts-100),
+                "exchange":"gate-io-futures","symbol":"BTC_USDT",
+                "is_snapshot":snapshot,"side":side,"price":str(price),"amount":str(amount)}
+    complete=[
+        level(1000,"bid",100,10,"true"),level(1000,"ask",101,15,"true"),
+        level(2000,"bid",100,12,"true"),level(2000,"ask",102,11,"true")]
+    m={"l2_format":None,"source_snapshot_groups":0,"source_l2_rows":0,
+       "emitted_l2_rows":0,"removed_l2_levels":0}
+    normalized=list(normalized_gate_l2_rows(iter(complete),m))
+    assert m["l2_format"]=="per_message_full_snapshots_rewritten_to_deltas",m
+    assert m["source_l2_rows"]==4 and len(normalized)==5,m
+    assert normalized[0]["is_snapshot"]=="true"
+    assert normalized[1]["is_snapshot"]=="true"
+    assert sorted((r["side"],float(r["price"]),float(r["amount"]))
+                  for r in normalized[2:])==[
+                    ("ask",101.,0.),("ask",102.,11.),("bid",100.,12.)]
+    native=[level(1000,"bid",100,10,"true"),level(1000,"ask",101,15,"true"),
+            level(2000,"bid",100,12,"false")]
+    m2=m.copy()
+    assert list(normalized_gate_l2_rows(iter(native),m2))==native
+    assert m2["l2_format"]=="initial_snapshot_plus_native_deltas"
     print("GATE_BASIS_ORIGIN_SIGNAL_TESTS_OK",len(models),"variants")
 
 
