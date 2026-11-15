@@ -203,6 +203,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
                 raise RuntimeError("Missing Gate pretrade midpoint")
             cfg=scenario(float(np.median(pretrade)),spec)
             report["scenario"]=cfg
+            print("GATE_SCENARIO",day,json.dumps(cfg),flush=True)
             if minutes==1430:
                 from tardis_segmented_hbt import convert_fuse_parts
                 parts,details=convert_fuse_parts(
@@ -261,7 +262,11 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
                     report["variants"][name]=summary
                     print("GATE_MODEL_OK",day,name,
                           "net_usdt",summary["trading"]["end_net_marked_equity_usdt"],
-                          "fee_usdt",summary["trading"]["fee_usdt"],flush=True)
+                          "fee_usdt",summary["trading"]["fee_usdt"],
+                          "fills",summary["trading"]["engine_fills"],
+                          "signal_activations",summary["binance_origin_filter"]["binance_origin_activations"],
+                          "active_decisions",summary["binance_origin_filter"]["active_decisions"],
+                          flush=True)
                 finally:
                     engine.close()
             base=report["variants"]["glft"]["trading"]["end_net_marked_equity_usdt"]
