@@ -181,11 +181,15 @@ def audit_feed(exchange, kind, symbol, day, stop_us, tick, start_us):
             state["first_local_us"]>start_us+5_000_000 or last<stop_us-30_000_000):
         raise ValueError(f"{kind} coverage incomplete: {state}")
     if (state["backward_timestamp_rows"] or state["invalid_rows"] or
-            state["non_grid_prices"] or state["gaps_over_30s"] or
+            state["non_grid_prices"] or
+            (kind != "trades" and state["gaps_over_30s"]) or
             state["negative_latency_rows"]):
         raise ValueError(f"{kind} integrity/clock/large-gap QA failed: {state}")
     if kind == "incremental_book_L2" and not state["initial_snapshot_complete"]:
         raise ValueError(f"No valid initial Gate L2 snapshot: {state}")
+    # Quiet trading is legitimate: a 30s gap between *trades* is not evidence
+    # that an order-book feed or trade feed disconnected. Preserve diagnostics,
+    # while discontinuity rejection applies to quotes and L2 market data.
     if kind == "trades" and state["trades_nonintegral_amount_rows"]:
         raise ValueError(
             "Gate trades amounts not verified as integral contract counts. "
