@@ -29,7 +29,10 @@ LABELS = ("Time weighted", "1-second equally weighted",
 
 
 class Tape:
-    def __init__(self, bt, bm, gt, gm):
+    def __init__(self, bt, bm, gt, gm, max_age_us=AGE_US):
+        self.max_age_us = int(max_age_us)
+        if self.max_age_us <= 0:
+            raise ValueError("Quote age limit must be positive")
         self.bt, self.bm = np.asarray(bt, np.int64), np.asarray(bm, float)
         self.gt, self.gm = np.asarray(gt, np.int64), np.asarray(gm, float)
         if (not len(bt) or not len(gt) or
@@ -43,13 +46,13 @@ class Tape:
         self.t = self.t[both]
         ib, ig = ib[both], ig[both]
         self.d = self.bm[ib] - self.gm[ig]
-        self.fresh = ((self.t-self.bt[ib] <= AGE_US) &
-                      (self.t-self.gt[ig] <= AGE_US))
+        self.fresh = ((self.t-self.bt[ib] <= self.max_age_us) &
+                      (self.t-self.gt[ig] <= self.max_age_us))
         # A quote becomes invalid 250ms after its latest update, including
         # even if neither feed sends any further messages during that interval.
         next_event = np.r_[self.t[1:], np.iinfo(np.int64).max]
         self.valid_end = np.minimum.reduce(
-            (next_event, self.bt[ib] + AGE_US, self.gt[ig] + AGE_US))
+            (next_event, self.bt[ib] + self.max_age_us, self.gt[ig] + self.max_age_us))
 
     def time_integral(self, lo, hi):
         """Piecewise-constant integral, expires both quote states at 250ms."""
@@ -75,7 +78,7 @@ class Tape:
         b = np.maximum(ib, 0)
         g = np.maximum(ig, 0)
         good = ((ib >= 0) & (ig >= 0) &
-                (grid-self.bt[b] <= AGE_US) & (grid-self.gt[g] <= AGE_US))
+                (grid-self.bt[b] <= self.max_age_us) & (grid-self.gt[g] <= self.max_age_us))
         delta = self.bm[b] - self.gm[g]
         return (float(np.mean(delta[good])) if np.any(good)
                 else float("nan")), int(np.count_nonzero(good))
@@ -154,7 +157,7 @@ def plot(day, rows, path):
     plt.close(fig)
 
 
-def run_day(day, output, delay_ms, observation_minutes):
+def run_day(day, output, delay_ms, observation_minutes, max_quote_age_ms):
     day0 = timestamp_us(day,"00:00:00")
     first = day0+WINDOW_US
     end = first+observation_minutes*60_000_000
@@ -164,7 +167,7 @@ def run_day(day, output, delay_ms, observation_minutes):
     # In the live strategy, Binance becomes visible only after its
     # extra assumed transport delay. Gate uses its measured local clock.
     bt = bt + int(round(delay_ms*1000))+1
-    tape = Tape(bt,bm,gt,gm)
+    tape = Tape(bt,bm,gt,gm,int(round(max_quote_age_ms*1000)))
     rows=[]
     for now in range(first,end,UPDATE_US):
         r=tape.estimate_at(now)
@@ -201,7 +204,7 @@ def run_day(day, output, delay_ms, observation_minutes):
         "observation_minutes":observation_minutes,
         "lookback_seconds":600,"refit_seconds":5,
         "binance_extra_visible_delay_ms":delay_ms,
-        "max_quote_age_ms":250,"normal_97pct_two_sided_sigma":GAUSSIAN_Z,
+        "max_quote_age_ms":max_quote_age_ms,"normal_97pct_two_sided_sigma":GAUSSIAN_Z,
         "n_estimates":len(rows),
         "fraction_windows_meeting_75pct_time_and_second_coverage":
             float(np.mean([r["coverage_75pct"] for r in rows])),
@@ -227,11 +230,12 @@ def main():
     p.add_argument("--out",default="reports/visualizations/binance_gate_basis_600s_5s")
     p.add_argument("--binance-delay-ms",type=float,default=2.5)
     p.add_argument("--minutes",type=int,default=50)
+    p.add_argument("--max-quote-age-ms",type=float,default=250.)
     args=p.parse_args()
-    if args.minutes<=0 or args.minutes>1430 or args.binance_delay_ms<0:
+    if args.minutes<=0 or args.minutes>1430 or args.binance_delay_ms<0 or args.max_quote_age_ms<=0:
         p.error("invalid minutes or delay")
     root=Path(args.out);root.mkdir(parents=True,exist_ok=True)
-    result=[run_day(d,root,args.binance_delay_ms,args.minutes) for d in args.days]
+    result=[run_day(d,root,args.binance_delay_ms,args.minutes,args.max_quote_age_ms) for d in args.days]
     (root/"summary.json").write_text(json.dumps(result,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     readme=(
         "# Binance–Gate historical basis: four methods, matched scales\n\n"
@@ -241,13 +245,13 @@ def main():
         "Gate uses L2-reconstructed quotes without added delay. "
         "Event timeline is the union of both feeds, with latest historically visible "
         "value at each event. Rows at the same microsecond are reduced to the final state.\n\n"
-        "A: piecewise-constant time-weighted mean, with both BBOs expiring at 250ms. "
+        f"A: piecewise-constant time-weighted mean, with both BBOs expiring at {args.max_quote_age_ms:g}ms. "
         "B: 600 fixed 1-second points, strict-past as-of, equal weight. "
         "C: equally weighted event samples, compute event mean and population sigma, "
         "discard points outside mean ±2.17009 sigma (nominal central Gaussian 97%), "
         "then recompute mean on retained points; actual rejection proportion is recorded. "
         "D: equally weighted event samples without trimming.\n\n"
-        "All methods exclude samples where either quote is older than 250ms. "
+        f"All methods exclude samples where either quote is older than {args.max_quote_age_ms:g}ms. "
         "CSV records validity and a common 75% eligibility diagnostic, rather than "
         "silently extrapolating stale quotes. Plots show even low-coverage estimates "
         "with valid-time fraction in the lower panel. Only eligible windows enter "
