@@ -1,0 +1,109 @@
+name: Locked-origin 1p96sigma Binance signal HBT beta gradient
+on:
+  push:
+    paths:
+      - '.github/workflows/locked-origin-beta-grid.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  official-hbt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT 2.4.4
+        run: python -m pip install hftbacktest==2.4.4
+      - name: New signal tests and preserved market invariants
+        run: |
+          python -m unittest discover -s scripts -p 'test_locked_origin_beta_grid.py' -v
+          python -m unittest discover -s scripts -p 'test_multivenue_glft.py' -v
+          python -m unittest discover -s scripts -p 'test_g0_glft_event_driven.py' -v
+      - name: Real Tardis HBT, 10min warmup and 50min 5-beta paired replay
+        run: |
+          python scripts/run_locked_origin_beta_grid.py \
+            --day "${{ matrix.day }}" --minutes 50 --extra-binance-delay-ms 2.5
+      - name: Validate realized fee-inclusive net results and gate diagnostics
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import os
+          p=Path("reports/locked_origin_beta_grid_okx_BTC_${{ matrix.day }}_50m.json")
+          if not p.exists():
+              print("No report produced")
+              raise SystemExit(1)
+          d=json.loads(p.read_text())
+          print("CASE",d["day"],d["status"])
+          if d["status"]=="no_glft_calibration":
+              print("NO_GLFT_CALIBRATION",d.get("calibration_diagnostic"))
+              raise SystemExit(0)
+          assert d["status"]=="complete",d.get("error")
+          assert len(d["variants"])==5
+          assert d["no_quote_age_exclusion"] is True
+          assert d["legacy_p90_p50_not_used"] is True
+          assert d["signal_diagnostic"]["basis_updates"]==600
+          for name,v in d["variants"].items():
+              trade=v["trading"]
+              assert trade["engine_fills"]==trade["buy_fills"]+trade["sell_fills"]
+              assert trade["fee_usdt"]>=0
+              print(name,"NET",trade["end_net_marked_equity_usdt"],
+                    "FEE",trade["fee_usdt"],"FILLS",trade["engine_fills"],
+                    "CANCEL",trade["cancel_requests"])
+          PY
+      - name: Preserve daily official HBT case
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: locked-beta-okx-BTC-${{ matrix.day }}-50min
+          path: reports/locked_origin_beta_grid_okx_BTC_${{ matrix.day }}_50m.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  aggregate:
+    needs: official-hbt
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Fetch paired results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: locked-beta-okx-BTC-*-50min
+          path: gathered
+          merge-multiple: false
+      - name: Verify common tape and summarize by independent date
+        run: |
+          python scripts/summarize_locked_origin_beta_grid.py \
+            --input gathered --output reports/locked_origin_beta_grid_aggregate \
+            --min-completed-days 3
+          cat reports/locked_origin_beta_grid_aggregate/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish aggregate report
+        uses: actions/upload-artifact@v4
+        with:
+          name: locked-beta-okx-BTC-three-date-summary
+          path: reports/locked_origin_beta_grid_aggregate/*
+          if-no-files-found: error
+          retention-days: 90
+      - name: Save aggregate on isolated analysis branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f reports/locked_origin_beta_grid_aggregate/summary.json
+          git add -f reports/locked_origin_beta_grid_aggregate/summary.md
+          git commit -m "analysis: publish locked-origin sigma gate 5-beta GLFT results"
+          git push origin HEAD:"$GITHUB_REF_NAME"
