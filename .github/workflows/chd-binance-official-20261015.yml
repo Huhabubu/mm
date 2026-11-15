@@ -1,0 +1,28 @@
+name: CryptoHFTData Oct 15 Binance official trades reconciliation
+on:
+  push:
+    branches:
+      - research/chd-202610-sample-qa
+    paths:
+      - scripts/qa_chd_binance_official_crosscheck.py
+      - .github/workflows/chd-binance-official-20261015.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  crosscheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify candidates using Binance official daily archive
+        run: python scripts/qa_chd_binance_official_crosscheck.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chd-binance-oct15-exchange-groundtruth
+          path: reports/chd_binance_20261015_exchange_crosscheck.json
+          retention-days: 30
