@@ -70,6 +70,37 @@ def causal_price_shift_ticks(now, binance_visible_ns, binance_mid, beta,
     return beta * gap_usdt / tick_size
 
 
+
+@njit
+def locked_origin_quote_shift(now, beta, binance_price, live_target_mid,
+                              grid_ns, grid_mean, grid_sigma, source_ns,
+                              source_base_b, source_base_m, source_allowed,
+                              tick_size):
+    """New independent gate: source-confirmed, 1.96 sigma, same direction.
+
+    Source anchors are constructed with native pre-trade BBO and time-weighted
+    600s basis. Quote shift uses HBT's CURRENT fused target mid; any local
+    dislocation must still pass the same Binance-dominant rule.
+    No arbitrary 250ms age filter is used in this experiment.
+    """
+    if beta == 0.0 or not np.isfinite(binance_price) or not np.isfinite(live_target_mid):
+        return 0.0
+    bi = np.searchsorted(grid_ns, now, side="right") - 1
+    si = np.searchsorted(source_ns, now, side="right") - 1
+    if bi < 0 or si < 0 or not source_allowed[si]:
+        return 0.0
+    std = grid_sigma[bi]
+    if not np.isfinite(std) or std <= 0.0 or not np.isfinite(grid_mean[bi]):
+        return 0.0
+    gap = binance_price - live_target_mid - grid_mean[bi]
+    delta_b = binance_price - source_base_b[si]
+    delta_m = live_target_mid - source_base_m[si]
+    if (abs(gap) <= 1.96 * std or gap * delta_b <= 0.0 or
+            abs(delta_b) <= abs(delta_m)):
+        return 0.0
+    return beta * gap / tick_size
+
+
 @njit
 def filtered_gap_shift(now, raw_shift_ticks, held_shift_ticks, last_update_ns,
                        enter_ticks, exit_ticks, refresh_change_ticks,
@@ -108,7 +139,10 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    extra_half_ticks=0.0, probe_ns=None,
                    wall_search_ticks=0, tick_size=TICK, contract_value=CTVAL,
                    order_qty=ORDER_QTY, position_cap=POSITION_CAP,
-                   recorder=None):
+                   recorder=None,
+                   locked_source_ns=None, locked_base_b=None,
+                   locked_base_m=None, locked_source_allowed=None,
+                   locked_basis_sigma=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -132,6 +166,15 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             raise ValueError("BBO and basis shapes differ")
         if not np.isfinite(beta):
             raise ValueError("Nonfinite beta")
+    if locked_source_ns is not None:
+        if (locked_base_b is None or locked_base_m is None or
+                locked_source_allowed is None or locked_basis_sigma is None or
+                basis_grid_ns is None or basis_values is None or
+                len(locked_source_ns) != len(locked_base_b) or
+                len(locked_source_ns) != len(locked_base_m) or
+                len(locked_source_ns) != len(locked_source_allowed) or
+                len(locked_basis_sigma) != len(basis_grid_ns)):
+            raise ValueError("Malformed locked-origin signal arrays")
     if engine.elapse(0) != 0:
         raise ValueError("Cannot initialize OKX market replay")
     t0 = engine.current_timestamp
@@ -373,7 +416,13 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             # Strict-past native BBO is only a freshness gate; basis stays causal.
             # Missing or stale quotes -> beta shift 0; no future labels enter.
             shift_ticks = 0.0
-            if (beta != 0.0 and okx_native_ns is not None and
+            if (beta != 0.0 and locked_source_ns is not None):
+                shift_ticks = locked_origin_quote_shift(
+                    now, beta, latest_binance, mid * tick_size,
+                    basis_grid_ns, basis_values, locked_basis_sigma,
+                    locked_source_ns, locked_base_b, locked_base_m,
+                    locked_source_allowed, tick_size)
+            elif (beta != 0.0 and okx_native_ns is not None and
                     okx_native_mid is not None and basis_grid_ns is not None and
                     basis_values is not None):
                 shift_ticks = causal_price_shift_ticks(
