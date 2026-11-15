@@ -43,7 +43,7 @@ jobs:
                   w.writerow(row)
               paths.append(str(p))
               print('FEED',kind,'rows',n,'snapshot rows',snap,'sides',dict(seq),'first',json.dumps(first),flush=True)
-            arr=tardis.convert(paths,tick_size=.1,lot_size=1.0,ss_buffer_size=200000,snapshot_mode='process')
+            arr=tardis.convert(paths,buffer_size=500000,ss_buffer_size=200000,snapshot_mode='process')
             validate_event_order(arr)
             print('CONVERT_EVENTS',len(arr),'EVENT_FLAGS',dict(collections.Counter(int(x['ev']) for x in arr[:1000])),'PRICE_RANGE',float(min(arr['px'])),float(max(arr['px'])),flush=True)
           req=urllib.request.Request('https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT',headers={'User-Agent':'mm-gate-depth20-probe'})
