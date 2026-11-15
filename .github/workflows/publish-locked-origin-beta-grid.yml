@@ -1,0 +1,44 @@
+name: Publish locked-origin beta results from verified HBT artifact
+on:
+  push:
+    paths:
+      - '.github/workflows/publish-locked-origin-beta-grid.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download completed original HBT case artifacts, no market replay
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43729021673
+          github-token: ${{ github.token }}
+          pattern: locked-beta-okx-BTC-*-50min
+          path: gathered
+          merge-multiple: false
+      - name: Rerun daily matched aggregation
+        run: |
+          python scripts/summarize_locked_origin_beta_grid.py \
+            --input gathered --output reports/locked_origin_beta_grid_aggregate \
+            --min-completed-days 3
+          cat reports/locked_origin_beta_grid_aggregate/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit finished research report from latest branch head
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f reports/locked_origin_beta_grid_aggregate/summary.json
+          git add -f reports/locked_origin_beta_grid_aggregate/summary.md
+          if git diff --cached --quiet; then
+            echo "Report unchanged"
+          else
+            git commit -m "analysis: publish verified five-beta HBT report"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi
