@@ -108,7 +108,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                    extra_half_ticks=0.0, probe_ns=None,
                    wall_search_ticks=0, tick_size=TICK, contract_value=CTVAL,
                    order_qty=ORDER_QTY, position_cap=POSITION_CAP,
-                   recorder=None):
+                   recorder=None, depth_cap_levels=0, depth_cap_stats=None):
     """Replay full warmup + trading with strictly causal external event deadlines.
 
     All actual sends, cancels, queue updates and fills use the official engine.
@@ -389,6 +389,61 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             reservation = mid - skew * pos + shift_ticks
             want_bid = min(round(reservation - half - extra_half_ticks), bid)
             want_ask = max(round(reservation + half + extra_half_ticks), ask)
+            # Gate 20-level scenario: diagnose ORIGINAL GLFT quotes in
+            # visible-price-level ranks, then optionally cap outward quotes.
+            # Kept disabled by default to preserve all existing baselines.
+            allow_bid = True
+            allow_ask = True
+            if depth_cap_levels > 0:
+                n_bid = 0
+                n_ask = 0
+                bid_level_limit = 0
+                ask_level_limit = 0
+                lb = book.roi_lb_tick
+                ub = lb + len(book.bid_depth) - 1
+                for pt in range(bid, lb - 1, -1):
+                    if book.bid_depth[pt - lb] > 0:
+                        n_bid += 1
+                        if n_bid == depth_cap_levels:
+                            bid_level_limit = pt
+                            break
+                for pt in range(ask, ub + 1):
+                    if book.ask_depth[pt - lb] > 0:
+                        n_ask += 1
+                        if n_ask == depth_cap_levels:
+                            ask_level_limit = pt
+                            break
+                if depth_cap_stats is not None:
+                    depth_cap_stats[0] += 1
+                    if bid_level_limit > 0:
+                        depth_cap_stats[1] += 1
+                    if ask_level_limit > 0:
+                        depth_cap_stats[2] += 1
+                if bid_level_limit > 0:
+                    if want_bid < bid_level_limit:
+                        if depth_cap_stats is not None:
+                            depth_cap_stats[3] += 1
+                            if sample_event:
+                                depth_cap_stats[8] += 1
+                        want_bid = bid_level_limit
+                else:
+                    allow_bid = False
+                    if depth_cap_stats is not None:
+                        depth_cap_stats[5] += 1
+                if ask_level_limit > 0:
+                    if want_ask > ask_level_limit:
+                        if depth_cap_stats is not None:
+                            depth_cap_stats[4] += 1
+                            if sample_event:
+                                depth_cap_stats[9] += 1
+                        want_ask = ask_level_limit
+                else:
+                    allow_ask = False
+                    if depth_cap_stats is not None:
+                        depth_cap_stats[6] += 1
+                if depth_cap_stats is not None and sample_event:
+                    depth_cap_stats[7] += 1
+
             if wall_search_ticks > 0:
                 # Post-process ONLY: keep GLFT A/k/sigma/risk/skew unchanged.
                 # Bound search to OUTWARD prices, then step one tick in front.
@@ -410,25 +465,25 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 order = it.get()
                 if order.side == BUY:
                     has_bid = True
-                    if (order.cancellable and order.price_tick != want_bid and
+                    if (order.cancellable and (not allow_bid or order.price_tick != want_bid) and
                             now - bid_action >= MIN_REQUOTE_NS):
                         engine.cancel(0, order.order_id, False)
                         bid_action = now
                         cancels += 1
                 elif order.side == SELL:
                     has_ask = True
-                    if (order.cancellable and order.price_tick != want_ask and
+                    if (order.cancellable and (not allow_ask or order.price_tick != want_ask) and
                             now - ask_action >= MIN_REQUOTE_NS):
                         engine.cancel(0, order.order_id, False)
                         ask_action = now
                         cancels += 1
-            if (not has_bid and pos + order_qty <= position_cap + 1e-9 and
+            if (allow_bid and not has_bid and pos + order_qty <= position_cap + 1e-9 and
                     now - bid_action >= MIN_REQUOTE_NS):
                 oid = int(want_bid) * 2
                 engine.submit_buy_order(0, oid, want_bid*tick_size, order_qty, GTX, LIMIT, False)
                 bid_action = now
                 submits += 1
-            if (not has_ask and pos - order_qty >= -position_cap - 1e-9 and
+            if (allow_ask and not has_ask and pos - order_qty >= -position_cap - 1e-9 and
                     now - ask_action >= MIN_REQUOTE_NS):
                 oid = int(want_ask) * 2 + 1
                 engine.submit_sell_order(0, oid, want_ask*tick_size, order_qty, GTX, LIMIT, False)
