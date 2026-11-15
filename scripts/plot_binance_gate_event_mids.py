@@ -137,7 +137,7 @@ def main():
         gt, gm, gi = read_mid("gate-io-futures", "quotes", "BTC_USDT", day, stop)
         print("GATE", day, json.dumps(gi), flush=True)
         times, b, g = align(bt, bm, gt, gm, start, stop)
-        filename = f"binance_gate_BTC_{day}_50min.png"
+        filename = f"binance_gate_BTC_{day}_{args.minutes}min.png"
         draw(day, start, stop, times, b, g, root / filename)
         meta = {"day": day, "start_utc": args.start,
                 "duration_minutes": args.minutes,
@@ -152,8 +152,8 @@ def main():
     (root / "summary.json").write_text(json.dumps(summaries, indent=2) + "\n")
     header = (
         "# Binance / Gate event-aligned mid-price plots\n\n"
-        "BTC USDT perpetuals, Tardis 1st-of-month free data, 00:10–01:00 UTC, "
-        "50 minutes for each date.\n\n"
+        f"BTC USDT perpetuals, Tardis 1st-of-month free data, starting {args.start} UTC, "
+        f"{args.minutes} minutes for each date.\n\n"
         "**Blue**: Binance native `book_ticker` midpoint. **Red**: Gate Tardis "
         "`quotes` midpoint reconstructed from L2. **Yellow**: raw difference "
         "between the two mid-prices (top shaded area and bottom gap panel).\n\n"
@@ -166,7 +166,7 @@ def main():
         "adjustment, and no 60-second basis subtraction. This is descriptive "
         "visualization, not a trading backtest.\n\n"
     )
-    header += "\n".join(f"- [{x['day']} — 50 minutes]({x['plot']})" for x in summaries) + "\n"
+    header += "\n".join(f"- [{x['day']} — {args.minutes} minutes]({x['plot']})" for x in summaries) + "\n"
     (root / "README.md").write_text(header, encoding="utf-8")
 
 
