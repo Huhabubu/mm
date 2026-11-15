@@ -71,13 +71,17 @@ def audit_feed(exchange, kind, symbol, day, stop_us, tick, start_us):
         "equal_local_timestamp_rows":0,"largest_local_gap_ms":0.0,
         "gaps_over_10s":0,"gaps_over_30s":0,"gaps_over_60s":0,
         "first_snapshot_us":None,"snapshot_bid_rows":0,"snapshot_ask_rows":0,
-        "snapshot_finished":False,"max_trade_amount_fractional_error":0.,
+        "snapshot_finished":False,"l2_incremental_rows":0,
+        "l2_snapshot_groups":0,"l2_incomplete_snapshot_groups":0,
+        "max_trade_amount_fractional_error":0.,
         "trades_nonintegral_amount_rows":0,
         "non_grid_prices":0,"header":None,
     }
     prev = None
     snapshot_started = False
     n_skipped_l2_before_snapshot = 0
+    group_snapshot = False
+    group_bid = group_ask = 0
     with urllib.request.urlopen(req, timeout=240) as response:
         with gzip.GzipFile(fileobj=response) as gz:
             with io.TextIOWrapper(gz, encoding="utf-8", newline="") as stream:
@@ -94,6 +98,13 @@ def audit_feed(exchange, kind, symbol, day, stop_us, tick, start_us):
                         continue
                     if state["first_local_us"] is None:
                         state["first_local_us"] = t
+                    if kind == "incremental_book_L2" and prev is not None and t != prev:
+                        if group_snapshot:
+                            state["l2_snapshot_groups"] += 1
+                            if group_bid == 0 or group_ask == 0:
+                                state["l2_incomplete_snapshot_groups"] += 1
+                        group_snapshot = False
+                        group_bid = group_ask = 0
                     if prev is not None:
                         diff = t-prev
                         if diff < 0:
@@ -131,6 +142,11 @@ def audit_feed(exchange, kind, symbol, day, stop_us, tick, start_us):
                                 n_skipped_l2_before_snapshot += 1
                                 continue
                             if snap == "true":
+                                group_snapshot = True
+                                if row["side"] == "bid":
+                                    group_bid += 1
+                                elif row["side"] == "ask":
+                                    group_ask += 1
                                 if not snapshot_started:
                                     state["first_snapshot_us"] = t
                                 snapshot_started = True
@@ -141,6 +157,7 @@ def audit_feed(exchange, kind, symbol, day, stop_us, tick, start_us):
                                         state["snapshot_ask_rows"] += 1
                             else:
                                 state["snapshot_finished"] = True
+                                state["l2_incremental_rows"] += 1
                             if row["side"] not in ("bid","ask"):
                                 state["invalid_rows"] += 1
                             px,qty = float(row["price"]),float(row["amount"])
@@ -173,9 +190,18 @@ def audit_feed(exchange, kind, symbol, day, stop_us, tick, start_us):
                         state["invalid_rows"] += 1
     state["skipped_l2_pre_snapshot"] = n_skipped_l2_before_snapshot
     if kind == "incremental_book_L2":
+        if group_snapshot:
+            state["l2_snapshot_groups"] += 1
+            if group_bid == 0 or group_ask == 0:
+                state["l2_incomplete_snapshot_groups"] += 1
+        full_each_update = state["l2_incremental_rows"] == 0
+        state["l2_snapshot_format"] = ("per_message_full_snapshot_candidate"
+                                         if full_each_update else "initial_snapshot_plus_deltas")
         state["initial_snapshot_complete"] = bool(
             state["first_snapshot_us"] and state["snapshot_bid_rows"]>0
-            and state["snapshot_ask_rows"]>0 and state["snapshot_finished"])
+            and state["snapshot_ask_rows"]>0
+            and (state["snapshot_finished"] or
+                 (full_each_update and state["l2_incomplete_snapshot_groups"]==0)))
     last = state["last_local_us"]
     if (state["rows"]==0 or state["first_local_us"] is None or
             state["first_local_us"]>start_us+5_000_000 or last<stop_us-30_000_000):
@@ -186,7 +212,7 @@ def audit_feed(exchange, kind, symbol, day, stop_us, tick, start_us):
             state["negative_latency_rows"]):
         raise ValueError(f"{kind} integrity/clock/large-gap QA failed: {state}")
     if kind == "incremental_book_L2" and not state["initial_snapshot_complete"]:
-        raise ValueError(f"No valid initial Gate L2 snapshot: {state}")
+        raise ValueError(f"Unverifiable Gate L2 snapshots/updates: {state}")
     # Quiet trading is legitimate: a 30s gap between *trades* is not evidence
     # that an order-book feed or trade feed disconnected. Preserve diagnostics,
     # while discontinuity rejection applies to quotes and L2 market data.
