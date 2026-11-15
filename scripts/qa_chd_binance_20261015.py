@@ -62,80 +62,80 @@ def audit_trades(path):
 
 
 def audit_book(path):
+    import numpy as np
+    import pyarrow.compute as pc
     f = pq.ParquetFile(path)
     columns = [x for x in ["received_time", "event_time", "event_type", "first_update_id",
                              "final_update_id", "prev_final_update_id", "last_update_id"] if x in f.schema_arrow.names]
     events = []
-    signatures_prev = None
+    signature_prev = None
     prev_final = None
-    checked = 0
-    broken = 0
+    checked = broken = snapshot_count = back_count = 0
     broken_examples = []
-    snapshot_count = 0
     adjacent_gap_max = (0, None)
     last_t = None
-    back_count = 0
-    for batch in f.iter_batches(batch_size=100_000, columns=columns):
-        rows = batch.to_pydict()
-        n = len(rows["received_time"])
-        for i in range(n):
-            record = {x: rows[x][i] for x in columns}
-            signature = (record["received_time"], record["event_type"],
-                         record.get("final_update_id"), record.get("prev_final_update_id"))
-            if signature == signatures_prev:
-                continue
-            signatures_prev = signature
-            timestamp = record["received_time"]
-            etype = record["event_type"]
-            if last_t is not None:
-                d = int(timestamp) - int(last_t)
-                if d < 0:
-                    back_count += 1
-                if d > adjacent_gap_max[0]:
-                    adjacent_gap_max = (d, (last_t, timestamp))
-            last_t = timestamp
-            if abs(timestamp - FOCUS_NS) <= 30_000_000_000 and len(events) < 5000:
-                events.append({
-                    "t": iso(timestamp),
-                    "received_ns": timestamp,
-                    "event_time": record.get("event_time"),
-                    "type": etype,
-                    "first": record.get("first_update_id"),
-                    "final": record.get("final_update_id"),
-                    "prev": record.get("prev_final_update_id"),
-                    "last": record.get("last_update_id"),
-                })
+
+    for batch in f.iter_batches(batch_size=120_000, columns=columns):
+        data = {name: batch.column(i) for i, name in enumerate(columns)}
+        t = data["received_time"].to_numpy(zero_copy_only=False)
+        ty = np.asarray(data["event_type"].to_pylist(), dtype=object)
+        fseq = pc.fill_null(data["final_update_id"], -1).to_numpy(zero_copy_only=False)
+        pu = pc.fill_null(data["prev_final_update_id"], -1).to_numpy(zero_copy_only=False)
+        if len(t) == 0:
+            continue
+        change = np.r_[True, (t[1:] != t[:-1]) | (ty[1:] != ty[:-1]) |
+                       (fseq[1:] != fseq[:-1]) | (pu[1:] != pu[:-1])]
+        indices = np.flatnonzero(change)
+        if signature_prev == (int(t[0]), ty[0], int(fseq[0]), int(pu[0])):
+            indices = indices[1:]
+        if not len(indices):
+            continue
+        evt_times = t[indices]
+        prev_times = np.r_[np.array([last_t], dtype=np.int64), evt_times] if last_t is not None else evt_times
+        if len(prev_times) > 1:
+            ds = np.diff(prev_times)
+            back_count += int(np.count_nonzero(ds < 0))
+            maximum = int(np.max(ds))
+            if maximum > adjacent_gap_max[0]:
+                idx = int(np.argmax(ds))
+                adjacent_gap_max = (maximum, (int(prev_times[idx]), int(prev_times[idx + 1])))
+        last_t = int(evt_times[-1])
+        for i in indices:
+            timestamp = int(t[i])
+            etype = ty[i]
+            seq = int(fseq[i])
+            prev = int(pu[i])
+            if abs(timestamp - FOCUS_NS) <= 16_000_000_000 and len(events) < 5000:
+                events.append({"t": iso(timestamp), "received_ns": timestamp,
+                               "type": etype, "final": seq, "prev": prev})
             if etype == "snapshot":
                 snapshot_count += 1
-                prev_final = record.get("final_update_id")
+                prev_final = seq
             elif etype == "update":
-                pu = record.get("prev_final_update_id")
-                if prev_final is not None and pu is not None:
+                if prev_final is not None and prev != -1:
                     checked += 1
-                    if pu != prev_final:
+                    if prev != prev_final:
                         broken += 1
                         if len(broken_examples) < 16:
                             broken_examples.append({
                                 "received": iso(timestamp),
                                 "previous_final": prev_final,
-                                "received_previous_final": pu,
-                                "current_final": record.get("final_update_id"),
-                                "current_first": record.get("first_update_id"),
+                                "received_previous_final": prev,
+                                "current_final": seq,
                             })
-                prev_final = record.get("final_update_id")
-    # Keep a compact window around the largest time gap and snapshot boundaries.
-    focus_events = events
-    if len(events) > 160:
-        focus_events = events[:80] + events[-80:]
+                prev_final = seq
+        k = int(indices[-1])
+        signature_prev = (int(t[k]), ty[k], int(fseq[k]), int(pu[k]))
+
     gap_start, gap_end = adjacent_gap_max[1] if adjacent_gap_max[1] else (None, None)
     return dict(rows=f.metadata.num_rows, snapshots=snapshot_count,
                 chain_pairs_checked=checked, chain_breaks=broken,
                 chain_break_examples=broken_examples,
                 received_backwards=back_count,
                 largest_receive_gap_seconds=round(adjacent_gap_max[0] / 1e9, 6),
-                largest_receive_gap={"from": iso(gap_start), "to": iso(gap_end)} if gap_start else None,
-                focus_events=focus_events,
-                focus_events_reduced=len(events) > 160)
+                largest_receive_gap={"from": iso(gap_start), "to": iso(gap_end)} if gap_start is not None else None,
+                focus_events=events[:100] + events[-100:] if len(events) > 200 else events,
+                focus_events_total=len(events))
 
 
 def main():
