@@ -19,11 +19,13 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install Parquet reader
-        run: python -m pip install --disable-pip-version-check pyarrow
+        run: python -m pip install --disable-pip-version-check pyarrow numpy
       - name: Verify venue-specific sequence rules
         run: python scripts/qa_cryptohftdata_oct_2026.py --self-test
       - name: Download and inspect BTC orderbooks and trades for October sample dates
-        run: python scripts/qa_cryptohftdata_oct_2026.py
+        run: |
+          python scripts/qa_cryptohftdata_oct_2026.py
+          python -c 'import json; rows=json.load(open("reports/chd_oct_2026_btc_sample_qa.json"))["files"]; bad=[r["key"] for r in rows if r["status"]!="readable"]; print(f"QA readable: {len(rows)-len(bad)}/{len(rows)}"); assert not bad, f"Failed files: {bad}"'
       - name: Archive summary JSON only (no raw market files)
         if: always()
         uses: actions/upload-artifact@v4
