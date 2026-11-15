@@ -12,6 +12,37 @@ from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TIC
 from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coefficients
 from g0_glft_event_driven import MIN_REQUOTE_NS, summarize
 @njit
+def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
+                       has_base, active, binance_price_changed, gate_feed_same_time):
+    """Single causal state transition: normal anchors, trigger, dominance, origin."""
+    above = dominant = activated = tie_block = 0
+    eff = 0.0
+    if (not np.isfinite(gap) or not np.isfinite(sigma) or sigma <= 0
+            or not np.isfinite(binance_price) or not np.isfinite(gate_price)):
+        return eff, base_b, base_m, has_base, False, above, dominant, activated, tie_block
+    if abs(gap) <= sigma:
+        return 0.0, binance_price, gate_price, True, False, above, dominant, activated, tie_block
+    if not has_base or abs(gap) <= 1.96 * sigma:
+        return 0.0, base_b, base_m, has_base, False, above, dominant, activated, tie_block
+    above = 1
+    delta_b = binance_price - base_b
+    delta_m = gate_price - base_m
+    dominance = ((gap > 0 and delta_b > 0) or (gap < 0 and delta_b < 0))
+    if not dominance or abs(delta_b) <= abs(delta_m):
+        return 0.0, base_b, base_m, has_base, False, above, dominant, activated, tie_block
+    dominant = 1
+    if not active:
+        if binance_price_changed and not gate_feed_same_time:
+            active = True
+            activated = 1
+        elif binance_price_changed:
+            tie_block = 1
+    if active:
+        eff = gap
+    return eff, base_b, base_m, has_base, active, above, dominant, activated, tie_block
+
+
+@njit
 def run_gate_origin_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                          beta, basis_grid_ns, basis_values, basis_sigmas,
                          quote_mode, gamma_code=GAMMA,
@@ -288,36 +319,18 @@ def run_gate_origin_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     observed_gap = latest_binance - mid * tick_size - basis_values[gi]
                     historical_sigma = basis_sigmas[gi]
                     trigger_checks += 1
-                    if abs(observed_gap) <= historical_sigma:
-                        base_b = latest_binance
-                        base_m = mid * tick_size
-                        has_base = True
-                        active_origin = False
-                    elif has_base:
-                        if abs(observed_gap) > 1.96 * historical_sigma:
-                            above_trigger += 1
-                            change_b = latest_binance - base_b
-                            change_m = mid * tick_size - base_m
-                            direction = ((observed_gap > 0.0 and change_b > 0.0)
-                                         or (observed_gap < 0.0 and change_b < 0.0))
-                            if direction and abs(change_b) > abs(change_m):
-                                direction_ok += 1
-                                if not active_origin:
-                                    # First activation must coincide with actual Binance
-                                    # PRICE movement, not size-only or Gate-only update.
-                                    # Feed event with same timestamp is ambiguous.
-                                    if binance_price_change and feed_status != 2:
-                                        active_origin = True
-                                        activated += 1
-                                    elif binance_price_change:
-                                        tie_excluded += 1
-                                if active_origin:
-                                    shift_ticks = observed_gap / tick_size
-                                    active_decisions += 1
-                            else:
-                                active_origin = False
-                        else:
-                            active_origin = False
+                    (effective_gap, base_b, base_m, has_base, active_origin,
+                     one_above, one_dominant, one_activated, one_tie) = gate_origin_filter(
+                        observed_gap, historical_sigma, latest_binance,
+                        mid * tick_size, base_b, base_m, has_base,
+                        active_origin, binance_price_change, feed_status == 2)
+                    above_trigger += one_above
+                    direction_ok += one_dominant
+                    activated += one_activated
+                    tie_excluded += one_tie
+                    if effective_gap != 0.0:
+                        shift_ticks = effective_gap / tick_size
+                        active_decisions += 1
                 else:
                     active_origin = False
             reservation = mid - skew * pos
