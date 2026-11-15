@@ -43,7 +43,11 @@ jobs:
           # Without quote refresh, freshness expires even if there is no new event.
           lone=Tape(np.array([0]),np.array([100.]),np.array([0]),np.array([98.]))
           val,frac=lone.time_integral(0,500_000)
-          assert abs(val-2.)<1e-12 and abs(frac-.5)<1e-12,(val,frac)
+          assert abs(val-2.)<1e-12 and abs(frac-1.)<1e-12,(val,frac)
+          # Historical age-limited experiments remain reproducible explicitly.
+          capped=Tape(np.array([0]),np.array([100.]),np.array([0]),np.array([98.]),250_000)
+          cv,cf=capped.time_integral(0,500_000)
+          assert abs(cv-2.)<1e-12 and abs(cf-.5)<1e-12,(cv,cf)
           # Strong event outlier gets trimmed by Gaussian central 97% rule.
           tt=np.arange(100,dtype=np.int64)*10_000
           bb=np.full(100,100.);bb[50]=200.
@@ -55,43 +59,28 @@ jobs:
           assert len(retained)==99 and np.mean(retained)==0
           print("CAUSAL_BASIS_TESTS_OK")
           PY
-      - name: Compare 4 methods on 3 Tardis first-of-month BTC windows
+      - name: Compare 4 methods with no quote-age exclusion on 3 Tardis days
         run: |
           python scripts/compare_binance_gate_basis.py \
             --days 2026-09-01 2026-10-01 2026-11-01 \
             --binance-delay-ms 2.5 \
-            --minutes 50
-      - name: Repeat as sensitivity check using 500ms Gate/Binance freshness
-        run: |
-          python scripts/compare_binance_gate_basis.py \
-            --days 2026-09-01 2026-10-01 2026-11-01 \
-            --binance-delay-ms 2.5 \
-            --max-quote-age-ms 500 \
             --minutes 50 \
-            --out reports/visualizations/binance_gate_basis_600s_5s_age500
+            --out reports/visualizations/binance_gate_basis_600s_5s_no_age
       - name: Upload charts, 5s time series, and summary
         uses: actions/upload-artifact@v4
         with:
-          name: binance-gate-basis-four-estimators-600s-5s
-          path: reports/visualizations/binance_gate_basis_600s_5s/
-          if-no-files-found: error
-          retention-days: 90
-      - name: Upload 500ms coverage sensitivity
-        uses: actions/upload-artifact@v4
-        with:
-          name: binance-gate-basis-four-estimators-600s-5s-age500
-          path: reports/visualizations/binance_gate_basis_600s_5s_age500/
+          name: binance-gate-basis-four-estimators-600s-5s-no-age
+          path: reports/visualizations/binance_gate_basis_600s_5s_no_age/
           if-no-files-found: error
           retention-days: 90
       - name: Commit summary figures to isolated analysis branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f reports/visualizations/binance_gate_basis_600s_5s/
-          git add -f reports/visualizations/binance_gate_basis_600s_5s_age500/
+          git add -f reports/visualizations/binance_gate_basis_600s_5s_no_age/
           if git diff --cached --quiet; then
             echo "Results unchanged"
           else
-            git commit -m "analysis: publish 600s/5s Binance Gate normal-gap estimator comparison"
+            git commit -m "analysis: publish Binance Gate basis estimates without quote-age exclusion"
             git push origin HEAD:"$GITHUB_REF_NAME"
           fi
