@@ -76,6 +76,7 @@ def scan(path, venue, kind, day, hour):
     """Use vectorized batches to avoid per-level Python loops in L2 files."""
     import numpy as np
     import pyarrow.parquet as pq
+    import pyarrow.compute as pc
 
     pf = pq.ParquetFile(path)
     available = set(pf.schema_arrow.names)
@@ -149,8 +150,8 @@ def scan(path, venue, kind, day, hour):
             result["received_max_ns"] = hi if result["received_max_ns"] is None else max(result["received_max_ns"], hi)
 
         if "price" in b and "quantity" in b:
-            prices = b["price"].to_numpy(zero_copy_only=False)
-            quantities = b["quantity"].to_numpy(zero_copy_only=False)
+            prices = b["price"].to_numpy(zero_copy_only=False).astype(np.float64)
+            quantities = b["quantity"].to_numpy(zero_copy_only=False).astype(np.float64)
             valid = np.isfinite(prices) & np.isfinite(quantities) & (prices > 0) & (quantities >= 0)
             if kind == "orderbook" and "side" in b:
                 sides = np.asarray(b["side"].to_pylist(), dtype=object)
@@ -176,8 +177,8 @@ def scan(path, venue, kind, day, hour):
         # One order-book update is repeated across many price-level rows.
         # Reduce first, then perform timestamp and venue sequence checks.
         events = np.asarray(b["event_type"].to_pylist(), dtype=object) if "event_type" in b else np.full(len(ts), None)
-        seq = b["final_update_id"].to_numpy(zero_copy_only=False) if "final_update_id" in b else np.full(len(ts), -1)
-        prev = b["prev_final_update_id"].to_numpy(zero_copy_only=False) if "prev_final_update_id" in b else np.full(len(ts), -1)
+        seq = pc.fill_null(b["final_update_id"], -1).to_numpy(zero_copy_only=False) if "final_update_id" in b else np.full(len(ts), -1)
+        prev = pc.fill_null(b["prev_final_update_id"], -1).to_numpy(zero_copy_only=False) if "prev_final_update_id" in b else np.full(len(ts), -1)
         if not len(ts):
             continue
         boundaries = np.r_[True, (ts[1:] != ts[:-1]) | (events[1:] != events[:-1]) |
