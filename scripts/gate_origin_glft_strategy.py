@@ -48,7 +48,7 @@ def run_gate_origin_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                          quote_mode, gamma_code=GAMMA,
                          tick_size=TICK, contract_value=CTVAL,
                          order_qty=ORDER_QTY, position_cap=POSITION_CAP,
-                         recorder=None):
+                         recorder=None, stop_at_ns=0):
     """Two sigma gates + Binance-origin anchor; HBT retains all matching/queues."""
     if not np.isfinite(beta) or beta < 0 or beta > 1:
         raise ValueError("Invalid beta")
@@ -64,6 +64,10 @@ def run_gate_origin_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("Cannot initialize OKX market replay")
     t0 = engine.current_timestamp
     t_stop = t0 + (TRAIN + trade_steps) * STEP_NS
+    if stop_at_ns > 0:
+        if stop_at_ns <= t0 + TRAIN * STEP_NS:
+            raise ValueError("UTC stopping deadline falls before trading")
+        t_stop = min(t_stop, stop_at_ns)
     next_sample = t0 + STEP_NS
     sample_count = 0
     idx = 0
