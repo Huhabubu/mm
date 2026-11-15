@@ -23,6 +23,7 @@ from cross_venue_event_probe import read_binance_bbo, visible_timestamps
 from g0_glft_event_driven import summarize
 from gate_basis_weighted_moments import load_gate_mid, exact_moments_5s
 from gate_origin_glft_strategy import run_gate_origin_glft
+from gate_l2_snapshot_adapter import normalized_gate_l2_rows
 from qa_gate_btc_futures import fetch_contract
 
 GATE_EXCHANGE="gate-io-futures"
@@ -46,7 +47,9 @@ def safe_gate_csv(kind, day, end_us, path, max_rows):
     metadata={"rows":0,"snapshot_rows":0,"initial_snapshot_bid":0,
               "initial_snapshot_ask":0,"initial_snapshot_complete":False,
               "invalid_rows":0,"local_backwards":0,"negative_feed_latency_rows":0,
-              "min_feed_latency_us":None,"first_local_us":None,"last_local_us":None}
+              "min_feed_latency_us":None,"first_local_us":None,"last_local_us":None,
+              "l2_format":None,"source_l2_rows":0,"emitted_l2_rows":0,
+              "source_snapshot_groups":0,"removed_l2_levels":0}
     first_snap=True
     first_snapshot_seen=False
     seen_post_snapshot=False
@@ -57,10 +60,12 @@ def safe_gate_csv(kind, day, end_us, path, max_rows):
                 reader=csv.DictReader(stream)
                 if not set(fields).issubset(set(reader.fieldnames or ())):
                     raise ValueError(f"Gate {kind} missing CSV columns")
+                adapted=(normalized_gate_l2_rows(reader,metadata)
+                         if kind=="incremental_book_L2" else reader)
                 with Path(path).open("w",encoding="utf-8",newline="") as dst:
                     writer=csv.DictWriter(dst,fieldnames=fields)
                     writer.writeheader()
-                    for row in reader:
+                    for row in adapted:
                         ts=int(row["local_timestamp"])
                         if ts>=end_us:
                             break
