@@ -1,0 +1,35 @@
+name: CryptoHFTData October daily rotating-hour content QA
+on:
+  push:
+    branches:
+      - research/chd-202610-sample-qa
+    paths:
+      - scripts/qa_chd_oct2026_daily_content.py
+      - .github/workflows/chd-oct2026-daily-content.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  daily-hour-audit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        segment: [0, 1, 2, 3, 4]
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Parquet and numeric libs
+        run: python -m pip install --disable-pip-version-check pyarrow numpy
+      - name: Sample one deterministic hour each date and extra Bybit 02:00 trades
+        run: python scripts/qa_chd_oct2026_daily_content.py --segment ${{ matrix.segment }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chd-oct-daily-content-part-${{ matrix.segment }}
+          path: reports/chd_oct2026_daily_content_part${{ matrix.segment }}.json
+          retention-days: 45
