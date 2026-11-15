@@ -1,0 +1,27 @@
+name: CryptoHFTData Binance Oct23 official trade confirmation
+on:
+  push:
+    branches:
+      - research/chd-202610-sample-qa
+    paths:
+      - scripts/qa_chd_binance_official_oct23.py
+      - .github/workflows/chd-binance-oct23-official.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  crosscheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python scripts/qa_chd_binance_official_oct23.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chd-binance-oct23-official
+          path: reports/chd_binance_20261023_exchange_crosscheck.json
+          retention-days: 30
