@@ -1,0 +1,29 @@
+name: Gate BTC pure GLFT depth-20 quote diagnostic
+on:
+  push:
+    paths:
+      - '.github/workflows/gate-btc-g0-depth20.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  g0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official HBT pinned
+        run: pip install hftbacktest==2.4.4
+      - name: Gate BTC 2026-11-01 10min warmup 50min G0 and 20-level cap
+        run: python scripts/run_gate_g0_depth20.py --day 2026-11-01 --minutes 50
+      - name: Upload aggregated results only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-btc-g0-depth20-nov01
+          path: reports/gate_btc_g0_depth20_2026-11-01.json
+          if-no-files-found: warn
+          retention-days: 90
