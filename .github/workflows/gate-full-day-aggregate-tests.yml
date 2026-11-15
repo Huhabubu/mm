@@ -1,0 +1,18 @@
+name: Gate six-day daily fee-inclusive HBT aggregation tests
+on:
+  push:
+    paths:
+      - '.github/workflows/gate-full-day-aggregate-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python scripts/test_gate_full_day_aggregate.py
