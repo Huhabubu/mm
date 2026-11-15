@@ -1,0 +1,81 @@
+name: Compare Binance Gate historical basis 600s window 5s updates
+on:
+  push:
+    paths:
+      - '.github/workflows/compare-binance-gate-basis.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install minimal numerical and plotting packages
+        run: python -m pip install numpy matplotlib
+      - name: Deterministic causal and estimator checks
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "scripts")
+          import numpy as np
+          from compare_binance_gate_basis import Tape, WINDOW_US, GAUSSIAN_Z
+          assert 2.16 < GAUSSIAN_Z < 2.18
+          # All historical quotes identical: every estimator must return same result.
+          ticks=np.arange(0,630_000_000,100_000,dtype=np.int64)
+          tape=Tape(ticks,np.full(len(ticks),100.),ticks,np.full(len(ticks),97.))
+          e=tape.estimate_at(600_000_000)
+          for key in ("time_weighted","one_second","event_trim_gauss97","event_equal"):
+              assert abs(e[key]-3.)<1e-12,(key,e[key])
+          assert abs(e["valid_time_fraction"]-1)<1e-12
+          assert e["valid_seconds"]==600
+          # Data strictly after the evaluation timestamp must not affect any estimate.
+          changed=np.full(len(ticks),100.)
+          changed[ticks>=600_000_000]=500.
+          tape2=Tape(ticks,changed,ticks,np.full(len(ticks),97.))
+          e2=tape2.estimate_at(600_000_000)
+          for key in ("time_weighted","one_second","event_trim_gauss97","event_equal"):
+              assert e[key]==e2[key],key
+          # Without quote refresh, freshness expires even if there is no new event.
+          lone=Tape(np.array([0]),np.array([100.]),np.array([0]),np.array([98.]))
+          val,frac=lone.time_integral(0,500_000)
+          assert abs(val-2.)<1e-12 and abs(frac-.5)<1e-12,(val,frac)
+          # Strong event outlier gets trimmed by Gaussian central 97% rule.
+          tt=np.arange(100,dtype=np.int64)*10_000
+          bb=np.full(100,100.);bb[50]=200.
+          s=Tape(tt,bb,tt,np.full(100,100.))
+          # Lookback must cover 600s, so test cut in 600s calibration clock.
+          spread=s.d.copy()
+          mu=np.mean(spread);sig=np.std(spread)
+          retained=spread[np.abs(spread-mu)<=GAUSSIAN_Z*sig]
+          assert len(retained)==99 and np.mean(retained)==0
+          print("CAUSAL_BASIS_TESTS_OK")
+          PY
+      - name: Compare 4 methods on 3 Tardis first-of-month BTC windows
+        run: |
+          python scripts/compare_binance_gate_basis.py \
+            --days 2026-09-01 2026-10-01 2026-11-01 \
+            --binance-delay-ms 2.5 \
+            --minutes 50
+      - name: Upload charts, 5s time series, and summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-gate-basis-four-estimators-600s-5s
+          path: reports/visualizations/binance_gate_basis_600s_5s/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Commit summary figures to isolated analysis branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f reports/visualizations/binance_gate_basis_600s_5s/
+          if git diff --cached --quiet; then
+            echo "Results unchanged"
+          else
+            git commit -m "analysis: publish 600s/5s Binance Gate normal-gap estimator comparison"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi
