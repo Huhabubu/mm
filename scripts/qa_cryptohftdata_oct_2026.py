@@ -85,6 +85,8 @@ def scan(path, venue, kind, day, hour):
         expected += ["event_type", "side", "final_update_id", "prev_final_update_id"]
     else:
         expected += ["trade_id"]
+        if venue == "binance_futures":
+            expected += ["order_type"]
     columns = [c for c in expected if c in available]
     if "received_time" not in columns:
         raise ValueError("Missing received_time field")
