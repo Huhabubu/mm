@@ -61,6 +61,14 @@ jobs:
             --days 2026-09-01 2026-10-01 2026-11-01 \
             --binance-delay-ms 2.5 \
             --minutes 50
+      - name: Repeat as sensitivity check using 500ms Gate/Binance freshness
+        run: |
+          python scripts/compare_binance_gate_basis.py \
+            --days 2026-09-01 2026-10-01 2026-11-01 \
+            --binance-delay-ms 2.5 \
+            --max-quote-age-ms 500 \
+            --minutes 50 \
+            --out reports/visualizations/binance_gate_basis_600s_5s_age500
       - name: Upload charts, 5s time series, and summary
         uses: actions/upload-artifact@v4
         with:
@@ -68,11 +76,19 @@ jobs:
           path: reports/visualizations/binance_gate_basis_600s_5s/
           if-no-files-found: error
           retention-days: 90
+      - name: Upload 500ms coverage sensitivity
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-gate-basis-four-estimators-600s-5s-age500
+          path: reports/visualizations/binance_gate_basis_600s_5s_age500/
+          if-no-files-found: error
+          retention-days: 90
       - name: Commit summary figures to isolated analysis branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -f reports/visualizations/binance_gate_basis_600s_5s/
+          git add -f reports/visualizations/binance_gate_basis_600s_5s_age500/
           if git diff --cached --quiet; then
             echo "Results unchanged"
           else
