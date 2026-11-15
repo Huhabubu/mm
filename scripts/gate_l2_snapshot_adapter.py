@@ -27,9 +27,10 @@ def normalized_gate_l2_rows(reader, stats):
             if any(row["is_snapshot"].lower()!="true" for row in group):
                 raise ValueError(f"Gate full-snapshot feed unexpectedly changed mode at {stamp}")
             next_book={}
+            last_row_by_price={}
             sides=set()
             for row in group:
-                side=row["side"];price=row["price"]
+                side=row["side"];price=float(row["price"])
                 if side not in ("bid","ask"):
                     raise ValueError("Invalid Gate snapshot side")
                 sides.add(side)
@@ -38,6 +39,7 @@ def normalized_gate_l2_rows(reader, stats):
                     raise ValueError("Negative snapshot size")
                 key=(side,price)
                 next_book[key]=size
+                last_row_by_price[key]=row
             if sides!={"bid","ask"}:
                 raise ValueError(f"Gate complete snapshot missing a side at {stamp}")
             stats["source_snapshot_groups"]+=1
@@ -49,27 +51,22 @@ def normalized_gate_l2_rows(reader, stats):
                     stats["emitted_l2_rows"]+=1
             else:
                 # Remove levels that disappeared in a full depth replacement.
-                for (side,price) in previous.keys()-next_book.keys():
+                for (side,price) in sorted(previous.keys()-next_book.keys()):
                     deleted=dict(group[0])
                     deleted["is_snapshot"]="false"
                     deleted["side"]=side
-                    deleted["price"]=price
+                    deleted["price"]=str(price)
                     deleted["amount"]="0"
                     yield deleted
                     stats["emitted_l2_rows"]+=1
                     stats["removed_l2_levels"]+=1
                 # Replace only price levels whose absolute quantities changed.
                 # Exact same-timestamp row order is preserved for new/changed.
-                emitted=set()
-                for row in group:
-                    key=(row["side"],row["price"])
-                    if key in emitted:
-                        continue
+                for key,row in last_row_by_price.items():
                     if previous.get(key)!=next_book[key]:
                         new=dict(row);new["is_snapshot"]="false"
                         yield new
                         stats["emitted_l2_rows"]+=1
-                    emitted.add(key)
             previous=next_book
     else:
         stats["l2_format"]="initial_snapshot_plus_native_deltas"
