@@ -1,0 +1,28 @@
+name: CryptoHFTData October Binance severe gap followup
+on:
+  push:
+    branches:
+      - research/chd-202610-sample-qa
+    paths:
+      - scripts/qa_chd_binance_oct_followup.py
+      - .github/workflows/chd-binance-oct-followup.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  followup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --disable-pip-version-check pyarrow numpy
+      - run: python scripts/qa_chd_binance_oct_followup.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chd-binance-oct-anomaly-followup
+          path: reports/chd_binance_oct_followup.json
+          retention-days: 45
