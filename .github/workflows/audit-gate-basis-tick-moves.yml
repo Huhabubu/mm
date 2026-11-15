@@ -34,7 +34,7 @@ jobs:
                   for i in range(600):
                       w.writerow({"time_utc":(first+timedelta(seconds=i*5)).isoformat(),
                                   "time_weighted":format(i*.1,".8f"),
-                                  "valid_time_fraction":1})
+                                  "valid_time_fraction":.9994 if i==0 else 1})
               x = one_day(f,.1)
               assert x["rolling_estimates"] == 600 and x["consecutive_changes"] == 599
               assert x["rounded_baseline_tick_levels"]["updates_with_price_tick_change"] == 599
