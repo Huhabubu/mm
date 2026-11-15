@@ -1,4 +1,4 @@
-name: Plot Binance Gate BTC 50min event-union mid-prices
+name: Plot Binance Gate BTC 10min event-union mid-prices
 on:
   push:
     paths:
@@ -36,26 +36,26 @@ jobs:
           assert g.tolist()==[9,8,10,10,11,11]
           print("CAUSAL_UNION_TEST_OK")
           PY
-      - name: Download Tardis and plot 3 genuine 50-minute windows
+      - name: Download Tardis and plot 3 genuine 10-minute windows
         run: |
           python scripts/plot_binance_gate_event_mids.py \
             --days 2026-09-01 2026-10-01 2026-11-01 \
-            --start 00:10:00 --minutes 50
+            --start 00:10:00 --minutes 10 --out reports/visualizations/binance_gate_mids_10min
       - name: Upload PNG plots and audit metadata
         uses: actions/upload-artifact@v4
         with:
-          name: binance-gate-BTC-50min-2026-09-10-11
-          path: reports/visualizations/binance_gate_mids/
+          name: binance-gate-BTC-10min-2026-09-10-11
+          path: reports/visualizations/binance_gate_mids_10min/
           if-no-files-found: error
           retention-days: 90
       - name: Save finished plots directly in this GitHub branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f reports/visualizations/binance_gate_mids/
+          git add -f reports/visualizations/binance_gate_mids_10min/
           if git diff --cached --quiet; then
             echo "No changed figures"
           else
-            git commit -m "analysis: publish Binance Gate 50min event-aligned price figures"
+            git commit -m "analysis: publish Binance Gate 10min event-aligned price figures"
             git push origin HEAD:"$GITHUB_REF_NAME"
           fi
