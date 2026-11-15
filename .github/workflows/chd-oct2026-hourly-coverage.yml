@@ -1,0 +1,54 @@
+name: CryptoHFTData 2026 October BTC hourly archive coverage
+on:
+  push:
+    branches:
+      - research/chd-202610-sample-qa
+    paths:
+      - scripts/qa_chd_oct2026_manifest.py
+      - scripts/aggregate_chd_oct2026_manifest.py
+      - .github/workflows/chd-oct2026-hourly-coverage.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  metadata-segments:
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        segment: [0, 1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check 5 days of hourly files with 1-byte range requests
+        run: python scripts/qa_chd_oct2026_manifest.py --segment ${{ matrix.segment }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chd-oct-manifest-part-${{ matrix.segment }}
+          path: reports/chd_oct2026_manifest_part${{ matrix.segment }}.json
+          retention-days: 30
+  aggregate:
+    needs: metadata-segments
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chd-oct-manifest-part-*
+          path: manifest_parts
+          merge-multiple: true
+      - name: Aggregate daily and venue-specific coverage
+        run: python scripts/aggregate_chd_oct2026_manifest.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chd-oct-manifest-summary
+          path: reports/chd_oct2026_manifest_summary.*
+          retention-days: 90
