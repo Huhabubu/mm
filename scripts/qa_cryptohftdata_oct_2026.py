@@ -73,102 +73,140 @@ def download(key, path):
 
 
 def scan(path, venue, kind, day, hour):
+    """Use vectorized batches to avoid per-level Python loops in L2 files."""
+    import numpy as np
     import pyarrow.parquet as pq
 
     pf = pq.ParquetFile(path)
-    available = pf.schema_arrow.names
-    needed = ["received_time", "event_time", "price", "quantity"]
+    available = set(pf.schema_arrow.names)
+    expected = ["received_time", "event_time", "price", "quantity"]
     if kind == "orderbook":
-        needed += ["event_type", "side", "final_update_id", "prev_final_update_id"]
+        expected += ["event_type", "side", "final_update_id", "prev_final_update_id"]
     else:
-        needed += ["trade_id"]
-    columns = [c for c in needed if c in available]
+        expected += ["trade_id"]
+    columns = [c for c in expected if c in available]
     if "received_time" not in columns:
         raise ValueError("Missing received_time field")
 
-    hour_start = int(datetime.fromisoformat(f"{day}T{hour}:00:00+00:00").timestamp() * 1_000_000_000)
-    hour_end = hour_start + 3_600_000_000_000
-    result = {
-        "rows": 0, "events": 0, "snapshot_events": 0,
-        "missing_expected_columns": sorted(set(needed) - set(columns)),
-        "received_backwards": 0, "received_outside_hour": 0,
-        "invalid_price_or_quantity": 0, "max_receive_gap_s": 0.0,
-        "receive_gaps_over_1s": 0, "receive_gaps_over_10s": 0,
-        "receive_gaps_over_60s": 0, "sequence_pairs_checked": 0,
-        "sequence_gap_candidates": 0, "binance_trade_id_gap_candidates": 0,
-        "binance_trade_ids_skipped": 0, "initial_book_snapshot_observed": False,
-        "received_min_ns": None, "received_max_ns": None,
-    }
-    prior_t = None
-    prior_message = None
-    prior_seq = None
-    prior_trade_id = None
-    first_book_event_seen = False
+    start_ns = int(datetime.fromisoformat(
+        f"{day}T{hour}:00:00+00:00").timestamp() * 1_000_000_000)
+    stop_ns = start_ns + 3_600_000_000_000
+    result = dict(
+        rows=0, events=0, snapshot_events=0,
+        missing_expected_columns=sorted(set(expected) - available),
+        received_backwards=0, received_outside_hour=0,
+        invalid_price_or_quantity=0, max_receive_gap_s=0.,
+        receive_gaps_over_1s=0, receive_gaps_over_10s=0,
+        receive_gaps_over_60s=0, sequence_pairs_checked=0,
+        sequence_gap_candidates=0, binance_trade_id_gap_candidates=0,
+        binance_trade_ids_skipped=0, initial_book_snapshot_observed=False,
+        received_min_ns=None, received_max_ns=None,
+        anomalies=[],
+    )
+    previous_t = None
+    previous_signature = None
+    previous_seq = None
+    previous_trade_id = None
+    first_book_message = True
 
-    for batch in pf.iter_batches(batch_size=30_000, columns=columns):
-        data = batch.to_pydict()
-        for idx, t in enumerate(data["received_time"]):
-            result["rows"] += 1
-            if t is None:
-                result["received_outside_hour"] += 1
-                continue
-            t = int(t)
-            result["received_min_ns"] = t if result["received_min_ns"] is None else min(result["received_min_ns"], t)
-            result["received_max_ns"] = t if result["received_max_ns"] is None else max(result["received_max_ns"], t)
-            if t < hour_start or t >= hour_end:
-                result["received_outside_hour"] += 1
+    def audit_receive_times(ts):
+        nonlocal previous_t
+        if len(ts) == 0:
+            return
+        result["events"] += len(ts)
+        prior = np.r_[np.array([previous_t], dtype=np.int64), ts] if previous_t is not None else ts
+        if len(prior) > 1:
+            ds = np.diff(prior)
+            result["received_backwards"] += int(np.count_nonzero(ds < 0))
+            positives = ds[ds >= 0]
+            if positives.size:
+                result["max_receive_gap_s"] = max(result["max_receive_gap_s"], float(np.max(positives)) / 1e9)
+                for label, ns in (("receive_gaps_over_1s", 1e9),
+                                  ("receive_gaps_over_10s", 10e9),
+                                  ("receive_gaps_over_60s", 60e9)):
+                    result[label] += int(np.count_nonzero(positives > ns))
+            flagged = np.flatnonzero((ds < 0) | (ds > 10_000_000_000))
+            for j in flagged[: max(0, 12 - len(result["anomalies"]))]:
+                result["anomalies"].append({
+                    "previous_received_ns": int(prior[j]),
+                    "current_received_ns": int(prior[j + 1]),
+                    "gap_seconds": round(int(ds[j]) / 1e9, 6)
+                })
+        previous_t = int(ts[-1])
 
-            if "price" in data and "quantity" in data:
-                side = data.get("side", [None] * len(data["received_time"]))[idx]
-                if side != "noop":
-                    try:
-                        if float(data["price"][idx]) <= 0 or float(data["quantity"][idx]) < 0:
-                            result["invalid_price_or_quantity"] += 1
-                    except (TypeError, ValueError):
-                        result["invalid_price_or_quantity"] += 1
+    for batch in pf.iter_batches(batch_size=100_000, columns=columns):
+        b = {name: batch.column(i) for i, name in enumerate(columns)}
+        ts = b["received_time"].to_numpy(zero_copy_only=False)
+        if np.any(np.isnan(ts)) if ts.dtype.kind == "f" else False:
+            raise ValueError("Null received_time")
+        ts = ts.astype(np.int64, copy=False)
+        result["rows"] += len(ts)
+        result["received_outside_hour"] += int(np.count_nonzero(
+            (ts < start_ns) | (ts >= stop_ns)))
+        if len(ts):
+            lo, hi = int(np.min(ts)), int(np.max(ts))
+            result["received_min_ns"] = lo if result["received_min_ns"] is None else min(result["received_min_ns"], lo)
+            result["received_max_ns"] = hi if result["received_max_ns"] is None else max(result["received_max_ns"], hi)
 
-            if kind == "orderbook":
-                event_type = data.get("event_type", [None] * len(data["received_time"]))[idx]
-                seq = data.get("final_update_id", [None] * len(data["received_time"]))[idx]
-                declared = data.get("prev_final_update_id", [None] * len(data["received_time"]))[idx]
-                signature = (t, event_type, seq, declared)
-                if signature == prior_message:
-                    continue
-                prior_message = signature
-                if not first_book_event_seen:
-                    result["initial_book_snapshot_observed"] = event_type == "snapshot"
-                    first_book_event_seen = True
-                if event_type == "snapshot":
-                    result["snapshot_events"] += 1
-                    prior_seq = seq
-                elif event_type == "update" and seq is not None:
-                    if prior_seq is not None:
-                        if venue in ("bybit", "bitget_futures"):
-                            result["sequence_pairs_checked"] += 1
-                            if sequence_gap(venue, int(prior_seq), int(seq), None if declared is None else int(declared)):
-                                result["sequence_gap_candidates"] += 1
-                    prior_seq = seq
-            else:
-                if venue == "binance_futures" and "trade_id" in data:
-                    try:
-                        trade_id = int(data["trade_id"][idx])
-                        if prior_trade_id is not None and trade_id > prior_trade_id + 1:
-                            result["binance_trade_id_gap_candidates"] += trade_id - prior_trade_id - 1
-                        prior_trade_id = trade_id
-                    except (TypeError, ValueError):
-                        result["binance_trade_ids_skipped"] += 1
+        if "price" in b and "quantity" in b:
+            prices = b["price"].to_numpy(zero_copy_only=False)
+            quantities = b["quantity"].to_numpy(zero_copy_only=False)
+            valid = np.isfinite(prices) & np.isfinite(quantities) & (prices > 0) & (quantities >= 0)
+            if kind == "orderbook" and "side" in b:
+                sides = np.asarray(b["side"].to_pylist(), dtype=object)
+                valid |= (sides == "noop")
+            result["invalid_price_or_quantity"] += int(np.count_nonzero(~valid))
 
-            result["events"] += 1
-            if prior_t is not None:
-                if t < prior_t:
-                    result["received_backwards"] += 1
-                else:
-                    delta = (t - prior_t) / 1_000_000_000
-                    result["max_receive_gap_s"] = max(result["max_receive_gap_s"], delta)
-                    for threshold, name in ((1, "receive_gaps_over_1s"), (10, "receive_gaps_over_10s"), (60, "receive_gaps_over_60s")):
-                        if delta > threshold:
-                            result[name] += 1
-            prior_t = t
+        if kind == "trades":
+            audit_receive_times(ts)
+            if venue == "binance_futures" and "trade_id" in b:
+                ids = b["trade_id"].to_numpy(zero_copy_only=False)
+                try:
+                    ids = ids.astype(np.int64)
+                    all_ids = np.r_[np.array([previous_trade_id], dtype=np.int64), ids] if previous_trade_id is not None else ids
+                    if len(all_ids) > 1:
+                        gaps = np.diff(all_ids)
+                        result["binance_trade_id_gap_candidates"] += int(np.sum(gaps[gaps > 1] - 1))
+                    if len(ids):
+                        previous_trade_id = int(ids[-1])
+                except (ValueError, TypeError):
+                    result["binance_trade_ids_skipped"] += len(ids)
+            continue
+
+        # One order-book update is repeated across many price-level rows.
+        # Reduce first, then perform timestamp and venue sequence checks.
+        events = np.asarray(b["event_type"].to_pylist(), dtype=object) if "event_type" in b else np.full(len(ts), None)
+        seq = b["final_update_id"].to_numpy(zero_copy_only=False) if "final_update_id" in b else np.full(len(ts), -1)
+        prev = b["prev_final_update_id"].to_numpy(zero_copy_only=False) if "prev_final_update_id" in b else np.full(len(ts), -1)
+        if not len(ts):
+            continue
+        boundaries = np.r_[True, (ts[1:] != ts[:-1]) | (events[1:] != events[:-1]) |
+                           (seq[1:] != seq[:-1]) | (prev[1:] != prev[:-1])]
+        chosen = np.flatnonzero(boundaries)
+        if previous_signature == (int(ts[0]), events[0], seq[0], prev[0]):
+            chosen = chosen[1:]
+        if not chosen.size:
+            continue
+        event_times = ts[chosen]
+        audit_receive_times(event_times)
+        result["snapshot_events"] += int(np.count_nonzero(events[chosen] == "snapshot"))
+        if first_book_message:
+            result["initial_book_snapshot_observed"] = bool(events[chosen[0]] == "snapshot")
+            first_book_message = False
+        for index in chosen:
+            event = events[index]
+            sid = seq[index]
+            declared = prev[index]
+            if event == "snapshot":
+                previous_seq = sid
+            elif event == "update":
+                if previous_seq is not None and venue in ("bybit", "bitget_futures"):
+                    result["sequence_pairs_checked"] += 1
+                    if sequence_gap(venue, int(previous_seq), int(sid), int(declared)):
+                        result["sequence_gap_candidates"] += 1
+                previous_seq = sid
+        last = chosen[-1]
+        previous_signature = (int(ts[last]), events[last], seq[last], prev[last])
 
     result["max_receive_gap_s"] = round(result["max_receive_gap_s"], 6)
     result["parquet_rows_match_metadata"] = result["rows"] == pf.metadata.num_rows
