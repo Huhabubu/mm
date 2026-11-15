@@ -1,6 +1,6 @@
 """Causal comparison of four 600s Binance/Gate basis estimators.
 
-Same 5s update clock, strict-past window, event union and quote-age rule.
+Same 5s update clock, strict-past window and event union. Quote-age exclusion is optional.
 Uses native Binance book_ticker and Gate L2-reconstructed quotes.
 This is an estimation diagnostic; not an HBT trading backtest.
 """
@@ -29,9 +29,9 @@ LABELS = ("Time weighted", "1-second equally weighted",
 
 
 class Tape:
-    def __init__(self, bt, bm, gt, gm, max_age_us=AGE_US):
-        self.max_age_us = int(max_age_us)
-        if self.max_age_us <= 0:
+    def __init__(self, bt, bm, gt, gm, max_age_us=None):
+        self.max_age_us = None if max_age_us is None else int(max_age_us)
+        if self.max_age_us is not None and self.max_age_us <= 0:
             raise ValueError("Quote age limit must be positive")
         self.bt, self.bm = np.asarray(bt, np.int64), np.asarray(bm, float)
         self.gt, self.gm = np.asarray(gt, np.int64), np.asarray(gm, float)
@@ -46,16 +46,19 @@ class Tape:
         self.t = self.t[both]
         ib, ig = ib[both], ig[both]
         self.d = self.bm[ib] - self.gm[ig]
-        self.fresh = ((self.t-self.bt[ib] <= self.max_age_us) &
-                      (self.t-self.gt[ig] <= self.max_age_us))
-        # A quote becomes invalid 250ms after its latest update, including
-        # even if neither feed sends any further messages during that interval.
+        # None means use the last available BBO until that venue next updates.
+        self.fresh = np.ones(len(self.t), dtype=bool)
         next_event = np.r_[self.t[1:], np.iinfo(np.int64).max]
-        self.valid_end = np.minimum.reduce(
-            (next_event, self.bt[ib] + self.max_age_us, self.gt[ig] + self.max_age_us))
+        self.valid_end = next_event
+        if self.max_age_us is not None:
+            self.fresh = ((self.t-self.bt[ib] <= self.max_age_us) &
+                          (self.t-self.gt[ig] <= self.max_age_us))
+            self.valid_end = np.minimum.reduce(
+                (next_event, self.bt[ib] + self.max_age_us,
+                 self.gt[ig] + self.max_age_us))
 
     def time_integral(self, lo, hi):
-        """Piecewise-constant integral, expires both quote states at 250ms."""
+        """Integrate each spread state until the next event (or optional age cap)."""
         if hi <= lo:
             raise ValueError("Invalid time interval")
         i = max(int(np.searchsorted(self.t, lo, "right")) - 1, 0)
@@ -77,8 +80,10 @@ class Tape:
         ig = np.searchsorted(self.gt, grid, "left") - 1
         b = np.maximum(ib, 0)
         g = np.maximum(ig, 0)
-        good = ((ib >= 0) & (ig >= 0) &
-                (grid-self.bt[b] <= self.max_age_us) & (grid-self.gt[g] <= self.max_age_us))
+        good = (ib >= 0) & (ig >= 0)
+        if self.max_age_us is not None:
+            good &= ((grid-self.bt[b] <= self.max_age_us) &
+                     (grid-self.gt[g] <= self.max_age_us))
         delta = self.bm[b] - self.gm[g]
         return (float(np.mean(delta[good])) if np.any(good)
                 else float("nan")), int(np.count_nonzero(good))
@@ -142,8 +147,8 @@ def plot(day, rows, path):
     top.grid(alpha=.25)
     top.legend(ncol=2,fontsize=9)
     bottom.plot(x,[r["valid_time_fraction"] for r in rows],
-                color="#ad7900",lw=1.1,label="Both quotes fresh: valid time")
-    bottom.axhline(.75,color="#a33b3b",ls="--",lw=1,label="75% coverage threshold")
+                color="#ad7900",lw=1.1,label="Both quote states available (age filter optional)")
+    bottom.axhline(.75,color="#a33b3b",ls="--",lw=1,label="75% coverage diagnostic")
     bottom.set_ylim(0,1.02)
     bottom.set_ylabel("Valid time fraction")
     bottom.set_xlabel("Minutes after 00:10 UTC (each baseline updated every 5 seconds)")
@@ -166,8 +171,22 @@ def run_day(day, output, delay_ms, observation_minutes, max_quote_age_ms):
     gt,gm,gate_meta = read_mid("gate-io-futures","quotes","BTC_USDT",day,end)
     # In the live strategy, Binance becomes visible only after its
     # extra assumed transport delay. Gate uses its measured local clock.
+    # File and spread invariants are checked by read_mid; report unusual
+    # interarrival gaps separately rather than using an arbitrary age exclusion.
+    def feed_gap_audit(time_array):
+        gaps = np.diff(time_array)
+        if not len(gaps):
+            raise ValueError("Need multiple quotes to audit feed continuity")
+        return {"max_interarrival_ms":float(np.max(gaps)/1000),
+                "p99_interarrival_ms":float(np.quantile(gaps,.99)/1000),
+                "gaps_over_10s":int(np.count_nonzero(gaps>10_000_000)),
+                "gaps_over_30s":int(np.count_nonzero(gaps>30_000_000))}
+    input_qa = {"binance":feed_gap_audit(bt), "gate":feed_gap_audit(gt)}
+    if any(v["gaps_over_30s"] for v in input_qa.values()):
+        raise ValueError(f"Input continuity QA failed: >30s quote gap: {input_qa}")
     bt = bt + int(round(delay_ms*1000))+1
-    tape = Tape(bt,bm,gt,gm,int(round(max_quote_age_ms*1000)))
+    tape = Tape(bt,bm,gt,gm,None if max_quote_age_ms is None
+                else int(round(max_quote_age_ms*1000)))
     rows=[]
     for now in range(first,end,UPDATE_US):
         r=tape.estimate_at(now)
@@ -206,6 +225,7 @@ def run_day(day, output, delay_ms, observation_minutes, max_quote_age_ms):
         "binance_extra_visible_delay_ms":delay_ms,
         "max_quote_age_ms":max_quote_age_ms,"normal_97pct_two_sided_sigma":GAUSSIAN_Z,
         "n_estimates":len(rows),
+        "total_events_evaluated":int(np.sum([r["valid_event_count"] for r in rows])),
         "fraction_windows_meeting_75pct_time_and_second_coverage":
             float(np.mean([r["coverage_75pct"] for r in rows])),
         "coverage_time_median":float(np.median([r["valid_time_fraction"] for r in rows])),
@@ -216,6 +236,7 @@ def run_day(day, output, delay_ms, observation_minutes, max_quote_age_ms):
         "metrics_all_observations":{k:stats(rows,k) for k in KEYS},
         "metrics_only_high_coverage":{k:stats(rows,k,True) for k in KEYS},
         "next_5s_descriptive_mae_only_high_coverage":predictive,
+        "input_quote_gap_audit":input_qa,
         "binance_source":bin_meta,"gate_source":gate_meta,
         "png":png,"csv":csvname,
     }
@@ -230,9 +251,10 @@ def main():
     p.add_argument("--out",default="reports/visualizations/binance_gate_basis_600s_5s")
     p.add_argument("--binance-delay-ms",type=float,default=2.5)
     p.add_argument("--minutes",type=int,default=50)
-    p.add_argument("--max-quote-age-ms",type=float,default=250.)
+    p.add_argument("--max-quote-age-ms",type=float,default=None,
+                   help="Default: no freshness exclusion; pass milliseconds to reproduce historical caps")
     args=p.parse_args()
-    if args.minutes<=0 or args.minutes>1430 or args.binance_delay_ms<0 or args.max_quote_age_ms<=0:
+    if args.minutes<=0 or args.minutes>1430 or args.binance_delay_ms<0 or (args.max_quote_age_ms is not None and args.max_quote_age_ms<=0):
         p.error("invalid minutes or delay")
     root=Path(args.out);root.mkdir(parents=True,exist_ok=True)
     result=[run_day(d,root,args.binance_delay_ms,args.minutes,args.max_quote_age_ms) for d in args.days]
@@ -245,16 +267,15 @@ def main():
         "Gate uses L2-reconstructed quotes without added delay. "
         "Event timeline is the union of both feeds, with latest historically visible "
         "value at each event. Rows at the same microsecond are reduced to the final state.\n\n"
-        f"A: piecewise-constant time-weighted mean, with both BBOs expiring at {args.max_quote_age_ms:g}ms. "
+        "A: piecewise-constant time-weighted mean, holding the last known BBO until the next event. "
         "B: 600 fixed 1-second points, strict-past as-of, equal weight. "
         "C: equally weighted event samples, compute event mean and population sigma, "
         "discard points outside mean ±2.17009 sigma (nominal central Gaussian 97%), "
         "then recompute mean on retained points; actual rejection proportion is recorded. "
         "D: equally weighted event samples without trimming.\n\n"
-        f"All methods exclude samples where either quote is older than {args.max_quote_age_ms:g}ms. "
-        "CSV records validity and a common 75% eligibility diagnostic, rather than "
-        "silently extrapolating stale quotes. Plots show even low-coverage estimates "
-        "with valid-time fraction in the lower panel. Only eligible windows enter "
+        f"Quote-age exclusion: {'disabled' if args.max_quote_age_ms is None else str(args.max_quote_age_ms)+'ms'}. "
+        "CSV retains availability coverage diagnostics (with no age cap, initial BBO presence only). "
+        "Plots include available-time fraction in the lower panel. Only eligible windows enter "
         "the high-coverage stability comparison. Future 5s spread MAE is a descriptive "
         "diagnostic only; future samples are never used in estimator construction. "
         "No trading simulation or fee-inclusive PnL is performed.\n\n"
