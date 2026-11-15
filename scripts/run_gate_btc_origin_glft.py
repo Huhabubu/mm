@@ -236,10 +236,12 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
                     raw=run_gate_origin_glft(engine,bt,bm,minutes*600,
                         beta,grid,basis,sigma,mode,cfg["gamma_code"],
                         cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
-                        rec.recorder)
+                        rec.recorder,trade_stop*1000 if minutes==1430 else 0)
                     if raw[5]!=1:
                         raise RuntimeError("Gate GLFT pretrade A/k calibration failed")
                     summary=summarize(raw,minutes,True,beta,cfg["position_cap"],cfg["qty"])
+                    if minutes==1430 and summary["end_time_ns"] < trade_stop*1000-1_000_000_000:
+                        raise RuntimeError("Full-day HBT replay stopped more than 1s before UTC midnight")
                     counters=raw[-1]
                     summary["binance_origin_filter"]={
                         k:int(v) for k,v in zip(
