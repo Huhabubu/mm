@@ -417,8 +417,12 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     depth_cap_stats[0] += 1
                     if bid_level_limit > 0:
                         depth_cap_stats[1] += 1
+                        if sample_event:
+                            depth_cap_stats[10] += 1
                     if ask_level_limit > 0:
                         depth_cap_stats[2] += 1
+                        if sample_event:
+                            depth_cap_stats[11] += 1
                 if bid_level_limit > 0:
                     if want_bid < bid_level_limit:
                         if depth_cap_stats is not None:
