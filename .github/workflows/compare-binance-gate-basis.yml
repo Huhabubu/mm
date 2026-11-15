@@ -32,7 +32,7 @@ jobs:
           for key in ("time_weighted","one_second","event_trim_gauss97","event_equal"):
               assert abs(e[key]-3.)<1e-12,(key,e[key])
           assert abs(e["valid_time_fraction"]-1)<1e-12
-          assert e["valid_seconds"]==600
+          assert e["valid_seconds"]==599  # t=0 has no strictly previous quote
           # Data strictly after the evaluation timestamp must not affect any estimate.
           changed=np.full(len(ticks),100.)
           changed[ticks>=600_000_000]=500.
