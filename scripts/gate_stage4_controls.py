@@ -1,4 +1,6 @@
-"""Isolated phase-4 control copy; HBT matching, old GLFT and Binance beta1 untouched.\n\nFresh Gate GLFT research branch: sigma gate, Binance-origin filter and two quote modes.
+"""Isolated phase-4 control copy; HBT matching, old GLFT and Binance beta1 untouched.
+
+Fresh Gate GLFT research branch: sigma gate, Binance-origin filter and two quote modes.
 
 Copied the event/reply/queue/fee/accounting backbone from g0_glft_event_driven
 without modifying that module. Gate-specific signal/price transformation is
@@ -48,13 +50,20 @@ def run_gate_stage4_control(engine, binance_visible_ns, binance_mid, trade_steps
                          quote_mode, gamma_code=GAMMA,
                          tick_size=TICK, contract_value=CTVAL,
                          order_qty=ORDER_QTY, position_cap=POSITION_CAP,
-                         recorder=None, stop_at_ns=0, control_kind=0,\n                         extra_half_ticks=0.0, local_sigma_ceiling=np.inf):
+                         recorder=None, stop_at_ns=0, control_kind=0,
+                         extra_half_ticks=0.0, local_sigma_ceiling=np.inf):
     """Two sigma gates + Binance-origin anchor; HBT retains all matching/queues."""
     if not np.isfinite(beta) or beta < 0 or beta > 1:
         raise ValueError("Invalid beta")
     if quote_mode not in (0,1,2):
         raise ValueError("0=baseline, 1=both, 2=defensive")
-    if control_kind not in (0,1,2):\n        raise ValueError("Stage4: 0=frozen reference, 1=static widen, 2=Gate-local sigma pause")\n    if not np.isfinite(extra_half_ticks) or extra_half_ticks < 0.0:\n        raise ValueError("Stage4: invalid widening offset")\n    if local_sigma_ceiling <= 0.0 or np.isnan(local_sigma_ceiling):\n        raise ValueError("Stage4: invalid Gate sigma threshold")\n    if (len(basis_grid_ns) != len(basis_values) or
+    if control_kind not in (0,1,2):
+        raise ValueError("Stage4: 0=frozen reference, 1=static widen, 2=Gate-local sigma pause")
+    if not np.isfinite(extra_half_ticks) or extra_half_ticks < 0.0:
+        raise ValueError("Stage4: invalid widening offset")
+    if local_sigma_ceiling <= 0.0 or np.isnan(local_sigma_ceiling):
+        raise ValueError("Stage4: invalid Gate sigma threshold")
+    if (len(basis_grid_ns) != len(basis_values) or
             len(basis_values) != len(basis_sigmas)):
         raise ValueError("Basis and sigma lengths mismatch")
     rolling = True
