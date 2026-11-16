@@ -22,7 +22,7 @@ def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
         return eff, base_b, base_m, has_base, False, above, dominant, activated, tie_block
     if abs(gap) <= sigma:
         return 0.0, binance_price, gate_price, True, False, above, dominant, activated, tie_block
-    if not has_base or abs(gap) <= 1.96 * sigma:
+    if not has_base or abs(gap) <= 1.645 * sigma:
         return 0.0, base_b, base_m, has_base, False, above, dominant, activated, tie_block
     above = 1
     delta_b = binance_price - base_b
