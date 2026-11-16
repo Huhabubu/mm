@@ -37,7 +37,6 @@ def read_day(path,day):
             "net_after_fees_usdt":net,
             "delta_net_vs_glft_usdt":net-base,
             "signed_fee_usdt":fee,
-            "gross_pre_fee_usdt":net+fee,
             "fills":fills,
             "submissions":int(t["submissions"]),
             "cancel_requests":int(t["cancel_requests"]),
