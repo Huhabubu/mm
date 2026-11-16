@@ -40,7 +40,7 @@ def strict_fill_arrays(path):
                  "exec_price","exec_qty")}
 
 
-def assert_exact_replay(raw, frozen, fee_equity, fees, end_position):
+def assert_exact_replay(raw, frozen, fee_equity, fees, end_position, position_cap, order_qty):
     actual = {
         "exchange_timestamp_ns": raw[-5],
         "side": raw[-4],
@@ -56,7 +56,7 @@ def assert_exact_replay(raw, frozen, fee_equity, fees, end_position):
             raise ValueError(f"Frozen HBT fill parity failed: {k}, "
                              f"actual={a.shape}, expected={reference.shape}, "
                              f"mismatch={mismatch}")
-    summary = summarize(raw,1430,True,0.0,0.0,0.0)
+    summary = summarize(raw,1430,True,0.0,position_cap,order_qty)
     t=summary["trading"]
     for label,a,b in (
         ("equity", t["end_net_marked_equity_usdt"], fee_equity),
@@ -262,7 +262,7 @@ def day_run(day, frozen_dir, annotated_dir, output):
             t=report["variants"]["glft"]["trading"]
             actual,vals=assert_exact_replay(
                 raw,frozen,t["end_net_marked_equity_usdt"],
-                t["fee_usdt"],t["end_position_contracts"])
+                t["fee_usdt"],t["end_position_contracts"],cfg["position_cap"],cfg["qty"])
             if int(raw[5])!=1:
                 raise ValueError("GLFT calibration stopped working")
             probe_rows=raw[-2][4]
