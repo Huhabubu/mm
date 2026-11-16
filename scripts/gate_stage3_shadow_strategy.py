@@ -290,7 +290,7 @@ def run_gate_stage3_shadow(engine, binance_visible_ns, binance_mid, trade_steps,
                 probe_rows[probe_idx, 7] = last_shadow_effective
                 probe_rows[probe_idx, 8] = last_shadow_gap
                 probe_rows[probe_idx, 9] = last_shadow_sigma
-                probe_rows[probe_idx, 10] = float(active_origin)
+                probe_rows[probe_idx, 10] = 1.0 if active_origin else 0.0
                 probe_rows[probe_idx, 11] = float(last_shadow_decision)
                 probe_rows[probe_idx, 12] = float(last_shadow_activation)
                 probe_rows[probe_idx, 13] = float(latest_binance_ns)
