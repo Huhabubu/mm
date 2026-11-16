@@ -14,6 +14,13 @@ from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TIC
 from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coefficients
 from g0_glft_event_driven import MIN_REQUOTE_NS, summarize
 @njit
+def stage5_risk_pause_sides(quote_mode, shift_ticks):
+    """A positive Binance-led residual threatens a Gate sell; negative threatens a buy."""
+    return (quote_mode == 3 and shift_ticks < 0.0,
+            quote_mode == 3 and shift_ticks > 0.0)
+
+
+@njit
 def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
                        has_base, active, binance_price_changed, gate_feed_same_time):
     """Single causal state transition: normal anchors, trigger, dominance, origin."""
@@ -358,8 +365,7 @@ def run_gate_stage5a_pause(engine, binance_visible_ns, binance_mid, trade_steps,
             # Binance-led displacement; normal side keeps GLFT price unchanged.
             # Positive gap: Gate asks may sell too cheaply; negative: bid may
             # catch a falling market. No inventory-specific exceptions.
-            pause_buy = quote_mode == 3 and shift_ticks < 0.0
-            pause_sell = quote_mode == 3 and shift_ticks > 0.0
+            pause_buy, pause_sell = stage5_risk_pause_sides(quote_mode, shift_ticks)
             if want_bid >= want_ask:
                 raise ValueError("Proposed self-crossed quote prices")
             # One side may be pending cancellation; no replacement until cleared.
