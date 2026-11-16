@@ -77,7 +77,8 @@ def run():
     c=scenario(78000,spec)
     assert c["qty"]==10 and c["position_cap"]==200
     assert abs(c["gamma_code"]-.0005)<1e-12
-    assert c["maker_fee_rate"]<0
+    assert c["maker_fee_rate"]==0.0002 and c["taker_fee_rate"]==0.0005
+    assert c["api_maker_fee_rate"]==-0.0001
     def level(ts,side,price,amount,snapshot):
         return {"local_timestamp":str(ts),"timestamp":str(ts-100),
                 "exchange":"gate-io-futures","symbol":"BTC_USDT",
