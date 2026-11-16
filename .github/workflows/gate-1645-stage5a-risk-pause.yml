@@ -1,0 +1,95 @@
+name: Gate BTC stage5A sigma1645 unilateral risk-side pause and frozen GLFT
+on:
+  push:
+    branches:
+      - analysis/gate-1645-pnl-stage1-20261116
+    paths:
+      - .github/workflows/gate-1645-stage5a-risk-pause.yml
+      - scripts/gate_stage5a_pause_strategy.py
+      - scripts/run_gate_stage5a_pause.py
+      - scripts/aggregate_gate_stage5a_pause.py
+      - scripts/test_gate_stage5a_pause.py
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify sign, cancel side, no-signal reset, unchanged original mode
+        run: |
+          PYTHONPATH=scripts python scripts/test_gate_stage5a_pause.py
+          PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
+          PYTHONPATH=scripts python scripts/test_analyze_gate_1645_fill_quality.py
+      - name: Read frozen original nine-strategy full-day result
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43786928308
+          name: gate-btc-origin-90pct-full-day-${{ matrix.day }}
+          github-token: ${{ github.token }}
+          path: frozen
+      - name: Reproduce frozen unilateral outward quote ledger and replay risk-side pause
+        run: |
+          python -u scripts/run_gate_stage5a_pause.py \
+             --day '${{ matrix.day }}' --frozen frozen \
+             --out 'stage5a_out/${{ matrix.day }}'
+      - name: Preserve official fills, Recorder and native-quote Markout
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage5a-${{ matrix.day }}
+          path: stage5a_out/${{ matrix.day }}/
+          if-no-files-found: error
+          retention-days: 90
+
+  aggregate:
+    needs: replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Read all six successful stage5A replay artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-stage5a-2026-*
+          path: stage5a_sixdays
+          merge-multiple: false
+      - name: Aggregate independent-daily fee-inclusive results and native Markout
+        run: |
+          python scripts/aggregate_gate_stage5a_pause.py \
+              --daily stage5a_sixdays \
+              --stage2 reports/gate_1645_stage2_markout/per_day_quality.csv \
+              --out reports/gate_1645_stage5a_risk_side_pause
+      - name: Preserve complete stage5A results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage5a-sixday-summary
+          path: reports/gate_1645_stage5a_risk_side_pause/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish results without touching frozen original strategies
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/gate_1645_stage5a_risk_side_pause/
+          if ! git diff --cached --quiet; then
+            git commit -m 'results(stage5A): official six-day risk-side pause and frozen defensive comparison'
+            git fetch origin "$GITHUB_REF_NAME"
+            git rebase "origin/$GITHUB_REF_NAME"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi
