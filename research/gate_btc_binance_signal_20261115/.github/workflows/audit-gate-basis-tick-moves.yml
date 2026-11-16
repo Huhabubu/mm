@@ -1,0 +1,65 @@
+name: Audit Gate tick movements of rolling 600s Binance Gate baseline
+on:
+  push:
+    paths:
+      - '.github/workflows/audit-gate-basis-tick-moves.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Focused unit tests for tick equivalence and 5s clock
+        run: |
+          python - <<'PY'
+          import csv
+          import sys
+          import tempfile
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from summarize_gate_basis_tick_moves import one_day
+          with tempfile.TemporaryDirectory() as d:
+              f = Path(d)/"test.csv"
+              first = datetime(2026,9,1,0,10,tzinfo=timezone.utc)
+              with f.open("w",newline="") as out:
+                  w = csv.DictWriter(out,fieldnames=["time_utc","time_weighted","valid_time_fraction"])
+                  w.writeheader()
+                  for i in range(600):
+                      w.writerow({"time_utc":(first+timedelta(seconds=i*5)).isoformat(),
+                                  "time_weighted":format(i*.1,".8f"),
+                                  "valid_time_fraction":.9994 if i==0 else 1})
+              x = one_day(f,.1)
+              assert x["rolling_estimates"] == 600 and x["consecutive_changes"] == 599
+              assert x["rounded_baseline_tick_levels"]["updates_with_price_tick_change"] == 599
+              assert x["rounded_baseline_tick_levels"]["cumulative_abs_integer_ticks"] == 599
+              assert x["raw_abs_tick_equivalents"]["at_least_one_tick"] == 599
+          print("TICK_MOVEMENT_TESTS_OK")
+          PY
+      - name: Analyze true 50min 5s rolling average from existing GitHub CSVs
+        run: |
+          python scripts/summarize_gate_basis_tick_moves.py --tick 0.1
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-basis-600s-5s-tick-movement
+          path: reports/visualizations/gate_basis_tick_movement/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Commit Gate tick movement report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f reports/visualizations/gate_basis_tick_movement/
+          if git diff --cached --quiet; then
+            echo "No report changes"
+          else
+            git commit -m "analysis: publish 50min rolling Gate basis tick movement stats"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi

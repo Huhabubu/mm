@@ -1,0 +1,112 @@
+name: Gate BTC stage5C locked mode first untouched April historical HBT
+on:
+  push:
+    branches:
+      - analysis/gate-1645-pnl-stage1-20261116
+    paths:
+      - .github/workflows/gate-1645-stage5c-april-holdout.yml
+      - scripts/run_gate_stage5c_holdout.py
+      - scripts/aggregate_gate_stage5c_holdout.py
+      - scripts/test_gate_stage5c_holdout.py
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  lock-before-april:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install exact HBT version and numerical libraries for deterministic tests
+        run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Run May-to-Nov training-only selection tests
+        run: PYTHONPATH=scripts python scripts/test_gate_stage5c_holdout.py
+      - name: Freeze one mode using ONLY already published six exploratory days
+        run: |
+          test -f reports/gate_1645_stage5a_risk_side_pause/summary.json
+          python scripts/run_gate_stage5c_holdout.py --mode lock \
+             --summary reports/gate_1645_stage5a_risk_side_pause/summary.json \
+             --out stage5c_lock/april_selection_lock.json
+      - name: Save immutable pre-April selection artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage5c-selection-locked-before-april
+          path: stage5c_lock/april_selection_lock.json
+          if-no-files-found: error
+          retention-days: 90
+
+  april-holdout:
+    needs: lock-before-april
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Read frozen mode selection, committed before any April source access
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-stage5c-selection-locked-before-april
+          path: frozen
+      - name: First touch previously unused April 2026 Gate and Binance native data
+        run: |
+          python -u scripts/run_gate_stage5c_holdout.py --mode eval \
+             --lock frozen/april_selection_lock.json \
+             --out stage5c_april
+      - name: Archive untouched April HBT fills, Recorder, native Markout and locked mode
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage5c-untouched-april-HBT
+          path: stage5c_april/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: april-holdout
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download locked mode and independent April replay result
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-stage5c-selection-locked-before-april
+          path: frozen
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-stage5c-untouched-april-HBT
+          path: april
+      - name: Generate audit report without selection or retuning
+        run: |
+          python scripts/aggregate_gate_stage5c_holdout.py \
+             --input april/stage5c_april_holdout.json \
+             --out reports/gate_1645_stage5c_april_holdout
+          cp frozen/april_selection_lock.json \
+             reports/gate_1645_stage5c_april_holdout/selection_lock.json
+      - name: Preserve single April historical HBT report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage5c-april-holdout-report
+          path: reports/gate_1645_stage5c_april_holdout/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish final report and pre-April mode lock
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/gate_1645_stage5c_april_holdout/
+          if ! git diff --cached --quiet; then
+            git commit -m 'results(stage5C): immutable selected mode tested on untouched historic April'
+            git fetch origin "$GITHUB_REF_NAME"
+            git rebase "origin/$GITHUB_REF_NAME"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi

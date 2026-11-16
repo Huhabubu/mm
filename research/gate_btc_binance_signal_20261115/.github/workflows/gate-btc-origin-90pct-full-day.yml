@@ -1,0 +1,78 @@
+name: Gate BTC 90pct sigma six full UTC days VIP0 no-rebate HBT
+on:
+  push:
+    paths:
+      - '.github/workflows/gate-btc-origin-90pct-full-day.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  full-day:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read separately passed 24h four-feed source integrity report
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43730903269
+          name: gate-btc-data-qa-${{ matrix.day }}
+          github-token: ${{ github.token }}
+          path: qa
+      - name: Read passed 50minute nine-model paired validation
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43786556232
+          name: gate-btc-origin-90pct-50m-${{ matrix.day }}
+          github-token: ${{ github.token }}
+          path: pilot
+      - name: Require both pretrade QA and full nine-model pilot
+        run: |
+          python - <<'PY'
+          import glob, json
+          qa_files=glob.glob("qa/qa_*_1440min.json")
+          pilot_files=glob.glob("pilot/*_50m.json")
+          assert len(qa_files)==1 and len(pilot_files)==1,(qa_files,pilot_files)
+          qa=json.load(open(qa_files[0])); pilot=json.load(open(pilot_files[0]))
+          assert qa["status"]=="passed" and len(qa["feeds"])==4,qa
+          assert pilot["status"]=="complete" and pilot["minutes_traded"]==50,pilot
+          assert len(pilot["variants"])==9,tuple(pilot["variants"])
+          for name,model in pilot["variants"].items():
+              assert model["trading"]["end_net_marked_equity_usdt"] is not None,name
+              assert model["calibration_attempts"]>0,name
+          print("ALL_GATES_PASSED",qa["day"],flush=True)
+          PY
+      - name: Install exact official HBT model
+        run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify estimator/filters and L2 snapshot adapter
+        run: python scripts/test_gate_origin_filter.py
+      - name: Official HBT full-day replay 00:10–24:00 UTC with nine variants
+        run: |
+          python -u scripts/run_gate_btc_origin_glft.py \
+            --day "${{ matrix.day }}" --minutes 1430 \
+            --out reports/gate_origin_glft_90pct_full_day
+      - name: Preserve official fee-inclusive marked-equity and raw HBT Recorder
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-btc-origin-90pct-full-day-${{ matrix.day }}
+          path: reports/gate_origin_glft_90pct_full_day/
+          retention-days: 90
+          if-no-files-found: warn
+      - name: Preserve small per-date nine-model JSON for six-day comparisons
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-btc-origin-90pct-daily-json-${{ matrix.day }}
+          path: reports/gate_origin_glft_90pct_full_day/*_1430m.json
+          retention-days: 90
+          if-no-files-found: warn

@@ -1,0 +1,56 @@
+name: Publish Gate six-day fee-inclusive HBT paired comparison
+on:
+  push:
+    paths:
+      - '.github/workflows/gate-full-day-publish-results.yml'
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Retrieve completed June whole-day HBT results
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43732378404
+          name: gate-btc-origin-full-day-2026-06-01
+          github-token: ${{ github.token }}
+          path: full_day_downloads/gate-btc-origin-full-day-2026-06-01
+      - name: Retrieve completed July–November whole-day HBT results
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43732616361
+          pattern: gate-btc-origin-full-day-*
+          github-token: ${{ github.token }}
+          path: full_day_downloads
+          merge-multiple: false
+      - name: Validate exactly six complete days and calculate paired net earnings
+        run: |
+          python scripts/aggregate_gate_origin_full_day.py \
+            --input full_day_downloads \
+            --out reports/gate_origin_glft_full_day_aggregate
+      - name: Preserve compact report JSON CSV and Markdown
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-btc-origin-six-day-fee-inclusive-aggregate
+          path: reports/gate_origin_glft_full_day_aggregate/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Commit report without changing source or main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f reports/gate_origin_glft_full_day_aggregate/
+          if git diff --cached --quiet; then
+            echo "No changes to aggregate report"
+          else
+            git commit -m "results: six-date fee-inclusive Gate GLFT beta-mode comparison"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi

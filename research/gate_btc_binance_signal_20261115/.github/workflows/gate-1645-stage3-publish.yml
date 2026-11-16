@@ -1,0 +1,51 @@
+name: Publish verified Gate stage3 six-day shadow attribution only
+on:
+  push:
+    branches:
+      - analysis/gate-1645-pnl-stage1-20261116
+    paths:
+      - .github/workflows/gate-1645-stage3-publish.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy
+      - name: Download six successful frozen stage3 shadow days
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43834100638
+          pattern: gate-stage3-shadow-2026-*
+          path: shadow_cases
+          merge-multiple: false
+          github-token: ${{ github.token }}
+      - name: Validate all six exact HBT parity cases and regenerate daily-equal analysis
+        run: |
+          python scripts/aggregate_gate_1645_stage3.py \
+            --input shadow_cases --out reports/gate_1645_stage3_shadow
+      - name: Publish six-day attribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-1645-stage3-shadow-published
+          path: reports/gate_1645_stage3_shadow/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Commit verified evidence without stale-branch conflicts
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/gate_1645_stage3_shadow/
+          if ! git diff --cached --quiet; then
+            git commit -m 'results: complete six-day Gate shadow signal adverse-selection evidence'
+            git fetch origin "$GITHUB_REF_NAME"
+            git rebase "origin/$GITHUB_REF_NAME"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi

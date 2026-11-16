@@ -1,0 +1,46 @@
+name: Gate BTC six-date full-day pretrade Tardis QA gate
+on:
+  push:
+    paths:
+      - '.github/workflows/gate-btc-pretrade-data-qa.yml'
+      - 'scripts/qa_gate_btc_futures.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate-data-qa:
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Pure QA function self-check
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "scripts")
+          from qa_gate_btc_futures import on_grid, FEEDS, REQUIRED
+          assert on_grid(101.7,.1)
+          assert not on_grid(101.75,.1)
+          assert len(FEEDS)==4
+          assert "is_snapshot" in REQUIRED["incremental_book_L2"]
+          print("SCHEMA_QA_UNIT_TESTS_OK")
+          PY
+      - name: Download and audit full UTC day of Gate trades L2 quotes and Binance BBO
+        run: |
+          python -u scripts/qa_gate_btc_futures.py --day "${{ matrix.day }}" --minutes 1440
+      - name: Upload exact QA result including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-btc-data-qa-${{ matrix.day }}
+          path: reports/gate_btc_sixday_data_qa/
+          retention-days: 90
+          if-no-files-found: warn

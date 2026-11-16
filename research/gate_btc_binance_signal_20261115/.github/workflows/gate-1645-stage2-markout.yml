@@ -1,0 +1,96 @@
+name: Gate BTC 1.645sigma stage2 native quote markout six full days
+on:
+  push:
+    branches:
+      - analysis/gate-1645-pnl-stage1-20261116
+    paths:
+      - .github/workflows/gate-1645-stage2-markout.yml
+      - scripts/analyze_gate_1645_fill_quality.py
+      - scripts/test_analyze_gate_1645_fill_quality.py
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  markout:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day:
+          - '2026-06-01'
+          - '2026-07-01'
+          - '2026-08-01'
+          - '2026-09-01'
+          - '2026-10-01'
+          - '2026-11-01'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy
+      - name: Test strict as-of, freshness and notional-weighted tails
+        run: |
+          PYTHONPATH=scripts python scripts/test_analyze_gate_1645_fill_quality.py
+          PYTHONPATH=scripts python scripts/test_analyze_gate_1645_stage1.py
+      - name: Download frozen official HBT 1.645sigma fills from six-day replay
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43786928308
+          name: gate-btc-origin-90pct-full-day-${{ matrix.day }}
+          github-token: ${{ github.token }}
+          path: frozen_case
+      - name: Re-read Tardis Gate native quotes and audit each executed fill
+        run: |
+          python -u scripts/analyze_gate_1645_fill_quality.py \
+            --mode day --day "${{ matrix.day }}" \
+            --case-dir frozen_case \
+            --out "stage2_results/${{ matrix.day }}"
+      - name: Preserve only derived metrics and annotated fills (no raw market feed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage2-quality-${{ matrix.day }}
+          path: stage2_results/${{ matrix.day }}/
+          if-no-files-found: error
+          retention-days: 90
+
+  aggregate:
+    needs: markout
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy
+      - name: Retrieve all six successful daily outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-stage2-quality-*
+          path: sixday
+          merge-multiple: false
+      - name: Equal-day average with all six-day coverage and tail-risk checks
+        run: |
+          python scripts/analyze_gate_1645_fill_quality.py \
+            --mode aggregate --input sixday \
+            --out reports/gate_1645_stage2_markout
+      - name: Publish six-day CSV JSON and Markdown evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage2-quality-sixday-aggregate
+          path: reports/gate_1645_stage2_markout/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Preserve summary on analysis branch only
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f reports/gate_1645_stage2_markout/
+          if ! git diff --cached --quiet; then
+            git commit -m "results: six-day Gate 1.645sigma fill quality markout"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi

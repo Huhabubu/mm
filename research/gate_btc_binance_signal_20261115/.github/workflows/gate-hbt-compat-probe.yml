@@ -1,0 +1,81 @@
+name: Probe Gate full-snapshot tape compatibility with official hftbacktest
+on:
+  push:
+    paths:
+      - '.github/workflows/gate-hbt-compat-probe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install official execution engine
+        run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Extract true first 30s Gate files and inspect converter behavior
+        run: |
+          python - <<'PY'
+          import csv,gzip,io,os,tempfile,urllib.request
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import numpy as np
+          from hftbacktest.data.utils import tardis
+          from hftbacktest.data.validation import validate_event_order
+          from hftbacktest import BacktestAsset,ROIVectorMarketDepthBacktest
+          day="2026-11-01"
+          end=int(datetime(2026,11,1,tzinfo=timezone.utc).timestamp()*1e6)+30_000_000
+          root=Path("reports/gate_hbt_compat")
+          root.mkdir(parents=True,exist_ok=True)
+          paths={}
+          for kind in ("trades","incremental_book_L2","quotes"):
+              url=f"https://datasets.tardis.dev/v1/gate-io-futures/{kind}/2026/11/01/BTC_USDT.csv.gz"
+              path=root/("book_ticker.csv" if kind=="quotes" else kind+".csv")
+              count=0; snapshot=0;latest=0
+              with urllib.request.urlopen(url,timeout=120) as response, gzip.GzipFile(fileobj=response) as gz:
+                  with io.TextIOWrapper(gz,encoding="utf-8",newline="") as f, path.open("w",newline="") as out:
+                      reader=csv.DictReader(f)
+                      writer=csv.DictWriter(out,fieldnames=reader.fieldnames)
+                      writer.writeheader()
+                      for row in reader:
+                          if int(row["local_timestamp"])>=end:break
+                          writer.writerow(row);count+=1
+                          if kind=="incremental_book_L2" and row["is_snapshot"]=="true":snapshot+=1
+                          latest=int(row["local_timestamp"])
+              paths[kind]=path
+              print("GATE_30S",kind,count,"snapshot_rows",snapshot,"last",latest,flush=True)
+          for mode in ("process","ignore_sod","ignore"):
+              try:
+                  npz=root/f"hbt_{mode}.npz"
+                  x=tardis.convert_fuse(str(paths["trades"]),str(paths["incremental_book_L2"]),
+                        str(paths["quotes"]),tick_size=.1,lot_size=1.,output_filename=str(npz),
+                        ss_buffer_size=30000,snapshot_mode=mode)
+                  validate_event_order(x)
+                  print("CONVERTER",mode,"rows",len(x),"first",str(x[:2]),flush=True)
+                  asset=(BacktestAsset().data([str(npz)]).linear_asset(.0001)
+                         .constant_order_latency(1_000_000,1_000_000)
+                         .power_prob_queue_model(2.0).no_partial_fill_exchange()
+                         .trading_value_fee_model(-.0001,.00075).tick_size(.1).lot_size(1.)
+                         .roi_lb(65000).roi_ub(200000).last_trades_capacity(100))
+                  h=ROIVectorMarketDepthBacktest([asset])
+                  try:
+                      st=h.elapse(1_000_000_000)
+                      print("HBT_REPLAY",mode,"status",st,"bid",h.depth(0).best_bid,
+                            "ask",h.depth(0).best_ask,flush=True)
+                  finally:
+                      h.close()
+              except Exception as exc:
+                  print("HBT_ERROR",mode,type(exc).__name__,str(exc)[:2000],flush=True)
+          PY
+      - name: Publish compact probe text logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-hbt-compat-small-files
+          path: reports/gate_hbt_compat/*.csv
+          retention-days: 7
+          if-no-files-found: warn
