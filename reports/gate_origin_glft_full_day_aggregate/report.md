@@ -1,5 +1,7 @@
 # Binance-origin Gate GLFT: six UTC-day fee-inclusive exploratory comparison
 
+> ⚠️ **历史含返佣结果，仅用于审计。** 本表采用了未获用户授权的 Maker **−0.01%** 返佣，不能作为正常扣费后净收益结论。正确的普通账户 Maker **+0.02%** 扣费情景请使用 [六日无返佣、手续费后净收益复核](../gate_origin_glft_full_day_vip0_no_rebate/report.md)。
+
 All dates are previously explored historical samples, not blind tests.
 Net means official HBT end-of-day marked equity **after** fees/rebates;
 negative signed fees represent maker rebates in the Gate public-fee scenario.
