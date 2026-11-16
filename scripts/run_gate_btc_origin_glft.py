@@ -133,8 +133,10 @@ def scenario(mid, spec):
             "position_cap":float(qty*INVENTORY_MULTIPLE),
             "gamma_code":RISK_AVERSION_PER_USDT*ctval*tick,
             "approx_order_notional_usdt":qty*ctval*mid,
-            "maker_fee_rate":float(spec["maker_fee_rate"]),
-            "taker_fee_rate":float(spec["taker_fee_rate"])}
+            "maker_fee_rate":0.0002,  # Gate BTC perpetual VIP0 research scenario; charge, no rebate.
+            "taker_fee_rate":0.0005,
+            "api_maker_fee_rate":float(spec["maker_fee_rate"]),
+            "api_taker_fee_rate":float(spec["taker_fee_rate"])}
 
 
 def build_asset(parts, low, high, spec):
@@ -208,6 +210,8 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
                 raise RuntimeError("Missing Gate pretrade midpoint")
             cfg=scenario(float(np.median(pretrade)),spec)
             report["scenario"]=cfg
+            report["experimental_trigger_sigma_multiple"]=1.645
+            report["fee_policy"]="VIP0_assumed_maker_plus_0.020pct_no_rebate"
             print("GATE_SCENARIO",day,json.dumps(cfg),flush=True)
             if minutes==1430:
                 from tardis_segmented_hbt import convert_fuse_parts
