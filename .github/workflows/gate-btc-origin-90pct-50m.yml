@@ -1,0 +1,57 @@
+name: Gate BTC 90pct 1.645 sigma 50min six-date pilot
+on:
+  push:
+    paths:
+      - '.github/workflows/gate-btc-origin-90pct-50m.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  gate-50m:
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Load verified full-day QA for this date
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43730903269
+          name: gate-btc-data-qa-${{ matrix.day }}
+          github-token: ${{ github.token }}
+          path: qa
+      - name: Stop on unresolved Gate/Binance data QA failure
+        run: |
+          python - <<'PY'
+          import glob,json
+          files=glob.glob('qa/qa_*_1440min.json')
+          assert len(files)==1,files
+          x=json.load(open(files[0]))
+          assert x['status']=='passed',x
+          assert len(x['feeds'])==4,x
+          for kind,v in x['feeds'].items():
+              assert v['invalid_rows']==0 and v['negative_latency_rows']==0,kind
+          print("FULL_DAY_QA_GATE_PASSED",x['day'],flush=True)
+          PY
+      - name: Install exact official HBT engine and its dependencies
+        run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify rolling sigma and signal-origin state transitions
+        run: python scripts/test_gate_origin_filter.py
+      - name: Run all nine beta/mode variants with official Gate hftbacktest
+        run: python -u scripts/run_gate_btc_origin_glft.py --day "${{ matrix.day }}" --minutes 50 --out reports/gate_origin_glft_90pct_50m
+      - name: Upload per-model fee-inclusive results and HBT Recorder/fills
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-btc-origin-90pct-50m-${{ matrix.day }}
+          path: reports/gate_origin_glft_90pct_50m/
+          if-no-files-found: warn
+          retention-days: 90
