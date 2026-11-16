@@ -196,6 +196,8 @@ def model_day(model, fill, trace, ts, mid, day_end_ns, ctval):
                 "fresh_count": int(np.count_nonzero(valid)),
                 "fresh_fraction": float(np.count_nonzero(valid)/count) if count else None,
                 "fresh": stats(x, weights),
+                "capture_on_same_fresh_fills": stats(
+                    annotated["capture_halfspread_bps"][valid], weights),
             }
         groups[direction] = {
             "fills": count, "capture": capture,
@@ -276,7 +278,7 @@ def aggregate(root, out_dir):
                         "date":r["day"],"model":model,"side":direction,"horizon_ms":int(horizon),
                         "all_fills":data["all_fills"],"fresh_fills":data["fresh_count"],
                         "coverage":data["fresh_fraction"],
-                        "capture_bps":group["capture"]["mean_bps"] if group["capture"] else None,
+                        "capture_bps":data["capture_on_same_fresh_fills"]["mean_bps"] if data["capture_on_same_fresh_fills"] else None,
                         "mean_markout_bps":s["mean_bps"] if s else None,
                         "notional_weighted_mean_bps":s["notional_weighted_mean_bps"] if s else None,
                         "p10_bps":s["p10_bps"] if s else None,
@@ -313,12 +315,12 @@ def aggregate(root, out_dir):
                        for key in metrics},
                 }
     result={"status":"complete","six_exploratory_dates":DAYS,
-            "primary":"each day equal-weighted, quote freshness<=500ms both endpoints",
+            "primary":"each day equal-weighted, quote freshness<=500ms both endpoints; spread capture on same eligible fill set",
             "note":"Descriptive fill conditional distributions, not causal effect or PnL attribution",
             "results":summary}
     (out_dir/"summary.json").write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n")
     lines=["# Gate BTC 1.645σ 双边β1：阶段②成交质量（六日探索性）","",
-           "基于官方HBT实际成交回报时刻及Tardis Gate原生quotes行情。主结果要求起点/终点盘口年龄均≤500ms；否则排除并报告覆盖率。未修改撮合/策略/阈值。", "",
+           "基于官方HBT实际成交回报时刻及Tardis Gate原生quotes行情。主结果要求起点/终点盘口年龄均≤500ms；捕获半价差与Markout使用同一批符合条件的成交，否则排除并报告覆盖率。未修改撮合/策略/阈值。", "",
            "| 模型 | 方向 | 期限 | 每日有效笔数均值 | 覆盖率 | 捕获半价差(bps) | Markout(bps) | P10 | 最差10%均值 | 负向占比 |",
            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for model in MODELS:
