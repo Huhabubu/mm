@@ -1,0 +1,135 @@
+name: Gate BTC 1.645sigma phase4 May-locked no-Binance turnover controls
+on:
+  push:
+    branches:
+      - analysis/gate-1645-pnl-stage1-20261116
+    paths:
+      - .github/workflows/gate-1645-stage4-controls.yml
+      - scripts/gate_stage4_controls.py
+      - scripts/run_gate_stage4_controls.py
+      - scripts/aggregate_gate_stage4_controls.py
+      - scripts/test_gate_stage4_controls.py
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install unchanged official HBT and numeric dependencies
+        run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify deterministic May-only lock and original GLFT gate
+        run: |
+          PYTHONPATH=scripts python scripts/test_gate_stage4_controls.py
+          PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
+          PYTHONPATH=scripts python scripts/test_analyze_gate_1645_fill_quality.py
+      - name: Run May 01 1430min pre-period baseline beta1 and eight locked-grid candidates
+        run: |
+          python -u scripts/run_gate_stage4_controls.py \
+            --mode train --day 2026-05-01 \
+            --out stage4_train
+      - name: Preserve pre-evaluation selected parameters and all May candidate fills
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage4-may-only-param-lock
+          path: stage4_train/stage4_train_lock.json
+          if-no-files-found: error
+          retention-days: 90
+
+  eval:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Use frozen May 01 parameter lock
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-stage4-may-only-param-lock
+          path: may_lock
+      - name: Read official frozen 1.645sigma HBT benchmark on same evaluation day
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 43786928308
+          name: gate-btc-origin-90pct-full-day-${{ matrix.day }}
+          github-token: ${{ github.token }}
+          path: frozen
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Replay two locked no-signal controls on full-day Gate native feeds
+        run: |
+          python -u scripts/run_gate_stage4_controls.py \
+            --mode eval --day '${{ matrix.day }}' \
+            --lock may_lock/stage4_train_lock.json --frozen frozen \
+            --out 'stage4_eval/${{ matrix.day }}'
+      - name: Save full Recorder, official fills and 100/500/1000ms quality labels
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage4-controls-${{ matrix.day }}
+          path: stage4_eval/${{ matrix.day }}/
+          if-no-files-found: error
+          retention-days: 90
+
+  aggregate:
+    needs: eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Read only pre-evaluation locked May parameters
+        uses: actions/download-artifact@v4
+        with:
+          name: gate-stage4-may-only-param-lock
+          path: stage4_lock
+      - name: Read all six successful locked full-day HBT runs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-stage4-controls-2026-*
+          path: stage4_sixday
+          merge-multiple: false
+      - name: Compute fair four-model day-equal comparison and actual volume mismatch
+        run: |
+          python scripts/aggregate_gate_stage4_controls.py \
+            --daily stage4_sixday \
+            --lock stage4_lock/stage4_train_lock.json \
+            --stage2 reports/gate_1645_stage2_markout/per_day_quality.csv \
+            --out reports/gate_1645_stage4_controls
+          mkdir -p reports/gate_1645_stage4_train_lock
+          cp stage4_lock/stage4_train_lock.json reports/gate_1645_stage4_train_lock/
+      - name: Preserve six-day four-model metrics, full summary, May prelock
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-stage4-sixday-four-model-controls
+          path: |
+            reports/gate_1645_stage4_controls/
+            reports/gate_1645_stage4_train_lock/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Commit reproducible evidence to isolated analysis branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/gate_1645_stage4_controls/ reports/gate_1645_stage4_train_lock/
+          if ! git diff --cached --quiet; then
+            git commit -m 'results: frozen-May stage4 no-signal matched turnover six-day HBT'
+            git fetch origin "$GITHUB_REF_NAME"
+            git rebase "origin/$GITHUB_REF_NAME"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi
