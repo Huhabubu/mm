@@ -43,7 +43,18 @@ def run():
     # Gate is the larger magnitude mover: reject even with Binance same sign.
     gate_dominates=step(3.,1.,101.,105.,100.,99.,True,False,True,False)
     assert gate_dominates[0]==0. and not gate_dominates[4]
-    # Between 1sigma and 1.96sigma: frozen anchors but no signal.
+    # New 90% band: 1.645 sigma activates, keeping 1sigma anchor unchanged.
+    just_below = step(1.64,1.,101.64,99.,100.,99.,True,False,True,False)
+    assert just_below[0]==0. and just_below[1]==100. and not just_below[4]
+    lower_band = step(1.80,1.,101.80,99.,100.,99.,True,False,True,False)
+    assert lower_band[0]==1.80 and lower_band[4] and lower_band[7]==1,lower_band
+    # The same 1.80 sigma event would fail the original 1.96 sigma trigger.
+    no_binance = step(1.80,1.,101.80,99.,100.,99.,True,False,False,False)
+    assert no_binance[0]==0. and not no_binance[4]
+    still_normal = step(.95,1.,100.95,99.,100.,99.,True,True,False,False)
+    assert still_normal[0]==0. and not still_normal[4] and still_normal[1]==100.95
+    # No change to a 1.0 sigma freeze threshold.
+    # Between 1sigma and 1.645sigma: frozen anchors but no signal.
     warm=step(1.5,1.,101.,99.,100.,99.,True,False,True,False)
     assert warm[1]==100. and warm[2]==99. and warm[0]==0.
     # Mean/sigma can change while anchors remain frozen.
