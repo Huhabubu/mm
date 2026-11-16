@@ -63,7 +63,7 @@ class ControlsStage4Tests(unittest.TestCase):
         a=r.copy();b=r.copy()
         assert_baseline_identity(a,b)
         b[-5]=np.array([17,23],np.int64)
-        with self.assertRaisesRegex(ValueError,"fill"):
+        with self.assertRaisesRegex(ValueError,"exchange_timestamp_ns"):
             assert_baseline_identity(a,b)
 
     def test_copy_keeps_default_controls_unsupported_values_rejected(self):
