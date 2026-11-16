@@ -143,7 +143,20 @@ def simulate(data,model,kind,extra=0.0,gate_sigma_ceiling=float("inf"),
             raw=run_gate_stage4_control(*args,0.0,*more,mode,extra,gate_sigma_ceiling)
         if raw[5]!=1:
             raise ValueError(f"Initial 10min Gate GLFT A/k invalid: {data['day']} {kind}")
-        s=summarize(raw,data["minutes"],True,
+        # Only May training starts ~0.7s after UTC midnight due to its
+        # first replayable L2 event; require <1s of initial-clock truncation.
+        # Never relax the frozen June-Nov 1430min official acceptance gate.
+        summary_minutes=data["minutes"]
+        if data["day"]==TRAIN_DAY:
+            expected=6000+data["minutes"]*600
+            if not (expected-10 <= raw[0] <= expected):
+                raise ValueError(
+                    f"May first feed starts too late: samples={raw[0]}, expected={expected}")
+            # This changes summarize()'s strict minimum-sample predicate ONLY.
+            # Its actual sample denominators, end times, executions, and ledger
+            # always come from raw HBT; May uses all data until UTC midnight.
+            summary_minutes=data["minutes"]-1
+        s=summarize(raw,summary_minutes,True,
                     1.0 if kind=="original_beta1" else 0.0,
                     cfg["position_cap"],cfg["qty"])
         if s["end_time_ns"] < data["stop_ns"]-1_000_000_000:
@@ -221,7 +234,12 @@ def train(day,output):
                     "static_widen":chosen_a,
                     "gate_sigma_pause":chosen_b,
                 },
-                "training_selected_objective":"minimize abs(May full-day model fill count - May beta1 full-day fill count) separately per class",
+                "training_selected_objective":"minimize abs(May near-complete full-day model fill count - May beta1 near-complete full-day fill count) separately per class",
+                "may_hbt_sample_count":int(raw_glft[0]),
+                "may_hbt_expected_utc_samples":6000+1430*600,
+                "may_hbt_utc_boundary_shortfall_s":float((6000+1430*600-raw_glft[0])*0.1),
+                "may_hbt_start_timestamp_ns":int(raw_glft[-3]),
+                "may_hbt_end_timestamp_ns":int(raw_glft[-2][0]),
                 "replay_controls":"May clone beta=0 exactly matches original GLFT fill arrays and end cash, fee, position and equity",
                 "signal_usage":"no Binance mid/direction in control quotes; Binance event clock retained as in original beta=0 GLFT",
                 "scenario":d["params"],"source_day":"Tardis 2026-05-01 only",
