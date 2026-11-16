@@ -44,8 +44,8 @@ class GateMarkoutTest(unittest.TestCase):
             anno2["capture_halfspread_bps"])
 
     def test_stale_start_or_end_excluded(self):
-        self.t=np.array([0,100,300],dtype=np.int64)*NS
-        self.mid=np.array([100.,100.,99.])
+        self.t=np.array([0,100],dtype=np.int64)*NS
+        self.mid=np.array([100.,100.])
         f={k:v[:1].copy() for k,v in self.f.items()}
         _,flags=label_fills(f,self.t,self.mid,1_000*NS,0.001)
         self.assertTrue(flags[100][1][0])
