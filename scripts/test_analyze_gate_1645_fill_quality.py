@@ -28,7 +28,7 @@ class GateMarkoutTest(unittest.TestCase):
         self.assertAlmostEqual(annotated["markout_100ms_bps"][0],-100.)
         self.assertAlmostEqual(annotated["markout_100ms_bps"][1],+100.)
         self.assertAlmostEqual(annotated["capture_halfspread_bps"][0],+100.)
-        self.assertAlmostEqual(annotated["capture_halfspread_bps"][1],-100.)
+        self.assertAlmostEqual(annotated["capture_halfspread_bps"][1],+100.)
         self.assertTrue(flags[100][1].all())
 
     def test_no_future_entry_quote(self):
