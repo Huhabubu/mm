@@ -296,7 +296,12 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                         rec.recorder,trade_stop*1000 if minutes==1430 else 0)
                     if raw[5]!=1:
                         raise RuntimeError("Gate GLFT pretrade A/k calibration failed")
-                    summary=summarize(raw,minutes,True,beta,cfg["position_cap"],cfg["qty"])
+                    summary=summarize(
+                        raw,minutes,True,beta,cfg["position_cap"],cfg["qty"],
+                        tail_tolerance_samples=(10 if symbol!=GATE_SYMBOL else 5))
+                    if symbol!=GATE_SYMBOL:
+                        summary["end_of_day_missing_100ms_samples"] = max(
+                            0,6000+minutes*600-int(raw[0]))
                     if minutes==1430 and summary["end_time_ns"] < trade_stop*1000-1_000_000_000:
                         raise RuntimeError("Full-day HBT replay stopped more than 1s before UTC midnight")
                     counters=raw[-1]
