@@ -47,15 +47,16 @@ def fetch_contract(symbol="BTC_USDT"):
     if contract.get("name") != symbol:
         raise ValueError("Gate API returned wrong contract")
     keys = ("name","type","quanto_multiplier","order_price_round","order_size_min",
-            "order_size_max","maker_fee_rate","taker_fee_rate","config_change_time")
+            "order_size_max","maker_fee_rate","taker_fee_rate","config_change_time","enable_decimal")
     spec = {k:contract.get(k) for k in keys}
     tick = float(spec["order_price_round"])
     ctval = float(spec["quanto_multiplier"])
-    min_qty = int(spec["order_size_min"])
+    min_qty = float(spec["order_size_min"])
     maker = float(spec["maker_fee_rate"])
     taker = float(spec["taker_fee_rate"])
     if not (spec["type"] == "direct" and tick > 0 and ctval > 0
-            and min_qty >= 1 and math.isfinite(maker) and math.isfinite(taker)):
+            and min_qty > 0 and math.isfinite(min_qty)
+            and math.isfinite(maker) and math.isfinite(taker)):
         raise ValueError(f"Unsupported Gate contract configuration: {spec}")
     return spec
 
