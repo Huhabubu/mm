@@ -41,7 +41,11 @@ def fetch_contract(symbol="BTC_USDT"):
     if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT"):
         raise ValueError(f"Unsupported Gate study symbol: {symbol}")
     endpoint = f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{symbol}"
-    req = urllib.request.Request(endpoint, headers=UA)
+    headers = dict(UA)
+    if symbol != "BTC_USDT":
+        # Gate 2026 decimal-contract API: legacy integer response truncates 0.1 -> 0.
+        headers["X-Gate-Size-Decimal"] = "1"
+    req = urllib.request.Request(endpoint, headers=headers)
     with urllib.request.urlopen(req, timeout=40) as stream:
         contract = json.load(stream)
     if contract.get("name") != symbol:
