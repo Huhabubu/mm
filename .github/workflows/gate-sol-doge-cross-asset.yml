@@ -1,0 +1,87 @@
+name: Gate SOL DOGE cross-asset GLFT 50min QA and full-day HBT
+on:
+  push:
+    branches:
+      - experiment/gate-sol-doge-20261117
+    paths:
+      - .github/workflows/gate-sol-doge-cross-asset.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify cross-asset dimensional consistency and unchanged baseline
+        run: |
+          python -m compileall -q scripts/run_gate_btc_origin_glft.py scripts/qa_gate_btc_futures.py scripts/aggregate_gate_altcoin_results.py
+          PYTHONPATH=scripts python scripts/test_gate_altcoin_units.py
+          PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
+          PYTHONPATH=scripts python scripts/test_gate_stage5a_pause.py
+          PYTHONPATH=scripts python scripts/test_analyze_gate_1645_fill_quality.py
+
+  replay:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        symbol: ['SOL_USDT', 'DOGE_USDT']
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Same-date four-model 50 minute pilot and fail-closed symbol checks
+        run: |
+          python -u scripts/run_gate_btc_origin_glft.py \
+            --symbol "${{ matrix.symbol }}" --day "${{ matrix.day }}" --minutes 50 \
+            --models glft,both_1p0,defensive_1p0,risk_side_pause \
+            --out "reports/altcoin/${{ matrix.symbol }}/pilot"
+      - name: Full UTC day after successful 50 minute GLFT fit
+        run: |
+          python -u scripts/run_gate_btc_origin_glft.py \
+            --symbol "${{ matrix.symbol }}" --day "${{ matrix.day }}" --minutes 1430 \
+            --models glft,both_1p0,defensive_1p0,risk_side_pause \
+            --out "reports/altcoin/${{ matrix.symbol }}/full_day"
+      - name: Preserve per-instrument full trade traces, quotes QA and failure reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-altcoin-${{ matrix.symbol }}-${{ matrix.day }}
+          path: reports/altcoin/${{ matrix.symbol }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+  summarize:
+    if: always()
+    needs: [unit, replay]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all available pilot/full-day results (including incomplete cases)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-altcoin-*
+          path: collected
+      - name: Explicitly preserve missing dates; compute only completed-day comparisons
+        run: |
+          python scripts/aggregate_gate_altcoin_results.py --root collected --out reports/gate_sol_doge_20261117
+      - name: Upload fee-inclusive and Markout comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-sol-doge-summary
+          path: reports/gate_sol_doge_20261117/
+          retention-days: 90
+          if-no-files-found: error
