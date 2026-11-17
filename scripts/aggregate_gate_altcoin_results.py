@@ -18,12 +18,27 @@ def summarize(root):
         if key in found:
             raise ValueError(f"Duplicate full-day result: {key}")
         found[key]=(path,data)
+    pilots = {}
+    for path in Path(root).rglob("*_50m.json"):
+        d=json.loads(path.read_text(encoding="utf-8"))
+        key=(d.get("gate_symbol"),d.get("day"))
+        if key[0] in SYMBOLS and key[1] in DAYS:
+            if key in pilots:
+                raise ValueError(f"Duplicate pilot result: {key}")
+            pilots[key]=d
     rows=[]
     for symbol in SYMBOLS:
         for day in DAYS:
             pair=(symbol,day)
             if pair not in found:
-                rows.append({"symbol":symbol,"day":day,"status":"missing_full_day"})
+                pilot=pilots.get(pair)
+                row={"symbol":symbol,"day":day,
+                     "status":("pilot_failed" if pilot and pilot.get("status")=="failed"
+                               else "missing_full_day")}
+                if pilot:
+                    row["pilot_status"]=pilot.get("status")
+                    row["error"]=pilot.get("error")
+                rows.append(row)
                 continue
             path,d=found[pair]
             row={"symbol":symbol,"day":day,"status":d.get("status"),
