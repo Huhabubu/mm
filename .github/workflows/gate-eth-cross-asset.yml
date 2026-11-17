@@ -1,0 +1,84 @@
+name: Gate ETH six-date four-model official HBT full-day replay
+on:
+  push:
+    branches:
+      - experiment/gate-eth-20261117
+    paths:
+      - .github/workflows/gate-eth-cross-asset.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify ETH contract units and unchanged Gate baseline
+        run: |
+          python -m compileall -q scripts/run_gate_btc_origin_glft.py scripts/qa_gate_btc_futures.py scripts/aggregate_gate_altcoin_results.py
+          PYTHONPATH=scripts python scripts/test_gate_altcoin_units.py
+          PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
+          PYTHONPATH=scripts python scripts/test_gate_stage5a_pause.py
+  replay:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: ETH four-model 50min official HBT pilot
+        run: |
+          python -u scripts/run_gate_btc_origin_glft.py \
+            --symbol ETH_USDT --day "${{ matrix.day }}" --minutes 50 \
+            --models glft,both_1p0,defensive_1p0,risk_side_pause \
+            --out "reports/eth/${{ matrix.day }}/pilot"
+      - name: ETH full UTC day after successful pilot
+        run: |
+          python -u scripts/run_gate_btc_origin_glft.py \
+            --symbol ETH_USDT --day "${{ matrix.day }}" --minutes 1430 \
+            --models glft,both_1p0,defensive_1p0,risk_side_pause \
+            --out "reports/eth/${{ matrix.day }}/full_day"
+      - name: Preserve ETH actual replay results and failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-${{ matrix.day }}
+          path: reports/eth/${{ matrix.day }}/
+          if-no-files-found: warn
+          retention-days: 90
+  summarize:
+    if: always()
+    needs: [unit,replay]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download available ETH day results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-eth-*
+          path: collected
+      - name: Summarize only completed fee-inclusive days
+        run: |
+          python scripts/aggregate_gate_altcoin_results.py \
+            --root collected --symbols ETH_USDT --out reports/gate_eth_20261117
+      - name: Upload ETH outcomes
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-summary
+          path: reports/gate_eth_20261117/
+          retention-days: 90
+          if-no-files-found: error
