@@ -36,11 +36,15 @@ REQUIRED = {
 UA = {"User-Agent": "mm-binance-gate-paper-qa/1.0"}
 
 
-def fetch_contract():
-    req = urllib.request.Request(GATE_API, headers=UA)
+def fetch_contract(symbol="BTC_USDT"):
+    """Read the current Gate direct USDT perpetual spec for this exact symbol."""
+    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT"):
+        raise ValueError(f"Unsupported Gate study symbol: {symbol}")
+    endpoint = f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{symbol}"
+    req = urllib.request.Request(endpoint, headers=UA)
     with urllib.request.urlopen(req, timeout=40) as stream:
         contract = json.load(stream)
-    if contract.get("name") != "BTC_USDT":
+    if contract.get("name") != symbol:
         raise ValueError("Gate API returned wrong contract")
     keys = ("name","type","quanto_multiplier","order_price_round","order_size_min",
             "order_size_max","maker_fee_rate","taker_fee_rate","config_change_time")
