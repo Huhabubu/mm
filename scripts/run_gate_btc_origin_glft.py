@@ -36,7 +36,8 @@ BINANCE_DELAY_MS=2.5
 UA={"User-Agent":"mm-gate-glft-btc-hbt/1.0"}
 
 
-def safe_gate_csv(kind, day, end_us, path, max_rows, symbol=GATE_SYMBOL, historical_tick=None):
+def safe_gate_csv(kind, day, end_us, path, max_rows, symbol=GATE_SYMBOL,
+                  historical_tick=None, historical_lot=None):
     """Stream losslessly into HBT Tardis CSV schema; no custom orderbook merge."""
     if kind not in SCHEMAS:
         raise ValueError(kind)
@@ -96,8 +97,10 @@ def safe_gate_csv(kind, day, end_us, path, max_rows, symbol=GATE_SYMBOL, histori
                             amt=float(row["amount"])
                             if not (math.isfinite(px) and px>0 and math.isfinite(amt) and amt>=0):
                                 metadata["invalid_rows"]+=1
-                            if kind=="trades" and abs(amt-round(amt))>1e-6:
-                                metadata["invalid_rows"]+=1
+                            if kind=="trades":
+                                unit = 1.0 if historical_lot is None else historical_lot
+                                if abs(amt/unit-round(amt/unit))>1e-6:
+                                    metadata["invalid_rows"]+=1
                         else:
                             bid=float(row["bid_price"]);ask=float(row["ask_price"])
                             if not (math.isfinite(bid) and math.isfinite(ask) and 0<bid<ask):
@@ -135,9 +138,9 @@ def safe_gate_csv(kind, day, end_us, path, max_rows, symbol=GATE_SYMBOL, histori
 
 def scenario(mid, spec):
     tick=float(spec["order_price_round"])
-    lot=int(spec["order_size_min"])
+    lot=float(spec["order_size_min"])
     ctval=float(spec["quanto_multiplier"])
-    if not (tick>0 and lot>=1 and ctval>0):
+    if not (tick>0 and lot>0 and ctval>0):
         raise ValueError("Invalid Gate contract")
     qty=max(lot,round(TARGET_NOTIONAL_USDT/(mid*ctval*lot))*lot)
     return {"tick":tick,"lot":lot,"ctval":ctval,"qty":float(qty),
@@ -145,7 +148,7 @@ def scenario(mid, spec):
             "gamma_code":RISK_AVERSION_PER_USDT*ctval*tick,
             "approx_order_notional_usdt":qty*ctval*mid,
             "tick_relative_bps":10_000*tick/mid,
-            "quantity_units":"Gate integer contracts",
+            "quantity_units":"Gate contract quantity; decimal lots when enabled",
             "gamma_units":"inverse (contract * price_tick)",
             "maker_fee_rate":0.0002,  # Gate BTC perpetual VIP0 research scenario; charge, no rebate.
             "taker_fee_rate":0.0005,
@@ -185,6 +188,8 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
     available["risk_side_pause"] = (1.0,3)
     chosen = (default_variants if selected_models is None else
               [(name,*available[name]) for name in selected_models])
+    if "glft" not in (name for name,_,_ in chosen):
+        raise ValueError("All comparisons require GLFT baseline")
     if not chosen or len(set(n for n,_,_ in chosen)) != len(chosen):
         raise ValueError("Invalid or repeated model selection")
     date=datetime.strptime(day,"%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -221,7 +226,9 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                     max_rows=90_000_000 if minutes==1430 else 6_000_000,
                     symbol=symbol,
                     historical_tick=(float(spec["order_price_round"])
-                                     if symbol!=GATE_SYMBOL else None))
+                                     if symbol!=GATE_SYMBOL else None),
+                    historical_lot=(float(spec["order_size_min"])
+                                    if symbol!=GATE_SYMBOL else None))
                 paths[kind]=path
             require_unshifted_target_clock(counts)
             report["feed_stats"]=counts
@@ -300,6 +307,9 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                              "binance_origin_activations","active_decisions",
                              "same_timestamp_ties_blocked"),counters)}
                     summary["quote_mode"]=name
+                    if symbol!=GATE_SYMBOL:
+                        summary["trading"]["end_mid_usdt_per_base"] = (
+                            summary["trading"].pop("end_mid_usdt_per_btc"))
                     records=rec.get(0)
                     if len(records)<minutes*600-20:
                         raise RuntimeError("Insufficient official Recorder samples")
