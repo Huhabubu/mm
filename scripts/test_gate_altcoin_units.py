@@ -84,6 +84,7 @@ def main():
     test_units("BTC_USDT",0.0001,0.1,1,80000)
     test_units("SOL_USDT",0.1,0.01,0.1,125)
     test_units("DOGE_USDT",10,0.00001,0.1,0.18)
+    test_units("ETH_USDT",0.01,0.01,1,3200)
     test_trade_unit_grid()
     print("GATE_ALTCOIN_UNITS_OK")
 
