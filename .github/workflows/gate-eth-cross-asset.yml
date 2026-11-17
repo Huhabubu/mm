@@ -5,6 +5,8 @@ on:
       - experiment/gate-eth-20261117
     paths:
       - .github/workflows/gate-eth-cross-asset.yml
+      - scripts/run_gate_btc_origin_glft.py
+      - scripts/qa_gate_btc_futures.py
   workflow_dispatch:
 permissions:
   contents: read
@@ -21,6 +23,7 @@ jobs:
       - name: Verify ETH contract units and unchanged Gate baseline
         run: |
           python -m compileall -q scripts/run_gate_btc_origin_glft.py scripts/qa_gate_btc_futures.py scripts/aggregate_gate_altcoin_results.py
+          python scripts/run_gate_btc_origin_glft.py --help | grep ETH_USDT
           PYTHONPATH=scripts python scripts/test_gate_altcoin_units.py
           PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
           PYTHONPATH=scripts python scripts/test_gate_stage5a_pause.py
