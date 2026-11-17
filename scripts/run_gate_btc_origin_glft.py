@@ -181,7 +181,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
     from hftbacktest import Recorder,ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
-    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT"):
+    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT", "ETH_USDT"):
         raise ValueError("Only studied Gate direct USDT perpetuals are supported")
     default_variants = variants()
     available = {name:(beta,mode) for name,beta,mode in default_variants}
