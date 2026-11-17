@@ -1,4 +1,4 @@
-"""Aggregate actual completed Gate SOL/DOGE paired HBT days; never fill missing with zero."""
+"""Aggregate actual completed Gate cross-asset paired HBT days; never fill missing with zero."""
 import argparse
 import json
 from collections import defaultdict
@@ -8,12 +8,12 @@ SYMBOLS=("SOL_USDT","DOGE_USDT")
 DAYS=tuple(f"2026-{month:02d}-01" for month in range(6,12))
 MODELS=("glft","both_1p0","defensive_1p0","risk_side_pause")
 
-def summarize(root):
+def summarize(root,symbols=SYMBOLS):
     found = {}
     for path in Path(root).rglob("*_1430m.json"):
         data=json.loads(path.read_text(encoding="utf-8"))
         key=(data.get("gate_symbol"),data.get("day"))
-        if key[0] not in SYMBOLS or key[1] not in DAYS:
+        if key[0] not in symbols or key[1] not in DAYS:
             continue
         if key in found:
             raise ValueError(f"Duplicate full-day result: {key}")
@@ -22,12 +22,12 @@ def summarize(root):
     for path in Path(root).rglob("*_50m.json"):
         d=json.loads(path.read_text(encoding="utf-8"))
         key=(d.get("gate_symbol"),d.get("day"))
-        if key[0] in SYMBOLS and key[1] in DAYS:
+        if key[0] in symbols and key[1] in DAYS:
             if key in pilots:
                 raise ValueError(f"Duplicate pilot result: {key}")
             pilots[key]=d
     rows=[]
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         for day in DAYS:
             pair=(symbol,day)
             if pair not in found:
@@ -78,10 +78,10 @@ def summarize(root):
             rows.append(row)
     return rows
 
-def write_summary(rows,out):
+def write_summary(rows,out,symbols=SYMBOLS):
     out=Path(out);out.mkdir(parents=True,exist_ok=True)
     (out/"per_day.json").write_text(json.dumps(rows,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
-    lines=["# Gate SOL/DOGE 六个历史月首日跨所回测","",
+    lines=["# Gate "+"/".join(s.replace("_USDT","") for s in symbols)+" 六个历史月首日跨所回测","",
            "统一设定：Binance 额外2.5ms、订单往返各1ms、同侧20ms、Maker +0.02%；",
            "每日期前10min预热、后1430min回测；严格只对完成的日期计算日均，失败/缺失记NA。","",
            "| 品种 | 日期 | 状态 | GLFT净收益 USDT | 双边β1净收益 USDT | 单侧暂停净收益 USDT | 双边相对改善 USDT |",
@@ -94,7 +94,7 @@ def write_summary(rows,out):
                          f'{m["risk_side_pause"]["net_usdt"]:.3f} | {row["delta_both_vs_glft_net_usdt"]:+.3f} |')
         else:
             lines.append(f'| {row["symbol"]} | {row["day"]} | {row["status"]} | NA | NA | NA | NA |')
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         valid=[x for x in rows if x["symbol"]==symbol and x["status"]=="complete"]
         lines+=["",f"## {symbol}: 完成 {len(valid)}/6 天"]
         if valid:
@@ -114,10 +114,14 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("--root",required=True)
     p.add_argument("--out",required=True)
+    p.add_argument("--symbols",default=",".join(SYMBOLS))
     a=p.parse_args()
-    rows=summarize(a.root)
-    write_summary(rows,a.out)
-    print("GATE_ALTCOIN_AGGREGATE",len([r for r in rows if r["status"]=="complete"]),"/12",flush=True)
+    symbols=tuple(s.strip() for s in a.symbols.split(","))
+    if not symbols or len(set(symbols))!=len(symbols) or any(s not in (*SYMBOLS,"ETH_USDT") for s in symbols):
+        raise ValueError("Invalid symbol selection")
+    rows=summarize(a.root,symbols)
+    write_summary(rows,a.out,symbols)
+    print("GATE_ALTCOIN_AGGREGATE",len([r for r in rows if r["status"]=="complete"]),f"/{len(symbols)*len(DAYS)}",flush=True)
 
 if __name__=="__main__":
     main()
