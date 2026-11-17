@@ -26,6 +26,7 @@ def test_contract_api_symbol():
         pass
     def fake(req, timeout=None):
         assert req.full_url.endswith("/contracts/SOL_USDT")
+        assert dict((k.lower(),v) for k,v in req.header_items())["x-gate-size-decimal"] == "1"
         import json
         return Handle(json.dumps(response).encode())
     with patch("qa_gate_btc_futures.urllib.request.urlopen", fake):
