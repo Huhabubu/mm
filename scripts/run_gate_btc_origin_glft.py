@@ -374,7 +374,7 @@ if __name__=="__main__":
     parser.add_argument("--day",required=True)
     parser.add_argument("--minutes",type=int,choices=(50,1430),default=50)
     parser.add_argument("--out",default="reports/gate_origin_glft")
-    parser.add_argument("--symbol",choices=("BTC_USDT","SOL_USDT","DOGE_USDT"),
+    parser.add_argument("--symbol",choices=("BTC_USDT","SOL_USDT","DOGE_USDT","ETH_USDT"),
                         default=GATE_SYMBOL)
     parser.add_argument("--models",default=None,
                         help="Comma-separated named variants; omitted retains BTC nine-model behavior")
