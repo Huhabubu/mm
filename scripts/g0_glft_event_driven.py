@@ -475,7 +475,7 @@ def run_event_glft(engine, binance_visible_ns, binance_mid, trade_steps,
 
 
 def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
-              order_qty=ORDER_QTY):
+              order_qty=ORDER_QTY, tail_tolerance_samples=5):
     """Aggregate only; no trades or raw market data leave the runner."""
     (samples, decisions, attempts, rejects, successes, initial_ok, updates,
      submits, cancels, buys, sells, fills, pos, max_pos, balance, fee,
@@ -487,7 +487,7 @@ def summarize(raw, minutes, rolling, beta=0.0, position_cap=POSITION_CAP,
         end = end[0]
     if initial_ok != 1 or successes < 1:
         raise RuntimeError("G0-R first 10 minutes cannot identify GLFT parameters")
-    if samples < TRAIN + minutes * 600 - 5:
+    if samples < TRAIN + minutes * 600 - tail_tolerance_samples:
         raise RuntimeError(f"Truncated market replay, samples={samples}")
     if fills != buys+sells or len(fill_ts) != fills:
         raise RuntimeError(f"Official fills and strategy accounting disagree: {fills} vs {buys+sells}")
