@@ -36,13 +36,13 @@ BINANCE_DELAY_MS=2.5
 UA={"User-Agent":"mm-gate-glft-btc-hbt/1.0"}
 
 
-def safe_gate_csv(kind, day, end_us, path, max_rows):
+def safe_gate_csv(kind, day, end_us, path, max_rows, symbol=GATE_SYMBOL, historical_tick=None):
     """Stream losslessly into HBT Tardis CSV schema; no custom orderbook merge."""
     if kind not in SCHEMAS:
         raise ValueError(kind)
     source_kind="quotes" if kind=="book_ticker" else kind
     y,m,d=day.split("-")
-    url=f"{ROOT}/{GATE_EXCHANGE}/{source_kind}/{y}/{m}/{d}/{GATE_SYMBOL}.csv.gz"
+    url=f"{ROOT}/{GATE_EXCHANGE}/{source_kind}/{y}/{m}/{d}/{symbol}.csv.gz"
     fields=SCHEMAS[kind]
     metadata={"rows":0,"snapshot_rows":0,"initial_snapshot_bid":0,
               "initial_snapshot_ask":0,"initial_snapshot_complete":False,
@@ -66,6 +66,8 @@ def safe_gate_csv(kind, day, end_us, path, max_rows):
                     writer=csv.DictWriter(dst,fieldnames=fields)
                     writer.writeheader()
                     for row in adapted:
+                        if symbol != GATE_SYMBOL and row.get("symbol") != symbol:
+                            raise ValueError(f"{kind}: unexpected Tardis symbol {row.get('symbol')}")
                         ts=int(row["local_timestamp"])
                         if ts>=end_us:
                             break
@@ -100,6 +102,15 @@ def safe_gate_csv(kind, day, end_us, path, max_rows):
                             bid=float(row["bid_price"]);ask=float(row["ask_price"])
                             if not (math.isfinite(bid) and math.isfinite(ask) and 0<bid<ask):
                                 metadata["invalid_rows"]+=1
+                        if historical_tick is not None:
+                            prices = ((float(row["price"]),)
+                                      if kind in ("trades", "incremental_book_L2")
+                                      else (float(row["bid_price"]), float(row["ask_price"])))
+                            if any(abs(px/historical_tick-round(px/historical_tick)) > 1e-5
+                                   for px in prices):
+                                raise ValueError(
+                                    f"{symbol} {day} {kind}: historical price incompatible "
+                                    f"with current tick={historical_tick}")
                         exchange_ts=int(row["timestamp"])
                         latency=ts-exchange_ts
                         if latency<0:
@@ -133,6 +144,9 @@ def scenario(mid, spec):
             "position_cap":float(qty*INVENTORY_MULTIPLE),
             "gamma_code":RISK_AVERSION_PER_USDT*ctval*tick,
             "approx_order_notional_usdt":qty*ctval*mid,
+            "tick_relative_bps":10_000*tick/mid,
+            "quantity_units":"Gate integer contracts",
+            "gamma_units":"inverse (contract * price_tick)",
             "maker_fee_rate":0.0002,  # Gate BTC perpetual VIP0 research scenario; charge, no rebate.
             "taker_fee_rate":0.0005,
             "api_maker_fee_rate":float(spec["maker_fee_rate"]),
@@ -159,10 +173,20 @@ def variants():
         for beta in (.25,.5,.75,1.)]
 
 
-def run(day, minutes=50, out="reports/gate_origin_glft"):
+def run(day, minutes=50, out="reports/gate_origin_glft",
+        symbol=GATE_SYMBOL, selected_models=None):
     from hftbacktest import Recorder,ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
+    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT"):
+        raise ValueError("Only studied Gate direct USDT perpetuals are supported")
+    default_variants = variants()
+    available = {name:(beta,mode) for name,beta,mode in default_variants}
+    available["risk_side_pause"] = (1.0,3)
+    chosen = (default_variants if selected_models is None else
+              [(name,*available[name]) for name in selected_models])
+    if not chosen or len(set(n for n,_,_ in chosen)) != len(chosen):
+        raise ValueError("Invalid or repeated model selection")
     date=datetime.strptime(day,"%Y-%m-%d").replace(tzinfo=timezone.utc)
     if date.day!=1 or minutes not in (50,1430):
         raise ValueError("Only first-of-month 50/1430 minute research runs supported")
@@ -173,7 +197,9 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
     out_path=Path(out)
     out_path.mkdir(parents=True,exist_ok=True)
     report_target=out_path/f"{day}_{minutes}m.json"
-    report={"day":day,"minutes_traded":minutes,"warmup_minutes":10,
+    report={"day":day,"gate_symbol":symbol,
+            "binance_symbol":symbol.replace("_",""),
+            "minutes_traded":minutes,"warmup_minutes":10,
             "baseline_window_seconds":600,"baseline_refit_seconds":5,
             "binance_extra_visible_delay_ms":BINANCE_DELAY_MS,
             "fee_inclusive_only":True,"status":"started",
@@ -182,21 +208,26 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
     try:
         with tempfile.TemporaryDirectory(prefix="mm_gate_origin_") as temp:
             root=Path(temp)
-            spec=fetch_contract()
+            spec=fetch_contract(symbol)
             if spec["type"]!="direct":
-                raise ValueError("Gate current contract not BTC direct USDT perpetual")
+                raise ValueError(f"Gate current contract not direct USDT perpetual: {symbol}")
             report["gate_current_contract"]=spec
             paths={};counts={}
             for kind in SCHEMAS:
                 path=root/f"{kind}.csv"
                 print("GATE_DOWNLOAD",day,kind,flush=True)
-                counts[kind]=safe_gate_csv(kind,day,end_us,path,
-                         max_rows=90_000_000 if minutes==1430 else 6_000_000)
+                counts[kind]=safe_gate_csv(
+                    kind,day,end_us,path,
+                    max_rows=90_000_000 if minutes==1430 else 6_000_000,
+                    symbol=symbol,
+                    historical_tick=(float(spec["order_price_round"])
+                                     if symbol!=GATE_SYMBOL else None))
                 paths[kind]=path
             require_unshifted_target_clock(counts)
             report["feed_stats"]=counts
             ot,om=load_gate_mid(paths["book_ticker"])
-            b_local,bm=read_binance_bbo(day,end_us,symbol="BTCUSDT")
+            b_local,bm=read_binance_bbo(
+                day,end_us,symbol=symbol.replace("_",""))
             bt=visible_timestamps(b_local,BINANCE_DELAY_MS)
             grid,basis,sigma,coverage=exact_moments_5s(
                 bt,bm,ot,om,trade_start*1000,trade_stop*1000)
@@ -209,6 +240,17 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
             if not len(pretrade):
                 raise RuntimeError("Missing Gate pretrade midpoint")
             cfg=scenario(float(np.median(pretrade)),spec)
+            if symbol!=GATE_SYMBOL:
+                binance_pre= bm[bt<trade_start*1000]
+                if not len(binance_pre):
+                    raise ValueError("Missing Binance pretrade BBO")
+                ratio=float(np.median(binance_pre)/np.median(pretrade))
+                if not 0.9<ratio<1.1:
+                    raise ValueError(f"Gate/Binance price-unit mismatch: {ratio}")
+                report["pretrade_binance_to_gate_price_ratio"]=ratio
+                if not 0.5*TARGET_NOTIONAL_USDT<=cfg["approx_order_notional_usdt"]<=1.5*TARGET_NOTIONAL_USDT:
+                    raise ValueError(
+                        f"Contract lot cannot match 80 USDT order: {cfg['approx_order_notional_usdt']}")
             report["scenario"]=cfg
             report["experimental_trigger_sigma_multiple"]=1.645
             report["fee_policy"]="VIP0_assumed_maker_plus_0.020pct_no_rebate"
@@ -232,12 +274,16 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
                 parts=[npz]
             low=float(np.min(om));high=float(np.max(om))
             tape_len=minutes*600+10
-            for name,beta,mode in variants():
+            for name,beta,mode in chosen:
                 print("GATE_MODEL_START",day,name,flush=True)
                 engine=ROIVectorMarketDepthBacktest([build_asset(parts,low,high,cfg)])
                 rec=Recorder(engine.num_assets,tape_len)
                 try:
-                    raw=run_gate_origin_glft(engine,bt,bm,minutes*600,
+                    strategy = run_gate_origin_glft
+                    if mode == 3:
+                        from gate_stage5a_pause_strategy import run_gate_stage5a_pause
+                        strategy = run_gate_stage5a_pause
+                    raw=strategy(engine,bt,bm,minutes*600,
                         beta,grid,basis,sigma,mode,cfg["gamma_code"],
                         cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
                         rec.recorder,trade_stop*1000 if minutes==1430 else 0)
@@ -270,6 +316,18 @@ def run(day, minutes=50, out="reports/gate_origin_glft"):
                         local_observed_ns=raw[-2][1],
                         exec_price=raw[-2][2],
                         exec_qty=raw[-2][3])
+                    if symbol!=GATE_SYMBOL:
+                        from analyze_gate_1645_fill_quality import model_day
+                        fill = {
+                            "exchange_timestamp_ns":raw[-5],
+                            "side":raw[-4],
+                            "local_observed_ns":raw[-2][1],
+                            "exec_price":raw[-2][2],
+                            "exec_qty":raw[-2][3],
+                        }
+                        _, quality = model_day(name,fill,{"trading":summary["trading"]},
+                                               ot,om,trade_stop*1000,cfg["ctval"])
+                        summary["quote_quality"]=quality
                     report["variants"][name]=summary
                     print("GATE_MODEL_OK",day,name,
                           "net_usdt",summary["trading"]["end_net_marked_equity_usdt"],
@@ -301,5 +359,10 @@ if __name__=="__main__":
     parser.add_argument("--day",required=True)
     parser.add_argument("--minutes",type=int,choices=(50,1430),default=50)
     parser.add_argument("--out",default="reports/gate_origin_glft")
+    parser.add_argument("--symbol",choices=("BTC_USDT","SOL_USDT","DOGE_USDT"),
+                        default=GATE_SYMBOL)
+    parser.add_argument("--models",default=None,
+                        help="Comma-separated named variants; omitted retains BTC nine-model behavior")
     args=parser.parse_args()
-    run(args.day,args.minutes,args.out)
+    selection=None if args.models is None else [s.strip() for s in args.models.split(",")]
+    run(args.day,args.minutes,args.out,args.symbol,selection)
