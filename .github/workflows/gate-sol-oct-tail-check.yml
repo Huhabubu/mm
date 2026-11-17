@@ -1,0 +1,50 @@
+name: Gate SOL October independent full-day replay tail tolerance check
+on:
+  push:
+    branches:
+      - experiment/gate-sol-doge-20261117
+    paths:
+      - .github/workflows/gate-sol-oct-tail-check.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  full-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify dimensional and model invariance unit tests
+        run: |
+          PYTHONPATH=scripts python scripts/test_gate_altcoin_units.py
+          PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
+      - name: Re-run SOL October full day with explicit maximum 1s UTC tail tolerance
+        run: |
+          python -u scripts/run_gate_btc_origin_glft.py \
+            --symbol SOL_USDT --day 2026-10-01 --minutes 1430 \
+            --models glft,both_1p0,defensive_1p0,risk_side_pause \
+            --out reports/gate_sol_oct_tail
+      - name: Require successful four-model replay and record measured tail
+        run: |
+          python - <<'PY'
+          import json
+          p="reports/gate_sol_oct_tail/2026-10-01_1430m.json"
+          x=json.load(open(p))
+          assert x["status"]=="complete" and len(x["variants"])==4
+          for name,v in x["variants"].items():
+              gap=v["end_of_day_missing_100ms_samples"]
+              assert 0<=gap<=10,(name,gap)
+              print("SOL_OCT_END_TAIL",name,gap,"100ms_samples")
+          PY
+      - name: Preserve official filled trades, recorder, markout, and tail audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-sol-oct-tail-2026-10-01
+          path: reports/gate_sol_oct_tail/
+          retention-days: 90
+          if-no-files-found: warn
