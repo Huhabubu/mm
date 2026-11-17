@@ -38,7 +38,7 @@ UA = {"User-Agent": "mm-binance-gate-paper-qa/1.0"}
 
 def fetch_contract(symbol="BTC_USDT"):
     """Read the current Gate direct USDT perpetual spec for this exact symbol."""
-    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT"):
+    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT", "ETH_USDT"):
         raise ValueError(f"Unsupported Gate study symbol: {symbol}")
     endpoint = f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{symbol}"
     headers = dict(UA)
