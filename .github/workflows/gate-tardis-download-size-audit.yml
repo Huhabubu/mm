@@ -1,4 +1,4 @@
-name: Tardis raw daily compressed archive size HEAD audit
+name: Tardis raw daily compressed archive size header audit
 on:
   push:
     branches:
@@ -28,14 +28,14 @@ jobs:
               paths+=[f'binance-futures/book_ticker/2026/06/01/{coin}USDT.csv.gz']
               total=0
               for path in paths:
-                  req=Request(f'{base}/{path}',method='HEAD',
+                  req=Request(f'{base}/{path}',method='GET',
                               headers={'User-Agent':'mm-gate-tardis-daily-size-audit/1.0'})
                   try:
                       with urlopen(req,timeout=35) as resp:
                           n=resp.headers.get('Content-Length')
-                          print('ARCHIVE_HEAD',coin,path,'http',resp.status,'bytes',n,flush=True)
+                          print('ARCHIVE_HEADER',coin,path,'http',resp.status,'bytes',n,'transfer',resp.headers.get('Transfer-Encoding'),flush=True)
                           if n: total+=int(n)
                   except (HTTPError,OSError) as e:
-                      print('ARCHIVE_HEAD_ERROR',coin,path,repr(e),flush=True)
+                      print('ARCHIVE_HEADER_ERROR',coin,path,repr(e),flush=True)
               print('ARCHIVE_TOTAL_KNOWN_BYTES',coin,total,flush=True)
           PY
