@@ -83,11 +83,21 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("post_only_clamp_mode must be legacy or unified")
     if forced_start_ns < 0:
         raise ValueError("forced_start_ns cannot be negative")
+    if diagnostics is not None and len(diagnostics)<7:
+        raise ValueError("Seven diagnostic slots required")
+    if fit_mode == "physical_1tick_poisson" and diagnostics is None:
+        raise ValueError("Physical estimator requires diagnostic start/coverage output")
     if wait_book_after_fill:
         if gate_book_local_ns is None or gate_book_exchange_ns is None:
             raise ValueError("Market sync requires explicit causal Gate BBO update clocks")
         if len(gate_book_local_ns) != len(gate_book_exchange_ns):
             raise ValueError("Mismatch in Gate BBO local/exchange update clocks")
+        if len(gate_book_local_ns)==0:
+            raise ValueError("Empty Gate BBO update clocks")
+        for jj in range(len(gate_book_local_ns)):
+            if (gate_book_exchange_ns[jj]>gate_book_local_ns[jj]
+                    or (jj>0 and gate_book_local_ns[jj]<gate_book_local_ns[jj-1])):
+                raise ValueError("Invalid Gate BBO update clock order")
     if cap_depth_at_visible_levels and not depth_is_20_level_snapshot:
         raise ValueError("20-level boundary cap requires verified 20-level snapshot source")
     if (len(basis_grid_ns) != len(basis_values) or
@@ -135,6 +145,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     resting_bid_ns = resting_ask_ns = 0
     last_resting_check_ns = t0
     prior_bid_resting = prior_ask_resting = False
+    # Local confirmation lower bounds for HBT resting exposure.
+    # Pending submit/cancel packet exchange-side state is not fully observable here.
     submits = cancels = buy_fills = sell_fills = decisions = 0
     okx_feed_events = order_reply_events = binance_events = 0
     observed_binance = 0.0
@@ -197,6 +209,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         if probe_ns is not None and probe_idx < n_probes:
             if probe_ns[probe_idx] >= now:
                 due = min(due, probe_ns[probe_idx])
+        if wait_book_after_fill and awaiting_market_sync and book_idx < len(gate_book_local_ns):
+            due = min(due, max(now, gate_book_local_ns[book_idx]))
         feed_status = 0
         if due > now:
             # Relative timeout in nanoseconds: do NOT pass an epoch timestamp.
@@ -213,6 +227,34 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             elif feed_status != 0:
                 raise ValueError("Unexpected HBT event status")
 
+        if diagnostics is not None and now > last_resting_check_ns:
+            elapsed = now-last_resting_check_ns
+            if prior_bid_resting:
+                resting_bid_ns += elapsed
+            if prior_ask_resting:
+                resting_ask_ns += elapsed
+            last_resting_check_ns = now
+            current_bid_resting = current_ask_resting = False
+            view = engine.orders(0).values()
+            while view.has_next():
+                current_order = view.get()
+                # Locally cancellable = confirmed open HBT order, conservative proxy.
+                if current_order.cancellable:
+                    if current_order.side == BUY:
+                        current_bid_resting = True
+                    elif current_order.side == SELL:
+                        current_ask_resting = True
+            prior_bid_resting = current_bid_resting
+            prior_ask_resting = current_ask_resting
+        # Consume separately timestamped real Gate BBO updates. A trade-only
+        # feed_status==2 is insufficient to release the private-fill lock.
+        if wait_book_after_fill:
+            while book_idx < len(gate_book_local_ns) and gate_book_local_ns[book_idx] <= now:
+                if awaiting_market_sync and book_update_unlocks(
+                        last_fill_exchange_ns,last_fill_observed_ns,
+                        gate_book_exchange_ns[book_idx],gate_book_local_ns[book_idx]):
+                    awaiting_market_sync = False
+                book_idx += 1
         # HBT has already consumed all its events at this timestamp.
         # External rows at same timestamp are consumed IN ORIGINAL ROW ORDER.
         signal_event = False
@@ -394,11 +436,23 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                         buy_fills += 1
                     else:
                         sell_fills += 1
+            if wait_book_after_fill and feed_status == 3:
+                latest_position = engine.position(0)
+                if latest_position != last_observed_position:
+                    awaiting_market_sync = True
+                    last_fill_observed_ns = now
+                    if n_fills == 0:
+                        raise ValueError("Private fill changed position without HBT FILLED trace")
+                    last_fill_exchange_ns = fill_ts_ns[n_fills-1]
+                last_observed_position = latest_position
             engine.clear_inactive_orders(0)
             if now >= t_stop or not np.isfinite(half):
                 continue
             if forced_start_ns > 0 and now < forced_start_ns:
                 continue
+            if (forced_start_ns > 0 and now >= forced_start_ns and
+                    not np.isfinite(half)):
+                raise ValueError("Forced shared start has no valid GLFT calibration")
 
             book = engine.depth(0)
             bid, ask = book.best_bid_tick, book.best_ask_tick
@@ -483,6 +537,9 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     if (order.cancellable and (pause_buy or order.price_tick != want_bid) and
                             now - bid_action >= min_requote_ns):
                         engine.cancel(0, order.order_id, False)
+                        if diagnostics is not None:
+                            op_head,op_tail,max_ops = note_order_operation(
+                                op_times,op_head,op_tail,now,max_ops)
                         bid_action = now
                         cancels += 1
                 elif order.side == SELL:
@@ -490,18 +547,29 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     if (order.cancellable and (pause_sell or order.price_tick != want_ask) and
                             now - ask_action >= min_requote_ns):
                         engine.cancel(0, order.order_id, False)
+                        if diagnostics is not None:
+                            op_head,op_tail,max_ops = note_order_operation(
+                                op_times,op_head,op_tail,now,max_ops)
                         ask_action = now
                         cancels += 1
-            if (not pause_buy and not has_bid and pos + order_qty <= position_cap + 1e-9 and
+            if (not pause_buy and not awaiting_market_sync and not has_bid and
+                    pos + order_qty <= position_cap + 1e-9 and
                     now - bid_action >= min_requote_ns):
                 oid = int(want_bid) * 2
                 engine.submit_buy_order(0, oid, want_bid*tick_size, order_qty, GTX, LIMIT, False)
+                if diagnostics is not None:
+                    op_head,op_tail,max_ops = note_order_operation(
+                        op_times,op_head,op_tail,now,max_ops)
                 bid_action = now
                 submits += 1
-            if (not pause_sell and not has_ask and pos - order_qty >= -position_cap - 1e-9 and
+            if (not pause_sell and not awaiting_market_sync and not has_ask and
+                    pos - order_qty >= -position_cap - 1e-9 and
                     now - ask_action >= min_requote_ns):
                 oid = int(want_ask) * 2 + 1
                 engine.submit_sell_order(0, oid, want_ask*tick_size, order_qty, GTX, LIMIT, False)
+                if diagnostics is not None:
+                    op_head,op_tail,max_ops = note_order_operation(
+                        op_times,op_head,op_tail,now,max_ops)
                 ask_action = now
                 submits += 1
             decisions += 1
@@ -524,6 +592,19 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 buy_fills += 1
             else:
                 sell_fills += 1
+    if diagnostics is not None:
+        # Denominator is the observed post-warmup trading session, not pretrade.
+        begin = t0+TRAIN*STEP_NS
+        if forced_start_ns > 0:
+            begin = max(begin,forced_start_ns)
+        duration=max(1,now-begin)
+        diagnostics[0] = max_ops
+        diagnostics[1] = resting_bid_ns/duration
+        diagnostics[2] = resting_ask_ns/duration
+        diagnostics[3] = first_fit_ns
+        diagnostics[4] = max(0,first_fit_ns-(t0+TRAIN*STEP_NS))
+        diagnostics[5] = 1 if first_fit_ns >= 0 else 0
+        diagnostics[6] = 1 if awaiting_market_sync else 0
     final = engine.state_values(0)
     book = engine.depth(0)
     final_mid = (book.best_bid + book.best_ask) / 2.0
