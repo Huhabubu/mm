@@ -9,7 +9,11 @@ import numpy as np
 from numba import njit
 from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
 from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TICK, TRAIN
-from g0_glft_rolling import UPDATE_EVERY_STEPS, fit_recent_arrivals, glft_coefficients
+from g0_glft_rolling import (UPDATE_EVERY_STEPS, fit_recent_arrivals,
+                             fit_physical_1tick_poisson, glft_coefficients)
+from core_glft_rules import (quoted_ticks, last_visible_bid_tick,
+    last_visible_ask_tick, cap_quotes_to_visible_depth,
+    book_update_unlocks, note_order_operation)
 from g0_glft_event_driven import MIN_REQUOTE_NS, summarize
 @njit
 def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
@@ -50,7 +54,16 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                          order_qty=ORDER_QTY, position_cap=POSITION_CAP,
                          recorder=None, stop_at_ns=0, probe_ns=None, shadow_gate=False,
                          control_kind=0, extra_half_ticks=0.0,
-                         local_sigma_ceiling=np.inf):
+                         local_sigma_ceiling=np.inf,
+                         min_requote_ns=MIN_REQUOTE_NS,
+                         fit_mode="legacy_half_tick",
+                         wait_book_after_fill=False,
+                         post_only_clamp_mode="legacy",
+                         cap_depth_at_visible_levels=False,
+                         forced_start_ns=0,
+                         gate_book_local_ns=None, gate_book_exchange_ns=None,
+                         depth_is_20_level_snapshot=False,
+                         diagnostics=None):
     """Two sigma gates + Binance-origin anchor; HBT retains all matching/queues."""
     if not np.isfinite(beta) or beta < 0 or beta > 1:
         raise ValueError("Invalid beta")
@@ -62,6 +75,21 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("Bad Stage4 widening offset")
     if local_sigma_ceiling <= 0 or np.isnan(local_sigma_ceiling):
         raise ValueError("Bad Gate sigma pause threshold")
+    if min_requote_ns not in (0,20_000_000):
+        raise ValueError("min_requote_ns must be 0 or 20_000_000")
+    if fit_mode not in ("legacy_half_tick","physical_1tick_poisson"):
+        raise ValueError("Unknown GLFT fit_mode")
+    if post_only_clamp_mode not in ("legacy","unified"):
+        raise ValueError("post_only_clamp_mode must be legacy or unified")
+    if forced_start_ns < 0:
+        raise ValueError("forced_start_ns cannot be negative")
+    if wait_book_after_fill:
+        if gate_book_local_ns is None or gate_book_exchange_ns is None:
+            raise ValueError("Market sync requires explicit causal Gate BBO update clocks")
+        if len(gate_book_local_ns) != len(gate_book_exchange_ns):
+            raise ValueError("Mismatch in Gate BBO local/exchange update clocks")
+    if cap_depth_at_visible_levels and not depth_is_20_level_snapshot:
+        raise ValueError("20-level boundary cap requires verified 20-level snapshot source")
     if (len(basis_grid_ns) != len(basis_values) or
             len(basis_values) != len(basis_sigmas)):
         raise ValueError("Basis and sigma lengths mismatch")
@@ -82,13 +110,31 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         idx += 1
 
     arrivals = np.full(TRAIN, np.nan, np.float64)
+    bid_arrivals = np.full(TRAIN, np.nan, np.float64)
+    ask_arrivals = np.full(TRAIN, np.nan, np.float64)
     changes = np.full(TRAIN, np.nan, np.float64)
     updates = np.full((1 + trade_steps // UPDATE_EVERY_STEPS + 2, 9), np.nan)
     n_updates = 0
     prev_mid = np.nan
     a = k = sigma = half = skew = np.nan
     attempts = rejects = successes = initial_ok = 0
-    bid_action = ask_action = t0 - MIN_REQUOTE_NS
+    bid_action = ask_action = t0 - min_requote_ns
+    first_fit_ns = -1
+    awaiting_market_sync = False
+    last_fill_exchange_ns = -1
+    last_fill_observed_ns = -1
+    last_observed_position = engine.position(0)
+    book_idx = 0
+    if gate_book_local_ns is not None:
+        while book_idx < len(gate_book_local_ns) and gate_book_local_ns[book_idx] <= t0:
+            book_idx += 1
+    if forced_start_ns and forced_start_ns < t0 + TRAIN*STEP_NS:
+        raise ValueError("forced_start_ns before 10min training")
+    op_times = np.empty(100_000 if diagnostics is not None else 1,np.int64)
+    op_head = op_tail = max_ops = 0
+    resting_bid_ns = resting_ask_ns = 0
+    last_resting_check_ns = t0
+    prior_bid_resting = prior_ask_resting = False
     submits = cancels = buy_fills = sell_fills = decisions = 0
     okx_feed_events = order_reply_events = binance_events = 0
     observed_binance = 0.0
@@ -124,7 +170,7 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     # Retain short-window allocation; cap long-day traces to avoid O(day_length)
     # preallocation (a full-day upper bound would consume ~170MB per model).
     # Existing FILLED observations still fail loudly if this cap is reached.
-    fill_limit = min(max(2 * (trade_steps * STEP_NS // MIN_REQUOTE_NS) + 10, 100),
+    fill_limit = min(max(2 * (trade_steps * STEP_NS // max(1_000_000, min_requote_ns)) + 10, 100),
                      100_000)
     fill_ts_ns = np.empty(fill_limit, np.int64)
     fill_sides = np.empty(fill_limit, np.int64)
@@ -191,15 +237,20 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 raise ValueError("Sample clock skipped an exact 100ms boundary")
             slot = sample_count % TRAIN
             furthest = -np.inf
+            bid_furthest = ask_furthest = -np.inf
             if np.isfinite(prev_mid):
                 for tr in engine.last_trades(0):
                     price_tick = tr.px / tick_size
                     if tr.ev & BUY_EVENT == BUY_EVENT:
                         furthest = max(furthest, price_tick - prev_mid)
+                        ask_furthest = max(ask_furthest, price_tick - prev_mid)
                     else:
                         furthest = max(furthest, prev_mid - price_tick)
+                        bid_furthest = max(bid_furthest, prev_mid - price_tick)
             engine.clear_last_trades(0)
             arrivals[slot] = furthest
+            bid_arrivals[slot] = bid_furthest
+            ask_arrivals[slot] = ask_furthest
             book = engine.depth(0)
             best_bid, best_ask = book.best_bid_tick, book.best_ask_tick
             if best_bid > 0 and best_ask > best_bid and best_ask < 1_000_000_000:
@@ -218,16 +269,22 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                             (sample_count - TRAIN) % UPDATE_EVERY_STEPS == 0))
             if recalibrate:
                 attempts += 1
-                valid, new_a, new_k, new_sigma, fit_levels, crossed, extreme = (
-                    fit_recent_arrivals(arrivals, changes))
+                if fit_mode == "legacy_half_tick":
+                    valid, new_a, new_k, new_sigma, fit_levels, crossed, extreme = (
+                        fit_recent_arrivals(arrivals, changes))
+                else:
+                    valid, new_a, new_k, new_sigma, fit_levels, crossed, extreme = (
+                        fit_physical_1tick_poisson(bid_arrivals, ask_arrivals, changes))
                 if valid:
                     new_half, new_skew = glft_coefficients(new_a, new_k, new_sigma, gamma_code, order_qty)
                     if np.isfinite(new_half) and np.isfinite(new_skew) and new_half > 0 and new_skew > 0:
                         a, k, sigma, half, skew = (
                             new_a, new_k, new_sigma, new_half, new_skew)
                         successes += 1
-                        if sample_count == TRAIN:
+                        if sample_count == TRAIN or fit_mode == "physical_1tick_poisson":
                             initial_ok = 1
+                        if first_fit_ns < 0:
+                            first_fit_ns = now
                         updates[n_updates, 0] = (sample_count - TRAIN) * STEP_NS / 1e9
                         updates[n_updates, 1] = a
                         updates[n_updates, 2] = k
@@ -340,6 +397,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             engine.clear_inactive_orders(0)
             if now >= t_stop or not np.isfinite(half):
                 continue
+            if forced_start_ns > 0 and now < forced_start_ns:
+                continue
 
             book = engine.depth(0)
             bid, ask = book.best_bid_tick, book.best_ask_tick
@@ -351,7 +410,10 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             # The 600s time-weighted normal spread/sigma were published at 5s
             # deadlines and read strictly before this decision timestamp.
             shift_ticks = 0.0
-            if (beta > 0.0 or shadow_gate) and np.isfinite(latest_binance):
+            binance_is_fresh = (fit_mode == "legacy_half_tick" or
+                                (latest_binance_ns >= 0 and
+                                 0 <= now-latest_binance_ns <= 250_000_000))
+            if (beta > 0.0 or shadow_gate) and np.isfinite(latest_binance) and binance_is_fresh:
                 gi = np.searchsorted(basis_grid_ns, now, side="left") - 1
                 if gi >= 0 and np.isfinite(basis_values[gi]) and (
                         np.isfinite(basis_sigmas[gi]) and basis_sigmas[gi] > 0.0):
@@ -384,12 +446,11 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     last_shadow_effective = 0.0
                     last_shadow_above = 0
                     last_shadow_dominant = 0
-            reservation = mid - skew * pos
             widened_half = half + extra_half_ticks if control_kind == 1 else half
-            base_bid = min(round(reservation - widened_half), bid)
-            base_ask = max(round(reservation + widened_half), ask)
+            base_bid, base_ask, want_bid, want_ask = quoted_ticks(
+                mid, pos, skew, widened_half, bid, ask, beta, shift_ticks,
+                quote_mode, post_only_clamp_mode)
             vol_pause = control_kind == 2 and sigma > local_sigma_ceiling
-            want_bid, want_ask = base_bid, base_ask
             # Read-only counterfactual quote for the actual baseline inventory.
             # Its value is never used in submit or cancel below.
             last_shadow_bid_target = base_bid
@@ -398,21 +459,17 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 so = last_shadow_effective / tick_size
                 last_shadow_bid_target = min(round(base_bid + so), ask - 1)
                 last_shadow_ask_target = max(round(base_ask + so), bid + 1)
-            if shift_ticks != 0.0:
-                offset = beta * shift_ticks
-                if quote_mode == 1:
-                    # Improve inside spread only while strictly post-only.
-                    want_bid = min(round(base_bid + offset), ask - 1)
-                    want_ask = max(round(base_ask + offset), bid + 1)
-                elif quote_mode == 2:
-                    if shift_ticks > 0:
-                        want_ask = max(round(base_ask + offset), bid + 1)
-                    else:
-                        want_bid = min(round(base_bid + offset), ask - 1)
             pause_buy = quote_mode == 3 and shift_ticks < 0.0
             pause_sell = quote_mode == 3 and shift_ticks > 0.0
             pause_buy = pause_buy or vol_pause
             pause_sell = pause_sell or vol_pause
+            if cap_depth_at_visible_levels:
+                edge_bid = last_visible_bid_tick(
+                    book.bid_depth,book.roi_lb_tick,bid,20)
+                edge_ask = last_visible_ask_tick(
+                    book.ask_depth,book.roi_lb_tick,book.roi_ub_tick,ask,20)
+                want_bid,want_ask = cap_quotes_to_visible_depth(
+                    want_bid,want_ask,edge_bid,edge_ask,bid,ask)
             if want_bid >= want_ask:
                 raise ValueError("Proposed self-crossed quote prices")
             # One side may be pending cancellation; no replacement until cleared.
@@ -424,25 +481,25 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 if order.side == BUY:
                     has_bid = True
                     if (order.cancellable and (pause_buy or order.price_tick != want_bid) and
-                            now - bid_action >= MIN_REQUOTE_NS):
+                            now - bid_action >= min_requote_ns):
                         engine.cancel(0, order.order_id, False)
                         bid_action = now
                         cancels += 1
                 elif order.side == SELL:
                     has_ask = True
                     if (order.cancellable and (pause_sell or order.price_tick != want_ask) and
-                            now - ask_action >= MIN_REQUOTE_NS):
+                            now - ask_action >= min_requote_ns):
                         engine.cancel(0, order.order_id, False)
                         ask_action = now
                         cancels += 1
             if (not pause_buy and not has_bid and pos + order_qty <= position_cap + 1e-9 and
-                    now - bid_action >= MIN_REQUOTE_NS):
+                    now - bid_action >= min_requote_ns):
                 oid = int(want_bid) * 2
                 engine.submit_buy_order(0, oid, want_bid*tick_size, order_qty, GTX, LIMIT, False)
                 bid_action = now
                 submits += 1
             if (not pause_sell and not has_ask and pos - order_qty >= -position_cap - 1e-9 and
-                    now - ask_action >= MIN_REQUOTE_NS):
+                    now - ask_action >= min_requote_ns):
                 oid = int(want_ask) * 2 + 1
                 engine.submit_sell_order(0, oid, want_ask*tick_size, order_qty, GTX, LIMIT, False)
                 ask_action = now
