@@ -133,17 +133,32 @@ def run_one(day="2026-11-01",minutes=50,trace_actions=False):
             if trace_actions:
                 if not np.array_equal(traces[0],traces[1]):
                     left,right=traces
-                    different = len(left) != len(right)
-                    upto = min(len(left),len(right))
-                    locations = np.flatnonzero(np.any(left[:upto] != right[:upto],axis=1))
-                    first = int(locations[0]) if len(locations) else upto
-                    print("ACTION_TRACE_FIRST_MISMATCH",day,beta,mode,
-                          "old_count",len(left),"core_count",len(right),
-                          "first",first,
-                          "old_window",left[max(0,first-3):first+4].tolist(),
-                          "core_window",right[max(0,first-3):first+4].tolist(),flush=True)
-                    raise AssertionError(
-                        f"Exact request sequence mismatch: {day} beta={beta} mode={mode}")
+                    if len(left)!=len(right):
+                        raise AssertionError("Unequal number of exact order requests")
+                    # Rust HashMap iteration is not ordered: independent HBT
+                    # instances can issue concurrent cancels in either order.
+                    # Preserve EVERY request's nanosecond, verb, ID and price.
+                    # Normalize ONLY the permutation inside a single timestamp.
+                    def normalize(x):
+                        order=np.lexsort((x[:,3],x[:,2],x[:,1],x[:,0]))
+                        return x[order]
+                    norm_old,norm_new=normalize(left),normalize(right)
+                    if not np.array_equal(norm_old,norm_new):
+                        ix=np.flatnonzero(np.any(norm_old!=norm_new,axis=1))
+                        at=int(ix[0]) if len(ix) else -1
+                        print("ACTION_REQUEST_CONTENT_DIVERGENCE",
+                              day,beta,mode,"index",at,
+                              "old",norm_old[at].tolist() if at>=0 else None,
+                              "core",norm_new[at].tolist() if at>=0 else None,
+                              flush=True)
+                        raise AssertionError("Order request content differs at exact timestamp")
+                    print("CORE_LEGACY_SAME_NANOSECOND_REQUEST_PERMUTATION",
+                          day,beta,mode,
+                          "position_differences",int(np.sum(np.any(left!=right,axis=1))),
+                          "request_count",len(left),flush=True)
+                else:
+                    print("CORE_LEGACY_REQUEST_SEQUENCE_IDENTICAL",
+                          day,beta,mode,len(traces[0]),flush=True)
                 self_count = len(traces[0])
                 if self_count != values[0][0][7] + values[0][0][8]:
                     raise AssertionError("Request trace misses a submit/cancel action")
