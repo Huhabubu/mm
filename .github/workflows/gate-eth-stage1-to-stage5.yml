@@ -1,0 +1,342 @@
+name: Gate ETH staged 1-5 audit and controlled HBT evidence
+on:
+  push:
+    branches:
+      - experiment/gate-eth-20261117
+    paths:
+      - .github/workflows/gate-eth-stage1-to-stage5.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  stage12:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Stage1 and Stage2 regression tests
+        run: |
+          PYTHONPATH=scripts python scripts/test_analyze_gate_1645_stage1.py
+          PYTHONPATH=scripts python scripts/test_analyze_gate_1645_fill_quality.py
+      - name: Read immutable ETH full-day results, six days, never BTC
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 44114624542
+          pattern: gate-eth-2026-*
+          path: frozen_raw
+          github-token: ${{ github.token }}
+      - name: Verify six frozen symbols, create compatible Stage1 zip inputs
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile,ZIP_DEFLATED
+          import json
+          root=Path('frozen_raw')
+          dest=Path('frozen_zip')
+          dest.mkdir(exist_ok=True)
+          for m in range(6,12):
+              day=f'2026-{m:02d}-01'
+              base=root/f'gate-eth-{day}'/'full_day'
+              f=base/f'{day}_1430m.json'
+              r=json.loads(f.read_text())
+              assert (r['status']=='complete' and r['gate_symbol']=='ETH_USDT'
+                      and r['binance_symbol']=='ETHUSDT' and r['minutes_traded']==1430), day
+              with ZipFile(dest/f'gate-{day}.zip','w',ZIP_DEFLATED,compresslevel=1) as z:
+                  for p in base.rglob('*'):
+                      if p.is_file():
+                          z.write(p,p.relative_to(base))
+          print('ETH_FROZEN_SIX_DAYS_IDENTITY_OK',flush=True)
+          PY
+      - name: Stage1 exact recorder/fill equity accounting and Stage2 100/500/1000ms markout
+        run: |
+          python scripts/analyze_gate_1645_stage1.py --input frozen_zip --out stage12_output/stage1
+          for month in 06 07 08 09 10 11; do
+            day="2026-${month}-01"
+            python -u scripts/analyze_gate_1645_fill_quality.py --mode day \
+              --symbol ETH_USDT --day "$day" \
+              --case-dir "frozen_raw/gate-eth-$day/full_day" \
+              --out "stage12_output/stage2_daily/$day"
+          done
+          python scripts/analyze_gate_1645_fill_quality.py --mode aggregate \
+             --input stage12_output/stage2_daily --out stage12_output/stage2/aggregate
+          python scripts/aggregate_gate_eth_stage5a.py \
+             --root frozen_raw --out stage12_output/stage5a
+      - name: Preserve independent stage1/2 and frozen four-mode stage5a evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-stage12-stage5a
+          path: stage12_output/
+          if-no-files-found: warn
+          retention-days: 90
+
+  stage4_train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Isolated GLFT and controls unit tests
+        run: |
+          PYTHONPATH=scripts python scripts/test_gate_stage4_controls.py
+          PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
+      - name: Fit ETH-only May 01 control parameters with no evaluation-date tuning
+        run: |
+          python -u scripts/run_gate_stage4_controls.py --mode train \
+            --symbol ETH_USDT --day 2026-05-01 --out eth_may_lock
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-eth-may-prelock
+          path: eth_may_lock/
+          if-no-files-found: warn
+          retention-days: 90
+
+  stage3:
+    needs: stage12
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Exact fill parity and cancellation deadline tests
+        run: |
+          PYTHONPATH=scripts python scripts/test_audit_gate_1645_stage3_shadow.py
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44114624542
+          name: gate-eth-${{ matrix.day }}
+          path: frozen_download
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-eth-stage12-stage5a
+          path: stage12
+      - name: Stage3 ETH shadow signal, compare every official fill and PnL against frozen
+        run: |
+          mkdir -p frozen
+          cp -a frozen_download/full_day/. frozen/
+          python -u scripts/audit_gate_1645_stage3_shadow.py --symbol ETH_USDT \
+            --day '${{ matrix.day }}' --frozen frozen \
+            --annotated 'stage12/stage2_daily/${{ matrix.day }}' \
+            --out 'stage3_out/${{ matrix.day }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-eth-stage3-${{ matrix.day }}
+          path: stage3_out/${{ matrix.day }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+  stage4_eval:
+    needs: [stage12,stage4_train]
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-eth-may-prelock
+          path: locked
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44114624542
+          name: gate-eth-${{ matrix.day }}
+          path: frozen_download
+          github-token: ${{ github.token }}
+      - name: Stage4 two ETH May-locked direction-free controls on official full-day replay
+        run: |
+          mkdir -p frozen
+          cp -a frozen_download/full_day/. frozen/
+          python -u scripts/run_gate_stage4_controls.py --mode eval \
+            --symbol ETH_USDT --day '${{ matrix.day }}' \
+            --lock locked/stage4_train_lock.json --frozen frozen \
+            --out 'stage4_out/${{ matrix.day }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-eth-stage4-${{ matrix.day }}
+          path: stage4_out/${{ matrix.day }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+  stage3_aggregate:
+    needs: stage3
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-eth-stage3-2026-*
+          path: stage3_all
+      - run: |
+          python scripts/aggregate_gate_1645_stage3.py \
+            --input stage3_all --out results/stage3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-stage3-summary
+          path: results/stage3/
+          if-no-files-found: error
+          retention-days: 90
+
+  stage4_aggregate:
+    needs: stage4_eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-eth-stage4-2026-*
+          path: stage4_all
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-eth-may-prelock
+          path: locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-eth-stage12-stage5a
+          path: stage12
+      - name: Report true May-matched turnover and check all six ETH controls
+        run: |
+          python scripts/aggregate_gate_stage4_controls.py \
+            --daily stage4_all --lock locked/stage4_train_lock.json \
+            --stage2 stage12/stage2/aggregate/per_day_quality.csv \
+            --out results/stage4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-stage4-summary
+          path: results/stage4/
+          if-no-files-found: error
+          retention-days: 90
+
+  stage5b:
+    needs: [stage3_aggregate,stage4_aggregate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-eth-stage3-2026-*
+          path: stage3_all
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-eth-stage12-stage5a
+          path: stage12
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-eth-stage4-summary
+          path: stage4
+      - name: Match same-fill categories and Stage4 ledger; construct exact input zips
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          dst=Path("stage5b_input")
+          dst.mkdir(exist_ok=True)
+          with ZipFile(dst/"shadow.zip","w",ZIP_DEFLATED) as z3:
+              for m in range(6,12):
+                  day=f"2026-{m:02d}-01"
+                  files=list(Path("stage3_all").rglob(day+"_stage3_classified.npz"))
+                  assert len(files)==1,(day,files)
+                  z3.write(files[0],f"daily/{day}/{day}_stage3_classified.npz")
+          for m in range(6,12):
+              day=f"2026-{m:02d}-01"
+              path=Path("stage12")/"stage2_daily"/day/(day+"_glft_annotated.npz")
+              assert path.is_file(),path
+              with ZipFile(dst/f"gate_stage2_verified_{m:02d}.zip","w",ZIP_DEFLATED) as z2:
+                  z2.write(path,day+"_glft_annotated.npz")
+          PY
+          python scripts/audit_gate_stage5b_same_fill.py \
+            --stage3-zip stage5b_input/shadow.zip \
+            --stage2-dir stage5b_input \
+            --stage4-json stage4/summary.json \
+            --out results/stage5b
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-stage5b-summary
+          path: results/stage5b/
+          if-no-files-found: error
+          retention-days: 90
+
+  stage5c:
+    needs: stage12
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Regression test selection locked ahead of April input
+        run: |
+          PYTHONPATH=scripts python scripts/test_gate_stage5c_holdout.py
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-eth-stage12-stage5a
+          path: stage12
+      - name: Lock ETH-only candidate using six historical June-Nov days
+        run: |
+          python scripts/run_gate_stage5c_holdout.py --mode lock \
+            --summary stage12/stage5a/summary.json \
+            --out eth_april_lock/april_selection_lock.json
+      - name: Replay previously unseen April 2026 ETH after mode selected
+        run: |
+          python -u scripts/run_gate_stage5c_holdout.py --mode eval \
+            --symbol ETH_USDT \
+            --lock eth_april_lock/april_selection_lock.json \
+            --out eth_april_holdout
+          python scripts/aggregate_gate_stage5c_holdout.py \
+            --input eth_april_holdout/stage5c_april_holdout.json \
+            --out results/stage5c
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-eth-stage5c-april
+          path: |
+            eth_april_lock/
+            eth_april_holdout/
+            results/stage5c/
+          if-no-files-found: warn
+          retention-days: 90
