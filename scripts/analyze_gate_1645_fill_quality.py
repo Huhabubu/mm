@@ -26,9 +26,9 @@ ROOT = "https://datasets.tardis.dev/v1/gate-io-futures/quotes"
 GROUPS = ("all", "buy", "sell")
 
 
-def read_quotes(day, url=None):
+def read_quotes(day, url=None, symbol="BTC_USDT"):
     year, month, daynum = day.split("-")
-    url = url or f"{ROOT}/{year}/{month}/{daynum}/BTC_USDT.csv.gz"
+    url = url or f"{ROOT}/{year}/{month}/{daynum}/{symbol}.csv.gz"
     t, m = [], []
     seen = 0
     equal = 0
@@ -223,7 +223,7 @@ def read_archive_case(root, day, model):
         return {k: d[k].copy() for k in d.files}
 
 
-def one_day(day, case_dir, out_dir, quotes_url=None):
+def one_day(day, case_dir, out_dir, quotes_url=None, symbol="BTC_USDT"):
     report = json.loads((case_dir / f"{day}_1430m.json").read_text())
     if (report.get("day") != day or report.get("status") != "complete"
         or report.get("minutes_traded") != 1430
@@ -231,7 +231,9 @@ def one_day(day, case_dir, out_dir, quotes_url=None):
         or report.get("binance_extra_visible_delay_ms") != 2.5
         or abs(report["scenario"]["maker_fee_rate"]-0.0002) > 1e-12):
         raise ValueError(f"Wrong HBT simulation scenario: {day}")
-    ts, mid, data_qa = read_quotes(day, url=quotes_url)
+    if report.get("gate_symbol","BTC_USDT") != symbol:
+        raise ValueError("Frozen symbol and markout quote symbol mismatch")
+    ts, mid, data_qa = read_quotes(day, url=quotes_url, symbol=symbol)
     end_ns = int((datetime.strptime(day,"%Y-%m-%d").replace(tzinfo=timezone.utc)
                   + timedelta(days=1)).timestamp()*1e9)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -345,13 +347,14 @@ if __name__=="__main__":
     p.add_argument("--day")
     p.add_argument("--case-dir")
     p.add_argument("--quotes-url",help="Optional testing/local gz URL")
+    p.add_argument("--symbol",default="BTC_USDT",choices=("BTC_USDT","ETH_USDT"))
     p.add_argument("--input")
     p.add_argument("--out",required=True)
     args=p.parse_args()
     if args.mode=="day":
         if not (args.day in DAYS and args.case_dir):
             p.error("day mode requires valid --day and --case-dir")
-        one_day(args.day,Path(args.case_dir),Path(args.out),args.quotes_url)
+        one_day(args.day,Path(args.case_dir),Path(args.out),args.quotes_url,args.symbol)
     else:
         if not args.input:
             p.error("aggregate mode requires --input")
