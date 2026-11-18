@@ -176,8 +176,28 @@ def variants():
         for beta in (.25,.5,.75,1.)]
 
 
+def load_gate_bbo_update_clocks(path):
+    """Gate native BBO updates are separate from trade feed events, in local time.
+
+    Tardis timestamps are microseconds; convert both to HBT nanoseconds.
+    Actual quotes values are not read ahead by the strategy.
+    """
+    local, exchange = [], []
+    with Path(path).open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            ts=int(row["local_timestamp"])
+            ex=int(row["timestamp"])
+            if ts<ex or ex<=0 or (local and ts<local[-1]):
+                raise ValueError("Invalid causal Gate BBO update timestamp")
+            local.append(ts)
+            exchange.append(ex)
+    if not local:
+        raise ValueError("Missing public Gate BBO update timestamps")
+    return np.asarray(local,dtype=np.int64)*1000, np.asarray(exchange,dtype=np.int64)*1000
+
+
 def run(day, minutes=50, out="reports/gate_origin_glft",
-        symbol=GATE_SYMBOL, selected_models=None):
+        symbol=GATE_SYMBOL, selected_models=None, core_options=None):
     from hftbacktest import Recorder,ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
@@ -209,7 +229,8 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
             "binance_extra_visible_delay_ms":BINANCE_DELAY_MS,
             "fee_inclusive_only":True,"status":"started",
             "sample_already_explored":True,"variants":{},
-            "daily_pnl":minutes==1430}
+            "daily_pnl":minutes==1430,
+            "core_extension":core_options is not None}
     try:
         with tempfile.TemporaryDirectory(prefix="mm_gate_origin_") as temp:
             root=Path(temp)
@@ -280,20 +301,63 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                 del hbt_events
                 parts=[npz]
             low=float(np.min(om));high=float(np.max(om))
+            if core_options is not None:
+                from core_glft_engine import run_core_glft
+                core_options=dict(core_options)
+                accepted = {"min_requote_ns","fit_mode","wait_book_after_fill",
+                            "post_only_clamp_mode","cap_depth_at_visible_levels",
+                            "forced_start_ns"}
+                if set(core_options)-accepted:
+                    raise ValueError("Unknown core options: "+repr(set(core_options)-accepted))
+                if core_options.get("wait_book_after_fill",False):
+                    bbo_local,bbo_exchange=load_gate_bbo_update_clocks(paths["book_ticker"])
+                    core_options["gate_book_local_ns"]=bbo_local
+                    core_options["gate_book_exchange_ns"]=bbo_exchange
+                depth_format=counts["incremental_book_L2"]["l2_format"]
+                core_options["depth_is_20_level_snapshot"]=(
+                    depth_format=="per_message_full_snapshots_rewritten_to_deltas")
+                shared_start=int(core_options.get("forced_start_ns",0))
+                if core_options.get("fit_mode","legacy_half_tick")=="physical_1tick_poisson" and shared_start==0:
+                    # First fit is feed-only: no one can place orders before it.
+                    probe=ROIVectorMarketDepthBacktest([build_asset(parts,low,high,cfg)])
+                    try:
+                        check=np.zeros(7,np.float64)
+                        run_core_glft(probe,bt,bm,minutes*600,
+                            0.,grid,basis,sigma,0,cfg["gamma_code"],cfg["tick"],
+                            cfg["ctval"],cfg["qty"],cfg["position_cap"],None,
+                            trade_stop*1000 if minutes==1430 else 0,
+                            diagnostics=check, **core_options)
+                        if check[3]<0 or check[5]!=1:
+                            raise RuntimeError("No successful physical GLFT calibration; exclude missing day")
+                        shared_start=int(check[3])
+                    finally:
+                        probe.close()
+                    core_options["forced_start_ns"]=shared_start
+                report["shared_first_eligible_entry_ns"]=shared_start if shared_start else None
+                report["core_options"]={key:val for key,val in core_options.items()
+                                       if key not in ("gate_book_local_ns","gate_book_exchange_ns")}
             tape_len=minutes*600+10
             for name,beta,mode in chosen:
                 print("GATE_MODEL_START",day,name,flush=True)
                 engine=ROIVectorMarketDepthBacktest([build_asset(parts,low,high,cfg)])
                 rec=Recorder(engine.num_assets,tape_len)
                 try:
-                    strategy = run_gate_origin_glft
-                    if mode == 3:
-                        from gate_stage5a_pause_strategy import run_gate_stage5a_pause
-                        strategy = run_gate_stage5a_pause
-                    raw=strategy(engine,bt,bm,minutes*600,
-                        beta,grid,basis,sigma,mode,cfg["gamma_code"],
-                        cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
-                        rec.recorder,trade_stop*1000 if minutes==1430 else 0)
+                    if core_options is None:
+                        strategy = run_gate_origin_glft
+                        if mode == 3:
+                            from gate_stage5a_pause_strategy import run_gate_stage5a_pause
+                            strategy = run_gate_stage5a_pause
+                        raw=strategy(engine,bt,bm,minutes*600,
+                            beta,grid,basis,sigma,mode,cfg["gamma_code"],
+                            cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
+                            rec.recorder,trade_stop*1000 if minutes==1430 else 0)
+                    else:
+                        diagnostic=np.zeros(7,np.float64)
+                        raw=run_core_glft(engine,bt,bm,minutes*600,
+                            beta,grid,basis,sigma,mode,cfg["gamma_code"],
+                            cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
+                            rec.recorder,trade_stop*1000 if minutes==1430 else 0,
+                            diagnostics=diagnostic, **core_options)
                     if raw[5]!=1:
                         raise RuntimeError("Gate GLFT pretrade A/k calibration failed")
                     summary=summarize(
@@ -312,6 +376,16 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                              "binance_origin_activations","active_decisions",
                              "same_timestamp_ties_blocked"),counters)}
                     summary["sigma_threshold"]=1.645
+                    if core_options is not None:
+                        summary["max_ops_per_sec"]=int(diagnostic[0])
+                        summary["resting_time_ratio"]={
+                            "bid":float(diagnostic[1]),
+                            "ask":float(diagnostic[2]),
+                            "definition":"time-weighted locally-cancellable order presence; not exchange-confirmed true resting",
+                            "verified_exchange_resting":False}
+                        summary["initial_fit_ns"]=(int(diagnostic[3]) if diagnostic[3]>=0 else None)
+                        summary["calibration_wait_ns"]=int(diagnostic[4])
+                        summary["market_sync_pending_at_stop"]=bool(diagnostic[6])
                     summary["quote_mode"]=name
                     if symbol!=GATE_SYMBOL:
                         summary["trading"]["end_mid_usdt_per_base"] = (
@@ -379,6 +453,13 @@ if __name__=="__main__":
                         default=GATE_SYMBOL)
     parser.add_argument("--models",default=None,
                         help="Comma-separated named variants; omitted retains BTC nine-model behavior")
+    parser.add_argument("--core-config",type=Path,default=None,
+                        help="Optional JSON of explicit 2B switch settings; omitted runs legacy")
+
     args=parser.parse_args()
     selection=None if args.models is None else [s.strip() for s in args.models.split(",")]
-    run(args.day,args.minutes,args.out,args.symbol,selection)
+    options=(None if args.core_config is None else
+             json.loads(args.core_config.read_text(encoding="utf-8")))
+    if options is not None and not isinstance(options,dict):
+        parser.error("--core-config JSON must be an object")
+    run(args.day,args.minutes,args.out,args.symbol,selection,options)
