@@ -79,7 +79,7 @@ def load_locked(path):
     return d
 
 
-def market_data(root,day,minutes,required_contract=None):
+def market_data(root,day,minutes,required_contract=None,symbol="BTC_USDT"):
     from hftbacktest import ROIVectorMarketDepthBacktest
     if minutes!=1430:
         raise ValueError("Stage4 only trains and evaluates identical 1430min UTC sessions")
@@ -87,16 +87,19 @@ def market_data(root,day,minutes,required_contract=None):
     begin_us=int(date.timestamp()*1_000_000)
     trade_start=begin_us+600_000_000
     stop=begin_us+86_400_000_000
-    spec=fetch_contract()
+    spec=fetch_contract(symbol)
     paths={}; counts={}
     for kind in SCHEMAS:
         file=root/f"{kind}.csv"
         print("STAGE4_FEED",day,kind,flush=True)
-        counts[kind]=safe_gate_csv(kind,day,stop,file,90_000_000)
+        counts[kind]=safe_gate_csv(kind,day,stop,file,90_000_000,
+            symbol=symbol,
+            historical_tick=(float(spec["order_price_round"]) if symbol!="BTC_USDT" else None),
+            historical_lot=(float(spec["order_size_min"]) if symbol!="BTC_USDT" else None))
         paths[kind]=file
     require_unshifted_target_clock(counts)
     gt,gm=load_gate_mid(paths["book_ticker"])
-    bt,bm=read_binance_bbo(day,stop,symbol="BTCUSDT")
+    bt,bm=read_binance_bbo(day,stop,symbol=symbol.replace("_",""))
     vis=visible_timestamps(bt,BINANCE_DELAY_MS)
     grid,basis,sigma,coverage=exact_moments_5s(
         vis,bm,gt,gm,trade_start*1000,stop*1000)
@@ -113,7 +116,7 @@ def market_data(root,day,minutes,required_contract=None):
                 raise ValueError(f"Contract/official replay mismatch: {field} {a} != {b}")
     parts,details=convert_fuse_parts(
         paths,counts,root,begin_us,stop,60,cfg["tick"],float(cfg["lot"]))
-    return {"day":day,"minutes":minutes,"params":cfg,"gt":gt,"gm":gm,
+    return {"day":day,"symbol":symbol,"minutes":minutes,"params":cfg,"gt":gt,"gm":gm,
             "visible":vis,"binance_mid":bm,"grid":grid,
             "basis":basis,"sigma":sigma,"coverage":coverage,
             "parts":parts,"low":float(np.min(gm)),"high":float(np.max(gm)),
@@ -158,7 +161,8 @@ def simulate(data,model,kind,extra=0.0,gate_sigma_ceiling=float("inf"),
             summary_minutes=data["minutes"]-1
         s=summarize(raw,summary_minutes,True,
                     1.0 if kind=="original_beta1" else 0.0,
-                    cfg["position_cap"],cfg["qty"])
+                    cfg["position_cap"],cfg["qty"],
+                    tail_tolerance_samples=(10 if data.get("symbol")!="BTC_USDT" else 5))
         if s["end_time_ns"] < data["stop_ns"]-1_000_000_000:
             raise ValueError("Official HBT truncated before day end")
         if output_dir is not None:
@@ -182,12 +186,12 @@ def simulate(data,model,kind,extra=0.0,gate_sigma_ceiling=float("inf"),
         eng.close()
 
 
-def train(day,output):
+def train(day,output,symbol="BTC_USDT"):
     if day!=TRAIN_DAY:
         raise ValueError("TRAIN DAY LOCK: only May 01 2026")
     output.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="stage4_train_may_") as tmp:
-        d=market_data(Path(tmp),day,1430)
+        d=market_data(Path(tmp),day,1430,symbol=symbol)
         raw_glft,s_glft=simulate(d,"glft","original_glft")
         raw_ref,s_ref=simulate(d,"both_1p0","original_beta1")
         raw_copy,s_copy=simulate(d,"glft_clone","reference_copy")
@@ -242,27 +246,30 @@ def train(day,output):
                 "may_hbt_end_timestamp_ns":int(raw_glft[-2][0]),
                 "replay_controls":"May clone beta=0 exactly matches original GLFT fill arrays and end cash, fee, position and equity",
                 "signal_usage":"no Binance mid/direction in control quotes; Binance event clock retained as in original beta=0 GLFT",
-                "scenario":d["params"],"source_day":"Tardis 2026-05-01 only",
+                "scenario":d["params"],"source_day":"Tardis 2026-05-01 only", "symbol":symbol,
                 "no_evaluation_optimization":True}
         (output/"stage4_train_lock.json").write_text(
             json.dumps(result,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
         print("STAGE4_MAY_LOCK",json.dumps(result["selected_controls"],ensure_ascii=False),flush=True)
 
 
-def evaluate(day,lock_file,frozen_dir,output):
+def evaluate(day,lock_file,frozen_dir,output,symbol="BTC_USDT"):
     if day not in EVAL_DAYS:
         raise ValueError("Stage4 eval only fixed June-Nov 2026 first days")
     lock=load_locked(lock_file)
+    if lock.get("symbol","BTC_USDT") != symbol:
+        raise ValueError("May prelock was fitted for another Gate symbol")
     out=output
     out.mkdir(parents=True,exist_ok=True)
     report=json.loads((frozen_dir/f"{day}_1430m.json").read_text())
     if (report["status"]!="complete" or
         report["binance_extra_visible_delay_ms"]!=2.5 or
         report["experimental_trigger_sigma_multiple"]!=1.645 or
-        len(report["variants"])!=9):
+        not set(TARGET_NAMES).issubset(report["variants"]) or
+        report.get("gate_symbol","BTC_USDT")!=symbol):
         raise ValueError("Wrong official fixed Gate reference scenario")
     with tempfile.TemporaryDirectory(prefix=f"stage4_eval_{day}_") as tmp:
-        d=market_data(Path(tmp),day,1430,report["scenario"])
+        d=market_data(Path(tmp),day,1430,report["scenario"],symbol=symbol)
         for kind in SCHEMAS:
             for field in ("rows","first_local_us","last_local_us"):
                 if d["feed_stats"][kind][field]!=report["feed_stats"][kind][field]:
@@ -312,10 +319,11 @@ if __name__=="__main__":
     ap.add_argument("--lock")
     ap.add_argument("--frozen")
     ap.add_argument("--out",required=True)
+    ap.add_argument("--symbol",default="BTC_USDT",choices=("BTC_USDT","ETH_USDT"))
     a=ap.parse_args()
     if a.mode=="train":
-        train(a.day,Path(a.out))
+        train(a.day,Path(a.out),a.symbol)
     else:
         if not a.lock or not a.frozen:
             ap.error("eval requires immutable May --lock and frozen per-date --frozen")
-        evaluate(a.day,a.lock,Path(a.frozen),Path(a.out))
+        evaluate(a.day,a.lock,Path(a.frozen),Path(a.out),a.symbol)
