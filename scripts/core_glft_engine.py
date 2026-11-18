@@ -446,7 +446,14 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     last_fill_observed_ns = now
                     if n_fills == 0:
                         raise ValueError("Private fill changed position without HBT FILLED trace")
-                    last_fill_exchange_ns = fill_ts_ns[n_fills-1]
+                    latest_exchange = -1
+                    for kk in range(n_fills-1,-1,-1):
+                        if fill_observed_ns[kk] != now:
+                            break
+                        latest_exchange=max(latest_exchange,fill_ts_ns[kk])
+                    if latest_exchange <= 0:
+                        raise ValueError("Missing local-reply official fill exchange timestamp")
+                    last_fill_exchange_ns = latest_exchange
                 last_observed_position = latest_position
             engine.clear_inactive_orders(0)
             if now >= t_stop or not np.isfinite(half):
@@ -470,6 +477,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             binance_is_fresh = (fit_mode == "legacy_half_tick" or
                                 (latest_binance_ns >= 0 and
                                  0 <= now-latest_binance_ns <= 250_000_000))
+            if not binance_is_fresh:
+                active_origin = False
             if (beta > 0.0 or shadow_gate) and np.isfinite(latest_binance) and binance_is_fresh:
                 gi = np.searchsorted(basis_grid_ns, now, side="left") - 1
                 if gi >= 0 and np.isfinite(basis_values[gi]) and (
