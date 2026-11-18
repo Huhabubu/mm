@@ -366,6 +366,37 @@ def one_day(day, case_dir, out_dir, quotes_url=None, depth_witness_dir=None):
           {m: by_model[m]["hbt_fills"] for m in MODELS},flush=True)
 
 
+def aggregate_depth_visibility(reports):
+    """Compare depth-source cohorts; a missing placement/L2 witness stays missing."""
+    result = {}
+    for model in MODELS:
+        result[model] = {}
+        for label, days in (("five_20_level_days", DAYS[:5]),
+                            ("november_400_initial_plus_deltas", DAYS[5:])):
+            rows = [(r["day"], r["models"][model]["depth_visibility"])
+                    for r in reports if r["day"] in days]
+            missing = [day for day, data in rows if data["status"] != "complete"]
+            if missing:
+                result[model][label] = {
+                    "status": "unavailable_missing_order_placement_l2_witness",
+                    "missing_days": missing,
+                    "orders_outside_visible_fraction": None,
+                    "fills_outside_visible_fraction": None,
+                }
+                continue
+            n_order = sum(data["orders"] for _, data in rows)
+            n_fill = sum(data["fills"] for _, data in rows)
+            out_order = sum(data["orders_outside_visible_count"] for _, data in rows)
+            out_fill = sum(data["fills_outside_visible_count"] for _, data in rows)
+            result[model][label] = {
+                "status": "complete", "days": list(days),
+                "order_submissions": n_order, "fill_events": n_fill,
+                "orders_outside_visible_fraction": out_order/n_order if n_order else None,
+                "fills_outside_visible_fraction": out_fill/n_fill if n_fill else None,
+            }
+    return result
+
+
 def aggregate(root, out_dir):
     reports = []
     for day in DAYS:
@@ -388,6 +419,12 @@ def aggregate(root, out_dir):
                          "total_fresh_fills":data["total_fresh_count"],
                          "total_coverage":data["total_fresh_fraction"],
                          "total_markout_bps":(data["total_markout"]["mean_bps"]
+                             if data["total_markout"] else None),
+                         "total_weighted_mean_bps":(data["total_markout"]["notional_weighted_mean_bps"]
+                             if data["total_markout"] else None),
+                         "total_p10_bps":(data["total_markout"]["p10_bps"]
+                             if data["total_markout"] else None),
+                         "total_negative_fraction":(data["total_markout"]["negative_fraction"]
                              if data["total_markout"] else None),
                          "total_markout_updated_bps":(
                              data["total_markout_after_quote_update"]["mean_bps"]
@@ -415,7 +452,8 @@ def aggregate(root, out_dir):
     with (out_dir/"per_day_quality.csv").open("w",newline="",encoding="utf-8") as f:
         w=csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader();w.writerows(rows)
-    metrics = ("total_coverage","total_markout_bps","total_markout_updated_bps",
+    metrics = ("total_coverage","total_markout_bps","total_weighted_mean_bps",
+               "total_p10_bps","total_negative_fraction","total_markout_updated_bps",
                "quote_age_lt100_total_bps","quote_age_100to250_total_bps",
                "coverage","capture_bps","mean_markout_bps",
                "notional_weighted_mean_bps","p10_bps","worst10_mean_bps",
@@ -446,7 +484,8 @@ def aggregate(root, out_dir):
             "primary":"execution-price total markout; equal-weighted by day; 500/1000ms core; future quote age<=500ms",
              "legacy":"entry-mid capture and markout, both endpoint quotes age<=500ms",
             "note":"Descriptive fill conditional distributions, not causal effect or PnL attribution",
-            "results":summary}
+            "results":summary,
+             "depth_visibility_comparison":aggregate_depth_visibility(reports)}
     (out_dir/"summary.json").write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n")
     lines=["# Gate BTC 1.645σ 双边β1：阶段②成交质量（六日探索性）","",
            "主口径是实际成交价到未来Gate中间价的Total Markout。要求未来报价年龄≤500ms，核心500/1000ms；报告入场时报价年龄分层及未来至少发生一次报价刷新的子样本。旧Capture与旧Markout另存供审计。未修改撮合、策略及手续费。", "",
