@@ -181,7 +181,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
     from hftbacktest import Recorder,ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
-    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT"):
+    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT", "ETH_USDT"):
         raise ValueError("Only studied Gate direct USDT perpetuals are supported")
     default_variants = variants()
     available = {name:(beta,mode) for name,beta,mode in default_variants}
@@ -215,8 +215,8 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
             root=Path(temp)
             spec=fetch_contract(symbol)
             if spec["type"]!="direct":
-                raise ValueError(f"Gate current contract not direct USDT perpetual: {symbol}")
-            report["gate_current_contract"]=spec
+                raise ValueError(f"Frozen Gate study contract not direct USDT perpetual: {symbol}")
+            report["gate_frozen_contract"]=spec
             paths={};counts={}
             for kind in SCHEMAS:
                 path=root/f"{kind}.csv"
@@ -308,9 +308,10 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                     summary["binance_origin_filter"]={
                         k:int(v) for k,v in zip(
                             ("binance_price_update_groups","eligible_gap_checks",
-                             "above_1p96sigma_checks","directional_dominance_checks",
+                             "above_threshold_checks","directional_dominance_checks",
                              "binance_origin_activations","active_decisions",
                              "same_timestamp_ties_blocked"),counters)}
+                    summary["sigma_threshold"]=1.645
                     summary["quote_mode"]=name
                     if symbol!=GATE_SYMBOL:
                         summary["trading"]["end_mid_usdt_per_base"] = (
@@ -374,7 +375,7 @@ if __name__=="__main__":
     parser.add_argument("--day",required=True)
     parser.add_argument("--minutes",type=int,choices=(50,1430),default=50)
     parser.add_argument("--out",default="reports/gate_origin_glft")
-    parser.add_argument("--symbol",choices=("BTC_USDT","SOL_USDT","DOGE_USDT"),
+    parser.add_argument("--symbol",choices=("BTC_USDT","SOL_USDT","DOGE_USDT","ETH_USDT"),
                         default=GATE_SYMBOL)
     parser.add_argument("--models",default=None,
                         help="Comma-separated named variants; omitted retains BTC nine-model behavior")
