@@ -514,3 +514,15 @@
 - [x] Stage2按各自实际成交计，原GLFT与Binance双边β1在500ms总Markout为**−0.6228 vs −0.5208bps**、1000ms **−0.6555 vs −0.5350bps**。全模型短期含2bps Maker手续费的单笔中间价估值仍为负；本轮修订不改变原收益或旧成交分类，旧Capture/旧Markout保存供审计。
 - [x] 前5天20档与11月初始400档的深度越界占比均留为**uncomputable**：现有冻结成交/quotes缺少订单提交时逐档L2与订单ID关联，脚本严格不补造0值。后续若有真实下单时点L2证据方可计算；11月初始400档不等于整日深层排队完全可靠。
 - [ ] **阶段二尚未启动**：后续独立分支先锁定旧模式逐笔回归、冻结合约规格、修复1.645σ字段名，再做单一核心策略引擎及5个可配置补丁，不覆盖本轮六日原实证结果。
+
+
+## 2026-11-18 Gate GLFT 阶段二：2A单核收口、2B五开关实现与冒烟测试
+
+- [x] 从阶段一冻结提交 `1b709c5` 建立独立 `feat/core-glft-engine-refactor`，保留历史Stage0/1/5A/5C正式数据与六日Stage2/5B新统计不变。
+- [x] 2A静态研究规格 `configs/contract_specs.json`：Gate BTC/SOL/DOGE/ETH 的历史研究使用tick/ctval/lot、Maker+2bps/Taker+5bps**假设费用**冻结，运行时Gate合约API请求已消除；Binance仅为BBO参考，未证实执行规格字段留null且禁止用于Binance交易模拟。新JSON按1.645σ记录 `above_threshold_checks` 与 `sigma_threshold=1.645`。
+- [x] Stage1/3/4/5A重复事件循环合并为 `scripts/core_glft_engine.py`，四个旧入口保留薄封装；研究目录快照保留原样。
+- [x] 以冻结原源码而非新封装作为参考的完整50min真实官方HBT回归：每纳秒订单操作类型/ID/价格多重集合完全一致，实际逐笔成交、100ms Recorder、含费终值精确一致。原始HashMap遍历导致同纳秒撤单先后位置变化，单独记录，**未宣称同纳秒内部序列字节级同序**。原GLFT/双边β1/单侧外移β1及Stage3、Stage4、Stage5A均通过：[CI #44336851755](https://github.com/Huhabubu/mm/actions/runs/44336851755)。
+- [x] 2B参数开关：0/20ms冷却、1tick独立双侧泊松拟合与首次成功同步入场、Binance 250ms新鲜度、严格时间后继BBO成交同步锁、后置Post-Only、真实20个可见档位上限。滑动1s最大订单请求数 `max_ops_per_sec` 输出。在线率目前为**本地可撤订单状态代理** `resting_time_ratio`，已标记非真实交易所挂单生效统计。
+- [x] 离线独立测试加真实旧模式回归验证通过；显式五开关联合50min BTC HBT烟雾测试 [#44336850404](https://github.com/Huhabubu/mm/actions/runs/44336850404) 通过，首次统一入场 `1793491800289000000 ns`；原GLFT/双边β1分别76/66笔成交，含费短样本净收益 −1.5041/−1.3010 USDT，仅验证代码可执行，**不得写入论文实证表或称样本外**。
+- [x] [详细阶段二代码与复现/限制记录](docs/gate_core_2a_2b_refactor_20261118.md)。
+- [ ] 阶段三六日稳健性与跨币种正式实验尚未开始；缺少交换所真实挂单生效/取消时点证据，真实在线率及远档队列不可声称已证明。
