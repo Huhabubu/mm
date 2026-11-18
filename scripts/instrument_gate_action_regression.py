@@ -15,11 +15,12 @@ def instrument_action_requests(source_path, output_path, function_name):
         if n != 1:
             raise ValueError(f"Expected one instrumentation anchor, got {n}: {anchor}")
         source = source.replace(anchor, value)
-    replace(
-        "    bid_action = ask_action = t0 - MIN_REQUOTE_NS",
-        "    bid_action = ask_action = t0 - MIN_REQUOTE_NS\n"
-        "    action_log = np.empty((1_000_000, 4), np.int64)\n"
-        "    n_actions = 0")
+    action_anchor = ("    bid_action = ask_action = t0 - MIN_REQUOTE_NS"
+                     if "    bid_action = ask_action = t0 - MIN_REQUOTE_NS" in source
+                     else "    bid_action = ask_action = t0 - min_requote_ns")
+    replace(action_anchor,
+            action_anchor + "\n    action_log = np.empty((1_000_000, 4), np.int64)"
+            + "\n    n_actions = 0")
     # Both strategies use the identical old exchange request API; emit
     # [local request nanoseconds, operation (1 cancel/2 buy/3 sell),
     #  order ID, price tick] in actual code execution order.
