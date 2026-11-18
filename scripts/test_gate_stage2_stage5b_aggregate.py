@@ -64,7 +64,7 @@ class SixDayQualityTest(unittest.TestCase):
             self.assertIn("Total Markout", (out/"report.md").read_text())
             with (out/"per_day_quality.csv").open(newline="") as f:
                 rows=list(csv.DictReader(f))
-            self.assertEqual(len(rows),36)
+            self.assertEqual(len(rows),108)
             self.assertIn("total_markout_bps",rows[0])
             self.assertIn("mean_markout_bps",rows[0])
 
