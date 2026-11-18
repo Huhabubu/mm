@@ -87,16 +87,19 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("Seven diagnostic slots required")
     if fit_mode == "physical_1tick_poisson" and diagnostics is None:
         raise ValueError("Physical estimator requires diagnostic start/coverage output")
+    # Always use concrete arrays: Numba must compile the disabled lock path too.
+    book_locals = np.empty(0,np.int64)
+    book_exchanges = np.empty(0,np.int64)
+    if gate_book_local_ns is not None:
+        book_locals = gate_book_local_ns
+    if gate_book_exchange_ns is not None:
+        book_exchanges = gate_book_exchange_ns
     if wait_book_after_fill:
-        if gate_book_local_ns is None or gate_book_exchange_ns is None:
-            raise ValueError("Market sync requires explicit causal Gate BBO update clocks")
-        if len(gate_book_local_ns) != len(gate_book_exchange_ns):
-            raise ValueError("Mismatch in Gate BBO local/exchange update clocks")
-        if len(gate_book_local_ns)==0:
-            raise ValueError("Empty Gate BBO update clocks")
-        for jj in range(len(gate_book_local_ns)):
-            if (gate_book_exchange_ns[jj]>gate_book_local_ns[jj]
-                    or (jj>0 and gate_book_local_ns[jj]<gate_book_local_ns[jj-1])):
+        if len(book_locals) != len(book_exchanges) or len(book_locals)==0:
+            raise ValueError("Market sync requires complete causal Gate BBO update clocks")
+        for jj in range(len(book_locals)):
+            if (book_exchanges[jj]>book_locals[jj]
+                    or (jj>0 and book_locals[jj]<book_locals[jj-1])):
                 raise ValueError("Invalid Gate BBO update clock order")
     if cap_depth_at_visible_levels and not depth_is_20_level_snapshot:
         raise ValueError("20-level boundary cap requires verified 20-level snapshot source")
@@ -135,8 +138,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     last_fill_observed_ns = -1
     last_observed_position = engine.position(0)
     book_idx = 0
-    if gate_book_local_ns is not None:
-        while book_idx < len(gate_book_local_ns) and gate_book_local_ns[book_idx] <= t0:
+    if wait_book_after_fill:
+        while book_idx < len(book_locals) and book_locals[book_idx] <= t0:
             book_idx += 1
     if forced_start_ns and forced_start_ns < t0 + TRAIN*STEP_NS:
         raise ValueError("forced_start_ns before 10min training")
@@ -209,8 +212,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         if probe_ns is not None and probe_idx < n_probes:
             if probe_ns[probe_idx] >= now:
                 due = min(due, probe_ns[probe_idx])
-        if wait_book_after_fill and awaiting_market_sync and book_idx < len(gate_book_local_ns):
-            due = min(due, max(now, gate_book_local_ns[book_idx]))
+        if wait_book_after_fill and awaiting_market_sync and book_idx < len(book_locals):
+            due = min(due, max(now, book_locals[book_idx]))
         feed_status = 0
         if due > now:
             # Relative timeout in nanoseconds: do NOT pass an epoch timestamp.
@@ -249,10 +252,10 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         # Consume separately timestamped real Gate BBO updates. A trade-only
         # feed_status==2 is insufficient to release the private-fill lock.
         if wait_book_after_fill:
-            while book_idx < len(gate_book_local_ns) and gate_book_local_ns[book_idx] <= now:
+            while book_idx < len(book_locals) and book_locals[book_idx] <= now:
                 if awaiting_market_sync and book_update_unlocks(
                         last_fill_exchange_ns,last_fill_observed_ns,
-                        gate_book_exchange_ns[book_idx],gate_book_local_ns[book_idx]):
+                        book_exchanges[book_idx],book_locals[book_idx]):
                     awaiting_market_sync = False
                 book_idx += 1
         # HBT has already consumed all its events at this timestamp.
