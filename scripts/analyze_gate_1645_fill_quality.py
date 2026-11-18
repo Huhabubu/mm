@@ -5,7 +5,8 @@ Quote clock: Tardis Gate quotes LOCAL receipt timestamp, in microseconds.
 Fill clock: HBT local observation timestamp, in nanoseconds.
 For the entry quote require quote_time < fill_observed_ns (strict).
 For future horizons require quote_time <= fill_observed_ns + horizon_ns.
-Both endpoints must be <=500ms old for the primary 'fresh' result.
+Legacy capture/drift use both endpoints <=500ms old. Primary total markout
+uses a fresh future quote; old labels remain available.
 """
 import argparse
 import csv
@@ -22,6 +23,8 @@ DAYS = tuple(f"2026-{m:02d}-01" for m in range(6, 12))
 MODELS = ("glft", "both_1p0")
 HORIZONS = (100, 500, 1000)
 FRESH_NS = 500_000_000
+PRIMARY_HORIZONS = (500, 1000)
+QUOTE_AGE_BUCKETS = ("lt_100ms", "100_to_250ms")
 ROOT = "https://datasets.tardis.dev/v1/gate-io-futures/quotes"
 GROUPS = ("all", "buy", "sell")
 
@@ -128,6 +131,15 @@ def asof_quotes(times, prices, queries, inclusive, last_valid_ns):
     return mid, age, valid
 
 
+def quote_age_bucket_mask(age_ms, bucket):
+    """Age of visible entry quote at the instant of local fill observation."""
+    if bucket == "lt_100ms":
+        return (age_ms >= 0) & (age_ms < 100)
+    if bucket == "100_to_250ms":
+        return (age_ms >= 100) & (age_ms <= 250)
+    raise ValueError(f"Unknown quote-age bucket: {bucket}")
+
+
 def label_fills(fill, ts, mid, day_end_ns, ctval):
     required = {"exchange_timestamp_ns","local_observed_ns","side","exec_price","exec_qty"}
     if set(fill) != required:
@@ -159,8 +171,14 @@ def label_fills(fill, ts, mid, day_end_ns, ctval):
         mh, ageh, validh = asof_quotes(ts, mid, future, True, day_end_ns)
         asof = valid0 & validh
         fresh = asof & (age0 <= FRESH_NS) & (ageh <= FRESH_NS)
-        markout = side * (mh-px0)/px0 * 10000
+        markout = side * (mh-px0)/px0 * 10000  # legacy entry-mid drift
+        total_markout = side * (mh-price)/price * 10000
+        total_fresh = validh & (ageh >= 0) & (ageh <= FRESH_NS)
+        future_quote_updated = validh & ((future - ageh) > t)
         result[f"markout_{h}ms_bps"] = markout
+        result[f"total_markout_{h}ms_bps"] = total_markout
+        result[f"total_fresh_{h}ms"] = total_fresh
+        result[f"future_quote_updated_{h}ms"] = future_quote_updated
         result[f"quote_age_{h}ms_ms"] = ageh/1e6
         result[f"asof_valid_{h}ms"] = asof
         result[f"fresh_{h}ms"] = fresh
@@ -190,7 +208,27 @@ def model_day(model, fill, trace, ts, mid, day_end_ns, ctval):
             valid = mask & fresh & np.isfinite(annotated[f"markout_{h}ms_bps"])
             x = annotated[f"markout_{h}ms_bps"][valid]
             weights = w[valid]
+            total_eligible = (mask & annotated[f"total_fresh_{h}ms"]
+                              & np.isfinite(annotated[f"total_markout_{h}ms_bps"]))
+            updated = total_eligible & annotated[f"future_quote_updated_{h}ms"]
+            age = annotated["quote_age_at_observation_ms"]
+            strata = {}
+            for bucket in QUOTE_AGE_BUCKETS:
+                subset = total_eligible & quote_age_bucket_mask(age, bucket)
+                strata[bucket] = {
+                    "fills": int(subset.sum()),
+                    "total_markout": stats(
+                        annotated[f"total_markout_{h}ms_bps"][subset], w[subset]),
+                }
             horizons[str(h)] = {
+                "total_fresh_count": int(total_eligible.sum()),
+                "total_fresh_fraction": float(total_eligible.sum()/count) if count else None,
+                "total_markout": stats(
+                    annotated[f"total_markout_{h}ms_bps"][total_eligible], w[total_eligible]),
+                "future_quote_updated_count": int(updated.sum()),
+                "total_markout_after_quote_update": stats(
+                    annotated[f"total_markout_{h}ms_bps"][updated], w[updated]),
+                "quote_age_strata": strata,
                 "all_fills": count,
                 "asof_count": int(np.count_nonzero(mask & asof)),
                 "fresh_count": int(np.count_nonzero(valid)),
