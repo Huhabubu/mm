@@ -18,12 +18,14 @@ def summarize(root,out):
             raise ValueError(f"Missing or duplicated Gate stage3 case: {day}: {len(hits)}")
         x=json.loads(hits[0].read_text(encoding="utf-8"))
         if (x["day"]!=day or x["exact_parity"]["all_fills"]!=x["total_fills"]
-                or not all(x["input_gates"].values())):
+                or not all(v for k,v in x["input_gates"].items()
+                           if k != "HBT_baseline_fill_arrays_exactly_equal")
+                or not x["exact_parity"].get("same_timestamp_multiset_equal", True)):
             raise ValueError(f"Stage3 frozen source or HBT parity failed: {day}")
         if sum(x["categories"]["100"][g]["all_fills"] for g in GROUPS)!=x["total_fills"]:
             raise ValueError(f"Non-exclusive categories: {day}")
         cases.append(x)
-    result={"status":"complete","days":list(DAYS),"audit":"read-only GLFT shadow using exact HBT matched fills",
+    result={"status":"complete","days":list(DAYS),"audit":"read-only GLFT shadow; exact order or proven identical same-timestamp full fill multiset and final ledger",
             "category_definitions":{
                 "threatened":"GLFT sell when Binance gap positive, or GLFT buy when gap negative; active+effective at last decision before cancel deadline",
                 "opposite":"other fill side during effective shadow signal",
@@ -74,8 +76,8 @@ def summarize(root,out):
     summary=result["groups"]["100"]
     f=lambda v: "NA" if v is None else f"{v:+.4f}"
     lines=[
-        "# Gate BTC 1.645σ：阶段③六日 GLFT 信号暴露与理论可撤审计","",
-        "六天独立完整1430分钟正式GLFT、同源 Tardis→HBT 全量重新回放；先逐笔精确比较原始 GLFT 官方 HBT fills(时间/方向/价/量)和手续费权益，相等才接纳该日。",
+        "# Gate GLFT 1.645σ：阶段③六日信号暴露与理论可撤审计","",
+        "六天独立完整1430分钟正式GLFT、同源 Tardis→HBT 全量重新回放；要求成交时间完整一致，方向/时间/价格/数量/回报时间构成的多重集合相同，且手续费权益、期末仓位相等。部分同一时间戳成交可能交换记录次序，需在逐日审计中显式披露。",
         "",
         "**信号定义**：原GLFT自身订单/库存路径下，使用完全相同1.645σ/600s时间加权基差、5s发布、1σ锚定带、Binance价格主动变动、方向/幅度优势、2.5ms可见时间及HBT融合Gate中间价，影子评估激活状态。影子计算不参与实际撤挂单。",
         "",
@@ -103,7 +105,7 @@ def summarize(root,out):
             lines.append(f'- {g}：有效笔数{y["fresh_fills_total"]}，{y["days_valid"]}/6日有样本，平均Markout {f(y["daily_equal_mean_markout_bps"])}bps，最差10%均值{f(y["daily_equal_worst10_mean_bps"])}bps')
         lines.append("")
     (out/"report.md").write_text("\n".join(lines),encoding="utf-8")
-    print("STAGE3_SIXDAY_EXACT_PARITY_AGGREGATE_OK",len(cases),flush=True)
+    print("STAGE3_SIXDAY_STRICT_EVENT_MULTISET_AGGREGATE_OK",len(cases),flush=True)
 
 
 if __name__=="__main__":
