@@ -21,22 +21,25 @@ def contract(symbol, ctval, tick, lot):
                 config_change_time=0, enable_decimal=lot<1)
 
 def test_contract_api_symbol():
-    response = contract("SOL_USDT", 0.1, 0.01, 0.1)
-    class Handle(io.BytesIO):
-        pass
-    def fake(req, timeout=None):
-        assert req.full_url.endswith("/contracts/SOL_USDT")
-        assert dict((k.lower(),v) for k,v in req.header_items())["x-gate-size-decimal"] == "1"
-        import json
-        return Handle(json.dumps(response).encode())
-    with patch("qa_gate_btc_futures.urllib.request.urlopen", fake):
-        assert fetch_contract("SOL_USDT")["order_size_min"] == "0.1"
+    # Name preserved for existing test runner; specs are now loaded offline.
+    from contract_specs import load_contract_spec
+    spec = fetch_contract("SOL_USDT")
+    assert spec["order_size_min"] == 0.1
+    assert spec["quanto_multiplier"] == 1.0
+    assert fetch_contract("ETH_USDT")["quanto_multiplier"] == 0.01
     try:
         fetch_contract("XRP_USDT")
-    except ValueError:
-        pass
+    except KeyError as e:
+        assert "Missing frozen contract configuration" in str(e)
     else:
-        raise AssertionError("Unexpected symbol accepted")
+        raise AssertionError("Unknown symbol accepted")
+    try:
+        load_contract_spec("BTCUSDT", venue="binance", for_trading=True)
+    except ValueError as e:
+        assert "reference-market BBO only" in str(e)
+    else:
+        raise AssertionError("Unverified reference-market execution allowed")
+
 
 def test_units(symbol, ctval, tick, lot, mid):
     cfg = scenario(mid, contract(symbol,ctval,tick,lot))
