@@ -17,6 +17,7 @@ from hftbacktest.data.utils import tardis
 from hftbacktest.data.validation import validate_event_order
 
 from core_glft_engine import run_core_glft
+from instrument_gate_action_regression import instrument_action_requests
 from gate_origin_glft_strategy import run_gate_origin_glft
 from run_gate_btc_origin_glft import (
     SCHEMAS, BINANCE_DELAY_MS, build_asset, exact_moments_5s,
@@ -52,7 +53,7 @@ def assert_exact_legacy_result(old, new, old_rec, new_rec):
           old[18],"fee_inclusive_end_equity")
 
 
-def run_one(day="2026-11-01",minutes=50):
+def run_one(day="2026-11-01",minutes=50,trace_actions=False):
     y=datetime.strptime(day,"%Y-%m-%d").replace(tzinfo=timezone.utc)
     if y.day!=1 or minutes!=50:
         raise ValueError("One historical month-first 50-minute deterministic probe only")
@@ -85,24 +86,48 @@ def run_one(day="2026-11-01",minutes=50):
         validate_event_order(events)
         del events
         low=float(np.min(om));high=float(np.max(om))
+        functions = (run_gate_origin_glft, run_core_glft)
+        if trace_actions:
+            here=Path(__file__).resolve().parent
+            old_copy=root/"trace_legacy.py"
+            new_copy=root/"trace_core.py"
+            functions = (
+                instrument_action_requests(
+                    here/"gate_origin_glft_strategy.py",old_copy,"run_gate_origin_glft"),
+                instrument_action_requests(
+                    here/"core_glft_engine.py",new_copy,"run_core_glft"))
         for beta,mode in ((0.,0),(1.,1),(1.,2)):
             values=[]
-            for function in (run_gate_origin_glft,run_core_glft):
+            traces=[]
+            for function in functions:
                 engine=ROIVectorMarketDepthBacktest(
                     [build_asset([fused],low,high,cfg)])
                 rec=Recorder(engine.num_assets,minutes*600+10)
                 try:
-                    raw=function(
+                    output=function(
                         engine,bt,bm,minutes*600,beta,grid,basis,sigma,mode,
                         cfg["gamma_code"],cfg["tick"],cfg["ctval"],
                         cfg["qty"],cfg["position_cap"],rec.recorder,
                         trade_stop_us*1000)
+                    if trace_actions:
+                        raw, request_trace = output
+                        traces.append(request_trace)
+                    else:
+                        raw = output
                     recording=rec.get(0).copy()
                     values.append((raw,recording))
                 finally:
                     engine.close()
             assert_exact_legacy_result(
                 values[0][0],values[1][0],values[0][1],values[1][1])
+            if trace_actions:
+                if not np.array_equal(traces[0],traces[1]):
+                    raise AssertionError(
+                        f"Exact request sequence mismatch: {day} beta={beta} mode={mode}")
+                self_count = len(traces[0])
+                if self_count != values[0][0][7] + values[0][0][8]:
+                    raise AssertionError("Request trace misses a submit/cancel action")
+                print("CORE_LEGACY_EXACT_REQUEST_TRACE",day,beta,mode,self_count,flush=True)
             print("CORE_LEGACY_MATCH_MODEL",day,beta,mode,flush=True)
 
 
@@ -110,5 +135,6 @@ if __name__=="__main__":
     p=argparse.ArgumentParser()
     p.add_argument("--day",default="2026-11-01")
     p.add_argument("--minutes",type=int,default=50)
+    p.add_argument("--trace-actions",action="store_true")
     x=p.parse_args()
-    run_one(x.day,x.minutes)
+    run_one(x.day,x.minutes,x.trace_actions)
