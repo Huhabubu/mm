@@ -110,7 +110,7 @@ def replay(data,model,out):
         eng.close()
 
 
-def evaluate(lock_file,out):
+def evaluate(lock_file,out,symbol="BTC_USDT"):
     locked=json.loads(lock_file.read_text(encoding="utf-8"))
     if (locked.get("status")!="locked" or
         locked.get("selected_mode") not in RANK_ORDER or
@@ -120,10 +120,10 @@ def evaluate(lock_file,out):
         raise ValueError("Stage5C selection not correctly locked")
     out.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="stage5c_untouched_april_") as temp:
-        data=market_data(Path(temp),HOLDOUT,1430)
+        data=market_data(Path(temp),HOLDOUT,1430,symbol=symbol)
         models=list(dict.fromkeys(("glft","both_1p0",locked["selected_mode"])))
         results={m:replay(data,m,out) for m in models}
-        report={"status":"complete","holdout_date":HOLDOUT,
+        report={"status":"complete","holdout_date":HOLDOUT,"gate_symbol":symbol,
                 "selected_mode":locked["selected_mode"],
                 "strategy_selection_lock":locked,
                 "first_time_reading_april_data_after_mode_locked":True,
@@ -146,6 +146,7 @@ if __name__=="__main__":
     p.add_argument("--summary",type=Path)
     p.add_argument("--lock",type=Path)
     p.add_argument("--out",type=Path,required=True)
+    p.add_argument("--symbol",default="BTC_USDT",choices=("BTC_USDT","ETH_USDT"))
     a=p.parse_args()
     if a.mode=="lock":
         if a.summary is None:
@@ -154,4 +155,4 @@ if __name__=="__main__":
     else:
         if a.lock is None:
             p.error("eval requires --lock; never select using April data")
-        evaluate(a.lock,a.out)
+        evaluate(a.lock,a.out,a.symbol)
