@@ -329,7 +329,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                             diagnostics=check, **core_options)
                         if check[3]<0 or check[5]!=1:
                             raise RuntimeError("No successful physical GLFT calibration; exclude missing day")
-                        shared_start=int(check[3])
+                        shared_start=int(probe_raw[-3])+int(check[3])
                     finally:
                         probe.close()
                     core_options["forced_start_ns"]=shared_start
