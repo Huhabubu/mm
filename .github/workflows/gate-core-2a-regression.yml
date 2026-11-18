@@ -14,6 +14,14 @@ on:
       - 'scripts/test_core_glft_parity_replay.py'
       - 'scripts/instrument_gate_action_regression.py'
       - 'scripts/test_gate_altcoin_units.py'
+      - 'scripts/gate_origin_glft_strategy.py'
+      - 'scripts/gate_stage3_shadow_strategy.py'
+      - 'scripts/gate_stage4_controls.py'
+      - 'scripts/gate_stage5a_pause_strategy.py'
+      - 'scripts/g0_glft_rolling.py'
+      - 'scripts/core_glft_rules.py'
+      - 'scripts/test_core_glft_physical_fit.py'
+      - 'scripts/test_core_glft_rules.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -33,6 +41,14 @@ jobs:
         run: PYTHONPATH=scripts python scripts/test_contract_specs.py
       - name: Legacy research units regression
         run: PYTHONPATH=scripts python scripts/test_gate_altcoin_units.py
+      - name: New physical one-tick Poisson side-arrival estimator tests
+        run: PYTHONPATH=scripts python scripts/test_core_glft_physical_fit.py
+      - name: Execution quote, clock and visible-depth rule tests
+        run: PYTHONPATH=scripts python scripts/test_core_glft_rules.py
+      - name: Stage4 and Stage5A existing offline regression
+        run: |
+          PYTHONPATH=scripts python scripts/test_gate_stage4_controls.py
+          PYTHONPATH=scripts python scripts/test_gate_stage5a_pause.py
       - name: Historical GLFT 1.645 sigma gate and order-book normalization regression
         run: PYTHONPATH=scripts python scripts/test_gate_origin_filter.py
   real_gate_btc:
