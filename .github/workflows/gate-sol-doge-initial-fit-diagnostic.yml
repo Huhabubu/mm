@@ -1,0 +1,115 @@
+name: Diagnose Gate SOL DOGE initial GLFT A-k acceptance (read-only)
+on:
+  push:
+    branches:
+      - analysis/gate-sol-doge-fit-fail-20261118
+    paths:
+      - .github/workflows/gate-sol-doge-initial-fit-diagnostic.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Unchanged GLFT estimator and rejection reason tests
+        run: |
+          python -m compileall -q scripts/diagnose_gate_altcoin_initial_fit.py
+          PYTHONPATH=scripts python scripts/test_diagnose_gate_altcoin_initial_fit.py
+          PYTHONPATH=scripts python scripts/test_gate_altcoin_units.py
+
+  days:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        symbol: ['SOL_USDT','DOGE_USDT']
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Extract original 10min Gate trades/L2/quotes and Binance clock; no orders
+        run: |
+          python -u scripts/diagnose_gate_altcoin_initial_fit.py \
+             --symbol '${{ matrix.symbol }}' --day '${{ matrix.day }}' \
+             --out 'fit_diagnostics/${{ matrix.symbol }}'
+      - name: Check diagnostic has exactly the original observed accepted/failure day
+        run: |
+          python - <<'PY'
+          import json
+          sym='${{ matrix.symbol }}'
+          day='${{ matrix.day }}'
+          path=f'fit_diagnostics/{sym}/{sym}_{day}_fit.json'
+          d=json.load(open(path))
+          expected_fail = ((sym=='SOL_USDT' and day in ('2026-08-01','2026-09-01','2026-11-01'))
+             or (sym=='DOGE_USDT' and day=='2026-11-01'))
+          assert d["accepted"] != expected_fail,(sym,day,d["reason"])
+          assert d["warmup_samples"]==6000
+          print("DIAGNOSTIC_MATCHES_FROZEN_INITIAL_FIT",sym,day,d["reason"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-fit-diag-${{ matrix.symbol }}-${{ matrix.day }}
+          path: fit_diagnostics/
+          if-no-files-found: warn
+          retention-days: 90
+
+  aggregate:
+    needs: days
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-fit-diag-*
+          path: all_fit
+      - name: Assemble 12 fully diagnosed dates; preserve all atomic checks
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json,csv
+          files=sorted(Path("all_fit").rglob("*_fit.json"))
+          assert len(files)==12,files
+          data=[json.loads(x.read_text()) for x in files]
+          assert len({(z["gate_symbol"],z["day"]) for z in data})==12
+          out=Path("reports/gate_sol_doge_first_fit_diagnosis_20261118")
+          out.mkdir(parents=True,exist_ok=True)
+          (out/"per_day.json").write_text(json.dumps(data,ensure_ascii=False,indent=2)+"\n")
+          cols=("gate_symbol","day","reason","accepted","qualifying_intervals",
+                "crossed_distance_levels","extreme_intervals_over_35_ticks",
+                "valid_midpoint_changes","estimated_A_per_second",
+                "estimated_k_per_tick","estimated_sigma_tick_per_sqrt_second",
+                "max_trade_through_ticks")
+          with (out/"per_day.csv").open("w",newline="",encoding="utf-8") as fp:
+              writer=csv.DictWriter(fp,fieldnames=cols)
+              writer.writeheader()
+              for z in data:
+                  writer.writerow({key:z[key] for key in cols})
+          print("FIT_DIAG_COMPLETE_12_OF_12",json.dumps([
+            {key:z[key] for key in ("gate_symbol","day","reason","qualifying_intervals",
+             "crossed_distance_levels","valid_midpoint_changes")}
+             for z in data],ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-fit-diagnostic-sixday-two-symbols-summary
+          path: reports/gate_sol_doge_first_fit_diagnosis_20261118/
+          if-no-files-found: error
+          retention-days: 90
