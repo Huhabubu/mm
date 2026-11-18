@@ -48,14 +48,42 @@ def assert_exact_replay(raw, frozen, fee_equity, fees, end_position, position_ca
         "exec_price": raw[-2][2],
         "exec_qty": raw[-2][3],
     }
-    for k,reference in frozen.items():
-        a = actual[k]
-        if (a.shape != reference.shape
-                or not np.array_equal(a, reference)):
-            mismatch=np.flatnonzero(a != reference)[:3] if a.shape == reference.shape else []
-            raise ValueError(f"Frozen HBT fill parity failed: {k}, "
-                             f"actual={a.shape}, expected={reference.shape}, "
-                             f"mismatch={mismatch}")
+    mismatched = [
+        k for k,reference in frozen.items()
+        if actual[k].shape != reference.shape
+        or not np.array_equal(actual[k],reference)
+    ]
+    order_exact = not mismatched
+    swapped_rows = 0
+    if mismatched:
+        if symbol == "BTC_USDT":
+            raise ValueError("Frozen BTC HBT fill order changed: " + str(mismatched))
+        # ETH HBT may return multiple opposite-side fills at the SAME exact
+        # timestamp in different order. Never accept a different event multiset.
+        # Requiring identical timestamp arrays rules out cross-time reordering.
+        if (actual["exchange_timestamp_ns"].shape != frozen["exchange_timestamp_ns"].shape
+                or not np.array_equal(actual["exchange_timestamp_ns"],
+                                      frozen["exchange_timestamp_ns"])):
+            raise ValueError("ETH frozen replay changed fill timestamps")
+        keys=("exchange_timestamp_ns","side","local_observed_ns","exec_price","exec_qty")
+        def canonical(x):
+            order=np.lexsort(tuple(x[k] for k in reversed(keys)))
+            return [x[k][order] for k in keys]
+        ca,cb=canonical(actual),canonical(frozen)
+        if any(not np.array_equal(a,b) for a,b in zip(ca,cb)):
+            raise ValueError("ETH frozen replay changed fill EVENT MULTISET: " + str(mismatched))
+        changed=np.zeros(len(frozen["side"]), dtype=np.bool_)
+        for k in mismatched:
+            changed |= actual[k]!=frozen[k]
+        swapped_rows=int(changed.sum())
+        times=frozen["exchange_timestamp_ns"]
+        if any(np.count_nonzero(times==times[i])<2 for i in np.flatnonzero(changed)):
+            raise ValueError("ETH replay differs beyond same-timestamp tie groups")
+        print("ETH_STAGE3_SAME_TIMESTAMP_TIE_PERMUTATION",swapped_rows,
+              "fields",mismatched,flush=True)
+    parity={"exact_order_equal":order_exact,
+            "same_timestamp_multiset_equal":True,
+            "same_timestamp_tie_permuted_rows":swapped_rows}
     summary = summarize(raw,1430,True,0.0,position_cap,order_qty,
                         tail_tolerance_samples=(10 if symbol!="BTC_USDT" else 5))
     t=summary["trading"]
@@ -66,7 +94,7 @@ def assert_exact_replay(raw, frozen, fee_equity, fees, end_position, position_ca
     ):
         if not math.isclose(a,b,rel_tol=0,abs_tol=1e-7):
             raise ValueError(f"Frozen HBT {label} parity failed: {a} != {b}")
-    return actual, t
+    return actual, t, parity
 
 
 def probe_deadlines(frozen):
@@ -266,7 +294,7 @@ def day_run(day, frozen_dir, annotated_dir, output, symbol="BTC_USDT"):
                 cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
                 rec.recorder,trade_stop*1000,probes,True)
             t=report["variants"]["glft"]["trading"]
-            actual,vals=assert_exact_replay(
+            actual,vals,parity=assert_exact_replay(
                 raw,frozen,t["end_net_marked_equity_usdt"],
                 t["fee_usdt"],t["end_position_contracts"],cfg["position_cap"],cfg["qty"],symbol)
             if int(raw[5])!=1:
@@ -284,12 +312,14 @@ def day_run(day, frozen_dir, annotated_dir, output, symbol="BTC_USDT"):
                 k:int(v) for k,v in zip(keys,raw[-1])}
             day_summary["frozen_beta1_native_counters"]=report["variants"]["both_1p0"]["binance_origin_filter"]
             day_summary["exact_parity"]={"all_fills":len(frozen["side"]),
+                **parity,
                 "baseline_fee_net_usdt":vals["end_net_marked_equity_usdt"],
                 "baseline_maker_fee_usdt":vals["fee_usdt"],
                 "baseline_end_position_contracts":vals["end_position_contracts"]}
             day_summary["input_gates"]={
                 "Tardis_native_quotes_from_frozen_source":True,
-                "HBT_baseline_fill_arrays_exactly_equal":True,
+                "HBT_baseline_fill_arrays_exactly_equal":parity["exact_order_equal"],
+                "HBT_baseline_same_timestamp_multiset_equal":True,
                 "HBT_baseline_net_exactly_equal_within_1e-7":True,
                 "HBT_fees_exactly_equal_within_1e-7":True,
                 "proxy_uses_HBT_fused_depth_for_G":True,
