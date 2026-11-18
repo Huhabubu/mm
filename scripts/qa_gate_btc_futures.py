@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = "https://datasets.tardis.dev/v1"
-GATE_API = "https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT"
+from contract_specs import load_contract_spec
 FEEDS = (
     ("gate-io-futures", "trades", "BTC_USDT"),
     ("gate-io-futures", "incremental_book_L2", "BTC_USDT"),
@@ -37,32 +37,8 @@ UA = {"User-Agent": "mm-binance-gate-paper-qa/1.0"}
 
 
 def fetch_contract(symbol="BTC_USDT"):
-    """Read the current Gate direct USDT perpetual spec for this exact symbol."""
-    if symbol not in ("BTC_USDT", "SOL_USDT", "DOGE_USDT"):
-        raise ValueError(f"Unsupported Gate study symbol: {symbol}")
-    endpoint = f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{symbol}"
-    headers = dict(UA)
-    if symbol != "BTC_USDT":
-        # Gate 2026 decimal-contract API: legacy integer response truncates 0.1 -> 0.
-        headers["X-Gate-Size-Decimal"] = "1"
-    req = urllib.request.Request(endpoint, headers=headers)
-    with urllib.request.urlopen(req, timeout=40) as stream:
-        contract = json.load(stream)
-    if contract.get("name") != symbol:
-        raise ValueError("Gate API returned wrong contract")
-    keys = ("name","type","quanto_multiplier","order_price_round","order_size_min",
-            "order_size_max","maker_fee_rate","taker_fee_rate","config_change_time","enable_decimal")
-    spec = {k:contract.get(k) for k in keys}
-    tick = float(spec["order_price_round"])
-    ctval = float(spec["quanto_multiplier"])
-    min_qty = float(spec["order_size_min"])
-    maker = float(spec["maker_fee_rate"])
-    taker = float(spec["taker_fee_rate"])
-    if not (spec["type"] == "direct" and tick > 0 and ctval > 0
-            and min_qty > 0 and math.isfinite(min_qty)
-            and math.isfinite(maker) and math.isfinite(taker)):
-        raise ValueError(f"Unsupported Gate contract configuration: {spec}")
-    return spec
+    """Offline frozen Gate HBT contract units and simulation fees; never call API."""
+    return load_contract_spec(symbol, venue="gate")
 
 
 def on_grid(x, step):
@@ -247,7 +223,7 @@ def main():
     output=Path(args.out);output.mkdir(parents=True,exist_ok=True)
     dest=output/f"qa_{args.day}_{args.minutes}min.json"
     report={"day":args.day,"window_minutes":args.minutes,
-            "gate_contract_api_observed_utc":datetime.now(timezone.utc).isoformat(),
+            "gate_contract_config_source":"configs/contract_specs.json",
             "status":"started","feeds":{}}
     try:
         spec=fetch_contract()
