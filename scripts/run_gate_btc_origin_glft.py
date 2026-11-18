@@ -322,7 +322,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                     probe=ROIVectorMarketDepthBacktest([build_asset(parts,low,high,cfg)])
                     try:
                         check=np.zeros(7,np.float64)
-                        run_core_glft(probe,bt,bm,minutes*600,
+                        probe_raw=run_core_glft(probe,bt,bm,minutes*600,
                             0.,grid,basis,sigma,0,cfg["gamma_code"],cfg["tick"],
                             cfg["ctval"],cfg["qty"],cfg["position_cap"],None,
                             trade_stop*1000 if minutes==1430 else 0,
