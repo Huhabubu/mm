@@ -132,6 +132,16 @@ def run_one(day="2026-11-01",minutes=50,trace_actions=False):
                 values[0][0],values[1][0],values[0][1],values[1][1])
             if trace_actions:
                 if not np.array_equal(traces[0],traces[1]):
+                    left,right=traces
+                    different = len(left) != len(right)
+                    upto = min(len(left),len(right))
+                    locations = np.flatnonzero(np.any(left[:upto] != right[:upto],axis=1))
+                    first = int(locations[0]) if len(locations) else upto
+                    print("ACTION_TRACE_FIRST_MISMATCH",day,beta,mode,
+                          "old_count",len(left),"core_count",len(right),
+                          "first",first,
+                          "old_window",left[max(0,first-3):first+4].tolist(),
+                          "core_window",right[max(0,first-3):first+4].tolist(),flush=True)
                     raise AssertionError(
                         f"Exact request sequence mismatch: {day} beta={beta} mode={mode}")
                 self_count = len(traces[0])
