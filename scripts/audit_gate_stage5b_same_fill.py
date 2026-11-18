@@ -26,6 +26,57 @@ def check_equal_stage2_stage3(c, f, day):
     return c["category"]
 
 
+def summarize_horizon(f, mask, day, cat, h):
+    """Compare new execution-price total markout with frozen legacy decomposition.
+
+    The main total calculation is independent of a stale entry midpoint.
+    Legacy capture+drift is retained but uses its original stricter eligibility.
+    """
+    needed = (f"total_fresh_{h}ms", f"total_markout_{h}ms_bps",
+              f"future_quote_updated_{h}ms")
+    if any(key not in f for key in needed):
+        raise ValueError(
+            f"Stage2 annotations must be regenerated with total markout for {day}")
+    total_ok = (mask & f[f"total_fresh_{h}ms"]
+                & np.isfinite(f[f"total_markout_{h}ms_bps"]))
+    old_ok = (mask & f[f"fresh_{h}ms"]
+              & np.isfinite(f[f"markout_{h}ms_bps"])
+              & np.isfinite(f["capture_halfspread_bps"]))
+    if not total_ok.any() or not old_ok.any():
+        raise ValueError(f"No valid Gate quote valuation for {day}, {cat}, {h}")
+    total = f[f"total_markout_{h}ms_bps"][total_ok]
+    capture = f["capture_halfspread_bps"][old_ok]
+    mark = f[f"markout_{h}ms_bps"][old_ok]
+    updated_ok = total_ok & f[f"future_quote_updated_{h}ms"]
+    age = f["quote_age_at_observation_ms"]
+    young = total_ok & (age >= 0) & (age < 100)
+    middle = total_ok & (age >= 100) & (age <= 250)
+    def mean_or_none(x):
+        return float(np.mean(x)) if len(x) else None
+    return {
+        "day": day, "class": cat, "horizon_ms": h,
+        "total_fills": int(mask.sum()),
+        "total_fresh_fills": int(total_ok.sum()),
+        "total_fresh_fraction": float(total_ok.sum()/mask.sum()) if mask.any() else None,
+        "total_markout_bps": float(total.mean()),
+        "total_markout_minus_maker2bps_bps": float(total.mean()-2.0),
+        "updated_quote_fills": int(updated_ok.sum()),
+        "updated_quote_total_markout_bps": mean_or_none(
+            f[f"total_markout_{h}ms_bps"][updated_ok]),
+        "entry_quote_lt100_fills": int(young.sum()),
+        "entry_quote_lt100_total_markout_bps": mean_or_none(
+            f[f"total_markout_{h}ms_bps"][young]),
+        "entry_quote_100to250_fills": int(middle.sum()),
+        "entry_quote_100to250_total_markout_bps": mean_or_none(
+            f[f"total_markout_{h}ms_bps"][middle]),
+        "fresh_fills": int(old_ok.sum()),
+        "capture_bps": float(capture.mean()),
+        "markout_bps": float(mark.mean()),  # legacy entry-mid drift
+        "capture_plus_markout_bps": float((capture+mark).mean()),
+        "short_horizon_maker_2bps_midmark": float((capture+mark).mean()-2.0),
+    }
+
+
 def calculate(stage3_zip,stage2_dir,stage4_summary,out_dir):
     out_dir.mkdir(parents=True,exist_ok=True)
     cases=[]
@@ -45,21 +96,7 @@ def calculate(stage3_zip,stage2_dir,stage4_summary,out_dir):
             for cat in CATS:
                 mask=groups==cat
                 for h in HORIZONS:
-                    eligible=(mask & f[f"fresh_{h}ms"]
-                            & np.isfinite(f[f"markout_{h}ms_bps"])
-                            & np.isfinite(f["capture_halfspread_bps"]))
-                    capture=f["capture_halfspread_bps"][eligible]
-                    mark=f[f"markout_{h}ms_bps"][eligible]
-                    if not len(capture):
-                        raise ValueError(f"No fresh Gate native quotes on {day}, {cat}, {h}")
-                    cases.append({
-                        "day":day,"class":cat,"horizon_ms":h,
-                        "total_fills":int(mask.sum()),"fresh_fills":int(eligible.sum()),
-                        "capture_bps":float(capture.mean()),
-                        "markout_bps":float(mark.mean()),
-                        "capture_plus_markout_bps":float((capture+mark).mean()),
-                        "short_horizon_maker_2bps_midmark":float((capture+mark).mean()-2.0),
-                    })
+                    cases.append(summarize_horizon(f, mask, day, cat, h))
     with (out_dir/"stage5b_same_fill_by_day.csv").open("w",newline="",encoding="utf-8") as fd:
         w=csv.DictWriter(fd,fieldnames=list(cases[0]));w.writeheader();w.writerows(cases)
     group_sixday={}
@@ -68,10 +105,17 @@ def calculate(stage3_zip,stage2_dir,stage4_summary,out_dir):
         for h in HORIZONS:
             rr=[r for r in cases if r["class"]==cat and r["horizon_ms"]==h]
             assert len(rr)==6
+            cols = ("total_markout_bps","total_markout_minus_maker2bps_bps",
+                    "total_fresh_fills","total_fresh_fraction",
+                    "updated_quote_total_markout_bps","updated_quote_fills",
+                    "entry_quote_lt100_total_markout_bps","entry_quote_lt100_fills",
+                    "entry_quote_100to250_total_markout_bps","entry_quote_100to250_fills",
+                    "capture_bps","markout_bps","capture_plus_markout_bps",
+                    "short_horizon_maker_2bps_midmark","fresh_fills")
             group_sixday[cat][str(h)]={
-                col:float(np.mean([x[col] for x in rr]))
-                for col in ("capture_bps","markout_bps","capture_plus_markout_bps",
-                            "short_horizon_maker_2bps_midmark","fresh_fills")
+                col:(float(np.mean([x[col] for x in rr if x[col] is not None]))
+                     if any(x[col] is not None for x in rr) else None)
+                for col in cols
             }
     breakeven=[]
     for day in DAYS:
@@ -91,7 +135,9 @@ def calculate(stage3_zip,stage2_dir,stage4_summary,out_dir):
     out={
         "status":"complete","review_days":list(DAYS),
         "groups":group_sixday,"break_even_fee":fee_sixday,
-        "warning":"Each quote valuation is at local fill-report as-of time; short-horizon midmark is not full-portfolio PnL; fixed 2bp maker cost; historic six days previously explored",
+        "primary": "execution-price total markout, 500ms/1000ms, future quote age <=500ms; 2bps maker-fee valuation",
+        "legacy": "capture + entry-mid drift on original both-endpoint-fresh fill set",
+        "warning":"Future midpoint is observed as-of local fill report plus horizon; execution-price total markout is a midprice valuation, not realized portfolio PnL; 2bps maker fee deducted only in explicitly named column; old capture+drift sample may differ; six historical days are exploratory",
     }
     (out_dir/"summary.json").write_text(json.dumps(out,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     print("STAGE5B_SAME_FILL_COMPLETE",json.dumps(out["groups"],ensure_ascii=False))
