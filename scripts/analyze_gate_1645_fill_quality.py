@@ -255,13 +255,78 @@ def model_day(model, fill, trace, ts, mid, day_end_ns, ctval):
     }
 
 
+def depth_visibility_diagnostic(day, model, witness_dir, fill):
+    """Order-placement queue-depth diagnostic, only with independently recorded L2.
+
+    Frozen Stage2 fills + native best-bid/best-ask quotes do NOT include order
+    submissions or the 20th/400th level. Never infer unobservable depth from them.
+    """
+    source = ("20_level_snapshots" if day < "2026-11-01"
+              else "400_level_initial_plus_native_deltas")
+    if witness_dir is None:
+        return {
+            "status": "unavailable_missing_order_placement_l2_witness",
+            "depth_source": source,
+            "orders_outside_visible_fraction": None,
+            "fills_outside_visible_fraction": None,
+        }
+    path = Path(witness_dir) / f"{day}_{model}_depth_witness.npz"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing requested depth witness: {path}")
+    fields = {
+        "order_side", "order_price_tick", "order_last_visible_tick",
+        "order_submit_local_ns", "order_book_local_ns",
+        "fill_order_side", "fill_order_price_tick", "fill_order_last_visible_tick",
+        "fill_order_submit_local_ns", "fill_order_book_local_ns",
+        "fill_exchange_timestamp_ns",
+    }
+    with np.load(path, allow_pickle=False) as data:
+        if not fields.issubset(data.files):
+            raise ValueError(f"Missing depth witness arrays: {fields-set(data.files)}")
+        w = {key: data[key] for key in fields}
+    for prefix in ("order", "fill_order"):
+        n = len(w[prefix+"_side"])
+        names = (prefix+"_side", prefix+"_price_tick", prefix+"_last_visible_tick",
+                 prefix+"_submit_local_ns", prefix+"_book_local_ns")
+        if any(len(w[name]) != n for name in names):
+            raise ValueError(f"Misaligned {prefix} depth witness arrays")
+        if np.any((w[prefix+"_side"] != 1) & (w[prefix+"_side"] != -1)):
+            raise ValueError("Invalid depth witness side")
+        if (not np.isfinite(w[prefix+"_price_tick"]).all()
+                or not np.isfinite(w[prefix+"_last_visible_tick"]).all()
+                or np.any(w[prefix+"_book_local_ns"] > w[prefix+"_submit_local_ns"])):
+            raise ValueError("Nonfinite or future-information L2 witness")
+    if (len(w["fill_order_side"]) != len(fill["side"])
+            or len(w["fill_exchange_timestamp_ns"]) != len(fill["side"])
+            or not np.array_equal(w["fill_order_side"], fill["side"])
+            or not np.array_equal(w["fill_exchange_timestamp_ns"], fill["exchange_timestamp_ns"])
+            or np.any(w["fill_order_submit_local_ns"] > fill["local_observed_ns"])):
+        raise ValueError("Depth witness differs from frozen official fill order/clock")
+    def beyond(prefix):
+        side = w[prefix+"_side"]
+        price = w[prefix+"_price_tick"]
+        edge = w[prefix+"_last_visible_tick"]
+        return np.where(side == 1, price < edge, price > edge)
+    a, b = beyond("order"), beyond("fill_order")
+    return {
+        "status": "complete",
+        "reference": "same-side last visible level at original order submission time",
+        "depth_source": source,
+        "orders": len(a), "fills": len(b),
+        "orders_outside_visible_count": int(a.sum()),
+        "fills_outside_visible_count": int(b.sum()),
+        "orders_outside_visible_fraction": float(a.mean()) if len(a) else None,
+        "fills_outside_visible_fraction": float(b.mean()) if len(b) else None,
+    }
+
+
 def read_archive_case(root, day, model):
     loc = root / "recorder" / day / model / "fills.npz"
     with np.load(loc, allow_pickle=False) as d:
         return {k: d[k].copy() for k in d.files}
 
 
-def one_day(day, case_dir, out_dir, quotes_url=None):
+def one_day(day, case_dir, out_dir, quotes_url=None, depth_witness_dir=None):
     report = json.loads((case_dir / f"{day}_1430m.json").read_text())
     if (report.get("day") != day or report.get("status") != "complete"
         or report.get("minutes_traded") != 1430
@@ -279,6 +344,7 @@ def one_day(day, case_dir, out_dir, quotes_url=None):
         annotated, summary = model_day(
             model, fill, report["variants"][model], ts, mid, end_ns,
             float(report["scenario"]["ctval"]))
+        summary["depth_visibility"] = depth_visibility_diagnostic(day, model, depth_witness_dir, fill)
         by_model[model] = summary
         np.savez_compressed(out_dir / f"{day}_{model}_annotated.npz", **annotated)
     output = {
@@ -291,6 +357,7 @@ def one_day(day, case_dir, out_dir, quotes_url=None):
         "future": "last Gate local_timestamp quote at or before local observation + horizon",
         "freshness_legacy_both_endpoints_max_age_ms": 500,
         "source_quote_qa": data_qa,
+        "depth_witness_required_for_actual_queue_position": True,
         "models": by_model,
     }
     (out_dir/f"{day}_quality.json").write_text(
@@ -365,7 +432,7 @@ def aggregate(root, out_dir):
                 if len(group)!=6:
                     raise ValueError(f"Missing six independent daily observations {model} {h}")
                 summary[model][direction][str(h)] = {
-                    "days":6, "valid_days":sum(x["mean_markout_bps"] is not None for x in group),
+                    "days":6, "valid_days":sum(x["total_markout_bps"] is not None for x in group),
                     "total_fills":sum(x["all_fills"] for x in group),
                     "total_fresh_fills":sum(x["fresh_fills"] for x in group),
                      "total_future_fresh_fills":sum(x["total_fresh_fills"] for x in group),
@@ -408,13 +475,15 @@ if __name__=="__main__":
     p.add_argument("--day")
     p.add_argument("--case-dir")
     p.add_argument("--quotes-url",help="Optional testing/local gz URL")
+    p.add_argument("--depth-witness-dir",help="Optional instrumented order + L2 witnesses; missing entries fail closed")
     p.add_argument("--input")
     p.add_argument("--out",required=True)
     args=p.parse_args()
     if args.mode=="day":
         if not (args.day in DAYS and args.case_dir):
             p.error("day mode requires valid --day and --case-dir")
-        one_day(args.day,Path(args.case_dir),Path(args.out),args.quotes_url)
+        one_day(args.day,Path(args.case_dir),Path(args.out),args.quotes_url,
+                Path(args.depth_witness_dir) if args.depth_witness_dir else None)
     else:
         if not args.input:
             p.error("aggregate mode requires --input")
