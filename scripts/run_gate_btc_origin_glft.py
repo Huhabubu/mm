@@ -383,7 +383,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                             "ask":float(diagnostic[2]),
                             "definition":"time-weighted locally-cancellable order presence; not exchange-confirmed true resting",
                             "verified_exchange_resting":False}
-                        summary["initial_fit_ns"]=(int(diagnostic[3]) if diagnostic[3]>=0 else None)
+                        summary["initial_fit_ns"]=(int(raw[-3])+int(diagnostic[3]) if diagnostic[3]>=0 else None)
                         summary["calibration_wait_ns"]=int(diagnostic[4])
                         summary["market_sync_pending_at_stop"]=bool(diagnostic[6])
                     summary["quote_mode"]=name
