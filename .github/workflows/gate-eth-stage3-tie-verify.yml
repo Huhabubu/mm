@@ -1,0 +1,139 @@
+name: Gate ETH Stage3 six-day strict same-timestamp fill multiset audit
+on:
+  push:
+    branches:
+      - experiment/gate-eth-20261117
+    paths:
+      - .github/workflows/gate-eth-stage3-tie-verify.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Unit tests for signal observation and fixed deadline
+        run: |
+          PYTHONPATH=scripts python scripts/test_audit_gate_1645_stage3_shadow.py
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44114624542
+          name: gate-eth-${{ matrix.day }}
+          path: frozen_download
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44215471830
+          name: gate-eth-stage12-stage5a
+          path: stage12
+          github-token: ${{ github.token }}
+      - name: Require exact HBT fill order OR identical unordered fills only within exact timestamp tie
+        run: |
+          mkdir -p frozen
+          cp -a frozen_download/full_day/. frozen/
+          python -u scripts/audit_gate_1645_stage3_shadow.py --symbol ETH_USDT \
+            --day '${{ matrix.day }}' --frozen frozen \
+            --annotated 'stage12/stage2_daily/${{ matrix.day }}' \
+            --out 'stage3_out/${{ matrix.day }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-eth-stage3-v2-${{ matrix.day }}
+          path: stage3_out/${{ matrix.day }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+  aggregate:
+    needs: replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-eth-stage3-v2-2026-*
+          path: stage3_all
+      - name: Six-day HBT event multiset / shadow conditions
+        run: |
+          python scripts/aggregate_gate_1645_stage3.py \
+            --input stage3_all --out stage3_summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-stage3-v2-summary
+          path: stage3_summary/
+          if-no-files-found: error
+          retention-days: 90
+
+  stage5b:
+    needs: aggregate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install numpy
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-eth-stage3-v2-2026-*
+          path: stage3_all
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44215471830
+          name: gate-eth-stage12-stage5a
+          path: stage12
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44215471830
+          name: gate-eth-stage4-summary
+          path: stage4
+          github-token: ${{ github.token }}
+      - name: Exact matching of original GLFT fill labels and short-horizon fee economics
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile,ZIP_DEFLATED
+          dst=Path("stage5b_input")
+          dst.mkdir(exist_ok=True)
+          with ZipFile(dst/"shadow.zip","w",ZIP_DEFLATED) as z3:
+              for m in range(6,12):
+                  day=f"2026-{m:02d}-01"
+                  files=list(Path("stage3_all").rglob(day+"_stage3_classified.npz"))
+                  assert len(files)==1,(day,files)
+                  z3.write(files[0],f"daily/{day}/{day}_stage3_classified.npz")
+          for m in range(6,12):
+              day=f"2026-{m:02d}-01"
+              path=Path("stage12")/"stage2_daily"/day/(day+"_glft_annotated.npz")
+              assert path.is_file(),path
+              with ZipFile(dst/f"gate_stage2_verified_{m:02d}.zip","w",ZIP_DEFLATED) as z2:
+                  z2.write(path,day+"_glft_annotated.npz")
+          PY
+          python scripts/audit_gate_stage5b_same_fill.py \
+            --stage3-zip stage5b_input/shadow.zip \
+            --stage2-dir stage5b_input \
+            --stage4-json stage4/summary.json \
+            --out stage5b_summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-eth-stage5b-v2-summary
+          path: stage5b_summary/
+          if-no-files-found: error
+          retention-days: 90
