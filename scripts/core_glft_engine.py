@@ -488,3 +488,17 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             np.array([price_updates,trigger_checks,above_trigger,direction_ok,
                       activated,active_decisions,tie_excluded],dtype=np.int64))
 
+
+
+
+def legacy_public_result(raw):
+    """Keep the historical 7-column empty-probe ABI for Stage1/4/5A runners.
+
+    Stage3 deliberately retains its 25-column counterfactual probe array.
+    The underlying event loop is unchanged by this result shape adapter.
+    """
+    state = raw[-2]
+    if state[4].shape[1] == 7:
+        return raw
+    return raw[:-2] + ((state[0],state[1],state[2],state[3],
+                        state[4][:,:7]),raw[-1])
