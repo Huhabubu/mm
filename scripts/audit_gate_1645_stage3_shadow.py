@@ -40,7 +40,7 @@ def strict_fill_arrays(path):
                  "exec_price","exec_qty")}
 
 
-def assert_exact_replay(raw, frozen, fee_equity, fees, end_position, position_cap, order_qty):
+def assert_exact_replay(raw, frozen, fee_equity, fees, end_position, position_cap, order_qty, symbol="BTC_USDT"):
     actual = {
         "exchange_timestamp_ns": raw[-5],
         "side": raw[-4],
@@ -56,7 +56,8 @@ def assert_exact_replay(raw, frozen, fee_equity, fees, end_position, position_ca
             raise ValueError(f"Frozen HBT fill parity failed: {k}, "
                              f"actual={a.shape}, expected={reference.shape}, "
                              f"mismatch={mismatch}")
-    summary = summarize(raw,1430,True,0.0,position_cap,order_qty)
+    summary = summarize(raw,1430,True,0.0,position_cap,order_qty,
+                        tail_tolerance_samples=(10 if symbol!="BTC_USDT" else 5))
     t=summary["trading"]
     for label,a,b in (
         ("equity", t["end_net_marked_equity_usdt"], fee_equity),
@@ -200,7 +201,7 @@ def summarize_classified(day, baseline, variant, annotated, diagnostics):
     return out
 
 
-def day_run(day, frozen_dir, annotated_dir, output):
+def day_run(day, frozen_dir, annotated_dir, output, symbol="BTC_USDT"):
     from hftbacktest import Recorder, ROIVectorMarketDepthBacktest
     from hftbacktest.data.utils import tardis
     from hftbacktest.data.validation import validate_event_order
@@ -217,6 +218,8 @@ def day_run(day, frozen_dir, annotated_dir, output):
             or report["binance_extra_visible_delay_ms"]!=2.5
             or report["scenario"]["maker_fee_rate"]!=0.0002):
         raise ValueError("Frozen full-day scenario mismatch")
+    if report.get("gate_symbol","BTC_USDT") != symbol:
+        raise ValueError("Frozen Gate symbol mismatch")
     frozen=strict_fill_arrays(frozen_dir/"recorder"/day/"glft"/"fills.npz")
     comparison=strict_fill_arrays(frozen_dir/"recorder"/day/"both_1p0"/"fills.npz")
     with np.load(annotated_dir/f"{day}_glft_annotated.npz") as d:
@@ -224,12 +227,15 @@ def day_run(day, frozen_dir, annotated_dir, output):
     probes,inverse=probe_deadlines(frozen)
     with tempfile.TemporaryDirectory(prefix="gate_stage3_") as temp:
         root=Path(temp)
-        spec=fetch_contract()
+        spec=fetch_contract(symbol)
         paths={};counts={}
         for kind in SCHEMAS:
             path=root/(kind+".csv")
             print("STAGE3_DOWNLOAD",day,kind,flush=True)
-            counts[kind]=safe_gate_csv(kind,day,trade_stop,path,90_000_000)
+            counts[kind]=safe_gate_csv(kind,day,trade_stop,path,90_000_000,
+                symbol=symbol,
+                historical_tick=(float(spec["order_price_round"]) if symbol!="BTC_USDT" else None),
+                historical_lot=(float(spec["order_size_min"]) if symbol!="BTC_USDT" else None))
             paths[kind]=path
         require_unshifted_target_clock(counts)
         for k in counts:
@@ -238,7 +244,7 @@ def day_run(day, frozen_dir, annotated_dir, output):
                 if counts[k][field]!=original[field]:
                     raise ValueError(f"Input feed changed: {k} {field}")
         gate_t,gate_mid=load_gate_mid(paths["book_ticker"])
-        bin_t,bin_mid=read_binance_bbo(day,trade_stop,symbol="BTCUSDT")
+        bin_t,bin_mid=read_binance_bbo(day,trade_stop,symbol=symbol.replace("_",""))
         visible=visible_timestamps(bin_t,BINANCE_DELAY_MS)
         grid,basis,sigma,cover=exact_moments_5s(
             visible,bin_mid,gate_t,gate_mid,trade_start*1000,trade_stop*1000)
@@ -262,7 +268,7 @@ def day_run(day, frozen_dir, annotated_dir, output):
             t=report["variants"]["glft"]["trading"]
             actual,vals=assert_exact_replay(
                 raw,frozen,t["end_net_marked_equity_usdt"],
-                t["fee_usdt"],t["end_position_contracts"],cfg["position_cap"],cfg["qty"])
+                t["fee_usdt"],t["end_position_contracts"],cfg["position_cap"],cfg["qty"],symbol)
             if int(raw[5])!=1:
                 raise ValueError("GLFT calibration stopped working")
             probe_rows=raw[-2][4]
@@ -312,5 +318,6 @@ if __name__=="__main__":
     p.add_argument("--frozen",required=True)
     p.add_argument("--annotated",required=True)
     p.add_argument("--out",required=True)
+    p.add_argument("--symbol",default="BTC_USDT",choices=("BTC_USDT","ETH_USDT"))
     a=p.parse_args()
-    day_run(a.day,Path(a.frozen),Path(a.annotated),Path(a.out))
+    day_run(a.day,Path(a.frozen),Path(a.annotated),Path(a.out),a.symbol)
