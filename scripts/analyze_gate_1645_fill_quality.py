@@ -283,10 +283,13 @@ def one_day(day, case_dir, out_dir, quotes_url=None):
         np.savez_compressed(out_dir / f"{day}_{model}_annotated.npz", **annotated)
     output = {
         "day": day, "status": "complete",
-        "definition": "signed(buy=+1,sell=-1)*(future Gate mid - entry Gate mid)/entry Gate mid*10000",
+        "definition": "signed(buy=+1,sell=-1)*(future Gate mid - official HBT execution price)/execution price*10000",
+        "legacy_definition": "signed(buy=+1,sell=-1)*(future Gate mid - entry Gate mid)/entry Gate mid*10000",
+        "core_horizons_ms": PRIMARY_HORIZONS,
+        "total_markout_primary_future_max_age_ms": 500,
         "start": "HBT local fill observation; Gate local_timestamp quote strictly earlier",
         "future": "last Gate local_timestamp quote at or before local observation + horizon",
-        "freshness_primary_max_age_ms": 500,
+        "freshness_legacy_both_endpoints_max_age_ms": 500,
         "source_quote_qa": data_qa,
         "models": by_model,
     }
@@ -315,6 +318,21 @@ def aggregate(root, out_dir):
                     rows.append({
                         "date":r["day"],"model":model,"side":direction,"horizon_ms":int(horizon),
                         "all_fills":data["all_fills"],"fresh_fills":data["fresh_count"],
+                         "total_fresh_fills":data["total_fresh_count"],
+                         "total_coverage":data["total_fresh_fraction"],
+                         "total_markout_bps":(data["total_markout"]["mean_bps"]
+                             if data["total_markout"] else None),
+                         "total_markout_updated_bps":(
+                             data["total_markout_after_quote_update"]["mean_bps"]
+                             if data["total_markout_after_quote_update"] else None),
+                         "quote_age_lt100_fills":data["quote_age_strata"]["lt_100ms"]["fills"],
+                         "quote_age_lt100_total_bps":(
+                             data["quote_age_strata"]["lt_100ms"]["total_markout"]["mean_bps"]
+                             if data["quote_age_strata"]["lt_100ms"]["total_markout"] else None),
+                         "quote_age_100to250_fills":data["quote_age_strata"]["100_to_250ms"]["fills"],
+                         "quote_age_100to250_total_bps":(
+                             data["quote_age_strata"]["100_to_250ms"]["total_markout"]["mean_bps"]
+                             if data["quote_age_strata"]["100_to_250ms"]["total_markout"] else None),
                         "coverage":data["fresh_fraction"],
                         "capture_bps":data["capture_on_same_fresh_fills"]["mean_bps"] if data["capture_on_same_fresh_fills"] else None,
                         "mean_markout_bps":s["mean_bps"] if s else None,
@@ -330,7 +348,9 @@ def aggregate(root, out_dir):
     with (out_dir/"per_day_quality.csv").open("w",newline="",encoding="utf-8") as f:
         w=csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader();w.writerows(rows)
-    metrics = ("coverage","capture_bps","mean_markout_bps",
+    metrics = ("total_coverage","total_markout_bps","total_markout_updated_bps",
+               "quote_age_lt100_total_bps","quote_age_100to250_total_bps",
+               "coverage","capture_bps","mean_markout_bps",
                "notional_weighted_mean_bps","p10_bps","worst10_mean_bps",
                "weighted_p10_bps","weighted_worst10_mean_bps",
                "negative_fraction","notional_weighted_negative_fraction")
@@ -348,30 +368,35 @@ def aggregate(root, out_dir):
                     "days":6, "valid_days":sum(x["mean_markout_bps"] is not None for x in group),
                     "total_fills":sum(x["all_fills"] for x in group),
                     "total_fresh_fills":sum(x["fresh_fills"] for x in group),
+                     "total_future_fresh_fills":sum(x["total_fresh_fills"] for x in group),
+                     "quote_age_lt100_fills":sum(x["quote_age_lt100_fills"] for x in group),
+                     "quote_age_100to250_fills":sum(x["quote_age_100to250_fills"] for x in group),
                     **{"equal_day_mean_"+key: (float(np.mean([x[key] for x in group if x[key] is not None]))
                         if any(x[key] is not None for x in group) else None)
                        for key in metrics},
                 }
     result={"status":"complete","six_exploratory_dates":DAYS,
-            "primary":"each day equal-weighted, quote freshness<=500ms both endpoints; spread capture on same eligible fill set",
+            "primary":"execution-price total markout; equal-weighted by day; 500/1000ms core; future quote age<=500ms",
+             "legacy":"entry-mid capture and markout, both endpoint quotes age<=500ms",
             "note":"Descriptive fill conditional distributions, not causal effect or PnL attribution",
             "results":summary}
     (out_dir/"summary.json").write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n")
     lines=["# Gate BTC 1.645σ 双边β1：阶段②成交质量（六日探索性）","",
-           "基于官方HBT实际成交回报时刻及Tardis Gate原生quotes行情。主结果要求起点/终点盘口年龄均≤500ms；捕获半价差与Markout使用同一批符合条件的成交，否则排除并报告覆盖率。未修改撮合/策略/阈值。", "",
-           "| 模型 | 方向 | 期限 | 每日有效笔数均值 | 覆盖率 | 捕获半价差(bps) | Markout(bps) | P10 | 最差10%均值 | 负向占比 |",
-           "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+           "主口径是实际成交价到未来Gate中间价的Total Markout。要求未来报价年龄≤500ms，核心500/1000ms；报告入场时报价年龄分层及未来至少发生一次报价刷新的子样本。旧Capture与旧Markout另存供审计。未修改撮合、策略及手续费。", "",
+           "| 模型 | 方向 | 期限 | 有效笔数/日 | 主覆盖率 | Total Markout(bps) | 报价更新后(bps) | <100ms报价(bps) | 100–250ms报价(bps) | 旧Capture(bps) | 旧Markout(bps) |",
+           "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for model in MODELS:
         for direction in GROUPS:
             for h in HORIZONS:
                 z=summary[model][direction][str(h)]
                 f=lambda key,dec=3: ("NA" if z["equal_day_mean_"+key] is None else
                                      f'{z["equal_day_mean_"+key]:.{dec}f}')
-                lines.append(f'| {model} | {direction} | {h}ms | {z["total_fresh_fills"]/6:.1f} | '
-                             f'{f("coverage",3)} | {f("capture_bps")} | '
-                             f'{f("mean_markout_bps")} | {f("p10_bps")} | '
-                             f'{f("worst10_mean_bps")} | {f("negative_fraction",3)} |')
-    lines.extend(["","负向Markout表示买后下跌或卖后上涨。报告另有逐日CSV及名义额加权均值、P10、最差10%均值和负向比例；0变化计入非负。P10按逐日10%分位点计算，最差10%均值按精确排序后的最差ceil(0.1N)笔计算；名义额加权尾部使用10%权重质量。所有指标仅是成交后价格变化，不与收益分解中的库存盈亏相加。","",
+                lines.append(f'| {model} | {direction} | {h}ms | {z["total_future_fresh_fills"]/6:.1f} | '
+                             f'{f("total_coverage",3)} | {f("total_markout_bps")} | '
+                             f'{f("total_markout_updated_bps")} | {f("quote_age_lt100_total_bps")} | '
+                             f'{f("quote_age_100to250_total_bps")} | {f("capture_bps")} | '
+                             f'{f("mean_markout_bps")} |')
+    lines.extend(["","总Markout以成交价为零点，负值为成交后未来中间价相对成交价的不利估值；尚未扣Maker费，不是净收益。旧Capture和Markout保留用于旧结果复核；各口径有效成交集合可能不同，不能直接混加。逐日CSV仍包含历史的尾部风险指标。","",
                   "跨所2.5ms为假设，资金费率、主动期末平仓成本未模拟；日期已用于研发探索，不能声称样本外显著性。",""])
     (out_dir/"report.md").write_text("\n".join(lines),encoding="utf-8")
     print("GATE_STAGE2_AGGREGATE_OK",flush=True)
