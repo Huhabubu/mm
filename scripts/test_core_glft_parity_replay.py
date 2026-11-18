@@ -8,6 +8,8 @@ Does NOT claim order-request identity until request-level tracing is implemented
 import argparse
 import math
 import tempfile
+import subprocess
+import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +20,6 @@ from hftbacktest.data.validation import validate_event_order
 
 from core_glft_engine import run_core_glft
 from instrument_gate_action_regression import instrument_action_requests
-from gate_origin_glft_strategy import run_gate_origin_glft
 from run_gate_btc_origin_glft import (
     SCHEMAS, BINANCE_DELAY_MS, build_asset, exact_moments_5s,
     fetch_contract, load_gate_mid, read_binance_bbo, require_unshifted_target_clock,
@@ -86,16 +87,25 @@ def run_one(day="2026-11-01",minutes=50,trace_actions=False):
         validate_event_order(events)
         del events
         low=float(np.min(om));high=float(np.max(om))
-        functions = (run_gate_origin_glft, run_core_glft)
+        # The original implementation is frozen at the exact Stage1 completion
+        # commit. It remains a reference even after production imports migrate.
+        original_source = subprocess.check_output(
+            ["git","show",
+             "1b709c5e25874da91b80cc0307a5a4c16ffeb992:scripts/gate_origin_glft_strategy.py"],
+            text=True)
+        here=Path(__file__).resolve().parent
+        frozen_path=root/"frozen_gate_origin_1b709c5.py"
+        frozen_path.write_text(original_source,encoding="utf-8")
+        spec=importlib.util.spec_from_file_location("frozen_gate_origin_1b709c5",frozen_path)
+        frozen_module=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(frozen_module)
+        functions=(frozen_module.run_gate_origin_glft,run_core_glft)
         if trace_actions:
-            here=Path(__file__).resolve().parent
-            old_copy=root/"trace_legacy.py"
-            new_copy=root/"trace_core.py"
-            functions = (
+            functions=(
                 instrument_action_requests(
-                    here/"gate_origin_glft_strategy.py",old_copy,"run_gate_origin_glft"),
+                    frozen_path,root/"trace_legacy.py","run_gate_origin_glft"),
                 instrument_action_requests(
-                    here/"core_glft_engine.py",new_copy,"run_core_glft"))
+                    here/"core_glft_engine.py",root/"trace_core.py","run_core_glft"))
         for beta,mode in ((0.,0),(1.,1),(1.,2)):
             values=[]
             traces=[]
