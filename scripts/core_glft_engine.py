@@ -613,7 +613,7 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         diagnostics[0] = max_ops
         diagnostics[1] = resting_bid_ns/duration
         diagnostics[2] = resting_ask_ns/duration
-        diagnostics[3] = first_fit_ns
+        diagnostics[3] = (first_fit_ns-t0) if first_fit_ns >= 0 else -1
         diagnostics[4] = max(0,first_fit_ns-(t0+TRAIN*STEP_NS))
         diagnostics[5] = 1 if first_fit_ns >= 0 else 0
         diagnostics[6] = 1 if awaiting_market_sync else 0
