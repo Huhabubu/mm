@@ -39,7 +39,7 @@ def analyze_case(archive, day, model, report, tolerance=0.00015,
     cfg = report["scenario"]
     if abs(float(cfg["maker_fee_rate"]) - 0.0002) > 1e-12:
         raise ValueError(f"Expected positive 2bps maker fee: {day}")
-    value = float(cfg["ctval"])  # BTC per Gate contract
+    value = float(cfg["ctval"])  # base-asset units per Gate contract
     path = f"recorder/{day}/{model}/"
     loaded = load_npz(archive, path + "recorder.npz")
     if set(loaded) != {"0"}:
@@ -88,7 +88,7 @@ def analyze_case(archive, day, model, report, tolerance=0.00015,
     if pos_error > 1e-7 or cash_error > tolerance:
         raise ValueError(f"Recorder/cash/fill mismatch: {day}, {model}, "
                          f"pos={pos_error}, balance={cash_error}")
-    last_mid = float(trading["end_mid_usdt_per_btc"])
+    last_mid = float(trading["end_mid_usdt_per_base"] if "end_mid_usdt_per_base" in trading else trading["end_mid_usdt_per_btc"])
     last_pos = float(trading["end_position_contracts"])
     last_bal = float(trading["balance_usdt"])
     fee = float(trading["fee_usdt"])
