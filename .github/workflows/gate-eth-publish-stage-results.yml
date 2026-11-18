@@ -1,0 +1,111 @@
+name: Publish verified ETH stage1-5 result summaries to isolated branch
+on:
+  push:
+    branches:
+      - experiment/gate-eth-20261117
+    paths:
+      - .github/workflows/gate-eth-publish-stage-results.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44215471830
+          name: gate-eth-stage12-stage5a
+          github-token: ${{ github.token }}
+          path: source/stage12
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44216822800
+          name: gate-eth-stage3-v2-summary
+          github-token: ${{ github.token }}
+          path: source/stage3
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44215471830
+          name: gate-eth-stage4-summary
+          github-token: ${{ github.token }}
+          path: source/stage4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44216822800
+          name: gate-eth-stage5b-v2-summary
+          github-token: ${{ github.token }}
+          path: source/stage5b
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: 44215471830
+          name: gate-eth-stage5c-april
+          github-token: ${{ github.token }}
+          path: source/stage5c
+      - name: Retain only verified compact paper evidence, no raw fills or Recorder
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from shutil import copy2
+          import json,hashlib
+          root=Path("reports/gate_eth_stages_20261118")
+          sources={
+            "stage1":["stage12/stage1/summary.json","stage12/stage1/sixday_attribution.csv"],
+            "stage2":["stage12/stage2/aggregate/summary.json","stage12/stage2/aggregate/per_day_quality.csv","stage12/stage2/aggregate/report.md"],
+            "stage3":["stage3/summary.json","stage3/group_summary.csv","stage3/report.md"],
+            "stage4":["stage4/summary.json","stage4/per_day_four_models.csv","stage4/report.md"],
+            "stage5a":["stage12/stage5a/summary.json","stage12/stage5a/per_day.csv"],
+            "stage5b":["stage5b/summary.json","stage5b/stage5b_same_fill_by_day.csv","stage5b/stage5b_break_even_by_day.csv"],
+            "stage5c":["stage5c/results/stage5c/summary.json","stage5c/results/stage5c/report.md","stage5c/eth_april_lock/april_selection_lock.json"],
+          }
+          manifest={"source_runs":{"frozen_replay":44114624542,"stages12_4_5c":44215471830,"stage3v2_stage5b":44216822800},
+                    "gate_symbol":"ETH_USDT","binance_symbol":"ETHUSDT",
+                    "frozen_fee_policy":"Maker +0.02%; no funding or forced unwind",
+                    "files":{}}
+          for stage,paths in sources.items():
+              dst=root/stage
+              dst.mkdir(parents=True,exist_ok=True)
+              for rel in paths:
+                  src=Path("source")/rel
+                  if not src.is_file():
+                      raise FileNotFoundError(f"Missing original evidence for {stage}: {src}")
+                  output=dst/src.name
+                  copy2(src,output)
+                  manifest["files"][str(output.relative_to(root))]=hashlib.sha256(output.read_bytes()).hexdigest()
+          for stage in ("stage1","stage2","stage3","stage4","stage5a","stage5b","stage5c"):
+              p=root/stage/"summary.json"
+              if json.loads(p.read_text()).get("status")!="complete":
+                  raise ValueError(f"{stage} summary incomplete")
+          (root/"manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+          (root/"README.md").write_text(
+              "# ETH / Gate 跨所做市完整阶段验证归档（2026-11-18）\n\n"
+              "原始基准为 Binance ETHUSDT 信号指导 Gate ETH_USDT，官方 hftbacktest 2.4.4，"
+              "2026年6至11月每月1日，均为有效完整日。Maker +0.02% 手续费后的净收益为主口径。\n\n"
+              "- Stage1/2：实际冻结 Recorder/成交会计与原生报价 Markout 独立审计\n"
+              "- Stage3：只读影子信号、严格同时间戳完整成交事件集合与期末账本等价核验。"
+              "六月有4行、九月有2行同时间戳内的原始排列差异；"
+              "精确顺序是否一致在原始 JSON 标志中单列，不能称全部逐笔顺序完全一致\n"
+              "- Stage4：仅2026-05-01训练 ETH 静态扩宽和 Gate 本地波动率对照，6—11月冻结评价\n"
+              "- Stage5A：使用四模型原生已冻结的完整日记录直接比较执行机制\n"
+              "- Stage5B：同笔经济性与费用阈值归因\n"
+              "- Stage5C：锁定后首次回放较早的2026-04-01 ETH 日期，属于历史稳健性，非时间前向样本外\n\n"
+              "限制：六日曾用于策略探索，尚缺独立时间前向检验；"
+              "未计资金费率、主动期末平仓、动态真实延迟及真实队列顺序。"
+              "理论可撤不是订单真实成功撤销。详细数字见各阶段原始 summary.json 与 CSV。\n",
+              encoding="utf-8")
+          print("GATE_ETH_RESULTS_DURABLE_7_STAGES",len(manifest["files"]),flush=True)
+          PY
+      - name: Commit only compact report files to ETH branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/gate_eth_stages_20261118/
+          if ! git diff --cached --quiet; then
+            git commit -m "results: verified Gate ETH Stage1-5 audits and May-locked controls"
+            git fetch origin "$GITHUB_REF_NAME"
+            git rebase "origin/$GITHUB_REF_NAME"
+            git push origin HEAD:"$GITHUB_REF_NAME"
+          fi
