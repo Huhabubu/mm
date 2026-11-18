@@ -271,11 +271,12 @@ def day_run(day, frozen_dir, annotated_dir, output):
             # Diagnostic event counts are from baseline shadow; reference beta1
             # native signal telemetry from frozen files for contextual comparison.
             keys=("binance_price_update_groups","eligible_gap_checks",
-                  "above_1p96sigma_checks","directional_dominance_checks",
+                  "above_threshold_checks","directional_dominance_checks",
                   "binance_origin_activations","active_decisions",
                   "same_timestamp_ties_blocked")
             day_summary["shadow_baseline_counters"]={
                 k:int(v) for k,v in zip(keys,raw[-1])}
+            day_summary["sigma_threshold"]=1.645
             day_summary["frozen_beta1_native_counters"]=report["variants"]["both_1p0"]["binance_origin_filter"]
             day_summary["exact_parity"]={"all_fills":len(frozen["side"]),
                 "baseline_fee_net_usdt":vals["end_net_marked_equity_usdt"],
