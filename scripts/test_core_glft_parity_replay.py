@@ -164,6 +164,76 @@ def run_one(day="2026-11-01",minutes=50,trace_actions=False):
                     raise AssertionError("Request trace misses a submit/cancel action")
                 print("CORE_LEGACY_EXACT_REQUEST_TRACE",day,beta,mode,self_count,flush=True)
             print("CORE_LEGACY_MATCH_MODEL",day,beta,mode,flush=True)
+        compare_stage_wrappers_on_replay({
+            "cfg":cfg,"fused":fused,"low":low,"high":high,"bt":bt,"bm":bm,
+            "grid":grid,"basis":basis,"sigma":sigma,"minutes":minutes,
+            "stop_ns":trade_stop_us*1000},root,trace_actions)
+
+
+def compare_stage_wrappers_on_replay(data, root, trace_actions):
+    """Additional Stage3/Stage4/Stage5A original-vs-core full request parity.
+
+    Data contains converted HBT events and preprocessing outputs; no feed
+    is re-downloaded for these cases.
+    """
+    from hftbacktest import Recorder, ROIVectorMarketDepthBacktest
+    cases=[
+        ("stage3_shadow","gate_stage3_shadow_strategy.py",
+         "run_gate_stage3_shadow",0.0,0,{"shadow_gate":True}),
+        ("stage4_reference","gate_stage4_controls.py",
+         "run_gate_stage4_control",0.0,0,{"control_kind":0}),
+        ("stage4_widen","gate_stage4_controls.py",
+         "run_gate_stage4_control",0.0,0,{"control_kind":1,"extra_half_ticks":15.471552}),
+        ("stage4_pause","gate_stage4_controls.py",
+         "run_gate_stage4_control",0.0,0,{"control_kind":2,"local_sigma_ceiling":43.510298}),
+        ("stage5a_pause","gate_stage5a_pause_strategy.py",
+         "run_gate_stage5a_pause",1.0,3,{}),
+    ]
+    here=Path(__file__).resolve().parent
+    for name,filename,fn_name,beta,mode,extra in cases:
+        src=subprocess.check_output([
+            "git","show",
+            "1b709c5e25874da91b80cc0307a5a4c16ffeb992:scripts/"+filename],
+            text=True)
+        frozen_path=root/f"frozen_{name}.py"
+        frozen_path.write_text(src,encoding="utf-8")
+        funcs=[]
+        if trace_actions:
+            funcs.append(instrument_action_requests(
+                frozen_path,root/f"trace_{name}.py",fn_name))
+            funcs.append(instrument_action_requests(
+                here/"core_glft_engine.py",root/f"trace_core_{name}.py","run_core_glft"))
+        else:
+            spec=importlib.util.spec_from_file_location("frozen_"+name,frozen_path)
+            frozen_module=importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(frozen_module)
+            funcs=[getattr(frozen_module,fn_name),run_core_glft]
+        results=[]
+        for index,fn in enumerate(funcs):
+            cfg=data["cfg"]
+            eng=ROIVectorMarketDepthBacktest([
+                build_asset([data["fused"]],data["low"],data["high"],cfg)])
+            rec=Recorder(eng.num_assets,data["minutes"]*600+10)
+            try:
+                output=fn(eng,data["bt"],data["bm"],data["minutes"]*600,beta,
+                          data["grid"],data["basis"],data["sigma"],mode,
+                          cfg["gamma_code"],cfg["tick"],cfg["ctval"],
+                          cfg["qty"],cfg["position_cap"],rec.recorder,
+                          data["stop_ns"],**extra)
+                raw, actions = output if trace_actions else (output, None)
+                results.append((raw,rec.get(0).copy(),actions))
+            finally:
+                eng.close()
+        assert_exact_legacy_result(results[0][0],results[1][0],
+                                   results[0][1],results[1][1])
+        if trace_actions:
+            left,right=results[0][2],results[1][2]
+            def canonical(x):
+                return x[np.lexsort((x[:,3],x[:,2],x[:,1],x[:,0]))]
+            if not np.array_equal(canonical(left),canonical(right)):
+                raise AssertionError(f"Stage-specific request mismatch: {name}")
+            print("STAGE_OLD_MODE_EXACT_REQUEST_CONTENT",name,len(left),flush=True)
+        print("STAGE_OLD_MODE_LEGACY_PARITY",name,flush=True)
 
 
 if __name__=="__main__":
