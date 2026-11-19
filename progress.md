@@ -536,3 +536,10 @@
 - [x] 预检通过：[Actions #44443012633](https://github.com/Huhabubu/mm/actions/runs/44443012633)，包括BTC2026-06-01的20档开关和BTC2026-11-01的原始新配置均在真实50min数据成功。预检数字不进入论文正式表。
 - [ ] **第5章全日矩阵 #44443409775**：[GitHub Actions](https://github.com/Huhabubu/mm/actions/runs/44443409775)。本轮真实全日计算尚未完成时，任何正式六日日收益、校准恢复率和交易质量汇总都不得预填。聚合会生成/提交 reports/chapter5_robustness_20261119/summary.json、per_day_models.csv、report.md。若缺失/失败将标注NA，绝不填零。
 
+### 2026-11-19 第5章回放现场发现的粗Tick统一报价边界问题
+
+- [x] 首次29场景工作流 #44443409775 的SOL/DOGE若干完整日发生统一报价后买卖价同档（统一报价半价差小于半tick时可能同时四舍五入到同一格），主动触发旧的自交叉保护退出。**这属于新后置Post-Only组合的报价工程边界，不能算作GLFT首次校准失败，也不可把该日算入回归覆盖率**。原6日BTC统一配置均通过；BTC20档边界对照随原工作流执行。
+- [x] 仅在新 `post_only_clamp_mode=unified` 下，若两报价同价，保留卖价并将买价保守下移1 tick，保证自成交报价不交叉；legacy模式不改。该处理在 `scripts/core_glft_rules.py`、`scripts/test_core_glft_rules.py` 实现/约束。
+- [x] **coarse-tick retry #44445139030**：在同一实验分支上独立以修复后的统一新配置重新运行SOL/DOGE/ETH各六个1430min真实日，共18场景；首次原分支成功但属于不同代码版本的跨币种结果不混入最终表。新工作流离线单测通过，正式全部日数及结果等待成功完成。
+- [ ] 最终29个统一结果将只合并原工作流成功的BTC6日无截断与BTC前5日20档截断，以及修复后工作流的SOL/DOGE/ETH各六日，按日等权生成Markdown/JSON/CSV；若任何失败将明确保留NA，不得称全样本完成。
+
