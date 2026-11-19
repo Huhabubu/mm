@@ -68,6 +68,13 @@ def summary_of(root):
                     "risk_flag_p50_difference_over_20ms",
                     "risk_flag_p99_difference_over_100ms"):
             row[f"target_minus_binance_{col}"]=compare.get(col)
+        # A large P95/P99 relative lag tail is an independent risk even
+        # when the L2 sequence/normalized feed gate itself is clean.
+        p95=compare.get("p95_delta_ms")
+        p99=compare.get("p99_delta_ms")
+        row["relative_lag_tail_requires_review"]=bool(
+            (isinstance(p95,(int,float)) and abs(p95)>30) or
+            (isinstance(p99,(int,float)) and abs(p99)>75))
         cases.append(row)
     groups={}
     contract_candidates={}
@@ -81,6 +88,7 @@ def summary_of(root):
             "complete_feed_days":sum(x["all_feed_rows_present"] for x in chosen),
             "normalized_gate_passed_days":sum(x["normalized_feeds_passed"] for x in chosen),
             "blocked_or_missing_days":[x["day"] for x in chosen if not x["normalized_feeds_passed"]],
+            "relative_lag_tail_review_days":[x["day"] for x in chosen if x["relative_lag_tail_requires_review"]],
             "historical_contract_verified_days":sum(x["contract_history_verified"] for x in chosen),
             "eligible_for_automatic_4b":False,
         }
@@ -97,6 +105,8 @@ def summary_of(root):
             "negative_capture_lag_block_fraction_gt":0.01,
             "target_minus_binance_p50_review_abs_gt_ms":20,
             "target_minus_binance_p99_review_abs_gt_ms":100,
+            "target_minus_binance_p95_tail_review_abs_gt_ms":30,
+            "target_minus_binance_p99_tail_review_abs_gt_ms":75,
             "l2_crossed_book_check":"after complete shared local_timestamp event batch only"
         },
         "source_delay_definition":"Tardis local_timestamp minus exchange timestamp in milliseconds, NOT pure one-way network delay",
@@ -142,6 +152,18 @@ def write_report(out,summary):
             f' | {c.get("l2_snapshot_groups")}/{c.get("l2_reconnect_resnapshots")}'
             f' | {c.get("incremental_book_L2_max_gap_ms")}'
             f' | {triple(c,"quotes")} | {triple(c,"binance_book_ticker")} | {diff} |')
+    lines.extend(["","## 跨源采集延迟尾部分布复核","",
+        "P95差值绝对值超过30ms或P99超过75ms的日期必须单列审查；"
+        "此筛选关注交易所时间戳、推送频率、采集时钟和分布尾部，"
+        "并不把差异自动解释为跨海网络传播延迟。",
+        "",
+        "| 交易所 | 日期 | 相对P95(ms) | 相对P99(ms) | 是否需单独审查 |",
+        "|---|---|---:|---:|---|"])
+    for c in cases:
+        lines.append(f'| {c["venue"]} | {c["day"]}'
+                     f' | {c.get("target_minus_binance_p95_delta_ms")}'
+                     f' | {c.get("target_minus_binance_p99_delta_ms")}'
+                     f' | {"是" if c["relative_lag_tail_requires_review"] else "否"} |')
     lines.extend(["","## 重建与断线风险","",
         "额外快照组是重建/重订阅的代理，精确WebSocket断线次数不能从免费归一化CSV观察。",
         "",
