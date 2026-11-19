@@ -82,6 +82,25 @@ class BitgetMultiAsset4ATests(unittest.TestCase):
             self.assertIsNone(row["incremental_book_L2_rows"])
             self.assertFalse(row["all_four_feeds_passed"])
 
+    def test_all_24_synthetic_dates_generate_complete_report_shapes(self):
+        # Explicitly synthetic fixtures, not paper observations.
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            write_fixtures(root)
+            agg,tail=report(root,Path("configs/bitget_multiasset_contract_specs_4a.json"))
+            self.assertEqual(agg["actual_asset_day_reports"],24)
+            self.assertEqual(len(agg["rows"]),24)
+            for sym in SYMBOLS:
+                self.assertEqual(agg["counts_by_symbol"][sym]["actual_daily_reports"],6)
+            self.assertTrue(agg["no_strategy_or_hbt_executed"])
+            out=root/"out"
+            write(out,agg,tail)
+            for filename in ("summary.json","report.md","per_day_gate.csv",
+                             "btc_oct_hourly_lag.csv","btc_oct_5minute_lag.csv",
+                             "btc_oct_lag_tail.json"):
+                self.assertTrue((out/filename).is_file(),filename)
+            self.assertIn("BTC 2026-10-01", (out/"report.md").read_text())
+
     def test_reject_wrong_source_directory(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp);write_fixtures(root)
