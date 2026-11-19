@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "purpose": "Bitget stage4A three additional symbols: candidates for full-day CSV grid and unit audit only; NOT certified historic exchange specifications",
+  "research_maker_fee_rate": 0.0002,
+  "standard_tier_maker_rate": 0.0002,
+  "standard_tier_taker_rate": 0.0006,
+  "base_qty_definition": "Bitget USDT perpetual orders/trades are expressed in base coin, rather than Gate contract quantity",
+  "historical_date_effective_verified": false,
+  "sources": {
+    "price_futures_SOLUSDT": "https://www.bitget.com/support/articles/12560603814243",
+    "price_futures_DOGEUSDT": "https://www.bitget.com/support/articles/12560603814159",
+    "min_eth": "https://www.bitget.com/support/articles/4407026242713-Bitget-Has-Changed-the-Minimum-Order-Size-for-ETHUSDT-on-Unified-Futures",
+    "current_trading_parameters": "https://www.bitget.com/futures/introduction/trading-parameters",
+    "current_api_schema": "https://www.bitget.com/docs/catalog/market-market-data/market-instruments",
+    "fee_tier": "https://www.bitget.com/support/articles/12560603892734"
+  },
+  "contracts": {
+    "ETHUSDT": {
+      "symbol": "ETHUSDT",
+      "asset": "ETH",
+      "tick_size_usdt": 0.01,
+      "min_order_qty_base": 0.01,
+      "qty_step_candidate_base": 0.01,
+      "contract_base_multiplier": 1,
+      "quantity_unit": "ETH",
+      "historical_date_effective_verified": false,
+      "price_tick_source": "official trading parameters page",
+      "min_qty_source": "official Bitget 2021 ETHUSDT order size announcement, current trading parameter table"
+    },
+    "SOLUSDT": {
+      "symbol": "SOLUSDT",
+      "asset": "SOL",
+      "tick_size_usdt": 0.001,
+      "min_order_qty_base": 0.1,
+      "qty_step_candidate_base": 0.1,
+      "contract_base_multiplier": 1,
+      "quantity_unit": "SOL",
+      "historical_date_effective_verified": false,
+      "price_tick_source": "official Bitget 2024-08-14 futures precision announcement",
+      "min_qty_source": "current official Bitget trading-parameters table, not point-in-time 2026-06"
+    },
+    "DOGEUSDT": {
+      "symbol": "DOGEUSDT",
+      "asset": "DOGE",
+      "tick_size_usdt": 0.00001,
+      "min_order_qty_base": 1,
+      "qty_step_candidate_base": 1,
+      "contract_base_multiplier": 1,
+      "quantity_unit": "DOGE",
+      "historical_date_effective_verified": false,
+      "price_tick_source": "official Bitget 2024-08-13 futures precision announcement",
+      "min_qty_source": "current Bitget futures trading parameters, not 2026-06 effective archive"
+    }
+  },
+  "important_limits": [
+    "Trade executions are partial-order fills and can be smaller than minimum order quantity or not multiples of order submission granularity; report such violations as diagnostics until HBT-unit verification, not necessarily as invalid source feed.",
+    "Historical instrument metadata is not certified via Tardis Pro API or day-effective exchange snapshots; do not treat candidate order min/step as proven for 2026 sample dates.",
+    "No live exchange trading API is called during the historical data scan; historical Tardis CSV is the sole measured feed."
+  ]
+}
