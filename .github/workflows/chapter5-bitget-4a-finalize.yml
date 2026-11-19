@@ -1,0 +1,134 @@
+name: Bitget stage4A final 4symbol x 6day source-verified archive (NO HBT)
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: bitget-4a-finalize-only
+  cancel-in-progress: false
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: exp/chapter5-cross-exchange
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Deterministic 24-day schema and source provenance tests
+        run: |
+          PYTHONPATH=scripts python scripts/test_bitget_multiasset_4a.py
+          python -m py_compile scripts/report_bitget_multiasset_4a.py
+      - name: Restore prior frozen BTC 4A six-date JSON evidence by original run ID
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 44459481767
+          github-token: '${{ secrets.GITHUB_TOKEN }}'
+          pattern: cross-4a-day-bitget-futures-*
+          path: collected
+      - name: Restore official new ETH SOL DOGE 18 days and Oct BTC full-day hourly lag evidence
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 44552849015
+          github-token: '${{ secrets.GITHUB_TOKEN }}'
+          pattern: bitget-4a-*
+          path: collected
+      - name: Exactly 24 unique real source asset-day files plus full BTC October tail audit
+        run: |
+          N=$(find collected -type f -name '4a_bitget-futures*.json' | wc -l)
+          echo "BITGET_ACTUAL_DAILY_SOURCES=$N"
+          test "$N" -eq 24
+          test "$(find collected -type f -name 'bitget_btc_oct_lag_tail.json' | wc -l)" -eq 1
+      - name: Publish Bitget-only four-symbol equal-structure 4A source-linked report
+        run: |
+          python scripts/report_bitget_multiasset_4a.py \
+            --root collected \
+            --contracts configs/bitget_multiasset_contract_specs_4a.json \
+            --out reports/chapter5_bitget_4a_20261119
+          cp configs/bitget_multiasset_contract_specs_4a.json \
+            reports/chapter5_bitget_4a_20261119/contract_specs_candidates.json
+      - name: Validate four-asset x six-day status, lag, L2, candidates and separation from stage4B
+        run: |
+          python - <<'PY'
+          import csv, json, math
+          from pathlib import Path
+          root=Path('reports/chapter5_bitget_4a_20261119')
+          s=json.loads((root/'summary.json').read_text())
+          with (root/'per_day_gate.csv').open(newline='') as f:
+              r=list(csv.DictReader(f))
+          assert s['actual_asset_day_reports']==24
+          assert s['requested_asset_days']==24
+          assert len(r)==24
+          assert s['no_strategy_or_hbt_executed'] is True
+          for coin in ['BTCUSDT','ETHUSDT','SOLUSDT','DOGEUSDT']:
+              a=[x for x in r if x['symbol']==coin]
+              assert len(a)==6,coin
+              assert len(set(x['utc_day'] for x in a))==6
+              assert all(x['status']!='missing' for x in a)
+              assert all(x['historical_contract_date_effective_verified']=='False' for x in a)
+              assert all(len(x['source_json_sha256'])==64 for x in a)
+              assert all(float(x['candidate_tick_usdt'])>0 for x in a)
+              assert all(float(x['candidate_order_qty_step_base'])>0 for x in a)
+              assert all(x['quotes_lag_p50_ms'] and x['binance_book_ticker_lag_p50_ms'] for x in a)
+          assert sum(x['source_run_id']=='44459481767' for x in r)==6
+          assert sum(x['source_run_id']=='44552849015' for x in r)==18
+          tail=json.loads((root/'btc_oct_lag_tail.json').read_text())
+          assert tail['date']=='2026-10-01' and tail['no_hbt']
+          assert len(tail['sources']['bitget_quotes']['hourly'])==24
+          assert len(tail['sources']['bitget_quotes']['five_minute'])==288
+          print('BITGET_4A_24_ACTUAL_DAYS_AND_BTC_OCT_HOURLY_SOURCE_PASS')
+          print('NORMALIZED_PASS_COUNTS',s['counts_by_symbol'])
+          PY
+      - name: Write GitHub Actions source-run manifest and claim boundaries
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('reports/chapter5_bitget_4a_20261119')
+          s=json.loads((root/'summary.json').read_text())
+          m={
+              'source_runs':{
+                  'frozen_btc_4a':{'run_id':44459481767,
+                      'head_sha':'9fc85b4af9d55f7b77eba57b6e43b8fb04b158ce',
+                      'role':'BTC six day source'},
+                  'new_bitget_three_assets':{'run_id':44552849015,
+                      'head_sha':'5d1577db53a77781e5615818774cb12b7b259727',
+                      'role':'ETH SOL DOGE 18 days plus BTC Oct lag re-read'}
+              },
+              'cases':s['sources_by_asset_day'],
+              'no_hbt':True,'okx_frozen':True,
+              'old_gate_and_chapter5_baselines_modified':False,
+              'Tardis_normalized_CSV_cannot_certify_raw_sequence_or_original_disconnections':True,
+              'historical_contract_effective_spec_verified':False,
+          }
+          (root/'manifest.json').write_text(
+              json.dumps(m,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bitget-4a-all-24-asset-days-report
+          path: reports/chapter5_bitget_4a_20261119/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Commit only new Bitget 4A report without modifying existing Gate/OKX reports
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/chapter5_bitget_4a_20261119/summary.json \
+            reports/chapter5_bitget_4a_20261119/report.md \
+            reports/chapter5_bitget_4a_20261119/per_day_gate.csv \
+            reports/chapter5_bitget_4a_20261119/btc_oct_hourly_lag.csv \
+            reports/chapter5_bitget_4a_20261119/btc_oct_5minute_lag.csv \
+            reports/chapter5_bitget_4a_20261119/btc_oct_lag_tail.json \
+            reports/chapter5_bitget_4a_20261119/contract_specs_candidates.json \
+            reports/chapter5_bitget_4a_20261119/manifest.json
+          git diff --cached --quiet || git commit -m 'results(4A): real Bitget BTC ETH SOL DOGE 24 full days and BTC October lag tail audit'
+          git pull --rebase origin exp/chapter5-cross-exchange
+          git push origin HEAD:exp/chapter5-cross-exchange
+      - name: Confirm audit-only job complete
+        run: echo 'BITGET_STAGE4A_ARCHIVED_NO_STAGE4B_OR_OKX_REPLAY'
