@@ -408,6 +408,23 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                         summary["trading"]["end_mid_usdt_per_base"] = (
                             summary["trading"].pop("end_mid_usdt_per_btc"))
                     records=rec.get(0)
+                    if core_options is not None:
+                        # HBT official 100ms Recorder position, not a trade-count proxy.
+                        positions=np.asarray(records["position"],dtype=np.float64)
+                        if not len(positions) or not np.isfinite(positions).all():
+                            raise ValueError("Nonfinite official Recorder inventory")
+                        summary["trading"]["position_std_contracts"]=float(np.std(positions))
+                        summary["trading"]["position_mean_contracts"]=float(np.mean(positions))
+                        turnover=float(summary["trading"]["trading_value_usdt"])
+                        net=float(summary["trading"]["end_net_marked_equity_usdt"])
+                        fee=float(summary["trading"]["fee_usdt"])
+                        gross=net+fee
+                        summary["trading"]["gross_marked_pnl_usdt"]=gross
+                        summary["trading"]["gross_marked_pnl_per_turnover_bps"]=(
+                            10_000*gross/turnover if turnover>0 else None)
+                        summary["trading"]["net_marked_pnl_per_turnover_bps"]=(
+                            10_000*net/turnover if turnover>0 else None)
+                        summary["trading"]["pnl_bps_denominator"]="official HBT two-sided trading_value_usdt"
                     if len(records)<minutes*600-20:
                         raise RuntimeError("Insufficient official Recorder samples")
                     if not np.all(np.diff(records["timestamp"])>0):
