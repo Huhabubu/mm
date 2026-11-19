@@ -89,6 +89,16 @@ def summary_of(root):
         "stage":"4A only","requested_days":9,"days_with_json":len(data),
         "no_backtest_performed":True,"venues":groups,
         "contract_candidates_from_official_docs_not_history_proof":contract_candidates,
+        "predeclared_screening_thresholds":{
+            "first_event_within_utc_open_ms":10000,
+            "last_event_before_utc_close_at_most_ms":30000,
+            "l2_message_gap_block_over_ms":10000,
+            "quotes_and_book_ticker_silence":"diagnostic only; not treated as websocket disconnect",
+            "negative_capture_lag_block_fraction_gt":0.01,
+            "target_minus_binance_p50_review_abs_gt_ms":20,
+            "target_minus_binance_p99_review_abs_gt_ms":100,
+            "l2_crossed_book_check":"after complete shared local_timestamp event batch only"
+        },
         "source_delay_definition":"Tardis local_timestamp minus exchange timestamp in milliseconds, NOT pure one-way network delay",
         "limitations":[
             "Normalized incremental_book_L2 cannot prove original WebSocket channel or raw sequence continuity",
