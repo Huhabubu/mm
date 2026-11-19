@@ -1,0 +1,101 @@
+name: Chapter5 repaired coarse-tick full-day SOL DOGE ETH replay
+on:
+  push:
+    branches: [exp/chapter5-robustness-cross-asset]
+    paths: ['.github/workflows/chapter5-alt-fixed-full-day.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Verify original legacy prices and one-tick coherent post-only repair
+        run: |
+          PYTHONPATH=scripts python scripts/test_core_glft_rules.py
+          PYTHONPATH=scripts python scripts/test_core_glft_physical_fit.py
+          PYTHONPATH=scripts python scripts/test_aggregate_chapter5_robustness.py
+  replay:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - {symbol: 'SOL_USDT', day: '2026-06-01'}
+          - {symbol: 'SOL_USDT', day: '2026-07-01'}
+          - {symbol: 'SOL_USDT', day: '2026-08-01'}
+          - {symbol: 'SOL_USDT', day: '2026-09-01'}
+          - {symbol: 'SOL_USDT', day: '2026-10-01'}
+          - {symbol: 'SOL_USDT', day: '2026-11-01'}
+          - {symbol: 'DOGE_USDT', day: '2026-06-01'}
+          - {symbol: 'DOGE_USDT', day: '2026-07-01'}
+          - {symbol: 'DOGE_USDT', day: '2026-08-01'}
+          - {symbol: 'DOGE_USDT', day: '2026-09-01'}
+          - {symbol: 'DOGE_USDT', day: '2026-10-01'}
+          - {symbol: 'DOGE_USDT', day: '2026-11-01'}
+          - {symbol: 'ETH_USDT', day: '2026-06-01'}
+          - {symbol: 'ETH_USDT', day: '2026-07-01'}
+          - {symbol: 'ETH_USDT', day: '2026-08-01'}
+          - {symbol: 'ETH_USDT', day: '2026-09-01'}
+          - {symbol: 'ETH_USDT', day: '2026-10-01'}
+          - {symbol: 'ETH_USDT', day: '2026-11-01'}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Official full 1430-minute post-fix Gate altcoin paired HBT replay
+        run: |
+          PYTHONPATH=scripts python -u scripts/run_gate_btc_origin_glft.py \
+            --symbol '${{ matrix.symbol }}' --day '${{ matrix.day }}' \
+            --minutes 1430 \
+            --models glft,both_1p0,risk_side_pause \
+            --core-config configs/core_glft_physical_robustness.json \
+            --out 'cases/${{ matrix.symbol }}/base'
+      - name: Validate day-specific price/queue, same first-fit and exact fee accounting
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('cases/${{ matrix.symbol }}/base/${{ matrix.day }}_1430m.json')
+          d=json.loads(p.read_text())
+          assert d['status']=='complete',d.get('error')
+          assert set(d['variants'])=={'glft','both_1p0','risk_side_pause'}
+          start=d['shared_first_eligible_entry_ns']
+          assert start is not None
+          for model,stats in d['variants'].items():
+              assert stats['initial_fit_ns']==start,model
+              trading=stats['trading']
+              assert abs(trading['gross_marked_pnl_usdt']-
+                  trading['end_net_marked_equity_usdt']-
+                  trading['fee_usdt'])<1e-6
+              assert trading['fee_usdt']>=0
+              assert '100' in stats['quote_quality']['groups']['all']['horizons']
+          print('CH5_FIXED_ALT_FULLDAY_SUCCESS','${{ matrix.symbol }}','${{ matrix.day }}')
+          PY
+      - name: Keep full-day success or explicit failed QA artifact plus official fills
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chapter5-fixed-case-${{ matrix.symbol }}-base-${{ matrix.day }}
+          path: |
+            cases/${{ matrix.symbol }}/base/${{ matrix.day }}_1430m.json
+            cases/${{ matrix.symbol }}/base/recorder/${{ matrix.day }}/*/fills.npz
+          if-no-files-found: warn
+          retention-days: 90
+  status:
+    if: always()
+    needs: [unit,replay]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Fixed altcoin full-day job matrix has finished; final combined BTC+altcoin aggregation is separately gated.'
