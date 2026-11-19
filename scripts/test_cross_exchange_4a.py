@@ -74,6 +74,48 @@ class RealAuditRulesTests(unittest.TestCase):
         self.assertEqual(d["normalized_gate_status"],"blocked")
         self.assertIn("initial_snapshot_missing_side",d["blocking_checks"])
 
+    def test_same_local_timestamp_batch_not_counted_as_crossed_book(self):
+        # Simplified synthetic example, not the paper's empirical order book.
+        head=["exchange","symbol","timestamp","local_timestamp","side","price","amount","is_snapshot"]
+        rows=[
+            ["bitget-futures","BTCUSDT",START+90_000,START+100_000,"bid","65000.0","1","true"],
+            ["bitget-futures","BTCUSDT",START+90_000,START+100_000,"ask","65000.1","1","true"],
+            ["bitget-futures","BTCUSDT",START+190_000,START+200_000,"bid","64999.9","1","false"],
+        ]
+        ts=START+35_000_000
+        rows.extend([
+            ["bitget-futures","BTCUSDT",ts-100,ts,"bid","65000.2","1","false"],
+            ["bitget-futures","BTCUSDT",ts-100,ts,"ask","65000.1","0","false"],
+            ["bitget-futures","BTCUSDT",ts-100,ts,"ask","65000.3","1","false"],
+            ["bitget-futures","BTCUSDT",START+69_000_000-100,START+69_000_000,
+             "bid","65000.2","2","false"]
+        ])
+        output=io.StringIO()
+        w=csv.writer(output);w.writerow(head);w.writerows(rows)
+        with patch("urllib.request.urlopen",return_value=io.BytesIO(
+                gzip.compress(output.getvalue().encode()))):
+            day=audit_stream("bitget-futures","BTCUSDT","incremental_book_L2",
+                              DAY,START,START+70_000_000,.1,.0001)
+        self.assertGreater(day["sampled_reconstructed_book_checks"],0)
+        self.assertEqual(day["sampled_reconstructed_book_crosses"],0)
+        # This sparse synthetic day deliberately has >10s feed gaps;
+        # only the 'crossed' field is under test.
+
+    def test_bbo_silence_is_diagnostic_not_network_gap_failure(self):
+        head=["exchange","symbol","timestamp","local_timestamp","bid_price","ask_price","bid_amount","ask_amount"]
+        rows=[
+            ["bitget-futures","BTCUSDT",START+90_000,START+100_000,"65000.0","65000.1","1","1"],
+            ["bitget-futures","BTCUSDT",START+50_000_000-100,START+50_000_000,
+             "65000.0","65000.2","1","1"]
+        ]
+        out=io.StringIO();w=csv.writer(out);w.writerow(head);w.writerows(rows)
+        with patch("urllib.request.urlopen",return_value=io.BytesIO(
+                gzip.compress(out.getvalue().encode()))):
+            day=audit_stream("bitget-futures","BTCUSDT","quotes",DAY,
+                              START,START+60_000_000,.1,.0001)
+        self.assertEqual(day["normalized_gate_status"],"passed")
+        self.assertEqual(day["bbo_unchanged_10s_count"],1)
+
     def test_quotes_trades_and_fail_closed_grid(self):
         for kind in ("trades","quotes"):
             with patch("urllib.request.urlopen",return_value=io.BytesIO(mock_gzip_rows(kind))):
