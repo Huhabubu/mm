@@ -83,8 +83,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("post_only_clamp_mode must be legacy or unified")
     if forced_start_ns < 0:
         raise ValueError("forced_start_ns cannot be negative")
-    if diagnostics is not None and len(diagnostics)<7:
-        raise ValueError("Seven diagnostic slots required")
+    if diagnostics is not None and len(diagnostics)<11:
+        raise ValueError("Eleven diagnostic slots required including visible-depth cap counters")
     if fit_mode == "physical_1tick_poisson" and diagnostics is None:
         raise ValueError("Physical estimator requires diagnostic start/coverage output")
     # Always use concrete arrays: Numba must compile the disabled lock path too.
@@ -145,6 +145,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("forced_start_ns before 10min training")
     op_times = np.empty(100_000 if diagnostics is not None else 1,np.int64)
     op_head = op_tail = max_ops = 0
+    depth_cap_checks = depth_cap_changed = depth_cap_insufficient = 0
+    depth_cap_changed_bid = depth_cap_changed_ask = 0
     resting_bid_ns = resting_ask_ns = 0
     last_resting_check_ns = t0
     prior_bid_resting = prior_ask_resting = False
@@ -530,12 +532,28 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             pause_buy = pause_buy or vol_pause
             pause_sell = pause_sell or vol_pause
             if cap_depth_at_visible_levels:
+                depth_cap_checks += 1
                 edge_bid = last_visible_bid_tick(
                     book.bid_depth,book.roi_lb_tick,bid,20)
                 edge_ask = last_visible_ask_tick(
                     book.ask_depth,book.roi_lb_tick,book.roi_ub_tick,ask,20)
-                want_bid,want_ask = cap_quotes_to_visible_depth(
-                    want_bid,want_ask,edge_bid,edge_ask,bid,ask)
+                if edge_bid < 0 or edge_ask < 0:
+                    # Explicit fail-safe: do not submit when 20 real levels
+                    # are unavailable. Existing orders can still be cancelled.
+                    depth_cap_insufficient += 1
+                    pause_buy = True
+                    pause_sell = True
+                else:
+                    prior_want_bid = want_bid
+                    prior_want_ask = want_ask
+                    want_bid,want_ask = cap_quotes_to_visible_depth(
+                        want_bid,want_ask,edge_bid,edge_ask,bid,ask)
+                    if want_bid != prior_want_bid:
+                        depth_cap_changed_bid += 1
+                    if want_ask != prior_want_ask:
+                        depth_cap_changed_ask += 1
+                    if want_bid != prior_want_bid or want_ask != prior_want_ask:
+                        depth_cap_changed += 1
             if want_bid >= want_ask:
                 raise ValueError("Proposed self-crossed quote prices")
             # One side may be pending cancellation; no replacement until cleared.
@@ -617,6 +635,10 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         diagnostics[4] = max(0,first_fit_ns-(t0+TRAIN*STEP_NS))
         diagnostics[5] = 1 if first_fit_ns >= 0 else 0
         diagnostics[6] = 1 if awaiting_market_sync else 0
+        diagnostics[7] = depth_cap_checks
+        diagnostics[8] = depth_cap_changed
+        diagnostics[9] = depth_cap_insufficient
+        diagnostics[10] = depth_cap_changed_bid + depth_cap_changed_ask
     final = engine.state_values(0)
     book = engine.depth(0)
     final_mid = (book.best_bid + book.best_ask) / 2.0
