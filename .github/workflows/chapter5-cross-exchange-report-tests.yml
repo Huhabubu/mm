@@ -1,0 +1,21 @@
+name: Stage4A cross-exchange data-gate report unit tests
+on:
+  push:
+    branches: [exp/chapter5-cross-exchange]
+    paths: ['.github/workflows/chapter5-cross-exchange-report-tests.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m py_compile scripts/audit_cross_exchange_4a.py scripts/summarize_cross_exchange_4a.py
+          PYTHONPATH=scripts python scripts/test_cross_exchange_4a.py
+          PYTHONPATH=scripts python scripts/test_cross_exchange_4a_report.py
