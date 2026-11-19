@@ -271,8 +271,8 @@ def write(out,agg,tail):
         "合约单位面值定义为每1个计量单位对应1个基础币。"
         "这些是HBT适配候选规格，未由Tardis Pro历史合约元数据逐日认证。",
         "",
-        "| 币种 | Tick(USDT) | 最小委托(币) | 候选委托数量步长(币) | 实测最小成交量(币)：六日范围 | 价格不合档行数(六日) | 成交量不合候选步长行数(六日) |",
-        "|---|---:|---:|---:|---|---:|---:|"])
+        "| 币种 | Tick(USDT) | 数量单位与面值 | 最小委托(币) | 候选数量步长(币) | 标准Maker/Taker bps | 统一Maker bps | 实测最小成交量(币)：六日范围 | 成交价格不合档行数 | 成交量不合候选步长行数 |",
+        "|---|---:|---|---:|---:|---|---:|---|---:|---:|"])
     for symbol in SYMBOLS:
         z=[r for r in rows if r["symbol"]==symbol]
         v0=z[0]
@@ -281,8 +281,10 @@ def write(out,agg,tail):
         nt=sum(r["trades_non_grid_prices"] or 0 for r in z)
         nq=sum(r["trades_amount_not_on_proposed_order_step"] or 0 for r in z)
         lines.append(f'| {symbol} | {v0["candidate_tick_usdt"]}'
+                     f' | 1 {symbol.replace("USDT","")} / 单位'
                      f' | {v0["candidate_min_order_qty_base"]}'
                      f' | {v0["candidate_order_qty_step_base"]}'
+                     f' | 2 / 6 | 2'
                      f' | {min(mins) if mins else "NA"}—{max(mins) if mins else "NA"}'
                      f' | {nt} | {nq} |')
     lines.extend(["","其中，成交量属于逐笔撮合成交，可能是订单被部分成交的数量；"
