@@ -42,12 +42,25 @@ def validate_case(report, path):
     config=report.get("core_options",{})
     if symbol not in SYMBOLS or day not in DAYS or not isinstance(config,dict):
         raise ValueError(f"Unexpected symbol/day/options: {path}")
-    case="cap" if config.get("cap_depth_at_visible_levels") is True else "base"
+    # An early download/QA failure may precede core_options construction.
+    # Artifact directory is the independent matrix-case identity.
+    marker=next((p for p in path.parts if p.startswith("chapter5-case-")),None)
+    if marker is not None:
+        if marker==f"chapter5-case-{symbol}-cap-{day}":
+            case="cap"
+        elif marker==f"chapter5-case-{symbol}-base-{day}":
+            case="base"
+        else:
+            raise ValueError(f"Artifact identity inconsistent with internal day/symbol: {path}")
+    else:
+        case="cap" if config.get("cap_depth_at_visible_levels") is True else "base"
     key=(symbol,day,case)
     if key not in expect_cases():
         raise ValueError(f"Unexpected experimental case {key}: {path}")
     if report.get("status") != "complete":
         return key,{"status":"failed","error":report.get("error","unknown"),"path":str(path)}
+    if config.get("cap_depth_at_visible_levels") is not (case=="cap"):
+        raise ValueError(f"Internal cap setting differs from job identity: {key}")
     if report.get("minutes_traded") != 1430 or report.get("binance_extra_visible_delay_ms") != 2.5:
         raise ValueError(f"Wrong full day / Binance delay: {key}")
     if not report.get("core_extension") or report.get("sigma_threshold",1.645)!=1.645:
