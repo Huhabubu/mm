@@ -1,0 +1,126 @@
+name: Bitget DOGE 4A exact-price off-grid forensic (NO HBT)
+on:
+  push:
+    branches: [exp/chapter5-cross-exchange]
+    paths: ['.github/workflows/chapter5-bitget-doge-grid-4a.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        day: ['2026-07-01','2026-08-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile scripts/audit_bitget_doge_tick_anomalies_4a.py
+      - name: Inspect actual Tardis DOGE trades/L2 price decimals and initial-snapshot boundaries
+        run: |
+          PYTHONPATH=scripts python -u scripts/audit_bitget_doge_tick_anomalies_4a.py \
+            --day '${{ matrix.day }}' \
+            --out 'grid/doge_tick_${{ matrix.day }}.json'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bitget-doge-grid-${{ matrix.day }}
+          path: grid/doge_tick_*.json
+          if-no-files-found: warn
+          retention-days: 90
+  aggregate:
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: exp/chapter5-cross-exchange
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bitget-doge-grid-*
+          path: collected
+      - name: Report 3 exact daily anomalies without claiming historical tick change
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv,json
+          root=Path('reports/chapter5_bitget_4a_doge_tick_20261119')
+          root.mkdir(parents=True,exist_ok=True)
+          files=sorted(Path('collected').rglob('doge_tick_*.json'))
+          assert len(files)==3,files
+          all_cases=[]
+          rows=[]
+          for p in files:
+              info=json.loads(p.read_text())
+              day=info['day']
+              assert p.parent.name==f'bitget-doge-grid-{day}'
+              all_cases.append(info)
+              l2=info['sources']['incremental_book_L2']
+              tr=info['sources']['trades']
+              rows.append({
+                'day':day,
+                'l2_rows':l2['rows'],
+                'l2_off_grid_float_count':l2['off_grid_float_count'],
+                'l2_off_grid_decimal_1e5_count':l2['off_grid_decimal_1e5_count'],
+                'l2_off_grid_decimal_1e6_count':l2['off_grid_decimal_1e6_count'],
+                'l2_off_grid_decimal_1e7_count':l2['off_grid_decimal_1e7_count'],
+                'l2_off_grid_snapshot_count':l2['off_grid_snapshot_count'],
+                'l2_off_grid_delta_count':l2['off_grid_delta_count'],
+                'l2_off_grid_distinct_local_timestamps':l2['off_grid_unique_timestamps'],
+                'l2_first_off_grid_local_us':l2['first_off_grid_local_us'],
+                'l2_last_off_grid_local_us':l2['last_off_grid_local_us'],
+                'trades_off_grid':tr['off_grid_float_count'],
+                'trades_end_shortfall_seconds':tr['end_shortfall_seconds'],
+              })
+          with (root/'per_day.csv').open('w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+          summary={'day_count':3,'rows':rows,'details':all_cases,
+                   'source_run_id':int('${{ github.run_id }}'),
+                   'source_head_sha':'${{ github.sha }}',
+                   'historical_tick_change_confirmed':False,
+                   'hbt_or_okx_executed':False}
+          (root/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
+          lines=['# Bitget DOGEUSDT 2026年7/8/11月严格价格网格异常复查','',
+                 '依据真实Tardis L2/trades原始CSV价格字符串，分别使用float容差和Decimal精确取模。',
+                 '严格候选Tick为0.00001 USDT；替代细网格0.000001和0.0000001仅用于识别历史价格精度，不构成历史规则修改证明。','',
+                 '| 日期 | L2浮点不合格 | L2精确10^-5不合格 | L2精确10^-6不合格 | 初始快照/增量中不合格 | 不合格消息时刻数 | 成交价格不合格 | 末笔成交距UTC收盘(秒) |',
+                 '|---|---:|---:|---:|---|---:|---:|---:|']
+          for x in rows:
+              lines.append(f"| {x['day']} | {x['l2_off_grid_float_count']}"
+                    f" | {x['l2_off_grid_decimal_1e5_count']}"
+                    f" | {x['l2_off_grid_decimal_1e6_count']}"
+                    f" | {x['l2_off_grid_snapshot_count']}/{x['l2_off_grid_delta_count']}"
+                    f" | {x['l2_off_grid_distinct_local_timestamps']}"
+                    f" | {x['trades_off_grid']}"
+                    f" | {x['trades_end_shortfall_seconds']} |")
+          lines+=['','具体异常原始price字符串、时间戳、snapshot标志、逐小时数量可见summary.json。',
+                  '先保留既有24资产日硬门禁结果；只有找到历史时点合约规格或明确数据格式变更证据后，才能更正候选Tick并重新审计。']
+          (root/'report.md').write_text('\n'.join(lines)+'\n')
+          print('DOGE_4A_EXACT_PRICE_FORENSIC',rows,flush=True)
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitget-doge-grid-three-day-audit
+          path: reports/chapter5_bitget_4a_doge_tick_20261119/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Commit only additional DOGE diagnostics, leave original 24-day QA unchanged
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f reports/chapter5_bitget_4a_doge_tick_20261119/summary.json \
+            reports/chapter5_bitget_4a_doge_tick_20261119/report.md \
+            reports/chapter5_bitget_4a_doge_tick_20261119/per_day.csv
+          git diff --cached --quiet || git commit -m 'audit(4A): exact DOGE out-of-grid Tardis prices and time clustering on three blocked days'
+          git pull --rebase origin exp/chapter5-cross-exchange
+          git push origin HEAD:exp/chapter5-cross-exchange
