@@ -2,7 +2,12 @@ name: Stage4A cross-exchange data-gate report unit tests
 on:
   push:
     branches: [exp/chapter5-cross-exchange]
-    paths: ['.github/workflows/chapter5-cross-exchange-report-tests.yml']
+    paths:
+      - '.github/workflows/chapter5-cross-exchange-report-tests.yml'
+      - 'scripts/test_cross_exchange_4a.py'
+      - 'scripts/test_cross_exchange_4a_report.py'
+      - 'scripts/audit_cross_exchange_4a.py'
+      - 'scripts/summarize_cross_exchange_4a.py'
   workflow_dispatch:
 permissions:
   contents: read
