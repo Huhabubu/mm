@@ -526,3 +526,13 @@
 - [x] 离线独立测试加真实旧模式回归验证通过；显式五开关联合50min BTC HBT烟雾测试 [#44336850404](https://github.com/Huhabubu/mm/actions/runs/44336850404) 通过，首次统一入场 `1793491800289000000 ns`；原GLFT/双边β1分别76/66笔成交，含费短样本净收益 −1.5041/−1.3010 USDT，仅验证代码可执行，**不得写入论文实证表或称样本外**。
 - [x] [详细阶段二代码与复现/限制记录](docs/gate_core_2a_2b_refactor_20261118.md)。
 - [ ] 阶段三六日稳健性与跨币种正式实验尚未开始；缺少交换所真实挂单生效/取消时点证据，真实在线率及远档队列不可声称已证明。
+
+## 2026-11-19 论文第5章正式全日实验（GitHub Actions任务已启动，结果仍待真实完成）
+
+- [x] 基于阶段二冻结提交 92f9b96d 建立独立实验分支 exp/chapter5-robustness-cross-asset，旧BTC论文主实证与已完成的Stage2/Stage5B六日报告全部保持不变。
+- [x] 旧归档证实BTC六日、SOL六日（旧校准3/6成功）、DOGE六日（旧校准5/6成功）和独立ETH实验六日的行情曾成功进入官方HBT回放；本轮所有日期仍需重新下载/QA，通过后才能认定本轮可用。
+- [x] 29组完整日场景：BTC/SOL/DOGE/ETH四币种各六日无20档截断的GLFT/both_1p0/risk_side_pause对照；另BTC 6—10月五日20档截断只比较GLFT/both_1p0。每组1430min完整UTC交易，所有模型必须同步首次有效校准时刻。
+- [x] 逐日与分层指标：Gross与含Maker2bps Net（USDT及每交易总额bps）、真实HBT成交笔数、双边名义额、100ms Recorder持仓标准差/最大绝对持仓、滑动1s最大请求、HBT本地确认可撤挂单时间代理、报价成交价基准100/500/1000ms Total Markout及未来报价更新子集、20档截断与盘口不足保护次数和分母。
+- [x] 预检通过：[Actions #44443012633](https://github.com/Huhabubu/mm/actions/runs/44443012633)，包括BTC2026-06-01的20档开关和BTC2026-11-01的原始新配置均在真实50min数据成功。预检数字不进入论文正式表。
+- [ ] **第5章全日矩阵 #44443409775**：[GitHub Actions](https://github.com/Huhabubu/mm/actions/runs/44443409775)。本轮真实全日计算尚未完成时，任何正式六日日收益、校准恢复率和交易质量汇总都不得预填。聚合会生成/提交 reports/chapter5_robustness_20261119/summary.json、per_day_models.csv、report.md。若缺失/失败将标注NA，绝不填零。
+
