@@ -304,6 +304,7 @@ def build_summary(found,rows):
         "quote_updated_subset":"last Gate quote used at horizon has local_timestamp strictly after local fill observation",
         "means":"per-day outcomes then equal-weight mean over completed dates; missing excluded, never zero",
         "resting_time_ratio_note":"local cancellable HBT order presence proxy, not exchange verified time-on-book",
+        "cross_asset_inventory_units":"position std and max position are in each Gate contract unit, not directly comparable across symbols",
         "depth_note":"2026-11-01 initial ~400 L2 then native increments is NOT certified full deep queue for all day",
         "calibration":calibration(found),
         "groups":output,
@@ -401,6 +402,7 @@ def render_report(data):
         "在模拟设定下Maker收2bps，仍缺实际逐时手续费等级、资金费、期末强制平仓、"
         "交易所真实订单队列和时钟误差独立校验。"
         "resting_time_ratio为本地确认可撤订单的**代理占比**，未证明交易所真实在线率。"
+        "持仓标准差和最大库存均以该币种合约张数计量，不同币种应优先对比收益/成交额bps而非直接比张数。 "
         "11月400档仅证明初始快照档数较多，整日深档队列可观测性仍有限。",
         "",
         "输入逐日原始文件/任务失败信息均可在GitHub Actions artifacts复核。"
