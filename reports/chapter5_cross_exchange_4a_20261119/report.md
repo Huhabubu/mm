@@ -1,20 +1,36 @@
 # 第5.3节阶段四4A：跨交易所真实Tardis前置数据门禁
 
-已产生审计文件 1/9。仅审计真实CSV，未执行HBT、成交或策略收益回测。
+已产生审计文件 9/9。仅审计真实CSV，未执行HBT、成交或策略收益回测。
 
 Tardis采集延迟 = local_timestamp − timestamp（毫秒），其包含网络、交易所发布节拍与时钟同步误差；不可直接解释为纯网络单程延迟。
 
 | 交易所 | UTC日期 | 四份CSV | 归一化盘口/时钟门禁 | L2快照组/额外重建组 | L2最大间隔ms | 本所 quotes P50/P95/P99 ms | Binance book_ticker P50/P95/P99 ms | 本所−Binance P50/P95/P99 ms |
 |---|---|---|---|---|---:|---|---|---|
-| bitget-futures | 2026-06-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
-| bitget-futures | 2026-07-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
-| bitget-futures | 2026-08-01 | 完整 | 阻断 | 8/7 | 731.807 | 6.15/11.65/19.05 | 2.75/7.55/87.45 | 3.4/4.1/-68.4 |
-| bitget-futures | 2026-09-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
-| bitget-futures | 2026-10-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
-| bitget-futures | 2026-11-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
-| okex-swap | 2026-09-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
-| okex-swap | 2026-10-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
-| okex-swap | 2026-11-01 | 缺失 | 阻断 | None/None | None | NA/NA/NA | NA/NA/NA | NA/NA/NA |
+| bitget-futures | 2026-06-01 | 完整 | 通过 | 5/4 | 745.842 | 8.65/15.95/34.55 | 2.95/14.55/34.65 | 5.7/1.4/-0.1 |
+| bitget-futures | 2026-07-01 | 完整 | 通过 | 6/5 | 2330.634 | 4.35/20.25/40.85 | 2.85/9.45/39.45 | 1.5/10.8/1.4 |
+| bitget-futures | 2026-08-01 | 完整 | 通过 | 8/7 | 731.807 | 6.15/11.65/19.05 | 2.75/7.55/87.45 | 3.4/4.1/-68.4 |
+| bitget-futures | 2026-09-01 | 完整 | 通过 | 5/4 | 1509.607 | 6.95/18.75/38.15 | 2.95/6.05/19.55 | 4.0/12.7/18.6 |
+| bitget-futures | 2026-10-01 | 完整 | 通过 | 6/5 | 971.764 | 9.65/73.25/90.05 | 2.65/4.15/10.25 | 7.0/69.1/79.8 |
+| bitget-futures | 2026-11-01 | 完整 | 通过 | 8/7 | 2030.328 | 6.95/24.85/53.95 | 3.35/4.05/8.15 | 3.6/20.8/45.8 |
+| okex-swap | 2026-09-01 | 完整 | 阻断 | 65/64 | 16501.192 | 4.35/6.45/9.25 | 2.95/6.05/19.55 | 1.4/0.4/-10.3 |
+| okex-swap | 2026-10-01 | 完整 | 阻断 | 49/48 | 2399.725 | 4.75/7.95/10.95 | 2.65/4.15/10.25 | 2.1/3.8/0.7 |
+| okex-swap | 2026-11-01 | 完整 | 阻断 | 13/12 | 3803.897 | 4.05/5.15/6.15 | 3.35/4.05/8.15 | 0.7/1.1/-2.0 |
+
+## 跨源采集延迟尾部分布复核
+
+P95差值绝对值超过30ms或P99超过75ms的日期必须单列审查；此筛选关注交易所时间戳、推送频率、采集时钟和分布尾部，并不把差异自动解释为跨海网络传播延迟。
+
+| 交易所 | 日期 | 相对P95(ms) | 相对P99(ms) | 是否需单独审查 |
+|---|---|---:|---:|---|
+| bitget-futures | 2026-06-01 | 1.4 | -0.1 | 否 |
+| bitget-futures | 2026-07-01 | 10.8 | 1.4 | 否 |
+| bitget-futures | 2026-08-01 | 4.1 | -68.4 | 否 |
+| bitget-futures | 2026-09-01 | 12.7 | 18.6 | 否 |
+| bitget-futures | 2026-10-01 | 69.1 | 79.8 | 是 |
+| bitget-futures | 2026-11-01 | 20.8 | 45.8 | 否 |
+| okex-swap | 2026-09-01 | 0.4 | -10.3 | 否 |
+| okex-swap | 2026-10-01 | 3.8 | 0.7 | 否 |
+| okex-swap | 2026-11-01 | 1.1 | -2.0 | 否 |
 
 ## 重建与断线风险
 
@@ -22,42 +38,43 @@ Tardis采集延迟 = local_timestamp − timestamp（毫秒），其包含网络
 
 | 交易所 | 日期 | 初始Bid/Ask档数 | 原生归一化增量行 | 额外快照组 | L2超过3秒间隔数 | L2超过10秒间隔数 | 阻断理由 |
 |---|---|---|---:|---:|---:|---:|---|
-| bitget-futures | 2026-06-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
-| bitget-futures | 2026-07-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
-| bitget-futures | 2026-08-01 | 1000/1000 | 38463135 | 7 | 0 | 0 | crossed_book_in_sample; market_data_gap_gt_10s=2 |
-| bitget-futures | 2026-09-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
-| bitget-futures | 2026-10-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
-| bitget-futures | 2026-11-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
-| okex-swap | 2026-09-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
-| okex-swap | 2026-10-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
-| okex-swap | 2026-11-01 | None/None | None | None | None | None | No actual CSV audit artifact for expected date |
+| bitget-futures | 2026-06-01 | 500/500 | 41885849 | 4 | 0 | 0 | 无记录的归一化CSV硬异常 |
+| bitget-futures | 2026-07-01 | 500/500 | 57234389 | 5 | 0 | 0 | 无记录的归一化CSV硬异常 |
+| bitget-futures | 2026-08-01 | 1000/1000 | 38463135 | 7 | 0 | 0 | 无记录的归一化CSV硬异常 |
+| bitget-futures | 2026-09-01 | 1000/1000 | 81622923 | 4 | 0 | 0 | 无记录的归一化CSV硬异常 |
+| bitget-futures | 2026-10-01 | 1000/1000 | 72149753 | 5 | 0 | 0 | 无记录的归一化CSV硬异常 |
+| bitget-futures | 2026-11-01 | 1000/1000 | 39300046 | 7 | 0 | 0 | 无记录的归一化CSV硬异常 |
+| okex-swap | 2026-09-01 | 400/400 | 48003501 | 64 | 1 | 1 | l2_feed_gap_gt_10s=1; l2_snapshot_integrity_invalid |
+| okex-swap | 2026-10-01 | 400/400 | 42155539 | 48 | 0 | 0 | l2_snapshot_integrity_invalid |
+| okex-swap | 2026-11-01 | 400/400 | 28204614 | 12 | 1 | 0 | l2_snapshot_integrity_invalid |
 
 ## 合约规格、单位与标准费率（分离历史认证状态）
 
 | 交易所 | 候选Tick(USDT) | 最小下单量(单位) | 数量步长(单位) | 合约乘数(BTC/单位) | 标准Maker/Taker bps | 统一Maker bps | 六日历史逐日规格认证 |
 |---|---:|---|---|---:|---|---:|---|
 | bitget-futures | 0.1 | 0.0001 BTC | 0.0001 BTC | 1 | 2.0 / 6.0 | 2.0 | 未逐日认证 |
+| okex-swap | 0.1 | 0.01 contract | 0.01 contract | 0.01 | 2.0 / 5.0 | 2.0 | 未逐日认证 |
 
 ### Tardis实际成交数量与候选规格步长的交叉检查
 
 | 交易所 | 日期 | 实测最小成交数量 | 不满足候选数量步长的成交行 | 交易价偏离候选Tick行 |
 |---|---|---:|---:|---:|
-| bitget-futures | 2026-06-01 | None | None | None |
-| bitget-futures | 2026-07-01 | None | None | None |
+| bitget-futures | 2026-06-01 | 0.0001 | 0 | 0 |
+| bitget-futures | 2026-07-01 | 0.0001 | 0 | 0 |
 | bitget-futures | 2026-08-01 | 0.0001 | 0 | 0 |
-| bitget-futures | 2026-09-01 | None | None | None |
-| bitget-futures | 2026-10-01 | None | None | None |
-| bitget-futures | 2026-11-01 | None | None | None |
-| okex-swap | 2026-09-01 | None | None | None |
-| okex-swap | 2026-10-01 | None | None | None |
-| okex-swap | 2026-11-01 | None | None | None |
+| bitget-futures | 2026-09-01 | 0.0001 | 0 | 0 |
+| bitget-futures | 2026-10-01 | 0.0001 | 0 | 0 |
+| bitget-futures | 2026-11-01 | 0.0001 | 0 | 0 |
+| okex-swap | 2026-09-01 | 0.01 | 0 | 0 |
+| okex-swap | 2026-10-01 | 0.01 | 0 | 0 |
+| okex-swap | 2026-11-01 | 0.01 | 0 | 0 |
 
 ## 归一化数据通过率（与4B许可不同）
 
 | 交易所 | 预定日 | 四类CSV齐全 | 归一化门禁通过 | 能否自动进入4B |
 |---|---:|---:|---:|---|
-| bitget-futures | 6 | 1 | 0 | 暂不许可：历史规格、原生频道和策略HBT适配未全部独立认证 |
-| okex-swap | 3 | 0 | 0 | 暂不许可：历史规格、原生频道和策略HBT适配未全部独立认证 |
+| bitget-futures | 6 | 6 | 6 | 暂不许可：历史规格、原生频道和策略HBT适配未全部独立认证 |
+| okex-swap | 3 | 3 | 0 | 暂不许可：历史规格、原生频道和策略HBT适配未全部独立认证 |
 
 ## 研究约束
 
