@@ -36,6 +36,12 @@ def quoted_ticks(mid, pos, skew, half, bid, ask, beta, shift_ticks,
         raw_ask = round(reservation+half+ask_shift)
         want_bid = min(raw_bid,ask-1)
         want_ask = max(raw_ask,bid+1)
+        # A positive GLFT half-spread can be < 0.5 tick for a coarse-tick
+        # asset. Both rounded quotes can then coincide *inside* the BBO.
+        # Preserve the ask and move only the bid one tick away, remaining
+        # strictly post-only and removing any self-cross possibility.
+        if want_bid >= want_ask:
+            want_bid = want_ask - 1
     else:
         raise ValueError("post_only_clamp_mode must be legacy or unified")
     if want_bid >= want_ask:
