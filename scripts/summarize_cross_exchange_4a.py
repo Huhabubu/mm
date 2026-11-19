@@ -50,7 +50,14 @@ def summary_of(root):
             }
             for col,val in fields.items():
                 row[f"{feed}_{col}"]=val
+            if feed=="trades":
+                row["trade_min_observed_amount"]=f.get("observed_qty_min_positive")
+                row["trade_amount_off_proposed_step_rows"]=f.get("amount_not_on_proposed_order_step")
+                row["trade_price_off_candidate_tick_rows"]=f.get("non_grid_prices")
             if feed=="incremental_book_L2":
+                row["l2_raw_sequence_available"]=f.get("raw_sequence_number_available",False)
+                row["l2_original_channel_proven_from_csv"]=f.get("native_channel_proven_by_normalized_csv",False)
+                row["l2_reconstructed_crossed_sample_checks"]=f.get("sampled_reconstructed_book_crosses")
                 for col in ("snapshot_groups","reconnect_resnapshots",
                             "initial_snapshot_bid_levels","initial_snapshot_ask_levels",
                             "incremental_rows","snapshot_rows","snapshots_missing_side",
@@ -63,6 +70,10 @@ def summary_of(root):
             row[f"target_minus_binance_{col}"]=compare.get(col)
         cases.append(row)
     groups={}
+    contract_candidates={}
+    for (venue,day),document in sorted(data.items()):
+        if venue not in contract_candidates and document.get("contract_candidate"):
+            contract_candidates[venue]=document["contract_candidate"]
     for venue,dates in (("bitget-futures",DAYS_BITGET),("okex-swap",DAYS_OKX)):
         chosen=[r for r in cases if r["venue"]==venue]
         groups[venue]={
@@ -77,6 +88,7 @@ def summary_of(root):
         "status":"all_days_audited" if len(data)==len(EXPECTED) else "incomplete",
         "stage":"4A only","requested_days":9,"days_with_json":len(data),
         "no_backtest_performed":True,"venues":groups,
+        "contract_candidates_from_official_docs_not_history_proof":contract_candidates,
         "source_delay_definition":"Tardis local_timestamp minus exchange timestamp in milliseconds, NOT pure one-way network delay",
         "limitations":[
             "Normalized incremental_book_L2 cannot prove original WebSocket channel or raw sequence continuity",
@@ -135,6 +147,25 @@ def write_report(out,summary):
             f' | {c.get("incremental_book_L2_gaps_over_3s")}'
             f' | {c.get("incremental_book_L2_gaps_over_10s")}'
             f' | {why or "无记录的归一化CSV硬异常"} |')
+    lines.extend(["","## 合约规格、单位与标准费率（分离历史认证状态）","",
+        "| 交易所 | 候选Tick(USDT) | 最小下单量(单位) | 数量步长(单位) | 合约乘数(BTC/单位) | 标准Maker/Taker bps | 统一Maker bps | 六日历史逐日规格认证 |",
+        "|---|---:|---|---|---:|---|---:|---|"])
+    for venue,cfg in summary["contract_candidates_from_official_docs_not_history_proof"].items():
+        lines.append(f'| {venue} | {cfg["expected_price_tick_usdt"]}'
+                     f' | {cfg["expected_min_size"]} {cfg["min_size_unit"]}'
+                     f' | {cfg["expected_order_step"]} {cfg["order_step_unit"]}'
+                     f' | {cfg["contract_multiplier_base_btc_per_unit"]}'
+                     f' | {cfg["standard_tier_maker_rate"]*10000:.1f} / {cfg["standard_tier_taker_rate"]*10000:.1f}'
+                     f' | {cfg["comparison_maker_rate"]*10000:.1f}'
+                     f' | {"已认证" if cfg["historical_date_effective_verified"] else "未逐日认证"} |')
+    lines.extend(["","### Tardis实际成交数量与候选规格步长的交叉检查","",
+        "| 交易所 | 日期 | 实测最小成交数量 | 不满足候选数量步长的成交行 | 交易价偏离候选Tick行 |",
+        "|---|---|---:|---:|---:|"])
+    for c in cases:
+        lines.append(f'| {c["venue"]} | {c["day"]}'
+                     f' | {c.get("trade_min_observed_amount")}'
+                     f' | {c.get("trade_amount_off_proposed_step_rows")}'
+                     f' | {c.get("trade_price_off_candidate_tick_rows")} |')
     lines.extend(["","## 归一化数据通过率（与4B许可不同）","",
         "| 交易所 | 预定日 | 四类CSV齐全 | 归一化门禁通过 | 能否自动进入4B |",
         "|---|---:|---:|---:|---|"])
