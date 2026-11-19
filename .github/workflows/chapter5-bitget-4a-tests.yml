@@ -2,7 +2,10 @@ name: Bitget Stage4A multiasset/offline report regression
 on:
   push:
     branches: [exp/chapter5-cross-exchange]
-    paths: ['.github/workflows/chapter5-bitget-4a-tests.yml']
+    paths:
+      - '.github/workflows/chapter5-bitget-4a-tests.yml'
+      - 'scripts/test_bitget_multiasset_4a.py'
+      - 'scripts/report_bitget_multiasset_4a.py'
   workflow_dispatch:
 permissions:
   contents: read
