@@ -17,6 +17,17 @@ class CoreRuleTests(unittest.TestCase):
         self.assertLess(unified[2],102)
         self.assertGreater(unified[3],100)
 
+    def test_unified_rounded_same_tick_is_separated_without_crossing(self):
+        # Simplified synthetic case, not thesis empirical evidence.
+        # A coarse-tick asset can produce two identical rounded targets.
+        with self.assertRaisesRegex(ValueError,"self-crossed"):
+            quoted_ticks(102.,0.,0.,0.01,100,104,0.,0.,0,"legacy")
+        q=quoted_ticks(102.,0.,0.,0.01,100,104,0.,0.,0,"unified")
+        self.assertEqual(q[2:],(101,102))
+        self.assertLess(q[2],q[3])
+        self.assertLess(q[2],104)
+        self.assertGreater(q[3],100)
+
     def test_unified_applies_binance_before_post_only(self):
         legacy=quoted_ticks(100.5,0,0,1,100,102,1,2,1,"legacy")
         unified=quoted_ticks(100.5,0,0,1,100,102,1,2,1,"unified")
