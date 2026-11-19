@@ -551,3 +551,13 @@
 - [x] BTC初始20档六月—十月在不限制时GLFT/双边净损益 **−255.61/−198.61 USDT/日**；增加同侧第20档限制变为 **−265.20/−218.87**。实际截断比例 **21.509%/23.005%**，同侧有效档不足触发保护均482次，各自全部报价决策约0.0004%。十一月初始400档+增量日单独报告；没有据此假定整日深层队列全部可观测。
 - [x] 500ms执行成交价基准Total Markout日等权 GLFT/双边/风险暂停：BTC **−0.5750/−0.5110/−0.5316 bps**，SOL **−0.5170/−0.3915/−0.3895**，DOGE **−0.6127/−0.4654/−0.4696**，ETH **−0.6207/−0.5327/−0.5588**。100/500/1000ms及future_quote_updated子集、Gross/Net USDT及每成交名义额bps、真实成交数、持仓STD、深度触发与在线率代理都在报告及JSON/CSV可审计。
 - [x] 费用仅按事先假设的正2bps Maker收费；期末仍用中间价估值，未计资金费、主动清仓、真实挂单生效/撤销时刻。resting_time_ratio为本地确认可撤订单时间代理，合同历史真实手续费未逐日独立验证。六日历史已被反复探索，**论文第五章只能写稳健性与跨币种敏感性描述，不得称严格前向样本外或预测信号因果贡献比例**。
+
+## 2026-11-19 第5章最终对称指标与29组Run逐项溯源（已完成）
+
+- [x] **最终核验通过**：[GitHub Actions #44451136754](https://github.com/Huhabubu/mm/actions/runs/44451136754)。来自固定BTC/20档Run `44443409775` 的11组与修复后SOL/DOGE/ETH Run `44445139030` 的18组，共**29/29组**成功完整日；聚合共82条「日×策略」记录（24个正常币种日×3模型+5个20档日×2模型）。
+- [x] 每组输入都按实际Run ID固定下载、验证币种/日/深度配置与原始artifact文件名、记录原始逐日JSON的 SHA-256 全量摘要与运行代码提交SHA；29条溯源明细同时写入 `reports/chapter5_robustness_20261119/manifest.json`、`summary.json.case_provenance`，每一条逐日CSV含 `source_run_id`、`source_run_url`、原始摘要。
+- [x] 统一会计门禁：逐日逐策略严格核对 `gross_pnl_usdt − maker_fee_usdt = net_pnl_usdt`、`maker_fee_usdt = 0.0002 × 双边成交名义额`，以及 Gross/Net bps 同以每日对应策略的双边成交额为分母（差额2bps）；所有模型 `initial_fit_ns` 必须等于该日共同首次成功校准时刻。100/500/1000ms Total Markout、`future_quote_updated`有效样本、持仓STD、单秒max ops与本地在线率代理均逐组存在且有限。
+- [x] BTC/SOL/DOGE/ETH与所有基准模型的Gross（USDT/日、成交额bps）、Net（同单位）、Turnover、持仓STD、`max_ops_per_sec`、`resting_time_ratio`和100/500/1000ms Markout字段完全对齐。净收益和各Markout窗口还写入按当日GLFT对照的日差值与**严格正差计1胜**；`summary.json`及报告列出Net/100ms/100ms更新子集/500ms/1000ms逐日胜率。四币种两种信号对GLFT的Net与三窗口Markout改善天数均为6/6（仅为六个已探索日期的描述性一致性）。
+- [x] 完整报告、逐日CSV、JSON、来源清单重新生成并提交到 `exp/chapter5-robustness-cross-asset` 的 `reports/chapter5_robustness_20261119/`；通过相对阶段二 `92f9b96d` 的变更清单验证，旧BTC主文报告均未触及。
+- [!] 研究局限保持：全部模型含费仍亏损；历史六日是探索过的日期、收益对照不构成独立样本外显著性证明；不同策略的Markout来自各自成交集合，不能直接推断信号消除特定撤单的逆向选择；20档外真实队列、资金费、期末清仓成本、交易所真实订单在线时间与历史实际费率仍未独立证实。
+
