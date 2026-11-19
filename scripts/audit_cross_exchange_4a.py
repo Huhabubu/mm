@@ -186,6 +186,23 @@ def audit_stream(exchange, symbol, kind, day, start_us, stop_us,
                                 stats["gap_over_3s_first5"].append({
                                     "previous_local_us":previous,
                                     "current_local_us":local,"gap_ms":round(gap_ms,3)})
+                    # Tardis CSV flattens one WebSocket book message into
+                    # multiple price-level rows. Check BBO only AFTER
+                    # applying all rows from the PREVIOUS local timestamp.
+                    # Inspecting mid-message would create false crossed books.
+                    if (kind=="incremental_book_L2" and previous is not None
+                            and local!=previous and initialized and
+                            not snap_in_progress and
+                            local-last_l2_check_us>=30_000_000):
+                        last_l2_check_us=previous
+                        if book_bid and book_ask:
+                            stats["sampled_reconstructed_book_checks"]+=1
+                            if max(book_bid)>=min(book_ask):
+                                stats["sampled_reconstructed_book_crosses"]+=1
+                        stats["observed_max_bid_depth"]=max(
+                            stats["observed_max_bid_depth"],len(book_bid))
+                        stats["observed_max_ask_depth"]=max(
+                            stats["observed_max_ask_depth"],len(book_ask))
                     previous=local
                     stats["last_local_us"]=local
                     stats["rows"]+=1
@@ -242,14 +259,7 @@ def audit_stream(exchange, symbol, kind, day, start_us, stop_us,
                             book.pop(price,None)
                         else:
                             book[price]=qty
-                        if initialized and not snap_in_progress and local-last_l2_check_us>=30_000_000:
-                            last_l2_check_us=local
-                            if book_bid and book_ask:
-                                stats["sampled_reconstructed_book_checks"]+=1
-                                if max(book_bid)>=min(book_ask):
-                                    stats["sampled_reconstructed_book_crosses"]+=1
-                            stats["observed_max_bid_depth"]=max(stats["observed_max_bid_depth"],len(book_bid))
-                            stats["observed_max_ask_depth"]=max(stats["observed_max_ask_depth"],len(book_ask))
+
 
                     elif kind=="trades":
                         side=row["side"]
@@ -301,9 +311,14 @@ def audit_stream(exchange, symbol, kind, day, start_us, stop_us,
                 "nonpositive_price","negative_amounts","non_grid_prices"):
         if stats[key]:
             blockers.append(f"{key}={stats[key]}")
-    if kind in ("incremental_book_L2","book_ticker","quotes"):
-        if stats["gaps_over_10s"]:
-            blockers.append(f"market_data_gap_gt_10s={stats['gaps_over_10s']}")
+    # L2 depth messages are the active feed-continuity witness.
+    # quotes = L2-derived BEST-price changes, and Binance book_ticker =
+    # native BBO changes; both may stay silent during legitimate fixed BBO.
+    # Preserve their long gaps as diagnostics, never infer disconnection.
+    if kind=="incremental_book_L2" and stats["gaps_over_10s"]:
+        blockers.append(f"l2_feed_gap_gt_10s={stats['gaps_over_10s']}")
+    if kind in ("quotes","book_ticker") and stats["gaps_over_10s"]:
+        stats["bbo_unchanged_10s_count"]=stats["gaps_over_10s"]
     if kind=="incremental_book_L2":
         if stats["snapshot_groups"]<1 or stats["incremental_rows"]<1:
             blockers.append("no_snapshot_plus_deltas")
