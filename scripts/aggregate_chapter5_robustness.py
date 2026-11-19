@@ -206,6 +206,15 @@ def summarize_models(rows, symbol, days, case="base"):
                 if r[f"markout_{h}ms_future_quote_updated_bps"]!="")
             item[f"markout_{h}ms_days_with_data"]=sum(
                 r[f"markout_{h}ms_bps"]!="" for r in z)
+        if case=="cap":
+            item["depth_cap_total_decision_checks"]=sum(int(r["depth_cap_checks"]) for r in z)
+            item["depth_cap_total_changed_checks"]=sum(int(r["depth_cap_changed"]) for r in z)
+            item["depth_cap_total_insufficient_checks"]=sum(int(r["depth_cap_insufficient"]) for r in z)
+            denom=item["depth_cap_total_decision_checks"]
+            item["depth_cap_pooled_changed_fraction"]=(
+                item["depth_cap_total_changed_checks"]/denom if denom else None)
+            item["depth_cap_pooled_insufficient_fraction"]=(
+                item["depth_cap_total_insufficient_checks"]/denom if denom else None)
         out[model]=item
     return out
 
@@ -314,8 +323,8 @@ def render_report(data):
         "100/500/1000ms Total Markout 采用阶段一已经验收的**成交价基准**，附未来报价确实更新的独立子集。",
         "下表每个数字先计算完整日指标，再按**独立有效日期等权**平均；NA表示无有效数据。",
         "",
-        "| 数据分组 | 模型 | 完成日 | Gross USDT | Net USDT | Net bps/turnover | 成交/日 | Turnover USDT | 持仓标准差(张) | 最大绝对持仓(张) | max ops/s | 买/卖本地挂单在线率 |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        "| 数据分组 | 模型 | 完成日 | Gross USDT | Gross bps/turnover | Net USDT | Net bps/turnover | 成交/日 | Turnover USDT | 持仓标准差(张) | 最大绝对持仓(张) | max ops/s | 买/卖本地挂单在线率 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
     ]
     for name,blob in data["groups"].items():
         for model,z in blob["model_stats"].items():
@@ -323,7 +332,7 @@ def render_report(data):
                    if z["resting_bid_ratio"] is not None and z["resting_ask_ratio"] is not None
                    else "NA")
             lines.append(f"| {names[name]} | {model} | {z['valid_days']}/{z['target_days']}"
-                         f" | {fmt(z['gross_pnl_usdt'],2)} | {fmt(z['net_pnl_usdt'],2)}"
+                         f" | {fmt(z['gross_pnl_usdt'],2)} | {fmt(z['gross_pnl_turnover_bps'])} | {fmt(z['net_pnl_usdt'],2)}"
                          f" | {fmt(z['net_pnl_turnover_bps'])}"
                          f" | {fmt(z['fills'],1)} | {fmt(z['turnover_usdt'],1)}"
                          f" | {fmt(z['position_std_contracts'])}"
@@ -347,13 +356,17 @@ def render_report(data):
             lines.append(f"| {names[name]} | {model} | {z['paired_days']}/{z['target_days']}"
                          f" | {fmt(z['mean_net_delta_usdt'],2)} | {z['positive_days']} |")
     lines.extend(["","## 20档限制触发统计","",
-        "| 模型 | 20档评价日 | 报价决策触发实际截断比例 | 盘口不足20档保护比例 |",
-        "|---|---:|---:|---:|"])
+        "| 模型 | 20档评价日 | 检查次数 | 实际截断次数 | 深度不足保护次数 | 触发实际截断比例(合计) | 深度不足保护比例(合计) |",
+        "|---|---:|---:|---:|---:|---:|---:|"])
     for model,z in data["groups"]["BTC_first5_cap20"]["model_stats"].items():
         lines.append(f"| {model} | {z['valid_days']}/5"
-                     f" | {fmt(z['depth_cap_changed_fraction'])}"
-                     f" | {fmt(z['depth_cap_insufficient_fraction'])} |")
-    lines.extend(["","该比例是逐日比例的等权平均。盘口不足20档时禁止新增两侧报价，并允许撤销存量订单；"
+                     f" | {z['depth_cap_total_decision_checks']}"
+                     f" | {z['depth_cap_total_changed_checks']}"
+                     f" | {z['depth_cap_total_insufficient_checks']}"
+                     f" | {fmt(z['depth_cap_pooled_changed_fraction'])}"
+                     f" | {fmt(z['depth_cap_pooled_insufficient_fraction'])} |")
+    lines.extend(["","上表比例=所有已完成日触发次数/对应所有检查次数；JSON也保留逐日比例等权平均，二者分母不同。" 
+                  "盘口不足20档时禁止新增两侧报价，并允许撤销存量订单；"
                   "若该对照日数据无法确认20档快照格式，整日失败并明确标出。","",
                   "## 冷启动覆盖与等待","",
                   "| 品种 | 完整日/6 | 逐日等待秒数（6/7/8/9/10/11月） |",
