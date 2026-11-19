@@ -332,7 +332,44 @@ def paired_net(rows, symbol, days, case="base"):
         result[model]={"paired_days":len(values),"target_days":len(days),
                        "mean_net_delta_usdt":mean(values),
                        "positive_days":sum(x>0 for x in values),
-                       "daily_net_delta_usdt":daily}
+                       "daily_net_delta_usdt":daily,
+                       "daily_net_improved":{d:int(v>0) for d,v in daily.items()},
+                       "strict_positive_fraction":sum(v>0 for v in values)/len(values) if values else None,
+                       "nonpositive_days":sum(v<=0 for v in values)}
+    return result
+
+def paired_markout(rows, symbol, days, case="base"):
+    """Same-day descriptive comparison of separately filled model portfolios."""
+    index={(r["day"],r["model"]):r for r in rows
+           if r["symbol"]==symbol and r["day"] in days
+           and r["case"]==case and r["status"]=="complete"}
+    result={}
+    for model in (MODELS[1:] if case=="base" else ("both_1p0",)):
+        horizons={}
+        for h in HORIZONS:
+            for suffix,name in (("","all_future_fresh"),
+                                ("_future_quote_updated","future_quote_updated")):
+                field=f"markout_{h}ms{suffix}_bps"
+                pairs={}
+                for day in days:
+                    if (day,"glft") not in index or (day,model) not in index:
+                        continue
+                    x=index[(day,model)][field]
+                    y=index[(day,"glft")][field]
+                    if x=="" or y=="":
+                        continue
+                    pairs[day]=float(x)-float(y)
+                values=list(pairs.values())
+                horizons[f"{h}ms_{name}"]={
+                    "paired_days":len(values),
+                    "target_days":len(days),
+                    "positive_days":sum(v>0 for v in values),
+                    "nonpositive_days":sum(v<=0 for v in values),
+                    "mean_delta_markout_bps":mean(values),
+                    "daily_delta_markout_bps":pairs,
+                    "note":"conditional fill-set comparison, not matched-fill causal proof",
+                }
+        result[model]=horizons
     return result
 
 def calibration(found):
@@ -368,6 +405,7 @@ def build_summary(found,rows):
         output[name]={
             "model_stats":summarize_models(rows,symbol,days,case),
             "paired_vs_glft":paired_net(rows,symbol,days,case),
+            "paired_markout_vs_glft":paired_markout(rows,symbol,days,case),
             "source_days":list(days),"cap_depth":case=="cap",
             "all_requested_days_complete":all(
                 found[(symbol,d,case)]["status"]=="complete" for d in days)
@@ -375,6 +413,16 @@ def build_summary(found,rows):
     absent=[{"symbol":key[0],"day":key[1],"case":key[2],
              "status":val["status"],"error":val.get("error")}
             for key,val in sorted(found.items()) if val["status"]!="complete"]
+    provenance=[]
+    for key,item in sorted(found.items()):
+        evidence=item.get("evidence")
+        if item["status"]=="complete" and (
+                not evidence or not evidence.get("json_sha256")):
+            raise ValueError(f"Missing independently verified input digest/provenance: {key}")
+        provenance.append({
+            "symbol":key[0],"day":key[1],"case":key[2],
+            "status":item["status"],**(evidence or {}),
+        })
     return {
         "status":"complete" if not absent else "incomplete",
         "source":"actual full-day official hftbacktest 2.4.4 per-symbol artifacts",
@@ -383,6 +431,9 @@ def build_summary(found,rows):
         "requested_cases":len(expect_cases()),
         "complete_cases":sum(v["status"]=="complete" for v in found.values()),
         "missing_or_failed_cases":absent,
+        "source_run_ids":{"btc_and_depth_cap":SOURCE_RUN["BTC_USDT"][0],
+                          "repaired_altcoins":SOURCE_RUN["SOL_USDT"][0]},
+        "case_provenance":provenance,
         "fee":{"maker_rate":0.0002,"maker_bps":2.0,
                "assumption":"positive 2bps HBT fee, not certified historical exchange fee"},
         "pnl_bps_denominator":"official HBT two-sided trading_value_usdt (turnover), NOT initial equity",
@@ -457,6 +508,25 @@ def render_report(data):
         for model,z in blob["paired_vs_glft"].items():
             lines.append(f"| {names[name]} | {model} | {z['paired_days']}/{z['target_days']}"
                          f" | {fmt(z['mean_net_delta_usdt'],2)} | {z['positive_days']} |")
+    lines.extend(["","## 逐日配对改善比例：同日策略与GLFT对照","",
+        "只有严格正差计为改善。净收益比较已扣Maker 2bps；"
+        "方向化Total Markout数值越大代表成交后价格越有利。",
+        "Markout胜率来自不同成交集合的条件比较，不能据此宣称逐笔规避逆向选择的因果效果。",
+        "",
+        "| 数据分组 | 信号模型 | 含费净收益改善日 | 100ms Markout改善 | 100ms未来报价已更新改善 | 500ms改善 | 1000ms改善 |",
+        "|---|---|---:|---:|---:|---:|---:|"])
+    for name,blob in data["groups"].items():
+        for model,by_h in blob["paired_markout_vs_glft"].items():
+            p=blob["paired_vs_glft"][model]
+            def w(h,scope):
+                v=by_h[f"{h}ms_{scope}"]
+                return f'{v["positive_days"]}/{v["paired_days"]}'
+            lines.append(
+                f'| {names[name]} | {model} | {p["positive_days"]}/{p["paired_days"]}'
+                f' | {w(100,"all_future_fresh")}'
+                f' | {w(100,"future_quote_updated")}'
+                f' | {w(500,"all_future_fresh")}'
+                f' | {w(1000,"all_future_fresh")} |')
     lines.extend(["","## 20档限制触发统计","",
         "| 模型 | 20档评价日 | 检查次数 | 实际截断次数 | 深度不足保护次数 | 触发实际截断比例(合计) | 深度不足保护比例(合计) |",
         "|---|---:|---:|---:|---:|---:|---:|"])
@@ -484,6 +554,17 @@ def render_report(data):
         for x in data["missing_or_failed_cases"]:
             message=str(x["error"]).replace("|","/")[:300]
             lines.append(f"| {x['symbol']} | {x['day']} | {x['case']} | {x['status']} | {message} |")
+    lines.extend(["","## 29组完整日来源与GitHub Actions Run ID","",
+        "归档流程按固定Run ID下载官方原始artifacts；逐一检查文件夹名称、"
+        "币种、日期、深度配置及SHA-256摘要。完整来源文件摘要在manifest.json。",
+        "",
+        "| 品种 | 日期 | 配置 | GitHub Actions Run ID | 归档文件名 |",
+        "|---|---|---|---:|---|"])
+    for item in data["case_provenance"]:
+        run_id=item.get("run_id")
+        link=(f'[#{run_id}]({item["run_url"]})' if run_id else "NA")
+        lines.append(f'| {item["symbol"]} | {item["day"]} | {item["case"]} | {link}'
+                     f' | `{item.get("artifact_name","NA")}` |')
     lines.extend(["","## 学术局限","",
         "六个月首日曾被用于模型选择/探索，**不能称为独立样本外验证**。"
         "不同模型成交集合不同，成交后Markout是条件描述性结果，不能推出规避逆向选择的因果成功次数。"
@@ -507,6 +588,21 @@ def main():
     summ=build_summary(found,rows)
     args.out.mkdir(parents=True,exist_ok=True)
     write_csv(args.out/"per_day_models.csv",rows)
+    manifest={
+        "status":summ["status"],
+        "requested_cases":summ["requested_cases"],
+        "complete_cases":summ["complete_cases"],
+        "source_run_ids":summ["source_run_ids"],
+        "cases":summ["case_provenance"],
+        "input_frozen_stage2_commit":"92f9b96d12af2ffd9847a883e49f6804e47dc9b0",
+        "official_full_day_minutes_per_case":1430,
+        "old_btc_main_reports_modified":False,
+        "old_failed_altcoin_replays_excluded":True,
+        "source_explanation":"Run IDs derived from pinned workflow artifact downloads; SHA256 values hash each original archived daily JSON.",
+    }
+    (args.out/"manifest.json").write_text(
+        json.dumps(manifest,ensure_ascii=False,indent=2,allow_nan=False)+"\n",
+        encoding="utf-8")
     (args.out/"summary.json").write_text(
         json.dumps(summ,ensure_ascii=False,indent=2,allow_nan=False)+"\n",
         encoding="utf-8")
