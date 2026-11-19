@@ -321,7 +321,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                     # First fit is feed-only: no one can place orders before it.
                     probe=ROIVectorMarketDepthBacktest([build_asset(parts,low,high,cfg)])
                     try:
-                        check=np.zeros(7,np.float64)
+                        check=np.zeros(11,np.float64)
                         probe_raw=run_core_glft(probe,bt,bm,minutes*600,
                             0.,grid,basis,sigma,0,cfg["gamma_code"],cfg["tick"],
                             cfg["ctval"],cfg["qty"],cfg["position_cap"],None,
@@ -352,7 +352,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                             cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
                             rec.recorder,trade_stop*1000 if minutes==1430 else 0)
                     else:
-                        diagnostic=np.zeros(7,np.float64)
+                        diagnostic=np.zeros(11,np.float64)
                         raw=run_core_glft(engine,bt,bm,minutes*600,
                             beta,grid,basis,sigma,mode,cfg["gamma_code"],
                             cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
@@ -386,6 +386,23 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                         summary["initial_fit_ns"]=(int(raw[-3])+int(diagnostic[3]) if diagnostic[3]>=0 else None)
                         summary["calibration_wait_ns"]=int(diagnostic[4])
                         summary["market_sync_pending_at_stop"]=bool(diagnostic[6])
+                        cap_check_count=int(diagnostic[7])
+                        cap_adjusted_count=int(diagnostic[8])
+                        cap_insufficient_count=int(diagnostic[9])
+                        summary["depth_cap_diagnostic"]={
+                            "verified_source_20level":bool(core_options["depth_is_20_level_snapshot"]),
+                            "enabled":bool(core_options.get("cap_depth_at_visible_levels",False)),
+                            "quote_decision_checks":cap_check_count,
+                            "price_adjustment_checks":cap_adjusted_count,
+                            "price_adjustment_fraction":(
+                                cap_adjusted_count/cap_check_count if cap_check_count else None),
+                            "insufficient_depth_protection_checks":cap_insufficient_count,
+                            "insufficient_depth_fraction":(
+                                cap_insufficient_count/cap_check_count if cap_check_count else None),
+                            "changed_side_count":int(diagnostic[10])
+                        }
+                        summary["min_per_side_order_action_ms"]=(
+                            core_options.get("min_requote_ns",20_000_000)/1e6)
                     summary["quote_mode"]=name
                     if symbol!=GATE_SYMBOL:
                         summary["trading"]["end_mid_usdt_per_base"] = (
@@ -406,7 +423,9 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                         local_observed_ns=raw[-2][1],
                         exec_price=raw[-2][2],
                         exec_qty=raw[-2][3])
-                    if symbol!=GATE_SYMBOL:
+                    # Stage1-accepted total Markout uses the exact execution
+                    # price, real future quote and the HBT local fill clock.
+                    if core_options is not None or symbol != GATE_SYMBOL:
                         from analyze_gate_1645_fill_quality import model_day
                         fill = {
                             "exchange_timestamp_ns":raw[-5],
