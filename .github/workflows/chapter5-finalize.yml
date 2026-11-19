@@ -1,0 +1,101 @@
+name: Chapter5 final validated official 29-case aggregation and publication
+on:
+  push:
+    branches: [exp/chapter5-robustness-cross-asset]
+    paths: ['.github/workflows/chapter5-finalize.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: chapter5-final-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: exp/chapter5-robustness-cross-asset
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Strict aggregate accounting and UTC-vs-HBT-clock tests
+        run: |
+          python -m py_compile scripts/aggregate_chapter5_robustness.py
+          PYTHONPATH=scripts python scripts/test_aggregate_chapter5_robustness.py
+      - name: Download frozen BTC six days and first five 20-depth scenarios
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 44443409775
+          github-token: '${{ secrets.GITHUB_TOKEN }}'
+          pattern: chapter5-case-BTC_USDT-*
+          path: collected
+      - name: Download all six repaired SOL DOGE ETH days; reject old failed alt candidates
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 44445139030
+          github-token: '${{ secrets.GITHUB_TOKEN }}'
+          pattern: chapter5-fixed-case-*
+          path: collected
+      - name: Count exactly 29 independent real archived full-day JSONs
+        run: |
+          n=$(find collected -type f -name '*_1430m.json' | wc -l)
+          echo "CHAPTER5_ARCHIVED_FULLDAY_JSON_COUNT=$n"
+          test "$n" -eq 29
+          for x in BTC_USDT SOL_USDT DOGE_USDT ETH_USDT; do
+            find collected -type f -name '*_1430m.json' | grep "$x" | wc -l
+          done
+      - name: Strictly validate all 29 observed sessions and produce journal tables
+        run: |
+          python scripts/aggregate_chapter5_robustness.py \
+            --root collected --out reports/chapter5_robustness_20261119
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('reports/chapter5_robustness_20261119/summary.json')
+          d=json.loads(p.read_text(encoding='utf-8'))
+          assert d['status']=='complete'
+          assert d['complete_cases']==d['requested_cases']==29
+          for sym in ('BTC_USDT','SOL_USDT','DOGE_USDT','ETH_USDT'):
+              assert d['calibration'][sym]['valid_days']==6, sym
+          for key in ('BTC_six_days','BTC_first5_20level','BTC_Nov1_400initial_plus_deltas','BTC_first5_cap20','SOL_six_days','DOGE_six_days','ETH_six_days_optional'):
+              assert d['groups'][key]['all_requested_days_complete'],key
+          print('CHAPTER5_ALL_29_INDEPENDENT_DAYS_VALIDATED')
+          PY
+      - name: Publish immutable source run manifest
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          out=Path('reports/chapter5_robustness_20261119/manifest.json')
+          out.write_text(json.dumps({
+            'btc_and_depth_cap_source_run_id':44443409775,
+            'fixed_altcoin_source_run_id':44445139030,
+            'btc_source_days':6,'btc_depth_cap_source_days':5,
+            'fixed_sol_days':6,'fixed_doge_days':6,'fixed_eth_days':6,
+            'input_frozen_stage2_commit':'92f9b96d12af2ffd9847a883e49f6804e47dc9b0',
+            'old_btc_main_reports_modified':False,
+            'old_failed_altcoin_replays_excluded':True,
+            'official_full_day_minutes_per_case':1430,
+            'notes':'Research results, six explored historical dates; official HBT 2.4.4; Maker assumed +2bps.'
+          },ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chapter5-final-29case-reports
+          path: reports/chapter5_robustness_20261119/
+          retention-days: 90
+          if-no-files-found: warn
+      - name: Commit only new chapter5 results, preserving old manuscript baselines
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add reports/chapter5_robustness_20261119/
+          git diff --cached --quiet || git commit -m 'results(ch5): verified 29 full-day BTC SOL DOGE ETH robustness cases'
+          git pull --rebase origin exp/chapter5-robustness-cross-asset
+          git push origin HEAD:exp/chapter5-robustness-cross-asset
+          git log -1 --oneline
