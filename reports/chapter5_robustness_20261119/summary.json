@@ -1,0 +1,1060 @@
+{
+  "status": "complete",
+  "source": "actual full-day official hftbacktest 2.4.4 per-symbol artifacts",
+  "never_modified_main_btc_baseline": true,
+  "dates": [
+    "2026-06-01",
+    "2026-07-01",
+    "2026-08-01",
+    "2026-09-01",
+    "2026-10-01",
+    "2026-11-01"
+  ],
+  "symbols": [
+    "BTC_USDT",
+    "SOL_USDT",
+    "DOGE_USDT",
+    "ETH_USDT"
+  ],
+  "requested_cases": 29,
+  "complete_cases": 29,
+  "missing_or_failed_cases": [],
+  "fee": {
+    "maker_rate": 0.0002,
+    "maker_bps": 2.0,
+    "assumption": "positive 2bps HBT fee, not certified historical exchange fee"
+  },
+  "pnl_bps_denominator": "official HBT two-sided trading_value_usdt (turnover), NOT initial equity",
+  "markout_definition": "side*(future Gate midpoint - exact HBT execution price)/execution price*10000",
+  "quote_clock": "local HBT fill observation -> Gate last quote with local_timestamp<=t+h; future quote max age 500ms",
+  "quote_updated_subset": "last Gate quote used at horizon has local_timestamp strictly after local fill observation",
+  "means": "per-day outcomes then equal-weight mean over completed dates; missing excluded, never zero",
+  "calibration_wait_definition": "shared initial_fit_ns minus UTC 00:10:00; engine's own calibration_wait_ns is separately validated against HBT replay t0+600s",
+  "resting_time_ratio_note": "local cancellable HBT order presence proxy, not exchange verified time-on-book",
+  "cross_asset_inventory_units": "position std and max position are in each Gate contract unit, not directly comparable across symbols",
+  "depth_note": "2026-11-01 initial ~400 L2 then native increments is NOT certified full deep queue for all day",
+  "calibration": {
+    "BTC_USDT": {
+      "valid_days": 6,
+      "requested_days": 6,
+      "per_day": [
+        {
+          "day": "2026-06-01",
+          "status": "complete",
+          "wait_s": 0.356,
+          "first_fit_ns": 1780272600356000000,
+          "error": null
+        },
+        {
+          "day": "2026-07-01",
+          "status": "complete",
+          "wait_s": 0.396,
+          "first_fit_ns": 1782864600396000000,
+          "error": null
+        },
+        {
+          "day": "2026-08-01",
+          "status": "complete",
+          "wait_s": 0.355,
+          "first_fit_ns": 1785543000355000000,
+          "error": null
+        },
+        {
+          "day": "2026-09-01",
+          "status": "complete",
+          "wait_s": 0.327,
+          "first_fit_ns": 1788221400327000000,
+          "error": null
+        },
+        {
+          "day": "2026-10-01",
+          "status": "complete",
+          "wait_s": 0.246,
+          "first_fit_ns": 1790813400246000000,
+          "error": null
+        },
+        {
+          "day": "2026-11-01",
+          "status": "complete",
+          "wait_s": 0.289,
+          "first_fit_ns": 1793491800289000000,
+          "error": null
+        }
+      ],
+      "no_successful_calibration_days": []
+    },
+    "SOL_USDT": {
+      "valid_days": 6,
+      "requested_days": 6,
+      "per_day": [
+        {
+          "day": "2026-06-01",
+          "status": "complete",
+          "wait_s": 0.222,
+          "first_fit_ns": 1780272600222000000,
+          "error": null
+        },
+        {
+          "day": "2026-07-01",
+          "status": "complete",
+          "wait_s": 0.362,
+          "first_fit_ns": 1782864600362000000,
+          "error": null
+        },
+        {
+          "day": "2026-08-01",
+          "status": "complete",
+          "wait_s": 0.281,
+          "first_fit_ns": 1785543000281000000,
+          "error": null
+        },
+        {
+          "day": "2026-09-01",
+          "status": "complete",
+          "wait_s": 35.306,
+          "first_fit_ns": 1788221435306000000,
+          "error": null
+        },
+        {
+          "day": "2026-10-01",
+          "status": "complete",
+          "wait_s": 0.187,
+          "first_fit_ns": 1790813400187000000,
+          "error": null
+        },
+        {
+          "day": "2026-11-01",
+          "status": "complete",
+          "wait_s": 0.204,
+          "first_fit_ns": 1793491800204000000,
+          "error": null
+        }
+      ],
+      "no_successful_calibration_days": []
+    },
+    "DOGE_USDT": {
+      "valid_days": 6,
+      "requested_days": 6,
+      "per_day": [
+        {
+          "day": "2026-06-01",
+          "status": "complete",
+          "wait_s": 0.222,
+          "first_fit_ns": 1780272600222000000,
+          "error": null
+        },
+        {
+          "day": "2026-07-01",
+          "status": "complete",
+          "wait_s": 0.322,
+          "first_fit_ns": 1782864600322000000,
+          "error": null
+        },
+        {
+          "day": "2026-08-01",
+          "status": "complete",
+          "wait_s": 0.253,
+          "first_fit_ns": 1785543000253000000,
+          "error": null
+        },
+        {
+          "day": "2026-09-01",
+          "status": "complete",
+          "wait_s": 0.264,
+          "first_fit_ns": 1788221400264000000,
+          "error": null
+        },
+        {
+          "day": "2026-10-01",
+          "status": "complete",
+          "wait_s": 0.109,
+          "first_fit_ns": 1790813400109000000,
+          "error": null
+        },
+        {
+          "day": "2026-11-01",
+          "status": "complete",
+          "wait_s": 1090.003,
+          "first_fit_ns": 1793492890003000000,
+          "error": null
+        }
+      ],
+      "no_successful_calibration_days": []
+    },
+    "ETH_USDT": {
+      "valid_days": 6,
+      "requested_days": 6,
+      "per_day": [
+        {
+          "day": "2026-06-01",
+          "status": "complete",
+          "wait_s": 0.481,
+          "first_fit_ns": 1780272600481000000,
+          "error": null
+        },
+        {
+          "day": "2026-07-01",
+          "status": "complete",
+          "wait_s": 0.461,
+          "first_fit_ns": 1782864600461000000,
+          "error": null
+        },
+        {
+          "day": "2026-08-01",
+          "status": "complete",
+          "wait_s": 0.309,
+          "first_fit_ns": 1785543000309000000,
+          "error": null
+        },
+        {
+          "day": "2026-09-01",
+          "status": "complete",
+          "wait_s": 0.216,
+          "first_fit_ns": 1788221400216000000,
+          "error": null
+        },
+        {
+          "day": "2026-10-01",
+          "status": "complete",
+          "wait_s": 0.239,
+          "first_fit_ns": 1790813400239000000,
+          "error": null
+        },
+        {
+          "day": "2026-11-01",
+          "status": "complete",
+          "wait_s": 0.288,
+          "first_fit_ns": 1793491800288000000,
+          "error": null
+        }
+      ],
+      "no_successful_calibration_days": []
+    }
+  },
+  "groups": {
+    "BTC_six_days": {
+      "model_stats": {
+        "glft": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -52.91620000000031,
+          "gross_pnl_turnover_bps": -0.6446910193527319,
+          "net_pnl_usdt": -221.59942484700005,
+          "net_pnl_turnover_bps": -2.6446910193527287,
+          "maker_fee_usdt": 168.68322484699976,
+          "fills": 10428.0,
+          "turnover_usdt": 843416.1242350003,
+          "position_std_contracts": 7.863519183665075,
+          "max_abs_position_contracts": 52.166666666666664,
+          "max_ops_per_sec": 125.5,
+          "resting_bid_ratio": 0.9897161158717068,
+          "resting_ask_ratio": 0.9897138123303137,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.3992294538661287,
+          "markout_100ms_future_quote_updated_bps": -0.41832056466631,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.5750295834427607,
+          "markout_500ms_future_quote_updated_bps": -0.5750295834427607,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.5977176052688972,
+          "markout_1000ms_future_quote_updated_bps": -0.5977176052688972,
+          "markout_1000ms_days_with_data": 6
+        },
+        "both_1p0": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -34.87521750000067,
+          "gross_pnl_turnover_bps": -0.5541681058972041,
+          "net_pnl_usdt": -172.45743179000044,
+          "net_pnl_turnover_bps": -2.554168105897201,
+          "maker_fee_usdt": 137.58221428999977,
+          "fills": 8517.833333333334,
+          "turnover_usdt": 687911.0714499995,
+          "position_std_contracts": 7.040773721372432,
+          "max_abs_position_contracts": 74.66666666666667,
+          "max_ops_per_sec": 211.33333333333334,
+          "resting_bid_ratio": 0.990787483803082,
+          "resting_ask_ratio": 0.9907814047240691,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.3660570559149381,
+          "markout_100ms_future_quote_updated_bps": -0.3846162732232938,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.5109841542380208,
+          "markout_500ms_future_quote_updated_bps": -0.5109841542380208,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.5232874683276704,
+          "markout_1000ms_future_quote_updated_bps": -0.5232874683276704,
+          "markout_1000ms_days_with_data": 6
+        },
+        "risk_side_pause": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -36.79543416666716,
+          "gross_pnl_turnover_bps": -0.5900295784753297,
+          "net_pnl_usdt": -167.7996877166669,
+          "net_pnl_turnover_bps": -2.590029578475329,
+          "maker_fee_usdt": 131.00425354999976,
+          "fills": 8109.166666666667,
+          "turnover_usdt": 655021.2677499988,
+          "position_std_contracts": 6.936883137643798,
+          "max_abs_position_contracts": 46.833333333333336,
+          "max_ops_per_sec": 119.66666666666667,
+          "resting_bid_ratio": 0.9804953104798163,
+          "resting_ask_ratio": 0.9789496634868136,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.376489398071258,
+          "markout_100ms_future_quote_updated_bps": -0.3933007447792227,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.5316470832456145,
+          "markout_500ms_future_quote_updated_bps": -0.5316470832456145,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.5511116173685314,
+          "markout_1000ms_future_quote_updated_bps": -0.5511116173685314,
+          "markout_1000ms_days_with_data": 6
+        }
+      },
+      "paired_vs_glft": {
+        "both_1p0": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 49.14199305699966,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 68.0531976519975,
+            "2026-07-01": 106.43345459600135,
+            "2026-08-01": 10.494685994000129,
+            "2026-09-01": 51.770531419998576,
+            "2026-10-01": 48.231227980000796,
+            "2026-11-01": 9.868860699999594
+          }
+        },
+        "risk_side_pause": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 53.79973713033316,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 75.50025073799895,
+            "2026-07-01": 113.11157639600134,
+            "2026-08-01": 11.630715148000178,
+            "2026-09-01": 56.88156325999833,
+            "2026-10-01": 54.74018054000064,
+            "2026-11-01": 10.934136699999506
+          }
+        }
+      },
+      "source_days": [
+        "2026-06-01",
+        "2026-07-01",
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01",
+        "2026-11-01"
+      ],
+      "cap_depth": false,
+      "all_requested_days_complete": true
+    },
+    "BTC_first5_20level": {
+      "model_stats": {
+        "glft": {
+          "valid_days": 5,
+          "target_days": 5,
+          "gross_pnl_usdt": -60.75411000000027,
+          "gross_pnl_turnover_bps": -0.6284186344698706,
+          "net_pnl_usdt": -255.6116387404,
+          "net_pnl_turnover_bps": -2.6284186344698672,
+          "maker_fee_usdt": 194.85752874039972,
+          "fills": 12028.2,
+          "turnover_usdt": 974287.6437020001,
+          "position_std_contracts": 7.966976669831562,
+          "max_abs_position_contracts": 52.6,
+          "max_ops_per_sec": 141.2,
+          "resting_bid_ratio": 0.98809244858213,
+          "resting_ask_ratio": 0.9880890202410996,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.38446922725569244,
+          "markout_100ms_future_quote_updated_bps": -0.405132088146107,
+          "markout_100ms_days_with_data": 5,
+          "markout_500ms_bps": -0.5680288159109836,
+          "markout_500ms_future_quote_updated_bps": -0.5680288159109836,
+          "markout_500ms_days_with_data": 5,
+          "markout_1000ms_bps": -0.5880213417604194,
+          "markout_1000ms_future_quote_updated_bps": -0.5880213417604194,
+          "markout_1000ms_days_with_data": 5
+        },
+        "both_1p0": {
+          "valid_days": 5,
+          "target_days": 5,
+          "gross_pnl_usdt": -39.770271000000626,
+          "gross_pnl_turnover_bps": -0.5319655718472699,
+          "net_pnl_usdt": -198.61501921200033,
+          "net_pnl_turnover_bps": -2.531965571847266,
+          "maker_fee_usdt": 158.8447482119997,
+          "fills": 9820.0,
+          "turnover_usdt": 794223.7410599993,
+          "position_std_contracts": 7.160414768340319,
+          "max_abs_position_contracts": 81.6,
+          "max_ops_per_sec": 226.4,
+          "resting_bid_ratio": 0.9893475527415875,
+          "resting_ask_ratio": 0.9893421159708666,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.3521067811309061,
+          "markout_100ms_future_quote_updated_bps": -0.37251421307597027,
+          "markout_100ms_days_with_data": 5,
+          "markout_500ms_bps": -0.5018295155702511,
+          "markout_500ms_future_quote_updated_bps": -0.5018295155702511,
+          "markout_500ms_days_with_data": 5,
+          "markout_1000ms_bps": -0.5100498092634047,
+          "markout_1000ms_future_quote_updated_bps": -0.5100498092634047,
+          "markout_1000ms_days_with_data": 5
+        },
+        "risk_side_pause": {
+          "valid_days": 5,
+          "target_days": 5,
+          "gross_pnl_usdt": -42.07573100000038,
+          "gross_pnl_turnover_bps": -0.5704140766305766,
+          "net_pnl_usdt": -193.2387815240001,
+          "net_pnl_turnover_bps": -2.570414076630575,
+          "maker_fee_usdt": 151.16305052399971,
+          "fills": 9343.2,
+          "turnover_usdt": 755815.2526199986,
+          "position_std_contracts": 7.033248786279925,
+          "max_abs_position_contracts": 48.2,
+          "max_ops_per_sec": 136.2,
+          "resting_bid_ratio": 0.9789334143413919,
+          "resting_ask_ratio": 0.9770369654828558,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.36166273228357293,
+          "markout_100ms_future_quote_updated_bps": -0.380107608772417,
+          "markout_100ms_days_with_data": 5,
+          "markout_500ms_bps": -0.5224157783815835,
+          "markout_500ms_future_quote_updated_bps": -0.5224157783815835,
+          "markout_500ms_days_with_data": 5,
+          "markout_1000ms_bps": -0.5387260986579863,
+          "markout_1000ms_future_quote_updated_bps": -0.5387260986579863,
+          "markout_1000ms_days_with_data": 5
+        }
+      },
+      "paired_vs_glft": {
+        "both_1p0": {
+          "paired_days": 5,
+          "target_days": 5,
+          "mean_net_delta_usdt": 56.99661952839968,
+          "positive_days": 5,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 68.0531976519975,
+            "2026-07-01": 106.43345459600135,
+            "2026-08-01": 10.494685994000129,
+            "2026-09-01": 51.770531419998576,
+            "2026-10-01": 48.231227980000796
+          }
+        },
+        "risk_side_pause": {
+          "paired_days": 5,
+          "target_days": 5,
+          "mean_net_delta_usdt": 62.37285721639989,
+          "positive_days": 5,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 75.50025073799895,
+            "2026-07-01": 113.11157639600134,
+            "2026-08-01": 11.630715148000178,
+            "2026-09-01": 56.88156325999833,
+            "2026-10-01": 54.74018054000064
+          }
+        }
+      },
+      "source_days": [
+        "2026-06-01",
+        "2026-07-01",
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01"
+      ],
+      "cap_depth": false,
+      "all_requested_days_complete": true
+    },
+    "BTC_Nov1_400initial_plus_deltas": {
+      "model_stats": {
+        "glft": {
+          "valid_days": 1,
+          "target_days": 1,
+          "gross_pnl_usdt": -13.726650000000518,
+          "gross_pnl_turnover_bps": -0.7260529437670385,
+          "net_pnl_usdt": -51.538355380000546,
+          "net_pnl_turnover_bps": -2.7260529437670353,
+          "maker_fee_usdt": 37.81170538000003,
+          "fills": 2427.0,
+          "turnover_usdt": 189058.52690000046,
+          "position_std_contracts": 7.346231752832643,
+          "max_abs_position_contracts": 50.0,
+          "max_ops_per_sec": 47.0,
+          "resting_bid_ratio": 0.9978344523195911,
+          "resting_ask_ratio": 0.997837772776385,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.4730305869183097,
+          "markout_100ms_future_quote_updated_bps": -0.48426294726732505,
+          "markout_100ms_days_with_data": 1,
+          "markout_500ms_bps": -0.6100334211016456,
+          "markout_500ms_future_quote_updated_bps": -0.6100334211016456,
+          "markout_500ms_days_with_data": 1,
+          "markout_1000ms_bps": -0.6461989228112857,
+          "markout_1000ms_future_quote_updated_bps": -0.6461989228112857,
+          "markout_1000ms_days_with_data": 1
+        },
+        "both_1p0": {
+          "valid_days": 1,
+          "target_days": 1,
+          "gross_pnl_usdt": -10.399950000000903,
+          "gross_pnl_turnover_bps": -0.665180776146875,
+          "net_pnl_usdt": -41.66949468000095,
+          "net_pnl_turnover_bps": -2.6651807761468764,
+          "maker_fee_usdt": 31.26954468000005,
+          "fills": 2007.0,
+          "turnover_usdt": 156347.72340000013,
+          "position_std_contracts": 6.442568486533002,
+          "max_abs_position_contracts": 40.0,
+          "max_ops_per_sec": 136.0,
+          "resting_bid_ratio": 0.9979871391105543,
+          "resting_ask_ratio": 0.9979778484900811,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.43580842983509777,
+          "markout_100ms_future_quote_updated_bps": -0.44512657395991145,
+          "markout_100ms_days_with_data": 1,
+          "markout_500ms_bps": -0.5567573475768691,
+          "markout_500ms_future_quote_updated_bps": -0.5567573475768691,
+          "markout_500ms_days_with_data": 1,
+          "markout_1000ms_bps": -0.5894757636489988,
+          "markout_1000ms_future_quote_updated_bps": -0.5894757636489988,
+          "markout_1000ms_days_with_data": 1
+        },
+        "risk_side_pause": {
+          "valid_days": 1,
+          "target_days": 1,
+          "gross_pnl_usdt": -10.393950000001002,
+          "gross_pnl_turnover_bps": -0.6881070876990951,
+          "net_pnl_usdt": -40.60421868000104,
+          "net_pnl_turnover_bps": -2.688107087699096,
+          "maker_fee_usdt": 30.210268680000038,
+          "fills": 1939.0,
+          "turnover_usdt": 151051.34340000013,
+          "position_std_contracts": 6.455054894463158,
+          "max_abs_position_contracts": 40.0,
+          "max_ops_per_sec": 37.0,
+          "resting_bid_ratio": 0.9883047911719377,
+          "resting_ask_ratio": 0.9885131535066022,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.450622727009683,
+          "markout_100ms_future_quote_updated_bps": -0.45926642481325136,
+          "markout_100ms_days_with_data": 1,
+          "markout_500ms_bps": -0.5778036075657691,
+          "markout_500ms_future_quote_updated_bps": -0.5778036075657691,
+          "markout_500ms_days_with_data": 1,
+          "markout_1000ms_bps": -0.6130392109212576,
+          "markout_1000ms_future_quote_updated_bps": -0.6130392109212576,
+          "markout_1000ms_days_with_data": 1
+        }
+      },
+      "paired_vs_glft": {
+        "both_1p0": {
+          "paired_days": 1,
+          "target_days": 1,
+          "mean_net_delta_usdt": 9.868860699999594,
+          "positive_days": 1,
+          "daily_net_delta_usdt": {
+            "2026-11-01": 9.868860699999594
+          }
+        },
+        "risk_side_pause": {
+          "paired_days": 1,
+          "target_days": 1,
+          "mean_net_delta_usdt": 10.934136699999506,
+          "positive_days": 1,
+          "daily_net_delta_usdt": {
+            "2026-11-01": 10.934136699999506
+          }
+        }
+      },
+      "source_days": [
+        "2026-11-01"
+      ],
+      "cap_depth": false,
+      "all_requested_days_complete": true
+    },
+    "BTC_first5_cap20": {
+      "model_stats": {
+        "glft": {
+          "valid_days": 5,
+          "target_days": 5,
+          "gross_pnl_usdt": -63.76975999999981,
+          "gross_pnl_turnover_bps": -0.6361157667772508,
+          "net_pnl_usdt": -265.20441022559976,
+          "net_pnl_turnover_bps": -2.636115766777249,
+          "maker_fee_usdt": 201.43465022559994,
+          "fills": 12425.4,
+          "turnover_usdt": 1007173.2511280004,
+          "position_std_contracts": 8.248760104355691,
+          "max_abs_position_contracts": 68.2,
+          "max_ops_per_sec": 142.6,
+          "resting_bid_ratio": 0.987385139563845,
+          "resting_ask_ratio": 0.9874119486875624,
+          "depth_cap_changed_fraction": 0.20741853900484958,
+          "depth_cap_insufficient_fraction": 3.229707303420213e-06,
+          "markout_100ms_bps": -0.3845372817853065,
+          "markout_100ms_future_quote_updated_bps": -0.405375502541444,
+          "markout_100ms_days_with_data": 5,
+          "markout_500ms_bps": -0.5722297041804298,
+          "markout_500ms_future_quote_updated_bps": -0.5722297041804298,
+          "markout_500ms_days_with_data": 5,
+          "markout_1000ms_bps": -0.5946836788250762,
+          "markout_1000ms_future_quote_updated_bps": -0.5946836788250762,
+          "markout_1000ms_days_with_data": 5,
+          "depth_cap_total_decision_checks": 119246304,
+          "depth_cap_total_changed_checks": 25649109,
+          "depth_cap_total_insufficient_checks": 482,
+          "depth_cap_pooled_changed_fraction": 0.21509353447130738,
+          "depth_cap_pooled_insufficient_fraction": 4.042053999426263e-06
+        },
+        "both_1p0": {
+          "valid_days": 5,
+          "target_days": 5,
+          "gross_pnl_usdt": -46.724219000000076,
+          "gross_pnl_turnover_bps": -0.5607449595603635,
+          "net_pnl_usdt": -218.87335177199984,
+          "net_pnl_turnover_bps": -2.560744959560359,
+          "maker_fee_usdt": 172.14913277199975,
+          "fills": 10629.2,
+          "turnover_usdt": 860745.6638600003,
+          "position_std_contracts": 7.565092852098625,
+          "max_abs_position_contracts": 81.2,
+          "max_ops_per_sec": 164.0,
+          "resting_bid_ratio": 0.9885783296008958,
+          "resting_ask_ratio": 0.9886213328811024,
+          "depth_cap_changed_fraction": 0.22138931356159125,
+          "depth_cap_insufficient_fraction": 3.228427523376126e-06,
+          "markout_100ms_bps": -0.3542028878165505,
+          "markout_100ms_future_quote_updated_bps": -0.37648435514308265,
+          "markout_100ms_days_with_data": 5,
+          "markout_500ms_bps": -0.5214127457682652,
+          "markout_500ms_future_quote_updated_bps": -0.5214127457682652,
+          "markout_500ms_days_with_data": 5,
+          "markout_1000ms_bps": -0.5363483884458985,
+          "markout_1000ms_future_quote_updated_bps": -0.5363483884458985,
+          "markout_1000ms_days_with_data": 5,
+          "depth_cap_total_decision_checks": 119324340,
+          "depth_cap_total_changed_checks": 27450029,
+          "depth_cap_total_insufficient_checks": 482,
+          "depth_cap_pooled_changed_fraction": 0.2300455129272033,
+          "depth_cap_pooled_insufficient_fraction": 4.039410567869053e-06
+        }
+      },
+      "paired_vs_glft": {
+        "both_1p0": {
+          "paired_days": 5,
+          "target_days": 5,
+          "mean_net_delta_usdt": 46.331058453599894,
+          "positive_days": 5,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 56.34562619399901,
+            "2026-07-01": 93.36198449200066,
+            "2026-08-01": 9.97405882200038,
+            "2026-09-01": 40.469497039999084,
+            "2026-10-01": 31.50412572000033
+          }
+        }
+      },
+      "source_days": [
+        "2026-06-01",
+        "2026-07-01",
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01"
+      ],
+      "cap_depth": true,
+      "all_requested_days_complete": true
+    },
+    "SOL_six_days": {
+      "model_stats": {
+        "glft": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -66.32666666666705,
+          "gross_pnl_turnover_bps": -0.5736628555589626,
+          "net_pnl_usdt": -293.0682346666671,
+          "net_pnl_turnover_bps": -2.5736628555589696,
+          "maker_fee_usdt": 226.741568,
+          "fills": 13984.833333333334,
+          "turnover_usdt": 1133707.8399999912,
+          "position_std_contracts": 1.1398256133968827,
+          "max_abs_position_contracts": 5.949999999999999,
+          "max_ops_per_sec": 85.0,
+          "resting_bid_ratio": 0.9789069437783159,
+          "resting_ask_ratio": 0.9786317653295752,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.3854143372657612,
+          "markout_100ms_future_quote_updated_bps": -0.4804377561661531,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.516960370302577,
+          "markout_500ms_future_quote_updated_bps": -0.516960370302577,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.56343415415306,
+          "markout_1000ms_future_quote_updated_bps": -0.56343415415306,
+          "markout_1000ms_days_with_data": 6
+        },
+        "both_1p0": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -41.5239166666666,
+          "gross_pnl_turnover_bps": -0.43236891962363777,
+          "net_pnl_usdt": -227.96709313333324,
+          "net_pnl_turnover_bps": -2.43236891962364,
+          "maker_fee_usdt": 186.44317646666659,
+          "fills": 11513.333333333334,
+          "turnover_usdt": 932215.8823333302,
+          "position_std_contracts": 1.0711135943308205,
+          "max_abs_position_contracts": 5.066666666666666,
+          "max_ops_per_sec": 111.16666666666667,
+          "resting_bid_ratio": 0.9816781779884968,
+          "resting_ask_ratio": 0.9814064532866512,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.28875527764964226,
+          "markout_100ms_future_quote_updated_bps": -0.39057480478782197,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.3915491608919128,
+          "markout_500ms_future_quote_updated_bps": -0.3915491608919128,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.42516177977507524,
+          "markout_1000ms_future_quote_updated_bps": -0.42516177977507524,
+          "markout_1000ms_days_with_data": 6
+        },
+        "risk_side_pause": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -40.03491666666686,
+          "gross_pnl_turnover_bps": -0.4314019360497703,
+          "net_pnl_usdt": -219.678201733333,
+          "net_pnl_turnover_bps": -2.4314019360497645,
+          "maker_fee_usdt": 179.6432850666661,
+          "fills": 11094.666666666666,
+          "turnover_usdt": 898216.4253333327,
+          "position_std_contracts": 1.0850596560203323,
+          "max_abs_position_contracts": 5.05,
+          "max_ops_per_sec": 52.166666666666664,
+          "resting_bid_ratio": 0.9692324383890892,
+          "resting_ask_ratio": 0.9685351957370871,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.28705087423440984,
+          "markout_100ms_future_quote_updated_bps": -0.3878830043482901,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.38951681573214286,
+          "markout_500ms_future_quote_updated_bps": -0.38951681573214286,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.4222219404163862,
+          "markout_1000ms_future_quote_updated_bps": -0.4222219404163862,
+          "markout_1000ms_days_with_data": 6
+        }
+      },
+      "paired_vs_glft": {
+        "both_1p0": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 65.10114153333384,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 94.12757799999952,
+            "2026-07-01": 101.5832289999995,
+            "2026-08-01": 25.302448600000744,
+            "2026-09-01": 62.60743839999802,
+            "2026-10-01": 83.2827408000017,
+            "2026-11-01": 23.703414400003567
+          }
+        },
+        "risk_side_pause": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 73.39003293333407,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 105.70192000000168,
+            "2026-07-01": 113.71693519999926,
+            "2026-08-01": 29.67906040000061,
+            "2026-09-01": 69.0812831999983,
+            "2026-10-01": 93.93100360000108,
+            "2026-11-01": 28.229995200003458
+          }
+        }
+      },
+      "source_days": [
+        "2026-06-01",
+        "2026-07-01",
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01",
+        "2026-11-01"
+      ],
+      "cap_depth": false,
+      "all_requested_days_complete": true
+    },
+    "DOGE_six_days": {
+      "model_stats": {
+        "glft": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -62.919716666666766,
+          "gross_pnl_turnover_bps": -0.642311342346399,
+          "net_pnl_usdt": -280.3224415733337,
+          "net_pnl_turnover_bps": -2.642311342346383,
+          "maker_fee_usdt": 217.40272490666698,
+          "fills": 13558.5,
+          "turnover_usdt": 1087013.6245333452,
+          "position_std_contracts": 122.14391889103042,
+          "max_abs_position_contracts": 570.3333333333334,
+          "max_ops_per_sec": 55.166666666666664,
+          "resting_bid_ratio": 0.9664287549557505,
+          "resting_ask_ratio": 0.9661336572880161,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.526467588503167,
+          "markout_100ms_future_quote_updated_bps": -0.6160700902202642,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.6127086954795475,
+          "markout_500ms_future_quote_updated_bps": -0.6127086954795475,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.6425354154331617,
+          "markout_1000ms_future_quote_updated_bps": -0.6425354154331617,
+          "markout_1000ms_days_with_data": 6
+        },
+        "both_1p0": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -35.25761666666661,
+          "gross_pnl_turnover_bps": -0.4522160828610153,
+          "net_pnl_usdt": -212.3190295466662,
+          "net_pnl_turnover_bps": -2.452216082860987,
+          "maker_fee_usdt": 177.06141287999958,
+          "fills": 11039.166666666666,
+          "turnover_usdt": 885307.0644000148,
+          "position_std_contracts": 114.22024550528243,
+          "max_abs_position_contracts": 529.8333333333334,
+          "max_ops_per_sec": 101.66666666666667,
+          "resting_bid_ratio": 0.9704720807332673,
+          "resting_ask_ratio": 0.9701461259059204,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.4275376604898575,
+          "markout_100ms_future_quote_updated_bps": -0.5216258486663493,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.465444410025837,
+          "markout_500ms_future_quote_updated_bps": -0.465444410025837,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.457865292026896,
+          "markout_1000ms_future_quote_updated_bps": -0.457865292026896,
+          "markout_1000ms_days_with_data": 6
+        },
+        "risk_side_pause": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -34.61679166666669,
+          "gross_pnl_turnover_bps": -0.4635666252674147,
+          "net_pnl_usdt": -203.2722808100002,
+          "net_pnl_turnover_bps": -2.4635666252673896,
+          "maker_fee_usdt": 168.6554891433335,
+          "fills": 10514.666666666666,
+          "turnover_usdt": 843277.4457166832,
+          "position_std_contracts": 117.41581933797674,
+          "max_abs_position_contracts": 466.1666666666667,
+          "max_ops_per_sec": 71.83333333333333,
+          "resting_bid_ratio": 0.9586744781623652,
+          "resting_ask_ratio": 0.9583897121074193,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.42425751021928804,
+          "markout_100ms_future_quote_updated_bps": -0.5196726804147621,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.4696063735801137,
+          "markout_500ms_future_quote_updated_bps": -0.4696063735801137,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.4676317075493254,
+          "markout_1000ms_future_quote_updated_bps": -0.4676317075493254,
+          "markout_1000ms_days_with_data": 6
+        }
+      },
+      "paired_vs_glft": {
+        "both_1p0": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 68.00341202666753,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 105.46385279999896,
+            "2026-07-01": 93.02730846000048,
+            "2026-08-01": 30.34220030000087,
+            "2026-09-01": 71.48108285999979,
+            "2026-10-01": 81.46019030000389,
+            "2026-11-01": 26.24583744000124
+          }
+        },
+        "risk_side_pause": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 77.05016076333352,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 115.48520639999813,
+            "2026-07-01": 107.90700053999862,
+            "2026-08-01": 36.231877000000054,
+            "2026-09-01": 79.77980534000059,
+            "2026-10-01": 92.11800370000299,
+            "2026-11-01": 30.779071600000762
+          }
+        }
+      },
+      "source_days": [
+        "2026-06-01",
+        "2026-07-01",
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01",
+        "2026-11-01"
+      ],
+      "cap_depth": false,
+      "all_requested_days_complete": true
+    },
+    "ETH_six_days_optional": {
+      "model_stats": {
+        "glft": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -94.82982999999962,
+          "gross_pnl_turnover_bps": -0.6854104389921828,
+          "net_pnl_usdt": -384.51273577466674,
+          "net_pnl_turnover_bps": -2.68541043899219,
+          "maker_fee_usdt": 289.6829057746672,
+          "fills": 18107.166666666668,
+          "turnover_usdt": 1448414.5288733349,
+          "position_std_contracts": 2.8987101579524768,
+          "max_abs_position_contracts": 19.733333333333334,
+          "max_ops_per_sec": 189.33333333333334,
+          "resting_bid_ratio": 0.9818706149030688,
+          "resting_ask_ratio": 0.9818723064517522,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.4422695537963501,
+          "markout_100ms_future_quote_updated_bps": -0.46043593968547136,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.6207220526799012,
+          "markout_500ms_future_quote_updated_bps": -0.6207220526799012,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.6538340685622771,
+          "markout_1000ms_future_quote_updated_bps": -0.6538340685622771,
+          "markout_1000ms_days_with_data": 6
+        },
+        "both_1p0": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -63.4164675000002,
+          "gross_pnl_turnover_bps": -0.5769090329029625,
+          "net_pnl_usdt": -301.0593584270002,
+          "net_pnl_turnover_bps": -2.5769090329029596,
+          "maker_fee_usdt": 237.64289092699994,
+          "fills": 14857.0,
+          "turnover_usdt": 1188214.4546349996,
+          "position_std_contracts": 2.606187973208157,
+          "max_abs_position_contracts": 22.616666666666664,
+          "max_ops_per_sec": 226.66666666666666,
+          "resting_bid_ratio": 0.9841071912350924,
+          "resting_ask_ratio": 0.9841152677934532,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.400670661813221,
+          "markout_100ms_future_quote_updated_bps": -0.417049379866081,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.5326561915322029,
+          "markout_500ms_future_quote_updated_bps": -0.5326561915322029,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.5537662781220368,
+          "markout_1000ms_future_quote_updated_bps": -0.5537662781220368,
+          "markout_1000ms_days_with_data": 6
+        },
+        "risk_side_pause": {
+          "valid_days": 6,
+          "target_days": 6,
+          "gross_pnl_usdt": -64.86363916666714,
+          "gross_pnl_turnover_bps": -0.614282818866845,
+          "net_pnl_usdt": -291.88729442933385,
+          "net_pnl_turnover_bps": -2.6142828188668417,
+          "maker_fee_usdt": 227.0236552626667,
+          "fills": 14192.333333333334,
+          "turnover_usdt": 1135118.2763133335,
+          "position_std_contracts": 2.560896315530572,
+          "max_abs_position_contracts": 18.950000000000003,
+          "max_ops_per_sec": 146.0,
+          "resting_bid_ratio": 0.9715751157776754,
+          "resting_ask_ratio": 0.9696383987733084,
+          "depth_cap_changed_fraction": null,
+          "depth_cap_insufficient_fraction": null,
+          "markout_100ms_bps": -0.41423153531098555,
+          "markout_100ms_future_quote_updated_bps": -0.4285691867486982,
+          "markout_100ms_days_with_data": 6,
+          "markout_500ms_bps": -0.5588159943120709,
+          "markout_500ms_future_quote_updated_bps": -0.5588159943120709,
+          "markout_500ms_days_with_data": 6,
+          "markout_1000ms_bps": -0.5852000222708239,
+          "markout_1000ms_future_quote_updated_bps": -0.5852000222708239,
+          "markout_1000ms_days_with_data": 6
+        }
+      },
+      "paired_vs_glft": {
+        "both_1p0": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 83.45337734766663,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 128.79106200000342,
+            "2026-07-01": 170.98580310599732,
+            "2026-08-01": 25.389412952002843,
+            "2026-09-01": 84.20588140799856,
+            "2026-10-01": 58.025010059997385,
+            "2026-11-01": 33.323094560000314
+          }
+        },
+        "risk_side_pause": {
+          "paired_days": 6,
+          "target_days": 6,
+          "mean_net_delta_usdt": 92.62544134533296,
+          "positive_days": 6,
+          "daily_net_delta_usdt": {
+            "2026-06-01": 143.3649944000013,
+            "2026-07-01": 186.69524589599774,
+            "2026-08-01": 28.071296292003026,
+            "2026-09-01": 93.93737190399816,
+            "2026-10-01": 67.21264757999711,
+            "2026-11-01": 36.47109200000047
+          }
+        }
+      },
+      "source_days": [
+        "2026-06-01",
+        "2026-07-01",
+        "2026-08-01",
+        "2026-09-01",
+        "2026-10-01",
+        "2026-11-01"
+      ],
+      "cap_depth": false,
+      "all_requested_days_complete": true
+    }
+  }
+}
