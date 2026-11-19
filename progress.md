@@ -573,3 +573,15 @@
 - [x] 结果文件在 `reports/chapter5_cross_exchange_4a_20261119/`：`summary.json`、`report.md`、`per_day_gate.csv`、`contract_specs_candidates.json`；保留每一日各源行数、P50/P95/P99、>3s/>10s间隔、初始快照/额外快照组、样本重建交叉异常、冻结规格来源与4B阻断原因。
 - [ ] 阶段4B**尚未启动且禁止自动触发**；Bitget先调查10月数据尾部及精确时点合约/手续费证据；OKX先检查初始快照前增量、9月16.5秒真实L2缺口及频繁重建，方可决定是否部分剔除或补数据。Bitget归一化6/6已通过，暂不必触发HTX兜底。所有后续策略实证还必须另行验证各交易所HBT合约量纲、手续费、延迟和撮合/成交概率假设。
 
+## 2026-11-19 Bitget四币种×六日4A终审（OKX冻结；4B未启动）
+
+- [x] 用户明确改为逐个交易所闭环：在 `exp/chapter5-cross-exchange` 仅审计Bitget BTC/ETH/SOL/DOGE USDT永续2026年6—11月每月1日各六天；**OKX本轮冻结、不处理预快照、不执行任何OKX/HBT回测**。原BTC六日来自已验收的Run `44459481767`，逐日源文件及历史报告均已在分支归档。
+- [x] 新增ETH/SOL/DOGE十八个真实完整日读取 Bitget trades、incremental_book_L2、quotes和Binance同一币种book_ticker共4类免费标准化Tardis CSV.GZ。全部18个任务及BTC 10月原数据逐小时/5min延迟专项Run [#44552849015](https://github.com/Huhabubu/mm/actions/runs/44552849015) 完成；离线检测Run #44554510429通过。
+- [x] 24资产日最终汇总与逐日审计溯源检查归档：[Actions #44555520097](https://github.com/Huhabubu/mm/actions/runs/44555520097)，结果目录 `reports/chapter5_bitget_4a_20261119/`（report.md、summary.json、per_day_gate.csv、btc_oct_hourly_lag.csv、btc_oct_5minute_lag.csv、btc_oct_lag_tail.json、contract_specs_candidates.json和manifest.json）。旧BTC结果及Gate主文冻结收益不改动。
+- [x] 四币种×六日**全部24/24数据源可下载、逐日真实CSV审计报告完整**。按事前不允许候选报价Tick违例的严格门禁 **21/24通过**：BTC 6/6、ETH 6/6、SOL 6/6、DOGE 3/6。DOGE 7、8、11月的L2 price不合0.00001 USDT候选Tick分别212、8810、8行，8月trades另1行不合Tick，8月末笔trade距UTC收盘92.96秒（交易安静不能直接证明数据断线）。
+- [x] 候选Bitget历史合同规格：ETH Tick0.01USDT、最小0.01ETH、下单数量步长候选0.01ETH；SOL Tick0.001USDT、最小0.1SOL、候选数量步长0.1SOL；DOGE Tick0.00001USDT、最小1DOGE、候选数量步长1DOGE；均按基础币计量。标准Maker2bps/Taker6bps与统一研究Maker2bps分开列出。实际成交数量与候选下单数量步长六日交叉检查无违例，BTC/ETH/SOL成交价也无候选Tick违例。**Tardis Pro历史生效规格及实际账户手续费等级未逐日独立认证；低于最小委托的部分成交不自动判为违例。**
+- [x] BTC 2026-10-01 延迟尾部：单独重读Bitget quotes 761057行、Binance book_ticker 35384160行；Bitget超50ms记录7.45%、Binance0.33%；Bitget 01 UTC小时P50/P95/P99=81.45/96.55/129.85ms（71.2%>50ms），02 UTC=19.45/94.15/123.65ms（45.8%>50ms）。严重异常主要集中1—2 UTC，另有较广但较弱的尾部分布（8小时P95>50ms，最严重三小时占全日超50ms事件56.8%）。不能将不同报价节拍/时钟差归结为纯网络单程延迟。
+- [x] DOGE 7/8/11月精确十进制异常复查：[Actions #44556158974](https://github.com/Huhabubu/mm/actions/runs/44556158974)，归档 `reports/chapter5_bitget_4a_doge_tick_20261119/`（summary.json/per_day.csv/report.md）。所有9030条L2超0.00001价格网格均符合0.000001网格，非浮点误报：7月212行全增量，8月51快照+8759增量，11月8条全部快照；并有8月1笔成交价对应更细网格。尚无历史规则生效证据证明该更细网格合法，严格3个DOGE日继续阻断。不能擅自更改候选Tick或把有问题的报价强行对齐。
+- [!] 免费Tardis标准化CSV不含完整原生WebSocket序号/断线标记；额外快照数仅重连/重订阅代理。Bitget四币种同日额外快照数重复出现4/5/7/4/5/7组，尚未验证各币种重建事件时间是否一致。下一阶段若获确认，还需先核实Bitget历史规格、每所HBT成交模型/手续费假设，记录和处理额外快照/超过1000ms L2间隔前后±5秒的风险窗口。
+- [ ] **阶段4B尚未启动**。当前未达到用户要求的24/24严谨全通过门禁；待DOGE历史价格精度或异常深档证据复核并形成可接受的数据使用方案后，再考虑正式Bitget-Gate比较。OKX保持冻结。
+
