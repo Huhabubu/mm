@@ -561,3 +561,15 @@
 - [x] 完整报告、逐日CSV、JSON、来源清单重新生成并提交到 `exp/chapter5-robustness-cross-asset` 的 `reports/chapter5_robustness_20261119/`；通过相对阶段二 `92f9b96d` 的变更清单验证，旧BTC主文报告均未触及。
 - [!] 研究局限保持：全部模型含费仍亏损；历史六日是探索过的日期、收益对照不构成独立样本外显著性证明；不同策略的Markout来自各自成交集合，不能直接推断信号消除特定撤单的逆向选择；20档外真实队列、资金费、期末清仓成本、交易所真实订单在线时间与历史实际费率仍未独立证实。
 
+## 2026-11-19 第5.3节跨交易所4A真实Tardis前置门禁（已归档；未启动4B）
+
+- [x] 从阶段三锁定提交 `fbeecc97e85ca36a4fedf514fa31f699c07042b4` 建立 `exp/chapter5-cross-exchange` 独立实验分支。原阶段三第5章收益、旧BTC主文及Stage0/1/5A/5C冻结报告没有改动。
+- [x] 基于用户提供的Tardis 2026年10—11月官方更新日期假设，审计 Bitget Futures BTCUSDT 2026年6—11月各1日六天和OKX Swap BTC-USDT-SWAP 2026年9—11月各1日三天；每个UTC完整交易日实读原始归一化 `trades`、`incremental_book_L2`、`quotes`、同日Binance Futures `book_ticker` 四类免费Tardis CSV.GZ，共9组×4数据源。运行：[GitHub Actions #44459481767](https://github.com/Huhabubu/mm/actions/runs/44459481767)，9/9扫描任务执行成功，审计结论另列。没有任何HBT回测、成交或模拟损益。
+- [x] 修正首次审计中的两种误报：Tardis同一WS消息可展开多行深度变化，必须在全部同一 `local_timestamp` 价位行处理后检查盘口交叉；L2衍生 `quotes`/Binance原生 `book_ticker` 在最优价不动时可长时间静默，不得直接当作WS断线。首次未修版Run `44458829664` 已取消；修正后的独立回归测试 [#44459603248](https://github.com/Huhabubu/mm/actions/runs/44459603248) 通过。
+- [x] **Bitget归一化CSV前置门禁6/6通过**：六日日最大L2消息间隔分别0.746/2.331/0.732/1.510/0.972/2.030秒，额外快照重建代理分别4/5/7/4/5/7组；所有6日成交样本价符合候选0.1USDT价格档，最小观测成交量0.0001 BTC，按候选0.0001 BTC数量步长统计无违反；6日每日L2均有首个快照与原生归一化增量，仍无法从免费CSV证明原WS频道和原始包序号完全连续。
+- [!] **Bitget 2026-10-01高分位采集延迟异常待审计**：本所 `quotes` P50/P95/P99为9.65/73.25/90.05ms，Binance原生 `book_ticker` 为2.65/4.15/10.25ms；P95差69.10ms、P99差79.80ms。不同数据源发布节拍/交易所时钟可能造成差异，**不得直接解释为跨海延迟**，也不得当作无异常样本直接运行4B。
+- [x] **OKX Swap严格4A门禁0/3通过**：9/10/11月L2首个完整400买+400卖价位快照之前分别已有74/55/8行增量、需单独确定可否安全跳过；对应每日日内快照总组数65/49/13（额外重建64/48/12）；9月L2最大16.501秒间隔且存在1次超过10秒的L2流中断证据，10/11月最大间隔2.400/3.804秒。全部三日阻断，不进入4B、也不声称连续队列可重建。
+- [x] 官方标准费率另行冻结为研究候选：Bitget Maker2bps/Taker6bps，OKX Maker2bps/Taker5bps；研究横向比较统一Maker2bps。Bitget BTCUSDT候选Tick0.1USDT、最小/步长0.0001BTC、数量按BTC；OKX BTC-USDT-SWAP候选Tick0.1USDT、合约面值0.01BTC/张、最小/步长0.01张。成交价/成交量与候选栅格交叉核验无违规行，但**Tardis历史 instrument metadata API需Pro/Business订阅，样本逐日历史生效规格和实际账户VIP费率均未认证**。
+- [x] 结果文件在 `reports/chapter5_cross_exchange_4a_20261119/`：`summary.json`、`report.md`、`per_day_gate.csv`、`contract_specs_candidates.json`；保留每一日各源行数、P50/P95/P99、>3s/>10s间隔、初始快照/额外快照组、样本重建交叉异常、冻结规格来源与4B阻断原因。
+- [ ] 阶段4B**尚未启动且禁止自动触发**；Bitget先调查10月数据尾部及精确时点合约/手续费证据；OKX先检查初始快照前增量、9月16.5秒真实L2缺口及频繁重建，方可决定是否部分剔除或补数据。Bitget归一化6/6已通过，暂不必触发HTX兜底。所有后续策略实证还必须另行验证各交易所HBT合约量纲、手续费、延迟和撮合/成交概率假设。
+
