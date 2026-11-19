@@ -88,8 +88,16 @@ def validate_case(report, path):
     for model,v in report["variants"].items():
         if v.get("initial_fit_ns") != start:
             raise ValueError(f"Models do not have identical first calibration time: {key}:{model}")
-        if abs(v.get("calibration_wait_ns",0)/1e9-wait)>0.001:
-            raise ValueError(f"Calibration waiting time mismatch: {key}:{model}")
+        # HBT starts at its first replayable native market event, which can
+        # occur several hundred milliseconds after UTC midnight. Core's
+        # calibration_wait_ns is relative to that t0+600s local replay clock;
+        # the chapter5 wait_s above is relative to UTC 00:10:00 precisely.
+        t0=v.get("start_time_ns")
+        if not isinstance(t0,int):
+            raise ValueError(f"Missing exact HBT first event nanosecond: {key}:{model}")
+        expected_engine_wait=max(0,start-(t0+600_000_000_000))
+        if abs(v.get("calibration_wait_ns",-1)-expected_engine_wait)>1_000_000:
+            raise ValueError(f"Engine-clock calibration waiting time mismatch: {key}:{model}")
         t=v["trading"]
         n=int(t["engine_fills"])
         if n != int(t["buy_fills"])+int(t["sell_fills"]):
@@ -303,6 +311,7 @@ def build_summary(found,rows):
         "quote_clock":"local HBT fill observation -> Gate last quote with local_timestamp<=t+h; future quote max age 500ms",
         "quote_updated_subset":"last Gate quote used at horizon has local_timestamp strictly after local fill observation",
         "means":"per-day outcomes then equal-weight mean over completed dates; missing excluded, never zero",
+        "calibration_wait_definition":"shared initial_fit_ns minus UTC 00:10:00; engine's own calibration_wait_ns is separately validated against HBT replay t0+600s",
         "resting_time_ratio_note":"local cancellable HBT order presence proxy, not exchange verified time-on-book",
         "cross_asset_inventory_units":"position std and max position are in each Gate contract unit, not directly comparable across symbols",
         "depth_note":"2026-11-01 initial ~400 L2 then native increments is NOT certified full deep queue for all day",
