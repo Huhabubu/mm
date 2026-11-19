@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import math
+import hashlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,39 @@ FIRST5 = DAYS[:5]
 SYMBOLS = ("BTC_USDT", "SOL_USDT", "DOGE_USDT", "ETH_USDT")
 MODELS = ("glft", "both_1p0", "risk_side_pause")
 HORIZONS = (100, 500, 1000)
+# Sources verified against the completed GitHub Actions runs; these are
+# source-job SHA values, not the later report publication commit.
+SOURCE_RUN = {
+    "BTC_USDT": (44443409775, "8ca127aab552e96923a46b0979af85fe6bca88c6"),
+    "SOL_USDT": (44445139030, "c4c711104079449bb8321aad618bec005964855f"),
+    "DOGE_USDT": (44445139030, "c4c711104079449bb8321aad618bec005964855f"),
+    "ETH_USDT": (44445139030, "c4c711104079449bb8321aad618bec005964855f"),
+}
+
+def source_evidence(key, path):
+    """Tie a real JSON to the downloaded run, named matrix artifact, and digest.
+
+    Actions downloads in the finalization workflow are pinned by run_id;
+    artifact name/relative path are independently checked here. A run ID
+    cannot be established from the JSON alone, only from the pinned download.
+    """
+    symbol, day, case = key
+    run_id, commit = SOURCE_RUN[symbol]
+    prefix = "chapter5-case" if symbol == "BTC_USDT" else "chapter5-fixed-case"
+    expected = f"{prefix}-{symbol}-{case}-{day}"
+    p = Path(path)
+    if expected not in p.parts or p.name != f"{day}_1430m.json":
+        raise ValueError(f"Invalid artifact name/path for {key}: {path}, expected {expected}")
+    if symbol != "BTC_USDT" and case != "base":
+        raise ValueError(f"Repaired altcoin run can only contain base cases: {key}")
+    return {
+        "run_id": run_id,
+        "run_url": f"https://github.com/Huhabubu/mm/actions/runs/{run_id}",
+        "source_head_sha": commit,
+        "artifact_name": expected,
+        "artifact_path": str(p),
+        "json_sha256": hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None,
+    }
 
 def expect_cases():
     return {(s,d,"base") for s in SYMBOLS for d in DAYS} | {
@@ -42,23 +76,25 @@ def validate_case(report, path):
     config=report.get("core_options",{})
     if symbol not in SYMBOLS or day not in DAYS or not isinstance(config,dict):
         raise ValueError(f"Unexpected symbol/day/options: {path}")
-    # An early download/QA failure may precede core_options construction.
-    # Artifact directory is the independent matrix-case identity.
-    marker=next((p for p in path.parts if p.startswith("chapter5-case-")),None)
-    if marker is not None:
-        if marker==f"chapter5-case-{symbol}-cap-{day}":
-            case="cap"
-        elif marker==f"chapter5-case-{symbol}-base-{day}":
-            case="base"
-        else:
-            raise ValueError(f"Artifact identity inconsistent with internal day/symbol: {path}")
+    # Classify using the actual downloaded artifact folder, including
+    # the distinct repaired cross-asset run; never trust just a JSON switch.
+    marker=next((p for p in path.parts if p.startswith("chapter5-case-")
+                 or p.startswith("chapter5-fixed-case-")),None)
+    if marker is None:
+        raise ValueError(f"Unprovenanced official HBT input: {path}")
+    if marker.endswith(f"-cap-{day}"):
+        case="cap"
+    elif marker.endswith(f"-base-{day}"):
+        case="base"
     else:
-        case="cap" if config.get("cap_depth_at_visible_levels") is True else "base"
+        raise ValueError(f"Artifact case identity inconsistent with day: {path}")
     key=(symbol,day,case)
     if key not in expect_cases():
         raise ValueError(f"Unexpected experimental case {key}: {path}")
+    evidence=source_evidence(key,path)
     if report.get("status") != "complete":
-        return key,{"status":"failed","error":report.get("error","unknown"),"path":str(path)}
+        return key,{"status":"failed","error":report.get("error","unknown"),
+                    "path":str(path),"evidence":evidence}
     if config.get("cap_depth_at_visible_levels") is not (case=="cap"):
         raise ValueError(f"Internal cap setting differs from job identity: {key}")
     if report.get("minutes_traded") != 1430 or report.get("binance_extra_visible_delay_ms") != 2.5:
@@ -108,6 +144,15 @@ def validate_case(report, path):
         turnover=numeric(t["trading_value_usdt"])
         if fee<0 or abs(gross-(net+fee))>1e-6 or turnover<0:
             raise ValueError(f"Invalid fee/gross/turnover accounting: {key}/{model}")
+        if abs(fee-0.0002*turnover)>1e-6:
+            raise ValueError(f"Maker fee not 2bps of turnover: {key}/{model}")
+        if turnover>0:
+            gross_bps=numeric(t["gross_marked_pnl_per_turnover_bps"])
+            net_bps=numeric(t["net_marked_pnl_per_turnover_bps"])
+            if (abs(gross_bps-10000*gross/turnover)>1e-8
+                    or abs(net_bps-10000*net/turnover)>1e-8
+                    or abs((gross_bps-net_bps)-2.0)>1e-8):
+                raise ValueError(f"Gross/Net bps denominator or fees mismatch: {key}/{model}")
         if n and turnover<=0:
             raise ValueError(f"Nonpositive turnover on traded day: {key}/{model}")
         if v.get("max_ops_per_sec") is None or v.get("resting_time_ratio",{}).get("verified_exchange_resting") is not False:
@@ -125,7 +170,8 @@ def validate_case(report, path):
         else:
             if v.get("depth_cap_diagnostic",{}).get("enabled"):
                 raise ValueError(f"Base replay accidentally capped: {key}/{model}")
-    return key,{"status":"complete","path":str(path),"report":report,"start":start,"wait_s":wait}
+    return key,{"status":"complete","path":str(path),"report":report,
+                "start":start,"wait_s":wait,"evidence":evidence}
 
 def collect(root):
     found={}
@@ -147,6 +193,11 @@ def row_for(key, model, result):
         "symbol":symbol,"day":day,"case":case,"model":model,
         "status":result["status"],"error":result.get("error",""),
         "source_artifact":result.get("path",""),
+        "source_run_id":result.get("evidence",{}).get("run_id",""),
+        "source_run_url":result.get("evidence",{}).get("run_url",""),
+        "source_head_sha":result.get("evidence",{}).get("source_head_sha",""),
+        "source_artifact_name":result.get("evidence",{}).get("artifact_name",""),
+        "source_json_sha256":result.get("evidence",{}).get("json_sha256",""),
         "first_fit_ns":"","calibration_wait_s":"",
         "gross_pnl_usdt":"","gross_pnl_turnover_bps":"",
         "net_pnl_usdt":"","net_pnl_turnover_bps":"",
@@ -155,11 +206,16 @@ def row_for(key, model, result):
         "max_ops_per_sec":"","resting_bid_ratio":"","resting_ask_ratio":"",
         "depth_cap_checks":"","depth_cap_changed":"","depth_cap_changed_fraction":"",
         "depth_cap_insufficient":"","depth_cap_insufficient_fraction":"",
+        "delta_net_vs_glft_usdt":"","net_improved_vs_glft":"",
     }
     for h in HORIZONS:
         base.update({f"markout_{h}ms_bps":"",f"markout_{h}ms_count":"",
                      f"markout_{h}ms_future_quote_updated_bps":"",
-                     f"markout_{h}ms_future_quote_updated_count":""})
+                     f"markout_{h}ms_future_quote_updated_count":"",
+                     f"delta_markout_{h}ms_vs_glft_bps":"",
+                     f"markout_{h}ms_improved_vs_glft":"",
+                     f"delta_markout_{h}ms_updated_vs_glft_bps":"",
+                     f"markout_{h}ms_updated_improved_vs_glft":""})
     if result["status"]!="complete":
         return base
     v=result["report"]["variants"][model]
@@ -203,6 +259,29 @@ def make_rows(found):
     for key in sorted(expect_cases()):
         for model in (MODELS if key[2]=="base" else MODELS[:2]):
             rows.append(row_for(key,model,found[key]))
+    # Derived per-day wins are paired against that SAME day and exact
+    # base/cap configuration; these are not within-day causal matched fills.
+    index={(r["symbol"],r["day"],r["case"],r["model"]):r for r in rows}
+    for row in rows:
+        if row["model"]=="glft" or row["status"]!="complete":
+            continue
+        base=index[(row["symbol"],row["day"],row["case"],"glft")]
+        if base["status"]!="complete":
+            continue
+        diff=float(row["net_pnl_usdt"])-float(base["net_pnl_usdt"])
+        row["delta_net_vs_glft_usdt"]=diff
+        row["net_improved_vs_glft"]=int(diff>0)
+        for h in HORIZONS:
+            for suffix,name in (
+                ("",""),
+                ("_future_quote_updated","_updated"),
+            ):
+                col=f"markout_{h}ms{suffix}_bps"
+                if row[col]=="" or base[col]=="":
+                    continue
+                delta=float(row[col])-float(base[col])
+                row[f"delta_markout_{h}ms{name}_vs_glft_bps"]=delta
+                row[f"markout_{h}ms{name}_improved_vs_glft"]=int(delta>0)
     return rows
 
 def summarize_models(rows, symbol, days, case="base"):
