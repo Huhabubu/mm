@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "purpose": "Chapter 5.3 pre-backtest data gate only; not authorized to place orders",
+  "scope": "Candidate contract specs documented by official exchange materials; historical date-effective verification required per day",
+  "date_window": [
+    "2026-06-01",
+    "2026-11-01"
+  ],
+  "comparison_maker_rate": 0.0002,
+  "contracts": {
+    "bitget-futures:BTCUSDT": {
+      "tardis_exchange": "bitget-futures",
+      "symbol": "BTCUSDT",
+      "contract_type": "linear_USDT_perpetual",
+      "currency": "BTC",
+      "expected_price_tick_usdt": 0.1,
+      "expected_min_size": 0.0001,
+      "min_size_unit": "BTC",
+      "expected_order_step": 0.0001,
+      "order_step_unit": "BTC",
+      "contract_multiplier_base_btc_per_unit": 1,
+      "standard_tier_maker_rate": 0.0002,
+      "standard_tier_taker_rate": 0.0006,
+      "comparison_maker_rate": 0.0002,
+      "exchange_fee_source": "https://www.bitget.com/support/articles/12560603892734",
+      "contract_source": "https://www.bitget.com/futures/introduction/futures-details",
+      "official_api": "https://api.bitget.com/api/v3/market/instruments?category=USDT-FUTURES&symbol=BTCUSDT",
+      "historical_date_effective_verified": false,
+      "historical_verification_note": "Documented venue rules; exact same effective units and fees on each 2026 month-first date still need point-in-time metadata or announcements",
+      "quoted_native_l2": "books",
+      "claimed_native_l2_since": "2026-04-28",
+      "claimed_source": "https://docs.tardis.dev/historical-data-details/bitget-futures"
+    },
+    "okex-swap:BTC-USDT-SWAP": {
+      "tardis_exchange": "okex-swap",
+      "symbol": "BTC-USDT-SWAP",
+      "contract_type": "linear_USDT_perpetual",
+      "currency": "BTC",
+      "expected_price_tick_usdt": 0.1,
+      "expected_min_size": 0.01,
+      "min_size_unit": "contract",
+      "expected_order_step": 0.01,
+      "order_step_unit": "contract",
+      "contract_multiplier_base_btc_per_unit": 0.01,
+      "standard_tier_maker_rate": 0.0002,
+      "standard_tier_taker_rate": 0.0005,
+      "comparison_maker_rate": 0.0002,
+      "exchange_fee_source": "https://www.okx.com/help/trading-fee-rules-faq",
+      "contract_source": "https://www.okx.com/docs-v5/en/",
+      "official_api": "https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=BTC-USDT-SWAP",
+      "historical_date_effective_verified": false,
+      "historical_verification_note": "Official documentation supports 0.01 BTC per contract, but historical exact minSz/lotSz/tickSz for each day not independently archived here",
+      "quoted_native_l2": "books",
+      "claimed_collector_tokyo_since": "2026-05-21",
+      "claimed_venue_tokyo_since": "2026-08-04",
+      "claimed_source": "https://docs.tardis.dev/historical-data-details/okex-swap"
+    }
+  },
+  "normalized_tardis_warning": "CSV incremental_book_L2 is normalized even when source is snapshots; native channel and sequence continuity cannot be proven from normalized CSV alone.",
+  "source_as_of": "2026-11-19"
+}
