@@ -22,6 +22,7 @@ def fixture(symbol="BTC_USDT", day="2026-06-01", cap=False):
                     "total_markout_after_quote_update":{"mean_bps":-0.3,"count":1}}
             for h in (100,500,1000)}}}}
         return {"initial_fit_ns":start,"calibration_wait_ns":0,
+                "start_time_ns":start-600_000_000_000,
                 "max_ops_per_sec":10,"resting_time_ratio":{
                     "bid":.4,"ask":.5,"verified_exchange_resting":False},
                 "quote_quality":quality,"depth_cap_diagnostic":{
@@ -58,6 +59,19 @@ class Chapter5AggregationTests(unittest.TestCase):
         self.assertEqual(row["wait_s"],0)
         key,row=validate_case(fixture(cap=True),Path("fake.json"))
         self.assertEqual(key,("BTC_USDT","2026-06-01","cap"))
+
+    def test_utc_wait_includes_initial_feed_delay_and_engine_wait_does_not(self):
+        v=fixture()
+        # First actual feed 0.356 seconds after 00:00:00.
+        late=356_000_000
+        v["shared_first_eligible_entry_ns"]+=late
+        for row in v["variants"].values():
+            row["initial_fit_ns"]+=late
+            row["start_time_ns"]+=late
+            # Core relative clock waits zero: fit is at first t0+600s.
+            self.assertEqual(row["calibration_wait_ns"],0)
+        _,result=validate_case(v,Path("fake.json"))
+        self.assertAlmostEqual(result["wait_s"],0.356,places=6)
 
     def test_force_same_calibration_or_bad_fee_rejected(self):
         v=fixture()
