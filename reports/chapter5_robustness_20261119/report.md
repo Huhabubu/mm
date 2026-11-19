@@ -75,6 +75,27 @@ Gross=含Maker手续费净损益+HBT手续费，Net=HBT含2bps Maker手续费期
 | ETH 六日（可选扩展） | both_1p0 | 6/6 | +83.45 | 6 |
 | ETH 六日（可选扩展） | risk_side_pause | 6/6 | +92.63 | 6 |
 
+## 逐日配对改善比例：同日策略与GLFT对照
+
+只有严格正差计为改善。净收益比较已扣Maker 2bps；方向化Total Markout数值越大代表成交后价格越有利。
+Markout胜率来自不同成交集合的条件比较，不能据此宣称逐笔规避逆向选择的因果效果。
+
+| 数据分组 | 信号模型 | 含费净收益改善日 | 100ms Markout改善 | 100ms未来报价已更新改善 | 500ms改善 | 1000ms改善 |
+|---|---|---:|---:|---:|---:|---:|
+| BTC 六日等权 | both_1p0 | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+| BTC 六日等权 | risk_side_pause | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+| BTC 前5日20档快照 | both_1p0 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| BTC 前5日20档快照 | risk_side_pause | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| BTC 11月1日初始400档+增量 | both_1p0 | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 |
+| BTC 11月1日初始400档+增量 | risk_side_pause | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 |
+| BTC 前5日可见20档限价 | both_1p0 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| SOL 六日 | both_1p0 | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+| SOL 六日 | risk_side_pause | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+| DOGE 六日 | both_1p0 | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+| DOGE 六日 | risk_side_pause | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+| ETH 六日（可选扩展） | both_1p0 | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+| ETH 六日（可选扩展） | risk_side_pause | 6/6 | 6/6 | 6/6 | 6/6 | 6/6 |
+
 ## 20档限制触发统计
 
 | 模型 | 20档评价日 | 检查次数 | 实际截断次数 | 深度不足保护次数 | 触发实际截断比例(合计) | 深度不足保护比例(合计) |
@@ -92,6 +113,42 @@ Gross=含Maker手续费净损益+HBT手续费，Net=HBT含2bps Maker手续费期
 | SOL_USDT | 6/6 | 0.222, 0.362, 0.281, 35.306, 0.187, 0.204 |
 | DOGE_USDT | 6/6 | 0.222, 0.322, 0.253, 0.264, 0.109, 1090.003 |
 | ETH_USDT | 6/6 | 0.481, 0.461, 0.309, 0.216, 0.239, 0.288 |
+
+## 29组完整日来源与GitHub Actions Run ID
+
+归档流程按固定Run ID下载官方原始artifacts；逐一检查文件夹名称、币种、日期、深度配置及SHA-256摘要。完整来源文件摘要在manifest.json。
+
+| 品种 | 日期 | 配置 | GitHub Actions Run ID | 归档文件名 |
+|---|---|---|---:|---|
+| BTC_USDT | 2026-06-01 | base | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-base-2026-06-01` |
+| BTC_USDT | 2026-06-01 | cap | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-cap-2026-06-01` |
+| BTC_USDT | 2026-07-01 | base | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-base-2026-07-01` |
+| BTC_USDT | 2026-07-01 | cap | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-cap-2026-07-01` |
+| BTC_USDT | 2026-08-01 | base | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-base-2026-08-01` |
+| BTC_USDT | 2026-08-01 | cap | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-cap-2026-08-01` |
+| BTC_USDT | 2026-09-01 | base | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-base-2026-09-01` |
+| BTC_USDT | 2026-09-01 | cap | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-cap-2026-09-01` |
+| BTC_USDT | 2026-10-01 | base | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-base-2026-10-01` |
+| BTC_USDT | 2026-10-01 | cap | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-cap-2026-10-01` |
+| BTC_USDT | 2026-11-01 | base | [#44443409775](https://github.com/Huhabubu/mm/actions/runs/44443409775) | `chapter5-case-BTC_USDT-base-2026-11-01` |
+| DOGE_USDT | 2026-06-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-DOGE_USDT-base-2026-06-01` |
+| DOGE_USDT | 2026-07-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-DOGE_USDT-base-2026-07-01` |
+| DOGE_USDT | 2026-08-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-DOGE_USDT-base-2026-08-01` |
+| DOGE_USDT | 2026-09-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-DOGE_USDT-base-2026-09-01` |
+| DOGE_USDT | 2026-10-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-DOGE_USDT-base-2026-10-01` |
+| DOGE_USDT | 2026-11-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-DOGE_USDT-base-2026-11-01` |
+| ETH_USDT | 2026-06-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-ETH_USDT-base-2026-06-01` |
+| ETH_USDT | 2026-07-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-ETH_USDT-base-2026-07-01` |
+| ETH_USDT | 2026-08-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-ETH_USDT-base-2026-08-01` |
+| ETH_USDT | 2026-09-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-ETH_USDT-base-2026-09-01` |
+| ETH_USDT | 2026-10-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-ETH_USDT-base-2026-10-01` |
+| ETH_USDT | 2026-11-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-ETH_USDT-base-2026-11-01` |
+| SOL_USDT | 2026-06-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-SOL_USDT-base-2026-06-01` |
+| SOL_USDT | 2026-07-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-SOL_USDT-base-2026-07-01` |
+| SOL_USDT | 2026-08-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-SOL_USDT-base-2026-08-01` |
+| SOL_USDT | 2026-09-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-SOL_USDT-base-2026-09-01` |
+| SOL_USDT | 2026-10-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-SOL_USDT-base-2026-10-01` |
+| SOL_USDT | 2026-11-01 | base | [#44445139030](https://github.com/Huhabubu/mm/actions/runs/44445139030) | `chapter5-fixed-case-SOL_USDT-base-2026-11-01` |
 
 ## 学术局限
 
