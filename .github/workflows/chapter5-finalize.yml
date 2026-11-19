@@ -94,7 +94,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add reports/chapter5_robustness_20261119/
+          git add -f reports/chapter5_robustness_20261119/summary.json reports/chapter5_robustness_20261119/report.md reports/chapter5_robustness_20261119/per_day_models.csv reports/chapter5_robustness_20261119/manifest.json
           git diff --cached --quiet || git commit -m 'results(ch5): verified 29 full-day BTC SOL DOGE ETH robustness cases'
           git pull --rebase origin exp/chapter5-robustness-cross-asset
           git push origin HEAD:exp/chapter5-robustness-cross-asset
