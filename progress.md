@@ -586,3 +586,16 @@
 - [!] **DOGE异常的另一种合规解释（尚未证实）**：Bitget [2024-08-13官方DOGEUSDT永续报价精度调整公告](https://www.bitget.com/support/articles/12560603814159) 明确从六位小数价格Tick 0.000001 调至五位小数0.00001，并注明调整前已有委托仍按原有精度价格执行。这为2026深层盘口残留0.000001网格报价提供了**潜在历史遗留委托假说**；但缺少各委托创建时间/历史成交证明，不能据此认定所有9030条源数据均合法，也不能静默放宽24日的价格步长门禁。
 - [ ] **阶段4B尚未启动**。当前未达到用户要求的24/24严谨全通过门禁；待DOGE历史价格精度或异常深档证据复核并形成可接受的数据使用方案后，再考虑正式Bitget-Gate比较。OKX保持冻结。
 
+
+## 2026-11-20 步骤4B首轮适配器与两场50分钟实际HBT冒烟完成（未启动24资产日）
+
+- [x] **当前实验仅Bitget；OKX冻结。** 在 exp/chapter5-cross-exchange 增加 configs/bitget_core_4b_smoke.json、scripts/run_bitget_core_glft.py、scripts/test_dual_grid_bitget.py、scripts/test_bitget_gate_qty_alignment.py、docs/bitget_4b_adapter_50m_20261120.md。兼容地给run_core_glft增加尾部可选quote_tick_mult=1，Gate旧路径默认1。safe_gate_csv仅追加白名单Bitget来源选项，不改Gate默认市场数据入口和冻结历史报告。
+- [x] **实际同日Gate基础币数量严格对齐（2026-08-01）**：BTC Gate 13单位×0.0001=0.0013 BTC、上限260单位×0.0001=0.026 BTC；Bitget q=0.0013 BTC、cap=0.026 BTC。DOGE Gate 115单位×10=1150 DOGE、上限2300×10=23000 DOGE；Bitget q=1150 DOGE、cap=23000 DOGE。均以同日Gate 00:00—00:10原生BBO中位价计算，Maker费率正0.0002。
+- [!] **ETH严格等值仍有必须显式阻断的量纲冲突**：Gate 0.1数量增量×0.01 ETH/合同=0.001 ETH；Bitget候选数量步长0.01 ETH，粗10倍，不能任意取整而宣称与Gate完全相等。适配器对不满足候选数量步长的Gate等值q明确报错；待证实历史Bitget真实数量步长或用户另外指定数量匹配容忍方案，不能以严格对等名义执行ETH相关样本。
+- [x] **DOGE无损双层网格**：HBT raw tick=0.000001 USDT且L2价格独立保留；quote_tick_mult=10形成合法报价tick=0.00001 USDT。物理Poisson穿透深度、100ms sigma、GLFT价差、库存/引导偏移在合法Tick计量；GTX最终价格必须在合法Tick且不穿过原生对手最优价。Gate mult=1走原函数；Numba单测覆盖六位价位保留、Post-Only对手盘限制、原先Gate行为。
+- [x] **GitHub Actions [#44656303120](https://github.com/Huhabubu/mm/actions/runs/44656303120) 全部4 jobs Success**：离线单测、BTC 2026-08-01真实官方HBT 50分钟、DOGE同期真实官方HBT 50分钟、Gate BTC 2026-11-01冻结原源码动作级/成交/净损益Golden完全一致。两个Bitget场景分别10分钟训练+50分钟交易，各自GLFT/both_1p0/risk_side_pause三个模型首次有效校准时刻严格相等：BTC 1785543000150000000ns，DOGE 1785543000157000000ns。
+- [x] **50分钟含2bps Maker费净收益及真实HBT成交**：BTC GLFT64笔/−1.460760 USDT、both1 54笔/−1.284359、risk-side52笔/−1.261362；DOGE GLFT62笔/−1.696882、both1 41笔/−0.894233、risk-side39笔/−0.770093。全部负收益；两组样本仅工程冒烟，不能当作整日或样本外收益。BTC各自成交集500ms Total Markout分别−0.7316/−0.7564/−0.7852bps，信号模型在该短窗成交后价格质量未改善；DOGE为−1.0923/−1.0306/−0.9734bps。
+- [x] **真实盘口无损及非交叉抽样**：BTC50m L2 1,614,272行、HBT事件1,550,896、完整Tardis local_timestamp消息完成后抽样73,719次/0次交叉；DOGE L2 158,944行，其中454行六位小数非合法报价格，但全部精确位于0.000001底层Tick且成功保留到官方HBT tape，HBT事件159,981、完成消息后抽样66,028次/0次交叉。实际报价在策略决策调用时均经合法Tick整除及Post-Only边界硬断言；最多每30ms一次抽样，不能声称全亚毫秒无交叉。费账簿、成交数/库存限额、共享起始拟合通过。
+- [x] 本轮工程结果详见 docs/bitget_4b_adapter_50m_20261120.md，两份50分钟模型JSON与6份官方HBT成交NPZ已保存到 Actions artifact。Gate冻结报告和此前Bitget/OKX数据门禁报告没有更改。
+- [ ] **Bitget四币种×六日正式24资产日HBT任务尚未创建或启动**。下一阶段需确认ETH的历史可执行数量步长，且正式全日需附带额外快照/大于1000ms L2间隔前后±5s、10月1日01—02UTC剔除、DOGE严格3日/无损6日对照。仅在事后删成交不能据此重算自洽组合净收益。
+
