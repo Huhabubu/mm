@@ -16,8 +16,8 @@ on:
 
 jobs:
   offline-verification:
-    name: Rust + Python Offline Protocol, Causal, Archive & HBT 2.4.4 Gates
-    runs-on: ubuntu-latest
+    name: Rust + Python Offline Protocol, Causal, Shutdown & Release Artifact (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
     env:
       CARGO_TERM_COLOR: always
       # Explicitly keep live WS execution disabled in CI
@@ -36,13 +36,58 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             collector/target
-          key: ${{ runner.os }}-cargo-collector-${{ hashFiles('collector/Cargo.toml', 'collector/Cargo.lock') }}
+          key: ubuntu-24.04-cargo-collector-${{ hashFiles('collector/Cargo.toml', 'collector/Cargo.lock') }}
 
-      - name: Run Rust unit & protocol/causal/storage integration tests
+      - name: Run Rust unit, protocol, causal, storage & graceful-shutdown tests
         run: cargo test --manifest-path collector/Cargo.toml
 
-      - name: Build Rust collector binary
-        run: cargo build --manifest-path collector/Cargo.toml
+      - name: Build release Rust collector binary (Ubuntu 24.04 x86_64)
+        run: cargo build --release --manifest-path collector/Cargo.toml
+
+      - name: Package & verify deployable EC2 release artifact
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist/pkg
+          cp collector/target/release/tokyo-l2-collector dist/pkg/tokyo-l2-collector
+          chmod 755 dist/pkg/tokyo-l2-collector
+
+          # Verify release binary runs offline preflight cleanly
+          ./dist/pkg/tokyo-l2-collector preflight --config collector/specs/config.example.json --offline > /dev/null
+
+          {
+            echo "repo=${GITHUB_REPOSITORY}"
+            echo "ref=${GITHUB_REF_NAME}"
+            echo "commit=${GITHUB_SHA}"
+            echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "rustc=$(rustc --version)"
+            echo "ldd=$(ldd --version | head -n 1)"
+            echo "uname=$(uname -a)"
+            echo "file=$(file dist/pkg/tokyo-l2-collector)"
+          } > dist/pkg/BUILD_INFO.txt
+
+          (cd dist/pkg && sha256sum tokyo-l2-collector > SHA256SUMS && sha256sum -c SHA256SUMS)
+          cp dist/pkg/SHA256SUMS dist/SHA256SUMS
+          cp dist/pkg/BUILD_INFO.txt dist/BUILD_INFO.txt
+
+          tar -C dist/pkg -czf dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz \
+            tokyo-l2-collector SHA256SUMS BUILD_INFO.txt
+          (cd dist && sha256sum tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz > tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256)
+          (cd dist && sha256sum -c tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256)
+          cat dist/BUILD_INFO.txt
+          cat dist/SHA256SUMS
+          cat dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256
+
+      - name: Upload deployable Ubuntu 24.04 x86_64 collector artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokyo-l2-collector-ubuntu24.04-x86_64
+          path: |
+            dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz
+            dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256
+            dist/SHA256SUMS
+            dist/BUILD_INFO.txt
+          retention-days: 30
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5

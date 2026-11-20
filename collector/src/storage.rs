@@ -171,6 +171,10 @@ impl HourlyTsvZstWriter {
         &self.sealed
     }
 
+    pub fn has_open_partition(&self) -> bool {
+        self.current.is_some()
+    }
+
     pub fn write_record(&mut self, rec: &CanonicalRecord) -> Result<Option<SealedPartition>, String> {
         let key = HourPartitionKey::from_wall_ns(rec.recv_wall_ns);
         let mut just_sealed = None;
@@ -226,6 +230,7 @@ impl HourlyTsvZstWriter {
     }
 
     /// Flush, fsync, verify zstd integrity, hash SHA-256, atomically rename, and emit manifest.
+    /// On any failure, leaves the `.partial` file untouched (never promotes corrupt/unverified data).
     pub fn seal_current(&mut self) -> Result<Option<SealedPartition>, String> {
         let Some(open) = self.current.take() else {
             return Ok(None);
@@ -247,6 +252,14 @@ impl HourlyTsvZstWriter {
 
         // Mandatory zstd full decompression test + SHA-256 computation before atomic rename
         let (bytes, sha256) = verify_zstd_and_sha256(&open.partial_path)?;
+
+        if open.final_path.exists() {
+            return Err(format!(
+                "Refusing to overwrite existing sealed partition {} (keeping partial {})",
+                open.final_path.display(),
+                open.partial_path.display()
+            ));
+        }
 
         fs::rename(&open.partial_path, &open.final_path).map_err(|e| {
             format!(
@@ -336,7 +349,17 @@ impl HourlyTsvZstWriter {
             ));
         }
 
-        let file = File::create(&partial_path)
+        if partial_path.exists() {
+            return Err(format!(
+                "Refusing to overwrite existing unsealed partial file {} (preserve/quarantine before restarting in the same UTC hour)",
+                partial_path.display()
+            ));
+        }
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial_path)
             .map_err(|e| format!("create {} failed: {}", partial_path.display(), e))?;
         let encoder = zstd::stream::write::Encoder::new(BufWriter::new(file), self.zstd_level)
             .map_err(|e| format!("zstd encoder init failed: {}", e))?;

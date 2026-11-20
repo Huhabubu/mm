@@ -6,11 +6,12 @@ use crate::types::{ConnId, EndpointKind, ExchangeId, RawFrame};
 use chrono::{Timelike, Utc};
 use futures_util::{SinkExt, StreamExt};
 use http::HeaderValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
@@ -20,6 +21,10 @@ fn wall_clock_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+fn flush_stderr() {
+    let _ = std::io::stderr().flush();
 }
 
 #[derive(Debug)]
@@ -71,16 +76,34 @@ enum ConnCommand {
     Resubscribe(String),
 }
 
-pub async fn run_live_collector(config: CollectorConfig, run_id: String) -> Result<(), String> {
+pub async fn run_live_collector(
+    config: CollectorConfig,
+    run_id: String,
+    duration_secs: Option<u64>,
+) -> Result<(), String> {
+    // Register OS shutdown signal listeners BEFORE spawning any network tasks and keep
+    // them alive through the entire sealing phase so SIGINT/SIGTERM never revert to SIG_DFL.
+    #[cfg(unix)]
+    let (mut sigint, mut sigterm) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        let s_int = signal(SignalKind::interrupt())
+            .map_err(|e| format!("failed to install SIGINT handler: {}", e))?;
+        let s_term = signal(SignalKind::terminate())
+            .map_err(|e| format!("failed to install SIGTERM handler: {}", e))?;
+        (s_int, s_term)
+    };
+
     let mono_origin = Instant::now();
     let boot_id = format!("{}_{}", run_id, wall_clock_ns());
     let data_root = PathBuf::from(&config.deployment.data_root);
     let cap = config.deployment.bounded_queue_capacity;
     let (tx, mut rx) = mpsc::channel::<EngineEvent>(cap);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut selectors: HashMap<EndpointKind, CausalSelector> = HashMap::new();
-    let mut writers: HashMap<ExchangeId, HourlyTsvZstWriter> = HashMap::new();
+    let mut writers: BTreeMap<ExchangeId, HourlyTsvZstWriter> = BTreeMap::new();
     let mut cmd_txs: HashMap<(EndpointKind, ConnId), mpsc::Sender<ConnCommand>> = HashMap::new();
+    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -140,183 +163,442 @@ pub async fn run_live_collector(config: CollectorConfig, run_id: String) -> Resu
             let cfg_c = Arc::clone(&cfg_arc);
             let syms_c = syms.clone();
             let http_c = http_client.clone();
-            tokio::spawn(async move {
-                ws_connection_loop(ep, conn_id, syms_c, cfg_c, http_c, mono_origin, tx_c, crx)
-                    .await;
-            });
+            let stop_rx = shutdown_rx.clone();
+            bg_handles.push(tokio::spawn(async move {
+                ws_connection_loop(
+                    ep,
+                    conn_id,
+                    syms_c,
+                    cfg_c,
+                    http_c,
+                    mono_origin,
+                    tx_c,
+                    crx,
+                    stop_rx,
+                )
+                .await;
+            }));
         }
     }
 
     // Periodic 1s watchdog + planned 00:00 UTC (A) / 12:00 UTC (B) rotation scheduler
     let tx_timer = tx.clone();
-    tokio::spawn(async move {
+    let mut timer_stop = shutdown_rx.clone();
+    bg_handles.push(tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut last_rotated_a_day: Option<String> = None;
         let mut last_rotated_b_day: Option<String> = None;
         loop {
-            interval.tick().await;
-            let now_utc = Utc::now();
-            let wall_ns = wall_clock_ns();
-            let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-            let _ = tx_timer.try_send(EngineEvent::WatchdogTick { wall_ns, mono_ns });
-
-            let day_key = now_utc.format("%Y-%m-%d").to_string();
-            if now_utc.hour() == 0 && now_utc.minute() == 0 && now_utc.second() < 5 {
-                if last_rotated_a_day.as_deref() != Some(&day_key) {
-                    last_rotated_a_day = Some(day_key.clone());
-                    let _ = tx_timer.try_send(EngineEvent::PlannedRotation {
-                        target: ConnId::A,
-                        wall_ns,
-                        mono_ns,
-                    });
+            tokio::select! {
+                biased;
+                _ = timer_stop.changed() => {
+                    if *timer_stop.borrow() {
+                        break;
+                    }
                 }
-            }
-            if now_utc.hour() == 12 && now_utc.minute() == 0 && now_utc.second() < 5 {
-                if last_rotated_b_day.as_deref() != Some(&day_key) {
-                    last_rotated_b_day = Some(day_key);
-                    let _ = tx_timer.try_send(EngineEvent::PlannedRotation {
-                        target: ConnId::B,
-                        wall_ns,
-                        mono_ns,
-                    });
+                _ = interval.tick() => {
+                    let now_utc = Utc::now();
+                    let wall_ns = wall_clock_ns();
+                    let mono_ns = mono_origin.elapsed().as_nanos() as u64;
+                    let _ = tx_timer.try_send(EngineEvent::WatchdogTick { wall_ns, mono_ns });
+
+                    let day_key = now_utc.format("%Y-%m-%d").to_string();
+                    if now_utc.hour() == 0 && now_utc.minute() == 0 && now_utc.second() < 5 {
+                        if last_rotated_a_day.as_deref() != Some(&day_key) {
+                            last_rotated_a_day = Some(day_key.clone());
+                            let _ = tx_timer.try_send(EngineEvent::PlannedRotation {
+                                target: ConnId::A,
+                                wall_ns,
+                                mono_ns,
+                            });
+                        }
+                    }
+                    if now_utc.hour() == 12 && now_utc.minute() == 0 && now_utc.second() < 5 {
+                        if last_rotated_b_day.as_deref() != Some(&day_key) {
+                            last_rotated_b_day = Some(day_key);
+                            let _ = tx_timer.try_send(EngineEvent::PlannedRotation {
+                                target: ConnId::B,
+                                wall_ns,
+                                mono_ns,
+                            });
+                        }
+                    }
                 }
             }
         }
-    });
+    }));
 
     info!(
-        "tokyo-l2-collector live engine started boot_id={} data_root={}",
+        "tokyo-l2-collector live engine started boot_id={} data_root={} duration_secs={:?}",
         boot_id,
-        data_root.display()
+        data_root.display(),
+        duration_secs
     );
+    flush_stderr();
 
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
+    let duration_sleep = async {
+        match duration_secs {
+            Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(duration_sleep);
 
+    let shutdown_reason: &'static str;
+
+    #[cfg(unix)]
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                info!("Received shutdown signal, sealing active hourly partitions...");
+            biased;
+            _ = sigint.recv() => {
+                shutdown_reason = "SIGINT";
                 break;
             }
-            Some(ev) = rx.recv() => {
-                let mut outputs: Vec<(EndpointKind, crate::causal_selector::SelectorOutput)> = Vec::new();
-                match ev {
-                    EngineEvent::Frame(f) => {
-                        let ep = f.endpoint;
-                        if let Some(sel) = selectors.get_mut(&ep) {
-                            outputs.push((ep, sel.on_frame(f)));
-                        }
-                    }
-                    EngineEvent::Disconnect { endpoint, conn_id, wall_ns, mono_ns, reason } => {
-                        if let Some(sel) = selectors.get_mut(&endpoint) {
-                            outputs.push((endpoint, sel.on_disconnect(conn_id, wall_ns, mono_ns, &reason)));
-                        }
-                    }
-                    EngineEvent::Reconnect { endpoint, conn_id, epoch, mono_ns } => {
-                        if let Some(sel) = selectors.get_mut(&endpoint) {
-                            sel.on_reconnect(conn_id, epoch, mono_ns);
-                        }
-                    }
-                    EngineEvent::RestSnapshot { endpoint, conn_id, symbol, last_update_id, raw_json, wall_ns, mono_ns } => {
-                        if let Some(sel) = selectors.get_mut(&endpoint) {
-                            outputs.push((endpoint, sel.on_rest_snapshot(conn_id, &symbol, last_update_id, &raw_json, wall_ns, mono_ns)));
-                        }
-                    }
-                    EngineEvent::LocalLoss { endpoint, dropped, wall_ns, mono_ns, reason } => {
-                        if let Some(sel) = selectors.get_mut(&endpoint) {
-                            outputs.push((endpoint, sel.on_local_loss(dropped, wall_ns, mono_ns, &reason)));
-                        }
-                    }
-                    EngineEvent::PlannedRotation { target, wall_ns, mono_ns } => {
-                        for (&ep, sel) in selectors.iter_mut() {
-                            outputs.push((ep, sel.on_planned_rotation(target, wall_ns, mono_ns)));
-                        }
-                    }
-                    EngineEvent::WatchdogTick { wall_ns, mono_ns } => {
-                        for (&ep, sel) in selectors.iter_mut() {
-                            outputs.push((ep, sel.check_silence_watchdog(wall_ns, mono_ns, 30_000_000_000)));
-                        }
-                    }
-                }
+            _ = sigterm.recv() => {
+                shutdown_reason = "SIGTERM";
+                break;
+            }
+            _ = &mut duration_sleep => {
+                shutdown_reason = "duration_elapsed";
+                break;
+            }
+            maybe_ev = rx.recv() => {
+                let Some(ev) = maybe_ev else {
+                    shutdown_reason = "channel_closed";
+                    break;
+                };
+                process_engine_event(
+                    ev,
+                    &config,
+                    mono_origin,
+                    &tx,
+                    &http_client,
+                    &mut selectors,
+                    &mut writers,
+                    &cmd_txs,
+                    &mut bg_handles,
+                    true,
+                );
+            }
+        }
+    }
 
-                for (ep, out) in outputs {
-                    let ex = ep.exchange();
-                    if let Some(writer) = writers.get_mut(&ex) {
-                        for rec in &out.records {
-                            if let Err(e) = writer.write_record(rec) {
-                                error!("Disk write error on {}: {}", ex, e);
-                            }
-                        }
-                    }
-                    for act in out.actions {
-                        match act {
-                            SelectorAction::Reconnect { conn_id, reason } => {
-                                if let Some(ctx) = cmd_txs.get(&(ep, conn_id)) {
-                                    let _ = ctx.try_send(ConnCommand::Reconnect(reason));
-                                }
-                            }
-                            SelectorAction::Resubscribe { conn_id, reason } => {
-                                if let Some(ctx) = cmd_txs.get(&(ep, conn_id)) {
-                                    let _ = ctx.try_send(ConnCommand::Resubscribe(reason));
-                                }
-                            }
-                            SelectorAction::FetchRestSnapshot { conn_id, symbol } => {
-                                if ep == EndpointKind::BinancePublic {
-                                    let tx_s = tx.clone();
-                                    let http_s = http_client.clone();
-                                    let url = format!(
-                                        "{}?symbol={}&limit={}",
-                                        config.exchanges.binance_futures.rest_depth_url,
-                                        symbol,
-                                        config.exchanges.binance_futures.depth_snapshot_limit
-                                    );
-                                    tokio::spawn(async move {
-                                        if let Ok(resp) = http_s.get(&url).send().await {
-                                            if let Ok(text) = resp.text().await {
-                                                let wall_ns = wall_clock_ns();
-                                                let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                                    if let Some(id) = v.get("lastUpdateId").and_then(|x| x.as_u64()) {
-                                                        let _ = tx_s.try_send(EngineEvent::RestSnapshot {
-                                                            endpoint: ep,
-                                                            conn_id,
-                                                            symbol,
-                                                            last_update_id: id,
-                                                            raw_json: text,
-                                                            wall_ns,
-                                                            mono_ns,
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            SelectorAction::Alert { severity, message } => {
-                                error!("[ALERT {}] {}", severity, message);
-                            }
-                        }
-                    }
+    #[cfg(not(unix))]
+    {
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut ctrl_c => {
+                    shutdown_reason = "CTRL_C";
+                    break;
+                }
+                _ = &mut duration_sleep => {
+                    shutdown_reason = "duration_elapsed";
+                    break;
+                }
+                maybe_ev = rx.recv() => {
+                    let Some(ev) = maybe_ev else {
+                        shutdown_reason = "channel_closed";
+                        break;
+                    };
+                    process_engine_event(
+                        ev,
+                        &config,
+                        mono_origin,
+                        &tx,
+                        &http_client,
+                        &mut selectors,
+                        &mut writers,
+                        &cmd_txs,
+                        &mut bg_handles,
+                        true,
+                    );
                 }
             }
         }
     }
 
-    for (ex, writer) in writers.iter_mut() {
-        match writer.seal_current() {
-            Ok(Some(s)) => info!(
-                "Sealed {} -> {} (sha256={})",
-                ex,
-                s.data_path.display(),
-                s.manifest.sha256
-            ),
-            Ok(None) => {}
-            Err(e) => error!("Failed sealing {}: {}", ex, e),
+    let seal_start = Instant::now();
+    info!(
+        "Received shutdown trigger (reason={}), stopping {} background tasks and sealing {} exchange writers...",
+        shutdown_reason,
+        bg_handles.len(),
+        writers.len()
+    );
+    flush_stderr();
+
+    // 1. Stop all background WebSocket / timer / REST tasks immediately so producers cease
+    //    competing for CPU, sockets, or channel capacity during sealing.
+    let _ = shutdown_tx.send(true);
+    for h in &bg_handles {
+        h.abort();
+    }
+    tokio::task::yield_now().await;
+    drop(tx);
+    rx.close();
+
+    // 2. Drain any already-buffered events in rx without spawning new side-effect actions.
+    let (dummy_tx, _) = mpsc::channel::<EngineEvent>(1);
+    let mut drained = 0u64;
+    while let Ok(ev) = rx.try_recv() {
+        drained += 1;
+        process_engine_event(
+            ev,
+            &config,
+            mono_origin,
+            &dummy_tx,
+            &http_client,
+            &mut selectors,
+            &mut writers,
+            &cmd_txs,
+            &mut bg_handles,
+            false,
+        );
+    }
+    info!("Drained {} queued events prior to final seal", drained);
+    flush_stderr();
+
+    // 3. Seal EVERY exchange deterministically in spawn_blocking (off Tokio worker threads),
+    //    continuing across all exchanges even if one fails.
+    let audit_root = data_root.clone();
+    let audit_boot_id = boot_id.clone();
+    let seal_res = tokio::task::spawn_blocking(move || {
+        let mut sealed_records: Vec<serde_json::Value> = Vec::new();
+        let mut failed_records: Vec<String> = Vec::new();
+        let mut empty_exchanges: Vec<String> = Vec::new();
+
+        for (ex, mut writer) in writers {
+            let ex_start = Instant::now();
+            if !writer.has_open_partition() {
+                info!("Exchange {} had no open partition to seal", ex);
+                empty_exchanges.push(ex.as_dir_name().to_string());
+                flush_stderr();
+                continue;
+            }
+            info!("Sealing active partition for {}...", ex);
+            flush_stderr();
+            match writer.seal_current() {
+                Ok(Some(s)) => {
+                    let elapsed_ms = ex_start.elapsed().as_millis() as u64;
+                    info!(
+                        "Sealed {} -> {} (bytes={}, data_lines={}, meta_lines={}, sha256={}, elapsed_ms={})",
+                        ex,
+                        s.data_path.display(),
+                        s.manifest.bytes,
+                        s.manifest.data_lines,
+                        s.manifest.meta_lines,
+                        s.manifest.sha256,
+                        elapsed_ms
+                    );
+                    flush_stderr();
+                    sealed_records.push(serde_json::json!({
+                        "exchange": ex.as_dir_name(),
+                        "data_path": s.data_path.to_string_lossy(),
+                        "manifest_path": s.manifest_path.to_string_lossy(),
+                        "bytes": s.manifest.bytes,
+                        "data_lines": s.manifest.data_lines,
+                        "data_escaped_lines": s.manifest.data_escaped_lines,
+                        "meta_lines": s.manifest.meta_lines,
+                        "local_loss_lines": s.manifest.local_loss_lines,
+                        "sha256": s.manifest.sha256,
+                        "elapsed_ms": elapsed_ms
+                    }));
+                }
+                Ok(None) => {
+                    empty_exchanges.push(ex.as_dir_name().to_string());
+                }
+                Err(e) => {
+                    let msg = format!("{}: {}", ex, e);
+                    error!("Failed sealing {}: {}", ex, e);
+                    flush_stderr();
+                    failed_records.push(msg);
+                }
+            }
+        }
+
+        let total_ms = seal_start.elapsed().as_millis() as u64;
+        // Persist a crash-auditable shutdown seal summary on disk even if external stderr pipe closed.
+        let meta_dir = audit_root.join("meta");
+        if std::fs::create_dir_all(&meta_dir).is_ok() {
+            let audit_path = meta_dir.join(format!("shutdown_{}.json", audit_boot_id));
+            let audit = serde_json::json!({
+                "boot_id": audit_boot_id,
+                "shutdown_reason": shutdown_reason,
+                "drained_events": drained,
+                "sealed_count": sealed_records.len(),
+                "empty_count": empty_exchanges.len(),
+                "failed_count": failed_records.len(),
+                "total_seal_elapsed_ms": total_ms,
+                "sealed": sealed_records,
+                "empty": empty_exchanges,
+                "failed": failed_records
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&audit) {
+                let _ = std::fs::write(&audit_path, bytes);
+            }
+        }
+
+        info!(
+            "Shutdown seal complete (reason={}, sealed={}, empty={}, failed={}, elapsed_ms={})",
+            shutdown_reason,
+            sealed_records.len(),
+            empty_exchanges.len(),
+            failed_records.len(),
+            total_ms
+        );
+        flush_stderr();
+
+        if failed_records.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("sealing failed for {} exchange(s): {}", failed_records.len(), failed_records.join("; ")))
+        }
+    })
+    .await
+    .map_err(|e| format!("shutdown sealing task panicked: {}", e))?;
+
+    // Explicitly keep signal listeners alive until sealing finishes.
+    #[cfg(unix)]
+    drop((sigint, sigterm));
+
+    seal_res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_engine_event(
+    ev: EngineEvent,
+    config: &CollectorConfig,
+    mono_origin: Instant,
+    tx: &mpsc::Sender<EngineEvent>,
+    http_client: &reqwest::Client,
+    selectors: &mut HashMap<EndpointKind, CausalSelector>,
+    writers: &mut BTreeMap<ExchangeId, HourlyTsvZstWriter>,
+    cmd_txs: &HashMap<(EndpointKind, ConnId), mpsc::Sender<ConnCommand>>,
+    bg_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    allow_actions: bool,
+) {
+    let mut outputs: Vec<(EndpointKind, crate::causal_selector::SelectorOutput)> = Vec::new();
+    match ev {
+        EngineEvent::Frame(f) => {
+            let ep = f.endpoint;
+            if let Some(sel) = selectors.get_mut(&ep) {
+                outputs.push((ep, sel.on_frame(f)));
+            }
+        }
+        EngineEvent::Disconnect { endpoint, conn_id, wall_ns, mono_ns, reason } => {
+            if let Some(sel) = selectors.get_mut(&endpoint) {
+                outputs.push((endpoint, sel.on_disconnect(conn_id, wall_ns, mono_ns, &reason)));
+            }
+        }
+        EngineEvent::Reconnect { endpoint, conn_id, epoch, mono_ns } => {
+            if let Some(sel) = selectors.get_mut(&endpoint) {
+                sel.on_reconnect(conn_id, epoch, mono_ns);
+            }
+        }
+        EngineEvent::RestSnapshot { endpoint, conn_id, symbol, last_update_id, raw_json, wall_ns, mono_ns } => {
+            if let Some(sel) = selectors.get_mut(&endpoint) {
+                outputs.push((endpoint, sel.on_rest_snapshot(conn_id, &symbol, last_update_id, &raw_json, wall_ns, mono_ns)));
+            }
+        }
+        EngineEvent::LocalLoss { endpoint, dropped, wall_ns, mono_ns, reason } => {
+            if let Some(sel) = selectors.get_mut(&endpoint) {
+                outputs.push((endpoint, sel.on_local_loss(dropped, wall_ns, mono_ns, &reason)));
+            }
+        }
+        EngineEvent::PlannedRotation { target, wall_ns, mono_ns } => {
+            for (&ep, sel) in selectors.iter_mut() {
+                outputs.push((ep, sel.on_planned_rotation(target, wall_ns, mono_ns)));
+            }
+        }
+        EngineEvent::WatchdogTick { wall_ns, mono_ns } => {
+            for (&ep, sel) in selectors.iter_mut() {
+                outputs.push((ep, sel.check_silence_watchdog(wall_ns, mono_ns, 30_000_000_000)));
+            }
         }
     }
-    Ok(())
+
+    for (ep, out) in outputs {
+        let ex = ep.exchange();
+        if let Some(writer) = writers.get_mut(&ex) {
+            for rec in &out.records {
+                match writer.write_record(rec) {
+                    Ok(Some(s)) => {
+                        info!(
+                            "Rolled and sealed {} -> {} (bytes={}, data_lines={}, sha256={})",
+                            ex,
+                            s.data_path.display(),
+                            s.manifest.bytes,
+                            s.manifest.data_lines,
+                            s.manifest.sha256
+                        );
+                        flush_stderr();
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Disk write error on {}: {}", ex, e);
+                        flush_stderr();
+                    }
+                }
+            }
+        }
+        if !allow_actions {
+            continue;
+        }
+        for act in out.actions {
+            match act {
+                SelectorAction::Reconnect { conn_id, reason } => {
+                    if let Some(ctx) = cmd_txs.get(&(ep, conn_id)) {
+                        let _ = ctx.try_send(ConnCommand::Reconnect(reason));
+                    }
+                }
+                SelectorAction::Resubscribe { conn_id, reason } => {
+                    if let Some(ctx) = cmd_txs.get(&(ep, conn_id)) {
+                        let _ = ctx.try_send(ConnCommand::Resubscribe(reason));
+                    }
+                }
+                SelectorAction::FetchRestSnapshot { conn_id, symbol } => {
+                    if ep == EndpointKind::BinancePublic {
+                        let tx_s = tx.clone();
+                        let http_s = http_client.clone();
+                        let url = format!(
+                            "{}?symbol={}&limit={}",
+                            config.exchanges.binance_futures.rest_depth_url,
+                            symbol,
+                            config.exchanges.binance_futures.depth_snapshot_limit
+                        );
+                        bg_handles.retain(|h| !h.is_finished());
+                        bg_handles.push(tokio::spawn(async move {
+                            if let Ok(resp) = http_s.get(&url).send().await {
+                                if let Ok(text) = resp.text().await {
+                                    let wall_ns = wall_clock_ns();
+                                    let mono_ns = mono_origin.elapsed().as_nanos() as u64;
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                        if let Some(id) = v.get("lastUpdateId").and_then(|x| x.as_u64()) {
+                                            let _ = tx_s.try_send(EngineEvent::RestSnapshot {
+                                                endpoint: ep,
+                                                conn_id,
+                                                symbol,
+                                                last_update_id: id,
+                                                raw_json: text,
+                                                wall_ns,
+                                                mono_ns,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }));
+                    }
+                }
+                SelectorAction::Alert { severity, message } => {
+                    error!("[ALERT {}] {}", severity, message);
+                    flush_stderr();
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -329,11 +611,15 @@ async fn ws_connection_loop(
     mono_origin: Instant,
     tx: mpsc::Sender<EngineEvent>,
     mut cmd_rx: mpsc::Receiver<ConnCommand>,
+    mut stop_rx: watch::Receiver<bool>,
 ) {
     let mut epoch = 0u64;
     let mut backoff_ms = 500u64;
 
     loop {
+        if *stop_rx.borrow() {
+            return;
+        }
         epoch += 1;
         let url = match endpoint {
             EndpointKind::BinancePublic => BinanceValidator::build_public_stream_url(
@@ -353,8 +639,11 @@ async fn ws_connection_loop(
             Ok(r) => r,
             Err(e) => {
                 error!("Invalid WS URL {}: {}", url, e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+                tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                }
             }
         };
 
@@ -370,7 +659,13 @@ async fn ws_connection_loop(
             }
         }
 
-        match tokio_tungstenite::connect_async(req).await {
+        let connect_res = tokio::select! {
+            biased;
+            _ = stop_rx.changed() => return,
+            res = tokio_tungstenite::connect_async(req) => res,
+        };
+
+        match connect_res {
             Ok((ws_stream, _)) => {
                 backoff_ms = 500;
                 let mono_ns = mono_origin.elapsed().as_nanos() as u64;
@@ -386,6 +681,7 @@ async fn ws_connection_loop(
                     conn_id.as_str(),
                     epoch
                 );
+                flush_stderr();
 
                 let (mut write, mut read) = ws_stream.split();
 
@@ -402,6 +698,7 @@ async fn ws_connection_loop(
                         let tx_s = tx.clone();
                         let http_s = http_client.clone();
                         let sym_c = sym.clone();
+                        let mut stop_s = stop_rx.clone();
                         let rest_url = format!(
                             "{}?symbol={}&limit={}",
                             config.exchanges.binance_futures.rest_depth_url,
@@ -409,7 +706,14 @@ async fn ws_connection_loop(
                             config.exchanges.binance_futures.depth_snapshot_limit
                         );
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            tokio::select! {
+                                biased;
+                                _ = stop_s.changed() => return,
+                                _ = tokio::time::sleep(Duration::from_millis(350)) => {}
+                            }
+                            if *stop_s.borrow() {
+                                return;
+                            }
                             if let Ok(resp) = http_s.get(&rest_url).send().await {
                                 if let Ok(text) = resp.text().await {
                                     let wall_ns = wall_clock_ns();
@@ -444,6 +748,12 @@ async fn ws_connection_loop(
 
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = stop_rx.changed() => {
+                            if *stop_rx.borrow() {
+                                return;
+                            }
+                        }
                         _ = ping_timer.tick() => {
                             let ping_res = match endpoint {
                                 EndpointKind::BybitPublic => {
@@ -498,15 +808,21 @@ async fn ws_connection_loop(
                                         epoch,
                                         payload: text,
                                     };
-                                    if tx.try_send(EngineEvent::Frame(frame)).is_err() {
-                                        // Never silently drop: force LOCAL_LOSS event notification.
-                                        let _ = tx.send(EngineEvent::LocalLoss {
-                                            endpoint,
-                                            dropped: 1,
-                                            wall_ns,
-                                            mono_ns,
-                                            reason: "bounded_channel_full".to_string(),
-                                        }).await;
+                                    match tx.try_send(EngineEvent::Frame(frame)) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            // Never silently drop: force LOCAL_LOSS event notification.
+                                            let _ = tx.send(EngineEvent::LocalLoss {
+                                                endpoint,
+                                                dropped: 1,
+                                                wall_ns,
+                                                mono_ns,
+                                                reason: "bounded_channel_full".to_string(),
+                                            }).await;
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            return;
+                                        }
                                     }
                                 }
                                 Some(Ok(Message::Ping(p))) => {
@@ -531,6 +847,9 @@ async fn ws_connection_loop(
                     }
                 }
 
+                if *stop_rx.borrow() {
+                    return;
+                }
                 let wall_ns = wall_clock_ns();
                 let mono_ns = mono_origin.elapsed().as_nanos() as u64;
                 let _ = tx
@@ -554,7 +873,11 @@ async fn ws_connection_loop(
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        tokio::select! {
+            biased;
+            _ = stop_rx.changed() => return,
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+        }
         backoff_ms = (backoff_ms * 2).min(15_000);
     }
 }

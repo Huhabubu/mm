@@ -559,6 +559,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
         args.run_id,
         "--allow-live-run",
     ]
+    if args.duration_secs is not None:
+        cmd.extend(["--duration-secs", str(args.duration_secs)])
     proc = subprocess.run(cmd)
     return int(proc.returncode)
 
@@ -603,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_col.add_argument("--config", type=Path, required=True)
     p_col.add_argument("--run-id", required=True)
     p_col.add_argument("--allow-live-run", action="store_true")
+    p_col.add_argument("--duration-secs", type=int, default=None, help="Optional clean internal run duration in seconds")
     p_col.set_defaults(func=cmd_collect)
 
     p_arc = sub.add_parser("archive", help="Verify sealed partitions and upload to single Google Drive Pro")

@@ -39,6 +39,9 @@ enum Commands {
         run_id: String,
         #[arg(long, default_value_t = false)]
         allow_live_run: bool,
+        /// Optional clean internal duration timer (seconds) for bounded P2 smoke/first-frame runs.
+        #[arg(long)]
+        duration_secs: Option<u64>,
     },
     /// Deterministically replay an offline JSONL multi-connection fixture through CausalSelector + HourlyTsvZstWriter.
     ReplayFixture {
@@ -109,6 +112,30 @@ struct ReplaySummary {
     total_records_written: u64,
 }
 
+use std::io::Write as _;
+
+/// Non-panicking stderr writer for `tracing_subscriber::fmt`.
+///
+/// By default, `tracing_subscriber::fmt()` enables `log_internal_errors(true)` and calls
+/// `eprintln!(...)` when `write_all` fails (e.g. `EPIPE` / `BrokenPipe` after an upstream
+/// `tee` or log pipe exits on `SIGINT`, or `EIO` on PTY hangup). Calling `eprintln!` on a
+/// closed stderr panics with exit code 101 and aborts the multi-exchange shutdown sealing loop.
+struct BestEffortStderr;
+
+impl std::io::Write for BestEffortStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match std::io::stderr().write(buf) {
+            Ok(n) => Ok(n),
+            Err(_) => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stderr().flush();
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -116,7 +143,8 @@ async fn main() -> ExitCode {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(|| BestEffortStderr)
+        .log_internal_errors(false)
         .init();
 
     let cli = Cli::parse();
@@ -171,6 +199,7 @@ async fn main() -> ExitCode {
             config,
             run_id,
             allow_live_run,
+            duration_secs,
         } => {
             let env_auth = std::env::var("TOKYO_L2_LIVE_AUTHORIZED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -192,16 +221,19 @@ async fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            if let Err(errs) = cfg.validate() {
+            let allow_local_test = std::env::var("TOKYO_L2_ALLOW_LOCALHOST_TEST_ENDPOINTS")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if let Err(errs) = cfg.validate_with_options(allow_local_test) {
                 let rep = BlockedReport::new("collect", errs, vec!["Fix config validation failures".to_string()]);
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap());
                 return ExitCode::from(2);
             }
-            match run_live_collector(cfg, run_id).await {
+            match run_live_collector(cfg, run_id, duration_secs).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     let rep = BlockedReport::new("collect", vec![e], vec!["Inspect runtime error".to_string()]);
-                    println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+                    let _ = writeln!(std::io::stdout(), "{}", serde_json::to_string_pretty(&rep).unwrap());
                     ExitCode::from(4)
                 }
             }

@@ -104,6 +104,14 @@ impl CollectorConfig {
     }
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
+        self.validate_with_options(false)
+    }
+
+    pub fn validate_with_options(&self, allow_localhost_test: bool) -> Result<(), Vec<String>> {
+        let is_local = |url: &str| {
+            allow_localhost_test
+                && (url.starts_with("ws://127.0.0.1:") || url.starts_with("http://127.0.0.1:"))
+        };
         let mut errs = Vec::new();
         if self.schema_version != 1 {
             errs.push(format!("Unsupported schema_version: {}", self.schema_version));
@@ -133,13 +141,17 @@ impl CollectorConfig {
             if b.symbols.is_empty() {
                 errs.push("binance_futures enabled with empty symbols".to_string());
             }
-            if !b.public_ws_url.contains("fstream.binance.com/public/stream") {
+            if !b.public_ws_url.contains("fstream.binance.com/public/stream")
+                && !(is_local(&b.public_ws_url) && b.public_ws_url.contains("/public/stream"))
+            {
                 errs.push(format!(
                     "binance_futures.public_ws_url must use /public/stream, got {}",
                     b.public_ws_url
                 ));
             }
-            if !b.market_ws_url.contains("fstream.binance.com/market/stream") {
+            if !b.market_ws_url.contains("fstream.binance.com/market/stream")
+                && !(is_local(&b.market_ws_url) && b.market_ws_url.contains("/market/stream"))
+            {
                 errs.push(format!(
                     "binance_futures.market_ws_url must use /market/stream, got {}",
                     b.market_ws_url
@@ -172,7 +184,7 @@ impl CollectorConfig {
             if by.symbols.is_empty() {
                 errs.push("bybit_linear enabled with empty symbols".to_string());
             }
-            if !by.ws_url.contains("stream.bybit.com/v5/public/linear") {
+            if !by.ws_url.contains("stream.bybit.com/v5/public/linear") && !is_local(&by.ws_url) {
                 errs.push(format!("bybit_linear.ws_url invalid: {}", by.ws_url));
             }
             for req in ["orderbook.50", "orderbook.1", "publicTrade"] {
@@ -192,7 +204,7 @@ impl CollectorConfig {
             if bg.symbols.is_empty() {
                 errs.push("bitget_v3 enabled with empty symbols".to_string());
             }
-            if !bg.ws_url.contains("ws.bitget.com/v3/ws/public") {
+            if !bg.ws_url.contains("ws.bitget.com/v3/ws/public") && !is_local(&bg.ws_url) {
                 errs.push(format!("bitget_v3.ws_url must be UTA v3 public endpoint, got {}", bg.ws_url));
             }
             if bg.channels.iter().any(|c| c == "trade") {
@@ -215,7 +227,7 @@ impl CollectorConfig {
             if g.symbols.is_empty() {
                 errs.push("gate_futures enabled with empty symbols".to_string());
             }
-            if !g.ws_url.contains("fx-ws.gateio.ws/v4/ws/usdt") {
+            if !g.ws_url.contains("fx-ws.gateio.ws/v4/ws/usdt") && !is_local(&g.ws_url) {
                 errs.push(format!("gate_futures.ws_url invalid: {}", g.ws_url));
             }
             match g.required_headers.get("X-Gate-Size-Decimal") {
