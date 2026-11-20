@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "status": "Bitget stage4B smoke candidate, not certified historical minSz/lotSz",
+  "pricing": "preserve full source L2 tick, restrict submitted GTX prices to legal Bitget quote tick",
+  "basis": "Bitget linear USDT perps hold base-coin position, HBT linear_asset(1)",
+  "quantity_policy": "take Gate per-day actual scenario order_qty_contracts * Gate quanto_multiplier. Require exact Bitget size-step compatibility; fail closed rather than rounding silently.",
+  "same_daily_gate_reference": "Gate 2026-06..11 month-first first 10min pretrade midpoint and existing Gate scenario() with TARGET_NOTIONAL_USDT=80, INVENTORY_MULTIPLE=20",
+  "maker_rate": 0.0002,
+  "taker_rate": 0.0006,
+  "engine_config": "configs/core_glft_physical_robustness.json",
+  "historical_spec_verified": false,
+  "symbols": {
+    "BTCUSDT": {
+      "gate_symbol": "BTC_USDT",
+      "hbt_tick_size": 0.1,
+      "legal_quote_tick": 0.1,
+      "quote_tick_mult": 1,
+      "bitget_lot_size_base": 0.0001,
+      "contract_value_base": 1,
+      "min_order_qty_base": 0.0001
+    },
+    "ETHUSDT": {
+      "gate_symbol": "ETH_USDT",
+      "hbt_tick_size": 0.01,
+      "legal_quote_tick": 0.01,
+      "quote_tick_mult": 1,
+      "bitget_lot_size_base": 0.01,
+      "contract_value_base": 1,
+      "min_order_qty_base": 0.01,
+      "warning": "Gate increments 0.001 ETH, Bitget candidate 0.01 ETH. Exact match not guaranteed."
+    },
+    "SOLUSDT": {
+      "gate_symbol": "SOL_USDT",
+      "hbt_tick_size": 0.001,
+      "legal_quote_tick": 0.001,
+      "quote_tick_mult": 1,
+      "bitget_lot_size_base": 0.1,
+      "contract_value_base": 1,
+      "min_order_qty_base": 0.1
+    },
+    "DOGEUSDT": {
+      "gate_symbol": "DOGE_USDT",
+      "hbt_tick_size": 0.000001,
+      "legal_quote_tick": 0.00001,
+      "quote_tick_mult": 10,
+      "bitget_lot_size_base": 1,
+      "contract_value_base": 1,
+      "min_order_qty_base": 1,
+      "warning": "raw historical off-quote L2 levels 0.000001 maintained in HBT without coalescing or rounding"
+    }
+  }
+}
