@@ -39,7 +39,7 @@ SPECS_DIR = COLLECTOR_DIR / "specs"
 if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
 
-from archive_sync import RemoteObjectInfo, sync_sealed_directory  # noqa: E402
+from archive_sync import RcloneBackend, RemoteObjectInfo, sync_sealed_directory  # noqa: E402
 from meta_daemon import (  # noqa: E402
     check_disk_usage_pct,
     fetch_specs_once,
@@ -74,12 +74,15 @@ def _rust_binary() -> Path:
 class MockRemoteBackend:
     """Controllable in-memory remote storage backend for offline archive & fault tests."""
 
-    def __init__(self, fail_on_copy: bool = False) -> None:
+    def __init__(self, fail_on_copy: bool = False, fail_on_stat: bool = False) -> None:
         self.store: dict[str, bytes] = {}
         self.fail_on_copy = fail_on_copy
+        self.fail_on_stat = fail_on_stat
         self.copy_calls = 0
 
     def stat_remote(self, remote_rel_path: str) -> RemoteObjectInfo:
+        if self.fail_on_stat:
+            raise RuntimeError(f"rclone stat_remote failed (rc=5) for {remote_rel_path}: 429 rateLimitExceeded")
         blob = self.store.get(remote_rel_path)
         if blob is None:
             return RemoteObjectInfo(exists=False)
@@ -91,7 +94,7 @@ class MockRemoteBackend:
             sha256=hashlib.sha256(blob).hexdigest(),
         )
 
-    def copy_file(self, local_path: Path, remote_rel_path: str) -> None:
+    def copy_file(self, local_path: Path, remote_rel_path: str, *, immutable: bool = True) -> None:
         self.copy_calls += 1
         if self.fail_on_copy:
             raise ConnectionResetError("simulated_upload_interruption")
@@ -1145,3 +1148,90 @@ def test_collect_guard_and_unified_cli_fail_closed() -> None:
         )
         assert p_ok.returncode == 0, f"preflight failed for {cfg}: {p_ok.stdout}\n{p_ok.stderr}"
         assert json.loads(p_ok.stdout)["status"] == "ok"
+
+
+def test_rclone_stat_remote_fail_closed_on_api_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: RcloneBackend.stat_remote MUST only return exists=False on rc 3/4 or empty rc 0; API errors raise & block upload."""
+    import archive_sync as arch_mod
+
+    backend = RcloneBackend("gdrive_main:tokyo_l2_data")
+    captured_cmds: list[list[str]] = []
+
+    def make_fake_run(returncode: int, stdout: str = "", stderr: str = ""):
+        def _fake(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured_cmds.append(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=returncode, stdout=stdout, stderr=stderr)
+        return _fake
+
+    # 1. Explicit not-found exit codes (3=dir not found, 4=file not found) -> exists=False
+    for rc in (3, 4):
+        monkeypatch.setattr(arch_mod.subprocess, "run", make_fake_run(rc, stderr="directory/file not found"))
+        info = backend.stat_remote("raw/gate_futures/2026-12-03/gate_futures_20261203_00.tsv.zst")
+        assert info.exists is False
+
+    # 2. rc=0 with empty JSON list -> exists=False
+    monkeypatch.setattr(arch_mod.subprocess, "run", make_fake_run(0, stdout="[]"))
+    assert backend.stat_remote("raw/gate_futures/2026-12-03/empty.tsv.zst").exists is False
+
+    # 3. rc=0 with object metadata -> exists=True with parsed ID/size/hashes
+    sample_json = json.dumps([{"ID": "drive-id-1", "Size": 1234, "Hashes": {"md5": "abc", "sha256": "def"}}])
+    monkeypatch.setattr(arch_mod.subprocess, "run", make_fake_run(0, stdout=sample_json))
+    found = backend.stat_remote("raw/gate_futures/2026-12-03/ok.tsv.zst")
+    assert found.exists is True
+    assert found.remote_id == "drive-id-1"
+    assert found.size == 1234
+    assert found.md5 == "abc"
+    assert found.sha256 == "def"
+
+    # 4. Transient API / auth / rate-limit / fatal errors (rc=1, 2, 5, 7) MUST raise RuntimeError!
+    for bad_rc in (1, 2, 5, 7):
+        monkeypatch.setattr(
+            arch_mod.subprocess,
+            "run",
+            make_fake_run(bad_rc, stderr="429 userRateLimitExceeded / transient API error"),
+        )
+        with pytest.raises(RuntimeError, match=f"rc={bad_rc}"):
+            backend.stat_remote("raw/gate_futures/2026-12-03/existing.tsv.zst")
+
+    # 5. Verify copy_file passes --immutable for raw partitions and omits it for mutable daily meta logs
+    captured_cmds.clear()
+    monkeypatch.setattr(arch_mod.subprocess, "run", make_fake_run(0))
+    dummy_local = tmp_path / "dummy.tsv.zst"
+    dummy_local.write_bytes(b"abc")
+    backend.copy_file(dummy_local, "raw/gate_futures/2026-12-03/dummy.tsv.zst", immutable=True)
+    backend.copy_file(dummy_local, "meta/rtt/rtt_20261203.csv", immutable=False)
+    assert "--immutable" in captured_cmds[0]
+    assert "--immutable" not in captured_cmds[1]
+
+    # Restore real subprocess.run before invoking the Rust replay binary
+    monkeypatch.undo()
+
+    # 6. End-to-end: when stat_remote fails transiently, sync_sealed_directory returns status=blocked,
+    #    NEVER calls copy_file (zero overwrite risk), and preserves local .tsv.zst!
+    mvp_cfg = SPECS_DIR / "config.btc_gate_binance_mvp.json"
+    base_wall = 1_796_256_000_000_000_000
+    base_ms = base_wall // 1_000_000
+    events = [
+        {
+            "op": "frame",
+            "recv_wall_ns": base_wall + 1_000_000,
+            "recv_mono_ns": 1_000_000,
+            "endpoint": "gate_public",
+            "conn_id": "A",
+            "epoch": 1,
+            "payload": json.dumps(
+                {"time": base_ms // 1000, "time_ms": base_ms, "channel": "futures.obu", "event": "update", "result": {"t": base_ms, "full": True, "s": "ob.BTC_USDT.50", "u": 1, "b": [["95000.0", "1.0"]], "a": [["95000.1", "1.0"]]}}
+            ),
+        }
+    ]
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    _run_rust_replay(mvp_cfg, events, sealed, boot_id="stat_err_test")
+    local_zst = list((sealed / "raw").rglob("*.tsv.zst"))[0]
+
+    stat_fail_backend = MockRemoteBackend(fail_on_stat=True)
+    res = sync_sealed_directory(sealed, backend=stat_fail_backend, verify_remote=True, prune_older_than_hours=0.0)
+    assert res["status"] == "blocked"
+    assert stat_fail_backend.copy_calls == 0, "MUST NOT attempt upload when stat_remote fails!"
+    assert local_zst.exists(), "MUST NOT delete local file when stat_remote fails!"
+

@@ -39,8 +39,14 @@ class RemoteObjectInfo:
 
 class ArchiveBackend(Protocol):
     def stat_remote(self, remote_rel_path: str) -> RemoteObjectInfo: ...
-    def copy_file(self, local_path: Path, remote_rel_path: str) -> None: ...
+    def copy_file(self, local_path: Path, remote_rel_path: str, *, immutable: bool = True) -> None: ...
     def readback_sha256(self, remote_rel_path: str) -> str: ...
+
+
+# Official rclone exit codes indicating genuine absence (vs API/network/auth failure):
+#   3 = Directory not found
+#   4 = File not found
+RCLONE_NOT_FOUND_EXIT_CODES = {3, 4}
 
 
 class RcloneBackend:
@@ -61,8 +67,14 @@ class RcloneBackend:
             timeout=60,
         )
         if proc.returncode != 0:
-            # Directory or file not found
-            return RemoteObjectInfo(exists=False)
+            if proc.returncode in RCLONE_NOT_FOUND_EXIT_CODES:
+                return RemoteObjectInfo(exists=False)
+            # Fail closed on ANY transient API/network/rate-limit/auth error!
+            # Never misclassify an unreachable remote as "does not exist".
+            stderr_msg = (proc.stderr or "").strip()
+            raise RuntimeError(
+                f"rclone stat_remote failed (rc={proc.returncode}) for {target}: {stderr_msg or 'unknown error'}"
+            )
         items = json.loads(proc.stdout or "[]")
         if not items:
             return RemoteObjectInfo(exists=False)
@@ -76,11 +88,16 @@ class RcloneBackend:
             sha256=hashes.get("sha256") or hashes.get("SHA-256"),
         )
 
-    def copy_file(self, local_path: Path, remote_rel_path: str) -> None:
+    def copy_file(self, local_path: Path, remote_rel_path: str, *, immutable: bool = True) -> None:
         parent = str(Path(remote_rel_path).parent).replace("\\", "/")
         dest_dir = self._full(parent)
+        cmd = ["rclone", "copy", "--no-traverse"]
+        if immutable:
+            # Defense-in-depth: refuse at rclone layer to overwrite any differing remote object
+            cmd.append("--immutable")
+        cmd.extend([str(local_path), dest_dir])
         subprocess.run(
-            ["rclone", "copy", "--no-traverse", str(local_path), dest_dir],
+            cmd,
             check=True,
             capture_output=True,
             text=True,
@@ -294,7 +311,7 @@ def sync_sealed_directory(
                 continue
             rel = fpath.relative_to(sealed_root).as_posix()
             try:
-                backend.copy_file(fpath, rel)
+                backend.copy_file(fpath, rel, immutable=False)
                 meta_uploaded.append(rel)
             except Exception as exc:
                 errors.append(f"{rel}: {type(exc).__name__}: {exc}")

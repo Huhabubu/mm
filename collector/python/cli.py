@@ -80,7 +80,7 @@ class _LocalMemoryRemoteBackend:
             sha256=hashlib.sha256(blob).hexdigest(),
         )
 
-    def copy_file(self, local_path: Path, remote_rel_path: str) -> None:
+    def copy_file(self, local_path: Path, remote_rel_path: str, *, immutable: bool = True) -> None:
         self.store[remote_rel_path] = local_path.read_bytes()
 
     def readback_sha256(self, remote_rel_path: str) -> str:
