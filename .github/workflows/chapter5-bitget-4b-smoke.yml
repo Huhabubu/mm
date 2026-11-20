@@ -4,6 +4,11 @@ on:
     branches: [exp/chapter5-cross-exchange]
     paths:
       - '.github/workflows/chapter5-bitget-4b-smoke.yml'
+      - 'scripts/core_glft_engine.py'
+      - 'scripts/core_glft_rules.py'
+      - 'scripts/run_bitget_core_glft.py'
+      - 'scripts/test_dual_grid_bitget.py'
+      - 'scripts/test_bitget_gate_qty_alignment.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -67,6 +72,8 @@ jobs:
               assert data['hbt_raw_price_tick']==1e-6
               assert data['legal_order_quote_tick']==1e-5
               assert data['lossless_raw_L2_check']['off_legal_quote_grid_rows']>0
+              assert data['lossless_raw_L2_check']['l2_post_message_book_checks']>0
+              assert data['lossless_raw_L2_check']['l2_crossed_post_message_book_checks']==0
           start=data['shared_first_eligible_entry_ns']
           assert isinstance(start,int) and start>0
           for name in ('glft','both_1p0','risk_side_pause'):
