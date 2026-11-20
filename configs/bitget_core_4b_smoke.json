@@ -3,7 +3,7 @@
   "status": "Bitget stage4B smoke candidate, not certified historical minSz/lotSz",
   "pricing": "preserve full source L2 tick, restrict submitted GTX prices to legal Bitget quote tick",
   "basis": "Bitget linear USDT perps hold base-coin position, HBT linear_asset(1)",
-  "quantity_policy": "take Gate per-day actual scenario order_qty_contracts * Gate quanto_multiplier. Require exact Bitget size-step compatibility; fail closed rather than rounding silently.",
+  "quantity_policy": "Gate same-day base-coin quantity target; nearest legal Bitget quantity increment (half-up ties and min size); report quantity and nominal difference at common Gate midpoint, preserve max_pos/order_qty multiple. Exact base equality is never implied for rounded assets.",
   "same_daily_gate_reference": "Gate 2026-06..11 month-first first 10min pretrade midpoint and existing Gate scenario() with TARGET_NOTIONAL_USDT=80, INVENTORY_MULTIPLE=20",
   "maker_rate": 0.0002,
   "taker_rate": 0.0006,
@@ -27,7 +27,7 @@
       "bitget_lot_size_base": 0.01,
       "contract_value_base": 1,
       "min_order_qty_base": 0.01,
-      "warning": "Gate increments 0.001 ETH, Bitget candidate 0.01 ETH. Exact match not guaranteed."
+      "warning": "Gate increments 0.001 ETH, Bitget candidate 0.01 ETH; nearest legal sizing is permitted with disclosed error, historical Bitget step unverified."
     },
     "SOLUSDT": {
       "gate_symbol": "SOL_USDT",

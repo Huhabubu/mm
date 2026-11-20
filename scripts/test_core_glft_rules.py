@@ -23,10 +23,20 @@ class CoreRuleTests(unittest.TestCase):
         old=quoted_ticks(102.,0.,0.,0.01,100,104,0.,0.,0,"legacy")
         self.assertEqual(old[2:],(100,104))  # frozen legacy BBO clipping
         q=quoted_ticks(102.,0.,0.,0.01,100,104,0.,0.,0,"unified")
-        self.assertEqual(q[2:],(101,102))
+        self.assertEqual(q[2:],(101,103))
         self.assertLess(q[2],q[3])
         self.assertLess(q[2],104)
         self.assertGreater(q[3],100)
+
+    def test_inventory_sign_guards_coarse_tick_collision(self):
+        # Synthetic coarse tick collision; not empirical market data.
+        longs=quoted_ticks(102.,1.,0.,.01,100,104,0.,0.,0,"unified")
+        shorts=quoted_ticks(102.,-1.,0.,.01,100,104,0.,0.,0,"unified")
+        flat=quoted_ticks(102.,0.,0.,.01,100,104,0.,0.,0,"unified")
+        self.assertEqual(longs[2:],(101,102))
+        self.assertEqual(shorts[2:],(102,103))
+        self.assertEqual(flat[2:],(101,103))
+        self.assertEqual(quoted_ticks(102.,0.,0.,.01,100,104,0.,0.,0,"legacy")[2:],(100,104))
 
     def test_unified_applies_binance_before_post_only(self):
         legacy=quoted_ticks(100.5,0,0,1,100,102,1,2,1,"legacy")

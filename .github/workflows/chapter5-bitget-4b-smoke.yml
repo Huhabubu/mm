@@ -120,3 +120,38 @@ jobs:
         run: |
           PYTHONPATH=scripts python -u scripts/test_core_glft_parity_replay.py \
             --day 2026-11-01 --minutes 50 --trace-actions
+  r1_smoke_unit_metrics:
+    needs: [smoke,gate_golden]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bitget-4b-smoke-*
+          path: collected
+      - name: Daywise gross_bps Total Markout inventory and exact decomposition on actual 50m HBT fills
+        run: |
+          python -u scripts/aggregate_cross_exchange_r1.py --root collected --out r1_smoke_summary
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+          rows=list(csv.DictReader((Path("r1_smoke_summary")/"per_day_unit_metrics.csv").open()))
+          assert len(rows)==6, "2 assets times 3 models required"
+          for row in rows:
+              assert row["total_markout_500ms_bps"] and row["total_markout_1000ms_bps"]
+              assert row["pos_std_over_order_qty"] and row["gross_bps"]
+              if row["model"]!="glft":
+                  assert abs(float(row["decomposition_residual_usdt"]))<1e-8
+          print("R1_TWO_REAL_50M_SMOKES_ACCOUNTING_OK",len(rows))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bitget-r1-two-50m-unit-metrics-and-fee-scenarios
+          path: r1_smoke_summary/
+          if-no-files-found: warn
+          retention-days: 90

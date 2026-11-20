@@ -66,9 +66,23 @@ class DualGridRules(unittest.TestCase):
         wrong=fit_physical_1tick_poisson(bid*10,ask*10,change*10)
         self.assertNotAlmostEqual(first[2],wrong[2],places=5)
 
+    def test_dual_grid_collision_preserves_inventory_reduction_side(self):
+        # Simplified synthetic raw=1e-6 and legal=1e-5 grid, not real DOGE.
+        def quote(pos):
+            return dual_grid_quoted_ticks(
+                6905.,pos,0.,.01,69000,69100,0.,0.,0,10)
+        self.assertEqual(quote(1.)[2:],(69040,69050))
+        self.assertEqual(quote(-1.)[2:],(69050,69060))
+        self.assertEqual(quote(0.)[2:],(69040,69060))
+        for pos in (-1.,0.,1.):
+            q=quote(pos)
+            self.assertEqual(q[2]%10,0)
+            self.assertEqual(q[3]%10,0)
+            self.assertLess(q[2],q[3])
+
     def test_exact_legacy_gate_quoted_ticks_unchanged(self):
         observed=quoted_ticks(102.,0.,0.,.01,100,104,0.,0.,0,"unified")
-        self.assertEqual(observed,(100,104,101,102))
+        self.assertEqual(observed,(100,104,101,103))
         self.assertEqual(quoted_ticks(101.,-1.,2.,1.,100,102,0.,0.,0,
                                        "legacy")[2],100)
 

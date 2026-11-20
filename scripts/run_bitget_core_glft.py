@@ -47,7 +47,11 @@ def config_for(symbol, cfg_path):
     return cfg,spec
 
 def exact_gate_equivalent(gate_pretrade_mid, gate_spec, bitget_spec):
-    """Fail closed if Gate position amount cannot be exactly ordered on Bitget."""
+    """Nearest legal Bitget quantity to Gate's frozen same-day base target.
+
+    Historical name retained for existing imports; strict equality is reported
+    as an explicit boolean and never assumed for rounded assets.
+    """
     frozen=gate_scenario(gate_pretrade_mid,gate_spec)
     gate_base_qty=float(frozen["qty"])*float(frozen["ctval"])
     gate_base_cap=float(frozen["position_cap"])*float(frozen["ctval"])
@@ -55,19 +59,18 @@ def exact_gate_equivalent(gate_pretrade_mid, gate_spec, bitget_spec):
     minimum=float(bitget_spec["min_order_qty_base"])
     if not (gate_base_qty>0 and gate_base_cap>0 and step>0 and minimum>0):
         raise ValueError("Invalid input quantity/contract units")
-    nearest=round(gate_base_qty/step)*step
-    error=nearest-gate_base_qty
-    if abs(error)>1e-9:
-        raise ValueError(
-            f"Cannot exactly align Gate with Bitget legal base quantity: "
-            f"Gate={gate_base_qty:.12g}, Bitget nearest={nearest:.12g}, "
-            f"difference={error:.12g} base; strict matched-quantity experiment blocked")
-    if nearest < minimum - 1e-9:
-        raise ValueError("Gate-equivalent quantity below Bitget min order")
-    bitget_qty=nearest
-    bitget_cap=bitget_qty*INVENTORY_MULTIPLE
-    if abs(bitget_cap-gate_base_cap)>1e-8:
-        raise ValueError("Gate vs Bitget base-position cap mismatch")
+    # Nearest legal increment, deterministic half-up tie and positive minimum.
+    min_steps=max(1,math.ceil(minimum/step-1e-10))
+    steps=max(min_steps,math.floor(gate_base_qty/step+0.5+1e-10))
+    bitget_qty=steps*step
+    if bitget_qty < minimum-1e-9 or not math.isclose(
+            bitget_qty/step,round(bitget_qty/step),abs_tol=1e-8):
+        raise ValueError("Bitget nearest quantity is off the candidate grid")
+    error=bitget_qty-gate_base_qty
+    gate_multiple=gate_base_cap/gate_base_qty
+    if not math.isclose(gate_multiple,INVENTORY_MULTIPLE,rel_tol=1e-10):
+        raise ValueError("Unexpected frozen Gate inventory multiple")
+    bitget_cap=bitget_qty*gate_multiple
     return {
         "gate_frozen_scenario":frozen,
         "gate_reference_mid_usdt":gate_pretrade_mid,
@@ -79,9 +82,18 @@ def exact_gate_equivalent(gate_pretrade_mid, gate_spec, bitget_spec):
         "bitget_order_qty_base":bitget_qty,
         "bitget_max_pos_base":bitget_cap,
         "bitget_candidate_order_step_base":step,
+        "gate_target_qty_base":gate_base_qty,
+        "bitget_actual_qty_base":bitget_qty,
+        "quantity_signed_difference_base":error,
         "quantity_abs_difference_base":abs(error),
-        "strict_base_amount_equal":True,
+        "quantity_relative_difference":error/gate_base_qty,
+        "strict_base_amount_equal":math.isclose(error,0.,abs_tol=1e-9),
+        "position_cap_over_order_qty_gate":gate_multiple,
+        "position_cap_over_order_qty_bitget":bitget_cap/bitget_qty,
         "gate_order_nominal_usdt":frozen["approx_order_notional_usdt"],
+        "bitget_nominal_at_gate_reference_usdt":bitget_qty*gate_pretrade_mid,
+        "nominal_difference_at_gate_reference_usdt":error*gate_pretrade_mid,
+        "nominal_relative_difference":error/gate_base_qty,
     }
 
 def source_l2_grid_check(path,raw_tick,legal_tick):
@@ -294,6 +306,7 @@ def run(day,symbol,out_dir,config_path,minutes=50):
                 "post_only_clamp_mode":"unified",
                 "cap_depth_at_visible_levels":False,
                 "quote_tick_mult":int(spec["quote_tick_mult"]),
+                "cross_timestamp_tie_mode":"microsecond",
                 "gate_book_local_ns":clocks_local,
                 "gate_book_exchange_ns":clocks_exchange,
                 "depth_is_20_level_snapshot":False,
@@ -331,7 +344,7 @@ def run(day,symbol,out_dir,config_path,minutes=50):
                     [converted],spec,low,high,config["maker_rate"],config["taker_rate"])])
                 recorder=Recorder(engine.num_assets,minutes*600+10)
                 try:
-                    d=np.zeros(11,np.float64)
+                    d=np.zeros(12,np.float64)
                     raw=run_core_glft(engine,visible,bt_mid,minutes*600,
                         beta,grid,basis,sigma,mode,gamma_code,
                         float(spec["hbt_tick_size"]),1.,q,cap,
@@ -344,8 +357,11 @@ def run(day,symbol,out_dir,config_path,minutes=50):
                     summary=summarize(raw,minutes,True,beta,cap,q,
                                       tail_tolerance_samples=10)
                     records=recorder.get(0)
-                    if len(records)<minutes*600-20:
-                        raise ValueError("Missing official HBT Recorder steps")
+                    effective_begin=max(int(raw[-3])+600*100_000_000,
+                                        int(options["forced_start_ns"]))
+                    expected=max(0,(int(raw[-2][0])-effective_begin)//100_000_000)
+                    if len(records)<max(0,expected-20):
+                        raise ValueError("Missing official active-session Recorder samples")
                     if np.any(np.diff(records["timestamp"])<=0):
                         raise ValueError("Nonmonotonic official Recorder time")
                     trading=summary["trading"]
@@ -358,11 +374,19 @@ def run(day,symbol,out_dir,config_path,minutes=50):
                             trading[new]=trading.pop(old)
                     trading["position_std_base"]=float(np.std(records["position"]))
                     trading["position_mean_base"]=float(np.mean(records["position"]))
+                    trading["pos_std"]=trading["position_std_base"]
+                    trading["pos_std_over_order_qty"]=trading["pos_std"]/q
+                    active_duration=max(len(records),1)*.1
+                    trading["mean_abs_inventory_base"]=float(raw[23])/active_duration
+                    trading["rms_inventory_base"]=math.sqrt(max(0.,float(raw[24]))/active_duration)
+                    trading["active_inventory_samples"]=len(records)
+                    trading["inventory_observation_scope"]="post_forced_entry_only"
                     turnover=float(trading["trading_value_usdt"])
                     net=float(trading["end_net_marked_equity_usdt"])
                     fee=float(trading["fee_usdt"])
                     gross=net+fee
                     trading["gross_marked_pnl_usdt"]=gross
+                    trading["gross_bps"]=10000*gross/turnover if turnover>0 else None
                     trading["gross_marked_pnl_per_turnover_bps"]=(
                         10000*gross/turnover if turnover>0 else None)
                     trading["net_marked_pnl_per_turnover_bps"]=(
@@ -372,6 +396,13 @@ def run(day,symbol,out_dir,config_path,minutes=50):
                     if trading["max_abs_position_base"]>cap+q+1e-9:
                         raise ValueError("Position cap exceeded")
                     summary["max_ops_per_sec"]=int(d[0])
+                    summary["observed_same_microsecond_price_change_pairs"]=int(d[11])
+                    summary["binance_origin_filter"]={
+                        k:int(v) for k,v in zip(
+                            ("binance_price_update_groups","eligible_gap_checks",
+                             "above_threshold_checks","directional_dominance_checks",
+                             "binance_origin_activations","active_decisions",
+                             "same_timestamp_ties_blocked"),raw[-1])}
                     summary["resting_time_ratio"]={
                         "bid":float(d[1]),"ask":float(d[2]),
                         "verified_exchange_resting":False,
@@ -414,7 +445,7 @@ def run(day,symbol,out_dir,config_path,minutes=50):
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser()
-    parser.add_argument("--symbol",required=True,choices=("BTCUSDT","DOGEUSDT"))
+    parser.add_argument("--symbol",required=True,choices=("BTCUSDT","ETHUSDT","SOLUSDT","DOGEUSDT"))
     parser.add_argument("--day",default="2026-08-01")
     parser.add_argument("--minutes",type=int,default=50,choices=(50,))
     parser.add_argument("--config",default="configs/bitget_core_4b_smoke.json")

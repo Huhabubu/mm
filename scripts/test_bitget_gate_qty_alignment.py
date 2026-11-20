@@ -26,13 +26,27 @@ class MatchedGateBaseQtyTests(unittest.TestCase):
             self.assertEqual(m["quantity_abs_difference_base"]<1e-9,True)
             self.assertEqual(m["bitget_order_qty_base"]>0,True)
 
-    def test_eth_alignment_can_fail_without_silent_round_up(self):
+    def test_eth_nearest_step_is_disclosed_and_inventory_multiple_matched(self):
         _,sp=config_for("ETHUSDT","configs/bitget_core_4b_smoke.json")
         gate=fetch_contract("ETH_USDT")
-        # Example spot mid yields 0.027 ETH in Gate contracts, which is NOT
-        # legal if the Bitget order quantity step is really 0.01 ETH.
-        with self.assertRaisesRegex(ValueError,"Cannot exactly align"):
-            exact_gate_equivalent(3000.,gate,sp)
+        # Simplified synthetic 3000 USDT reference; not a historic day.
+        m=exact_gate_equivalent(3000.,gate,sp)
+        self.assertAlmostEqual(m["gate_order_qty_base"],.027)
+        self.assertAlmostEqual(m["bitget_order_qty_base"],.03)
+        self.assertAlmostEqual(m["quantity_signed_difference_base"],.003)
+        self.assertAlmostEqual(m["nominal_difference_at_gate_reference_usdt"],9.)
+        self.assertFalse(m["strict_base_amount_equal"])
+        self.assertAlmostEqual(m["position_cap_over_order_qty_gate"],20.)
+        self.assertAlmostEqual(m["position_cap_over_order_qty_bitget"],20.)
+        self.assertAlmostEqual(m["bitget_max_pos_base"],.6)
+
+    def test_nearest_positive_minimum_for_tiny_target(self):
+        _,sp=config_for("ETHUSDT","configs/bitget_core_4b_smoke.json")
+        gate=fetch_contract("ETH_USDT")
+        m=exact_gate_equivalent(50000.,gate,sp)
+        self.assertGreaterEqual(m["bitget_order_qty_base"],sp["min_order_qty_base"])
+        self.assertAlmostEqual(m["bitget_order_qty_base"]/sp["bitget_lot_size_base"],
+                               round(m["bitget_order_qty_base"]/sp["bitget_lot_size_base"]))
 
     def test_grouped_raw_doge_book_keeps_6_digits_without_false_mid_message_cross(self):
         # Simplified synthetic example, not the empirical paper dataset.

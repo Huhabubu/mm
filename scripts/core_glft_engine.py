@@ -13,7 +13,8 @@ from g0_glft_rolling import (UPDATE_EVERY_STEPS, fit_recent_arrivals,
                              fit_physical_1tick_poisson, glft_coefficients)
 from core_glft_rules import (quoted_ticks, dual_grid_quoted_ticks, last_visible_bid_tick,
     last_visible_ask_tick, cap_quotes_to_visible_depth,
-    book_update_unlocks, note_order_operation)
+    book_update_unlocks, note_order_operation, same_microsecond_target_feed,
+    inventory_sample_is_live)
 from g0_glft_event_driven import MIN_REQUOTE_NS, summarize
 @njit
 def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
@@ -63,7 +64,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                          forced_start_ns=0,
                          gate_book_local_ns=None, gate_book_exchange_ns=None,
                          depth_is_20_level_snapshot=False,
-                         diagnostics=None, quote_tick_mult=1):
+                         diagnostics=None, quote_tick_mult=1,
+                         cross_timestamp_tie_mode="legacy_ns"):
     """Two sigma gates + Binance-origin anchor; HBT retains all matching/queues."""
     if not np.isfinite(beta) or beta < 0 or beta > 1:
         raise ValueError("Invalid beta")
@@ -83,6 +85,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("post_only_clamp_mode must be legacy or unified")
     if forced_start_ns < 0:
         raise ValueError("forced_start_ns cannot be negative")
+    if cross_timestamp_tie_mode not in ("legacy_ns", "microsecond"):
+        raise ValueError("cross_timestamp_tie_mode must be legacy_ns or microsecond")
     if quote_tick_mult < 1 or int(quote_tick_mult) != quote_tick_mult:
         raise ValueError("quote_tick_mult must be a positive integer")
     if quote_tick_mult > 1 and (
@@ -183,6 +187,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
     price_updates = trigger_checks = above_trigger = direction_ok = 0
     activated = active_decisions = 0
     tie_excluded = 0
+    observed_microsecond_collision = 0
+    last_target_feed_ns = -1
     initial_trade_count = engine.state_values(0).num_trades
     max_position = 0.0
     min_equity = np.inf
@@ -234,6 +240,7 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 raise ValueError("HBT overshot event deadline")
             if feed_status == 2:
                 okx_feed_events += 1
+                last_target_feed_ns = now
             elif feed_status == 3:
                 order_reply_events += 1
             elif feed_status != 0:
@@ -284,6 +291,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                                 and latest_binance != prior_binance)
         if binance_price_change:
             price_updates += 1
+            if same_microsecond_target_feed(last_target_feed_ns, latest_binance_ns):
+                observed_microsecond_collision += 1
 
         sample_event = False
         if now >= next_sample:
@@ -354,8 +363,9 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 else:
                     rejects += 1
 
-            # For fair reporting, inventory/equity are still sampled every 100ms.
-            if sample_count > TRAIN:
+            # Only count live trading exposure, excluding forced-start calibration wait.
+            # The default legacy path (forced_start_ns=0) is unchanged.
+            if inventory_sample_is_live(sample_count, TRAIN, now, forced_start_ns):
                 book = engine.depth(0)
                 if book.best_bid_tick > 0 and book.best_ask_tick > book.best_bid_tick:
                     mid_price = (book.best_bid_tick + book.best_ask_tick) * tick_size / 2
@@ -499,7 +509,10 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                      one_above, one_dominant, one_activated, one_tie) = gate_origin_filter(
                         observed_gap, historical_sigma, latest_binance,
                         mid * tick_size * quote_tick_mult, base_b, base_m, has_base,
-                        active_origin, binance_price_change, feed_status == 2)
+                        active_origin, binance_price_change,
+                        (same_microsecond_target_feed(last_target_feed_ns, latest_binance_ns)
+                         if cross_timestamp_tie_mode == "microsecond"
+                         else feed_status == 2))
                     above_trigger += one_above
                     direction_ok += one_dominant
                     activated += one_activated
@@ -651,6 +664,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         diagnostics[8] = depth_cap_changed
         diagnostics[9] = depth_cap_insufficient
         diagnostics[10] = depth_cap_changed_bid + depth_cap_changed_ask
+        if len(diagnostics) > 11:
+            diagnostics[11] = observed_microsecond_collision
     final = engine.state_values(0)
     book = engine.depth(0)
     final_mid = (book.best_bid + book.best_ask) / 2.0

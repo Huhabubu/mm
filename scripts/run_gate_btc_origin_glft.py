@@ -309,7 +309,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                 core_options=dict(core_options)
                 accepted = {"min_requote_ns","fit_mode","wait_book_after_fill",
                             "post_only_clamp_mode","cap_depth_at_visible_levels",
-                            "forced_start_ns"}
+                            "forced_start_ns","cross_timestamp_tie_mode"}
                 if set(core_options)-accepted:
                     raise ValueError("Unknown core options: "+repr(set(core_options)-accepted))
                 if core_options.get("wait_book_after_fill",False):
@@ -355,7 +355,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                             cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
                             rec.recorder,trade_stop*1000 if minutes==1430 else 0)
                     else:
-                        diagnostic=np.zeros(11,np.float64)
+                        diagnostic=np.zeros(12,np.float64)
                         raw=run_core_glft(engine,bt,bm,minutes*600,
                             beta,grid,basis,sigma,mode,cfg["gamma_code"],
                             cfg["tick"],cfg["ctval"],cfg["qty"],cfg["position_cap"],
@@ -381,6 +381,7 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                     summary["sigma_threshold"]=1.645
                     if core_options is not None:
                         summary["max_ops_per_sec"]=int(diagnostic[0])
+                        summary["observed_same_microsecond_price_change_pairs"]=int(diagnostic[11])
                         summary["resting_time_ratio"]={
                             "bid":float(diagnostic[1]),
                             "ask":float(diagnostic[2]),
@@ -417,6 +418,16 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                         if not len(positions) or not np.isfinite(positions).all():
                             raise ValueError("Nonfinite official Recorder inventory")
                         summary["trading"]["position_std_contracts"]=float(np.std(positions))
+                        summary["trading"]["pos_std"]=summary["trading"]["position_std_contracts"]
+                        summary["trading"]["pos_std_over_order_qty"]=(
+                            summary["trading"]["pos_std"]/cfg["qty"])
+                        active_duration=max(len(positions),1)*.1
+                        summary["trading"]["mean_abs_inventory_contracts"]=(
+                            float(raw[23])/active_duration)
+                        summary["trading"]["rms_inventory_contracts"]=(
+                            float(np.sqrt(max(0.,float(raw[24]))/active_duration)))
+                        summary["trading"]["active_inventory_samples"]=len(positions)
+                        summary["trading"]["inventory_observation_scope"]="post_forced_entry_only"
                         summary["trading"]["position_mean_contracts"]=float(np.mean(positions))
                         turnover=float(summary["trading"]["trading_value_usdt"])
                         net=float(summary["trading"]["end_net_marked_equity_usdt"])
@@ -428,8 +439,12 @@ def run(day, minutes=50, out="reports/gate_origin_glft",
                         summary["trading"]["net_marked_pnl_per_turnover_bps"]=(
                             10_000*net/turnover if turnover>0 else None)
                         summary["trading"]["pnl_bps_denominator"]="official HBT two-sided trading_value_usdt"
-                    if len(records)<minutes*600-20:
-                        raise RuntimeError("Insufficient official Recorder samples")
+                    effective_begin=max(int(raw[-3])+600*100_000_000,
+                                        int(core_options.get("forced_start_ns",0))
+                                        if core_options else 0)
+                    expected=max(0,(int(raw[-2][0])-effective_begin)//100_000_000)
+                    if len(records)<max(0,expected-20):
+                        raise RuntimeError("Insufficient official active-session Recorder samples")
                     if not np.all(np.diff(records["timestamp"])>0):
                         raise RuntimeError("Nonmonotonic official Recorder clock")
                     if not np.isfinite(summary["trading"]["end_net_marked_equity_usdt"]):

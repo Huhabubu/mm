@@ -1,6 +1,21 @@
 """Small Numba-compatible Gate GLFT execution rules, fed by one HBT engine."""
+import math
 import numpy as np
 from numba import njit
+
+
+@njit
+def same_microsecond_target_feed(target_feed_ns, external_visible_ns):
+    """Microsecond collision while retaining the external +1ns tie ordering."""
+    return (target_feed_ns >= 0 and external_visible_ns >= 0
+            and target_feed_ns // 1000 == external_visible_ns // 1000)
+
+
+@njit
+def inventory_sample_is_live(sample_count, warmup_steps, now, forced_start_ns):
+    """Exclude pre-entry zero inventory samples in the new shared-entry mode."""
+    return (sample_count > warmup_steps
+            and (forced_start_ns == 0 or now >= forced_start_ns))
 
 
 @njit
@@ -36,12 +51,24 @@ def quoted_ticks(mid, pos, skew, half, bid, ask, beta, shift_ticks,
         raw_ask = round(reservation+half+ask_shift)
         want_bid = min(raw_bid,ask-1)
         want_ask = max(raw_ask,bid+1)
-        # A positive GLFT half-spread can be < 0.5 tick for a coarse-tick
-        # asset. Both rounded quotes can then coincide *inside* the BBO.
-        # Preserve the ask and move only the bid one tick away, remaining
-        # strictly post-only and removing any self-cross possibility.
+        # Protect the inventory-reducing side when coarse ticks collide.
+        # With no inventory, bracket the unrounded theoretical quote center.
         if want_bid >= want_ask:
-            want_bid = want_ask - 1
+            if pos > 0:
+                want_bid = want_ask - 1
+            elif pos < 0:
+                want_ask = want_bid + 1
+            else:
+                center = reservation + (bid_shift + ask_shift) / 2.0
+                if abs(center - round(center)) < 1e-10:
+                    want_bid = min(round(center) - 1, ask - 1)
+                    want_ask = max(round(center) + 1, bid + 1)
+                else:
+                    lo = math.floor(center)
+                    want_bid = min(lo, ask - 1)
+                    want_ask = max(lo + 1, bid + 1)
+                if want_bid >= want_ask:
+                    want_bid = want_ask - 1
     else:
         raise ValueError("post_only_clamp_mode must be legacy or unified")
     if want_bid >= want_ask:
@@ -94,7 +121,22 @@ def dual_grid_quoted_ticks(mid_quote_ticks, pos, skew_quote_ticks, half_quote_ti
     want_ask = max(round(reservation+half_quote_ticks+ask_shift)*quote_tick_mult,
                    ask_postonly_limit)
     if want_bid >= want_ask:
-        want_bid = want_ask - quote_tick_mult
+        if pos > 0:
+            want_bid = want_ask - quote_tick_mult
+        elif pos < 0:
+            want_ask = want_bid + quote_tick_mult
+        else:
+            center = reservation + (bid_shift + ask_shift) / 2.0
+            if abs(center - round(center)) < 1e-10:
+                lo = round(center) - 1
+                hi = round(center) + 1
+            else:
+                lo = math.floor(center)
+                hi = lo + 1
+            want_bid = min(lo * quote_tick_mult, bid_postonly_limit)
+            want_ask = max(hi * quote_tick_mult, ask_postonly_limit)
+            if want_bid >= want_ask:
+                want_bid = want_ask - quote_tick_mult
     if (want_bid <= 0 or want_bid >= book_ask_raw_tick
             or want_ask <= book_bid_raw_tick or want_bid >= want_ask
             or want_bid % quote_tick_mult or want_ask % quote_tick_mult):

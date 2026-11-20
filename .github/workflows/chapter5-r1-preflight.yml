@@ -1,0 +1,130 @@
+name: R1 preflight core tests Gate 24 asset-day capture-lag audit and 50m tie replay (NO BITGET FULL DAYS)
+on:
+  push:
+    branches: [exp/chapter5-cross-exchange]
+    paths:
+      - '.github/workflows/chapter5-r1-preflight.yml'
+      - 'scripts/audit_gate_capture_lag_r1.py'
+      - 'scripts/aggregate_cross_exchange_r1.py'
+      - 'scripts/test_gate_capture_lag_r1.py'
+      - 'scripts/test_aggregate_cross_exchange_r1.py'
+      - 'scripts/test_r1_core_defects.py'
+      - 'scripts/core_glft_engine.py'
+      - 'configs/core_glft_physical_robustness.json'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'hftbacktest==2.4.4' numpy numba
+      - name: R1 syntax and synthetic defect accounting data-audit unit tests
+        run: |
+          python -m py_compile scripts/audit_gate_capture_lag_r1.py scripts/aggregate_cross_exchange_r1.py scripts/core_glft_engine.py scripts/core_glft_rules.py scripts/run_bitget_core_glft.py
+          PYTHONPATH=scripts python scripts/test_r1_core_defects.py
+          PYTHONPATH=scripts python scripts/test_gate_capture_lag_r1.py
+          PYTHONPATH=scripts python scripts/test_aggregate_cross_exchange_r1.py
+          PYTHONPATH=scripts python scripts/test_cross_venue_event_probe.py
+          PYTHONPATH=scripts python scripts/test_core_glft_rules.py
+          PYTHONPATH=scripts python scripts/test_dual_grid_bitget.py
+          PYTHONPATH=scripts python scripts/test_bitget_gate_qty_alignment.py
+          PYTHONPATH=scripts python scripts/test_core_glft_physical_fit.py
+  gate_tie_50min:
+    needs: offline
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install 'hftbacktest==2.4.4' numpy numba
+      - name: Real Gate BTC 2026-11-01 50m physical shared-start microsecond guard (NO FULL DAY)
+        run: |
+          PYTHONPATH=scripts python -u scripts/run_gate_btc_origin_glft.py --day 2026-11-01 --minutes 50 \
+            --symbol BTC_USDT --models glft,both_1p0 \
+            --core-config configs/core_glft_physical_robustness.json --out gate_r1_tie
+      - name: Print actual same-timestamp tie gating and recorder active coverage
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('gate_r1_tie/2026-11-01_50m.json').read_text())
+          assert d['status']=='complete',d.get('error')
+          assert d['core_options']['cross_timestamp_tie_mode']=='microsecond'
+          for model in ('glft','both_1p0'):
+              v=d['variants'][model]
+              print('GATE_R1_REAL_50M',model,
+                    'same_timestamp_ties_blocked',v['binance_origin_filter']['same_timestamp_ties_blocked'],
+                    'same_microsecond_price_change_pairs',v['observed_same_microsecond_price_change_pairs'],
+                    'pos_std',v['trading']['position_std_contracts'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-r1-2026-11-01-50m-tie-proof
+          path: gate_r1_tie/
+          if-no-files-found: warn
+          retention-days: 90
+  gate_lag_24:
+    needs: offline
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        symbol: [BTC, ETH, SOL, DOGE]
+        day: ['2026-06-01','2026-07-01','2026-08-01','2026-09-01','2026-10-01','2026-11-01']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Stream two actual full UTC-day normalized BBO feeds; NO HBT
+        run: |
+          python -u scripts/audit_gate_capture_lag_r1.py \
+            --symbol '${{ matrix.symbol }}' --day '${{ matrix.day }}' \
+            --out 'gate_r1_lag/gate_r1_lag_${{ matrix.symbol }}_${{ matrix.day }}.json'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-r1-lag-${{ matrix.symbol }}-${{ matrix.day }}
+          path: gate_r1_lag/gate_r1_lag_*.json
+          if-no-files-found: warn
+          retention-days: 90
+  gate_lag_table:
+    needs: [offline,gate_lag_24]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-r1-lag-*
+          path: collected
+      - name: Exactly 24 historical Gate/Binance paired rows or explicit failure
+        run: |
+          python scripts/audit_gate_capture_lag_r1.py \
+            --aggregate-root collected --out gate_r1_summary
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-r1-lag-24-asset-day-audit-table
+          path: gate_r1_summary/
+          if-no-files-found: warn
+          retention-days: 90
