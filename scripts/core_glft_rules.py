@@ -49,6 +49,58 @@ def quoted_ticks(mid, pos, skew, half, bid, ask, beta, shift_ticks,
     return base_bid,base_ask,want_bid,want_ask
 
 
+
+@njit
+def dual_grid_quoted_ticks(mid_quote_ticks, pos, skew_quote_ticks, half_quote_ticks,
+                           book_bid_raw_tick, book_ask_raw_tick, beta,
+                           shift_quote_ticks, quote_mode, quote_tick_mult):
+    """One economic quoting tick spans N *lossless* HBT/orderbook ticks.
+
+    Mid, GLFT sigma, fitted arrival distances and origin shift are already
+    expressed in *legal quote ticks*, while HBT book/price/order IDs remain
+    in raw ticks. Never coalesce raw orderbook levels. Only final order
+    targets are multiples of quote_tick_mult. Opposing best prices may
+    themselves be old 6-decimal legacy price levels.
+    """
+    if quote_tick_mult <= 1:
+        raise ValueError("Dual-grid helper requires multiplier > 1")
+    if quote_mode not in (0, 1, 2, 3):
+        raise ValueError("Invalid quote mode")
+    reservation = mid_quote_ticks - skew_quote_ticks * pos
+    # Baseline quote positions retain own-top-of-book restraint.
+    own_bid_legal = (book_bid_raw_tick // quote_tick_mult) * quote_tick_mult
+    own_ask_legal = ((book_ask_raw_tick + quote_tick_mult - 1)
+                     // quote_tick_mult) * quote_tick_mult
+    base_bid = min(round(reservation - half_quote_ticks) * quote_tick_mult,
+                   own_bid_legal)
+    base_ask = max(round(reservation + half_quote_ticks) * quote_tick_mult,
+                   own_ask_legal)
+    # STRICT GTX post-only: bid must be BELOW raw best ask, which can
+    # itself be off the legal quoting grid (and conversely for ask).
+    bid_postonly_limit = ((book_ask_raw_tick - 1) // quote_tick_mult) * quote_tick_mult
+    ask_postonly_limit = ((book_bid_raw_tick + quote_tick_mult)
+                          // quote_tick_mult) * quote_tick_mult
+    bid_shift = 0.0
+    ask_shift = 0.0
+    if quote_mode == 1:
+        bid_shift = ask_shift = beta * shift_quote_ticks
+    elif quote_mode == 2:
+        if shift_quote_ticks > 0:
+            ask_shift = beta * shift_quote_ticks
+        elif shift_quote_ticks < 0:
+            bid_shift = beta * shift_quote_ticks
+    want_bid = min(round(reservation-half_quote_ticks+bid_shift)*quote_tick_mult,
+                   bid_postonly_limit)
+    want_ask = max(round(reservation+half_quote_ticks+ask_shift)*quote_tick_mult,
+                   ask_postonly_limit)
+    if want_bid >= want_ask:
+        want_bid = want_ask - quote_tick_mult
+    if (want_bid <= 0 or want_bid >= book_ask_raw_tick
+            or want_ask <= book_bid_raw_tick or want_bid >= want_ask
+            or want_bid % quote_tick_mult or want_ask % quote_tick_mult):
+        raise ValueError("Dual-grid quote crossed an orderbook or is off-grid")
+    return base_bid,base_ask,want_bid,want_ask
+
 @njit
 def last_visible_bid_tick(book_bid_depth, roi_lower_tick, best_bid_tick,
                           target_levels=20):
