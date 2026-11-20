@@ -248,6 +248,121 @@ class AssetDayBuffers:
         self.last_book_local_ts = local_ts
 
 
+_EVENT_DIRECTION_MASK = np.uint64(EXCH_EVENT | LOCAL_EVENT)
+_EVENT_SEMANTIC_MASK = ~_EVENT_DIRECTION_MASK
+
+
+def _find_first_order_conflict(data: np.ndarray) -> dict[str, Any] | None:
+    """Locate the first exchange-time or local-time ordering violation for diagnostics."""
+    exch_idx = np.flatnonzero((data["ev"] & EXCH_EVENT) == EXCH_EVENT)
+    if len(exch_idx) > 1:
+        bad = np.flatnonzero(np.diff(data["exch_ts"][exch_idx]) < 0)
+        if len(bad) > 0:
+            pos = int(bad[0])
+            i0, i1 = int(exch_idx[pos]), int(exch_idx[pos + 1])
+            return {
+                "axis": "exch_ts",
+                "prev_index": i0,
+                "curr_index": i1,
+                "prev_ev": hex(int(data["ev"][i0])),
+                "curr_ev": hex(int(data["ev"][i1])),
+                "prev_exch_ts": int(data["exch_ts"][i0]),
+                "curr_exch_ts": int(data["exch_ts"][i1]),
+                "prev_local_ts": int(data["local_ts"][i0]),
+                "curr_local_ts": int(data["local_ts"][i1]),
+                "total_exch_conflicts": int(len(bad)),
+            }
+    local_idx = np.flatnonzero((data["ev"] & LOCAL_EVENT) == LOCAL_EVENT)
+    if len(local_idx) > 1:
+        bad = np.flatnonzero(np.diff(data["local_ts"][local_idx]) < 0)
+        if len(bad) > 0:
+            pos = int(bad[0])
+            i0, i1 = int(local_idx[pos]), int(local_idx[pos + 1])
+            return {
+                "axis": "local_ts",
+                "prev_index": i0,
+                "curr_index": i1,
+                "prev_ev": hex(int(data["ev"][i0])),
+                "curr_ev": hex(int(data["ev"][i1])),
+                "prev_exch_ts": int(data["exch_ts"][i0]),
+                "curr_exch_ts": int(data["exch_ts"][i1]),
+                "prev_local_ts": int(data["local_ts"][i0]),
+                "curr_local_ts": int(data["local_ts"][i1]),
+                "total_local_conflicts": int(len(bad)),
+            }
+    return None
+
+
+def _find_first_raw_reversal(raw_arr: np.ndarray, field_name: str) -> dict[str, Any] | None:
+    """Record the first raw timestamp reversal (observational diagnostic only; never alters data)."""
+    if len(raw_arr) < 2:
+        return None
+    bad = np.flatnonzero(np.diff(raw_arr[field_name]) < 0)
+    if len(bad) == 0:
+        return None
+    i0 = int(bad[0])
+    i1 = i0 + 1
+    return {
+        "axis": field_name,
+        "prev_index": i0,
+        "curr_index": i1,
+        "prev_ev": hex(int(raw_arr["ev"][i0])),
+        "curr_ev": hex(int(raw_arr["ev"][i1])),
+        "prev_exch_ts": int(raw_arr["exch_ts"][i0]),
+        "curr_exch_ts": int(raw_arr["exch_ts"][i1]),
+        "prev_local_ts": int(raw_arr["local_ts"][i0]),
+        "curr_local_ts": int(raw_arr["local_ts"][i1]),
+        "total_reversals": int(len(bad)),
+    }
+
+
+def _order_and_validate_hbt_events(
+    raw_arr: np.ndarray,
+    *,
+    exchange: str,
+    symbol: str,
+    date_utc: str,
+    stream_kind: str,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Strip direction flags, run HBT correct_event_order(), and strictly run validate_event_order().
+
+    `hftbacktest.data.validation.correct_event_order()` assigns `EXCH_EVENT` and `LOCAL_EVENT`
+    via bitwise OR when splitting out-of-order rows. Any pre-set `EXCH_EVENT | LOCAL_EVENT` bits
+    on input rows must be cleared beforehand (while preserving event type and buy/sell side bits)
+    so split rows do not erroneously retain both direction flags.
+    """
+    first_raw_exch = _find_first_raw_reversal(raw_arr, "exch_ts")
+    first_raw_local = _find_first_raw_reversal(raw_arr, "local_ts")
+
+    clean = raw_arr.copy()
+    clean["ev"] = clean["ev"] & _EVENT_SEMANTIC_MASK
+
+    ordered = correct_event_order(
+        clean,
+        np.argsort(clean["exch_ts"], kind="mergesort"),
+        np.argsort(clean["local_ts"], kind="mergesort"),
+    )
+    try:
+        validate_event_order(ordered)
+    except ValueError as exc:
+        conflict = _find_first_order_conflict(ordered)
+        raise ValueError(
+            f"{exc} (exchange={exchange}, symbol={symbol}, date_utc={date_utc}, "
+            f"stream={stream_kind}, first_conflict={json.dumps(conflict, sort_keys=True)})"
+        ) from exc
+
+    diag = {
+        "input_rows": int(len(raw_arr)),
+        "ordered_rows": int(len(ordered)),
+        "split_extra_rows": int(len(ordered) - len(raw_arr)),
+        "raw_exch_ts_reversals": int(first_raw_exch["total_reversals"]) if first_raw_exch else 0,
+        "raw_local_ts_reversals": int(first_raw_local["total_reversals"]) if first_raw_local else 0,
+        "first_raw_exch_reversal": first_raw_exch,
+        "first_raw_local_reversal": first_raw_local,
+    }
+    return ordered, diag
+
+
 def _emit_depth_batch(
     buf: AssetDayBuffers,
     is_snapshot: bool,
@@ -256,19 +371,22 @@ def _emit_depth_batch(
     bid_levels: list[tuple[float, float]],
     ask_levels: list[tuple[float, float]],
 ) -> None:
-    """Emit atomic WS depth message into HBT event rows sharing identical (exch_ts, local_ts)."""
+    """Emit atomic WS depth message into HBT event rows sharing identical (exch_ts, local_ts).
+
+    Direction flags (`EXCH_EVENT` / `LOCAL_EVENT`) are intentionally NOT pre-set here; they are
+    assigned exclusively by `hftbacktest.data.validation.correct_event_order()`.
+    """
     if exch_ts_ns > local_ts_ns:
         buf.exch_ahead_of_local_count += 1
-    base_flags = EXCH_EVENT | LOCAL_EVENT
     if is_snapshot:
-        buf.hbt_rows.append((DEPTH_CLEAR_EVENT | base_flags, exch_ts_ns, local_ts_ns, 0.0, 0.0, 0, 0, 0.0))
+        buf.hbt_rows.append((DEPTH_CLEAR_EVENT, exch_ts_ns, local_ts_ns, 0.0, 0.0, 0, 0, 0.0))
         ev_type = DEPTH_SNAPSHOT_EVENT
     else:
         ev_type = DEPTH_EVENT
     for px, qty in bid_levels:
-        buf.hbt_rows.append((ev_type | BUY_EVENT | base_flags, exch_ts_ns, local_ts_ns, px, qty, 0, 0, 0.0))
+        buf.hbt_rows.append((ev_type | BUY_EVENT, exch_ts_ns, local_ts_ns, px, qty, 0, 0, 0.0))
     for px, qty in ask_levels:
-        buf.hbt_rows.append((ev_type | SELL_EVENT | base_flags, exch_ts_ns, local_ts_ns, px, qty, 0, 0, 0.0))
+        buf.hbt_rows.append((ev_type | SELL_EVENT, exch_ts_ns, local_ts_ns, px, qty, 0, 0, 0.0))
     buf.apply_levels(is_snapshot, bid_levels, ask_levels, local_ts_ns)
 
 
@@ -416,7 +534,7 @@ def _ingest_gate_record(
                 ival |= TRADE_FLAG_IS_INTERNAL
                 buf.special_flag_counts["is_internal"] += 1
             buf.hbt_rows.append(
-                (TRADE_EVENT | side_flag | EXCH_EVENT | LOCAL_EVENT, exch_ts, local_ts, px, qty, 0, ival, 0.0)
+                (TRADE_EVENT | side_flag, exch_ts, local_ts, px, qty, 0, ival, 0.0)
             )
 
     elif channel == "futures.book_ticker" and isinstance(result, dict):
@@ -514,7 +632,7 @@ def _ingest_bybit_record(
                 ival |= TRADE_FLAG_RPI
                 buf.special_flag_counts["RPI"] += 1
             buf.hbt_rows.append(
-                (TRADE_EVENT | side_flag | EXCH_EVENT | LOCAL_EVENT, exch_ts, local_ts, px, qty, 0, ival, 0.0)
+                (TRADE_EVENT | side_flag, exch_ts, local_ts, px, qty, 0, ival, 0.0)
             )
 
 
@@ -601,7 +719,7 @@ def _ingest_bitget_record(
                 ival |= TRADE_FLAG_RPI
                 buf.special_flag_counts["RPI"] += 1
             buf.hbt_rows.append(
-                (TRADE_EVENT | side_flag | EXCH_EVENT | LOCAL_EVENT, exch_ts, local_ts, px, qty, 0, ival, 0.0)
+                (TRADE_EVENT | side_flag, exch_ts, local_ts, px, qty, 0, ival, 0.0)
             )
 
 
@@ -1009,17 +1127,29 @@ def run_qa_convert(
 
             if buf.hbt_rows:
                 raw_arr = np.array(buf.hbt_rows, dtype=event_dtype)
-                ordered = correct_event_order(
+                ordered, order_diag = _order_and_validate_hbt_events(
                     raw_arr,
-                    np.argsort(raw_arr["exch_ts"], kind="mergesort"),
-                    np.argsort(raw_arr["local_ts"], kind="mergesort"),
+                    exchange=exchange,
+                    symbol=sym,
+                    date_utc=date_utc,
+                    stream_kind="binance_depth_diag",
                 )
-                validate_event_order(ordered)
                 dep_path = out_dir / f"binance_depth_diag_{sym}_{ymd}.npz"
                 np.savez_compressed(dep_path, data=ordered)
                 day_files["binance_depth_diag"] = str(dep_path)
                 day_sha256["binance_depth_diag"] = _sha256_file(dep_path)
-                artifacts.append({"kind": "binance_depth_diag", "exchange": exchange, "symbol": sym, "date_utc": date_utc, "path": str(dep_path), "sha256": day_sha256["binance_depth_diag"], "rows": int(len(ordered))})
+                artifacts.append(
+                    {
+                        "kind": "binance_depth_diag",
+                        "exchange": exchange,
+                        "symbol": sym,
+                        "date_utc": date_utc,
+                        "path": str(dep_path),
+                        "sha256": day_sha256["binance_depth_diag"],
+                        "rows": int(len(ordered)),
+                        "order_diagnostics": order_diag,
+                    }
+                )
 
             if buf.agg_trade_rows:
                 agg_path = out_dir / f"binance_aggtrade_diag_{sym}_{ymd}.npz"
@@ -1044,17 +1174,29 @@ def run_qa_convert(
                 reasons.append("missing_l2_snapshot_anchor")
             if buf.hbt_rows:
                 raw_arr = np.array(buf.hbt_rows, dtype=event_dtype)
-                ordered = correct_event_order(
+                ordered, order_diag = _order_and_validate_hbt_events(
                     raw_arr,
-                    np.argsort(raw_arr["exch_ts"], kind="mergesort"),
-                    np.argsort(raw_arr["local_ts"], kind="mergesort"),
+                    exchange=exchange,
+                    symbol=sym,
+                    date_utc=date_utc,
+                    stream_kind="follower_l2_hbt",
                 )
-                validate_event_order(ordered)
                 l2_path = out_dir / f"{exchange}_l2_{sym}_{ymd}.npz"
                 np.savez_compressed(l2_path, data=ordered)
                 day_files["follower_l2_hbt"] = str(l2_path)
                 day_sha256["follower_l2_hbt"] = _sha256_file(l2_path)
-                artifacts.append({"kind": "follower_l2_hbt", "exchange": exchange, "symbol": sym, "date_utc": date_utc, "path": str(l2_path), "sha256": day_sha256["follower_l2_hbt"], "rows": int(len(ordered))})
+                artifacts.append(
+                    {
+                        "kind": "follower_l2_hbt",
+                        "exchange": exchange,
+                        "symbol": sym,
+                        "date_utc": date_utc,
+                        "path": str(l2_path),
+                        "sha256": day_sha256["follower_l2_hbt"],
+                        "rows": int(len(ordered)),
+                        "order_diagnostics": order_diag,
+                    }
+                )
 
             if buf.edge_samples:
                 edge_path = out_dir / f"{exchange}_l2_edges_{sym}_{ymd}.npz"
