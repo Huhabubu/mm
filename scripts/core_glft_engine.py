@@ -11,7 +11,7 @@ from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
 from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TICK, TRAIN
 from g0_glft_rolling import (UPDATE_EVERY_STEPS, fit_recent_arrivals,
                              fit_physical_1tick_poisson, glft_coefficients)
-from core_glft_rules import (quoted_ticks, last_visible_bid_tick,
+from core_glft_rules import (quoted_ticks, dual_grid_quoted_ticks, last_visible_bid_tick,
     last_visible_ask_tick, cap_quotes_to_visible_depth,
     book_update_unlocks, note_order_operation)
 from g0_glft_event_driven import MIN_REQUOTE_NS, summarize
@@ -63,7 +63,7 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                          forced_start_ns=0,
                          gate_book_local_ns=None, gate_book_exchange_ns=None,
                          depth_is_20_level_snapshot=False,
-                         diagnostics=None):
+                         diagnostics=None, quote_tick_mult=1):
     """Two sigma gates + Binance-origin anchor; HBT retains all matching/queues."""
     if not np.isfinite(beta) or beta < 0 or beta > 1:
         raise ValueError("Invalid beta")
@@ -83,6 +83,13 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("post_only_clamp_mode must be legacy or unified")
     if forced_start_ns < 0:
         raise ValueError("forced_start_ns cannot be negative")
+    if quote_tick_mult < 1 or int(quote_tick_mult) != quote_tick_mult:
+        raise ValueError("quote_tick_mult must be a positive integer")
+    if quote_tick_mult > 1 and (
+            fit_mode != "physical_1tick_poisson"
+            or post_only_clamp_mode != "unified"
+            or cap_depth_at_visible_levels):
+        raise ValueError("Dual-grid requires physical fit, unified GTX and no depth cap")
     if diagnostics is not None and len(diagnostics)<11:
         raise ValueError("Eleven diagnostic slots required including visible-depth cap counters")
     if fit_mode == "physical_1tick_poisson" and diagnostics is None:
@@ -287,7 +294,7 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             bid_furthest = ask_furthest = -np.inf
             if np.isfinite(prev_mid):
                 for tr in engine.last_trades(0):
-                    price_tick = tr.px / tick_size
+                    price_tick = tr.px / (tick_size * quote_tick_mult)
                     if tr.ev & BUY_EVENT == BUY_EVENT:
                         furthest = max(furthest, price_tick - prev_mid)
                         ask_furthest = max(ask_furthest, price_tick - prev_mid)
@@ -301,7 +308,7 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             book = engine.depth(0)
             best_bid, best_ask = book.best_bid_tick, book.best_ask_tick
             if best_bid > 0 and best_ask > best_bid and best_ask < 1_000_000_000:
-                mid_tick = (best_bid + best_ask) / 2.0
+                mid_tick = (best_bid + best_ask) / (2.0 * quote_tick_mult)
                 changes[slot] = mid_tick - prev_mid if np.isfinite(prev_mid) else np.nan
                 prev_mid = mid_tick
             else:
@@ -470,7 +477,7 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             bid, ask = book.best_bid_tick, book.best_ask_tick
             if bid <= 0 or ask <= bid or ask > 1_000_000_000:
                 continue
-            mid = (bid + ask) / 2.0
+            mid = (bid + ask) / (2.0 * quote_tick_mult)
             pos = engine.position(0)
             # Price difference is between *now-visible* Binance and HBT Gate mid.
             # The 600s time-weighted normal spread/sigma were published at 5s
@@ -485,13 +492,13 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 gi = np.searchsorted(basis_grid_ns, now, side="left") - 1
                 if gi >= 0 and np.isfinite(basis_values[gi]) and (
                         np.isfinite(basis_sigmas[gi]) and basis_sigmas[gi] > 0.0):
-                    observed_gap = latest_binance - mid * tick_size - basis_values[gi]
+                    observed_gap = latest_binance - mid * tick_size * quote_tick_mult - basis_values[gi]
                     historical_sigma = basis_sigmas[gi]
                     trigger_checks += 1
                     (effective_gap, base_b, base_m, has_base, active_origin,
                      one_above, one_dominant, one_activated, one_tie) = gate_origin_filter(
                         observed_gap, historical_sigma, latest_binance,
-                        mid * tick_size, base_b, base_m, has_base,
+                        mid * tick_size * quote_tick_mult, base_b, base_m, has_base,
                         active_origin, binance_price_change, feed_status == 2)
                     above_trigger += one_above
                     direction_ok += one_dominant
@@ -501,13 +508,13 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     last_shadow_sigma = historical_sigma
                     last_shadow_decision = now
                     last_shadow_effective = effective_gap
-                    last_shadow_gate_mid = mid * tick_size
+                    last_shadow_gate_mid = mid * tick_size * quote_tick_mult
                     last_shadow_above = one_above
                     last_shadow_dominant = one_dominant
                     if one_activated:
                         last_shadow_activation = now
                     if effective_gap != 0.0:
-                        shift_ticks = effective_gap / tick_size
+                        shift_ticks = effective_gap / (tick_size * quote_tick_mult)
                         active_decisions += 1
                 else:
                     active_origin = False
@@ -515,18 +522,23 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                     last_shadow_above = 0
                     last_shadow_dominant = 0
             widened_half = half + extra_half_ticks if control_kind == 1 else half
-            base_bid, base_ask, want_bid, want_ask = quoted_ticks(
-                mid, pos, skew, widened_half, bid, ask, beta, shift_ticks,
-                quote_mode, post_only_clamp_mode)
+            if quote_tick_mult == 1:
+                base_bid, base_ask, want_bid, want_ask = quoted_ticks(
+                    mid, pos, skew, widened_half, bid, ask, beta, shift_ticks,
+                    quote_mode, post_only_clamp_mode)
+            else:
+                base_bid, base_ask, want_bid, want_ask = dual_grid_quoted_ticks(
+                    mid, pos, skew, widened_half, bid, ask, beta, shift_ticks,
+                    quote_mode, quote_tick_mult)
             vol_pause = control_kind == 2 and sigma > local_sigma_ceiling
             # Read-only counterfactual quote for the actual baseline inventory.
             # Its value is never used in submit or cancel below.
             last_shadow_bid_target = base_bid
             last_shadow_ask_target = base_ask
             if shadow_gate and last_shadow_effective != 0.0:
-                so = last_shadow_effective / tick_size
-                last_shadow_bid_target = min(round(base_bid + so), ask - 1)
-                last_shadow_ask_target = max(round(base_ask + so), bid + 1)
+                so = last_shadow_effective / (tick_size * quote_tick_mult)
+                last_shadow_bid_target = min(round(base_bid + so * quote_tick_mult), ask - 1)
+                last_shadow_ask_target = max(round(base_ask + so * quote_tick_mult), bid + 1)
             pause_buy = quote_mode == 3 and shift_ticks < 0.0
             pause_sell = quote_mode == 3 and shift_ticks > 0.0
             pause_buy = pause_buy or vol_pause
