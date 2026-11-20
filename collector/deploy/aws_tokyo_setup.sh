@@ -26,9 +26,9 @@ if [[ "${REGION}" != "ap-northeast-1" || "${AZ_ID}" != "${EXPECTED_AZ_ID}" ]]; t
   exit 2
 fi
 
-echo "=== [2/6] Installing OS packages (chrony, zstd, rclone, jq, build-essential) ==="
+echo "=== [2/6] Installing OS packages (chrony, zstd, rclone, jq, curl, python3-venv) ==="
 sudo apt-get update -y
-sudo apt-get install -y chrony zstd rclone jq curl build-essential pkg-config libssl-dev python3-venv
+sudo apt-get install -y chrony zstd rclone jq curl python3-venv
 
 echo "=== [3/6] Configuring AWS Time Sync Service (169.254.169.123) ==="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,14 +43,9 @@ sudo mkdir -p "${DATA_ROOT}/raw" "${DATA_ROOT}/meta/specs" "${DATA_ROOT}/meta/rt
 sudo chown -R "$(id -u):$(id -g)" "${DATA_ROOT}"
 df -h "${DATA_ROOT}"
 
-echo "=== [5/6] Building Rust release binary & verifying Python .venv ==="
+echo "=== [5/6] Installing CI-verified prebuilt Rust binary (no EC2 Rust build) & Python .venv ==="
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  # shellcheck disable=SC1091
-  source "${HOME}/.cargo/env"
-fi
-cargo build --release --manifest-path "${REPO_ROOT}/collector/Cargo.toml"
+bash "${SCRIPT_DIR}/install_prebuilt_collector.sh" "${TOKYO_L2_RELEASE_TAG:-}"
 
 if [[ ! -d "${REPO_ROOT}/.venv" ]]; then
   python3 -m venv "${REPO_ROOT}/.venv"

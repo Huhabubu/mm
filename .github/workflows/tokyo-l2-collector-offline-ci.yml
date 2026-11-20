@@ -18,6 +18,8 @@ jobs:
   offline-verification:
     name: Rust + Python Offline Protocol, Causal, Shutdown & Release Artifact (Ubuntu 24.04)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     env:
       CARGO_TERM_COLOR: always
       # Explicitly keep live WS execution disabled in CI
@@ -59,6 +61,7 @@ jobs:
             echo "repo=${GITHUB_REPOSITORY}"
             echo "ref=${GITHUB_REF_NAME}"
             echo "commit=${GITHUB_SHA}"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "rustc=$(rustc --version)"
             echo "ldd=$(ldd --version | head -n 1)"
@@ -67,13 +70,15 @@ jobs:
           } > dist/pkg/BUILD_INFO.txt
 
           (cd dist/pkg && sha256sum tokyo-l2-collector > SHA256SUMS && sha256sum -c SHA256SUMS)
+          cp dist/pkg/tokyo-l2-collector dist/tokyo-l2-collector
+          chmod 755 dist/tokyo-l2-collector
           cp dist/pkg/SHA256SUMS dist/SHA256SUMS
           cp dist/pkg/BUILD_INFO.txt dist/BUILD_INFO.txt
 
           tar -C dist/pkg -czf dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz \
             tokyo-l2-collector SHA256SUMS BUILD_INFO.txt
           (cd dist && sha256sum tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz > tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256)
-          (cd dist && sha256sum -c tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256)
+          (cd dist && sha256sum -c SHA256SUMS && sha256sum -c tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256)
           cat dist/BUILD_INFO.txt
           cat dist/SHA256SUMS
           cat dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256
@@ -83,6 +88,7 @@ jobs:
         with:
           name: tokyo-l2-collector-ubuntu24.04-x86_64
           path: |
+            dist/tokyo-l2-collector
             dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz
             dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256
             dist/SHA256SUMS
@@ -118,3 +124,56 @@ jobs:
           echo "${OUT}"
           test "${RC}" -eq 3
           echo "${OUT}" | grep -q '"status": "blocked"'
+
+      - name: Publish verified Ubuntu 24.04 binary to GitHub Prerelease
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/feat/tokyo-l2-collector') || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAG="collector-pre-${SHORT_SHA}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          cat > dist/RELEASE_NOTES.md <<EOF
+          Verified Ubuntu 24.04 x86_64 prebuilt release binary for \`tokyo-l2-collector\` (no Rust compilation required on EC2).
+
+          - **Branch**: \`${GITHUB_REF_NAME}\`
+          - **Commit**: \`${GITHUB_SHA}\`
+          - **CI Run**: ${RUN_URL}
+          - **Verification Gates Passed**: Rust unit/protocol/causal/storage/graceful-shutdown tests, Python E2E/anti-lookahead/archive/HBT 2.4.4 tests, offline preflight (24-market & MVP), and live-collect fail-closed guard.
+
+          ### SHA-256 Checksums
+          \`\`\`
+          $(cat dist/SHA256SUMS)
+          $(cat dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256)
+          \`\`\`
+
+          ### Build Info
+          \`\`\`
+          $(cat dist/BUILD_INFO.txt)
+          \`\`\`
+          EOF
+
+          ASSETS=(
+            dist/tokyo-l2-collector
+            dist/SHA256SUMS
+            dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz
+            dist/tokyo-l2-collector-ubuntu24.04-x86_64.tar.gz.sha256
+            dist/BUILD_INFO.txt
+          )
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${ASSETS[@]}"
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --prerelease \
+              --title "tokyo-l2-collector Ubuntu 24.04 x86_64 (${SHORT_SHA})" \
+              --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --prerelease \
+              --title "tokyo-l2-collector Ubuntu 24.04 x86_64 (${SHORT_SHA})" \
+              --notes-file dist/RELEASE_NOTES.md \
+              "${ASSETS[@]}"
+          fi
