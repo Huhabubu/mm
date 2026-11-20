@@ -106,8 +106,8 @@ jobs:
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install hftbacktest==2.4.4 numpy numba zstandard pytest
 
-      - name: Run Python offline E2E, anti-lookahead, 4-exchange & fault-injection tests
-        run: .venv/bin/pytest -v collector/tests/test_pipeline_offline.py
+      - name: Run Python offline E2E, anti-lookahead, 4-exchange, archive ledger & fault-injection tests
+        run: .venv/bin/pytest -v collector/tests/
 
       - name: Run single-command offline preflight (Binance+Gate BTC MVP)
         run: ./collector/bin/preflight --config collector/specs/config.btc_gate_binance_mvp.json --offline

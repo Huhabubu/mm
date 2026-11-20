@@ -29,6 +29,7 @@ import io
 import json
 import math
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -50,7 +51,13 @@ from hftbacktest import (
 )
 from hftbacktest.data.validation import correct_event_order, validate_event_order
 
-from archive_sync import verify_local_partition
+from archive_sync import (
+    ArchiveBackend,
+    ArchiveLedger,
+    RcloneBackend,
+    restore_pruned_partition,
+    verify_local_partition,
+)
 
 # Trade special flag bitmask stored in HBT event_dtype `ival`
 TRADE_FLAG_IS_INTERNAL = 1 << 0  # Gate futures.trades is_internal
@@ -667,18 +674,56 @@ def evaluate_50_level_coverage(
     }
 
 
-def _resolve_manifest_inputs(manifest_arg: Path, allow_unverified_local: bool) -> tuple[list[tuple[Path, Path]], Path | None, list[str]]:
-    """Resolve input manifest/ledger/directory into [(data_path, manifest_path), ...]."""
+def _resolve_manifest_inputs(
+    manifest_arg: Path,
+    allow_unverified_local: bool,
+) -> tuple[list[tuple[Path, Path, dict[str, Any] | None]], Path | None, list[str]]:
+    """Resolve input manifest/SQLite ledger/JSONL ledger/directory into [(data_path, manifest_path, ledger_entry), ...]."""
     errors: list[str] = []
-    pairs: list[tuple[Path, Path]] = []
+    items: list[tuple[Path, Path, dict[str, Any] | None]] = []
     inferred_meta_dir: Path | None = None
 
     if manifest_arg.is_dir():
         raw_root = manifest_arg / "raw" if (manifest_arg / "raw").exists() else manifest_arg
         inferred_meta_dir = manifest_arg / "meta" if (manifest_arg / "meta").exists() else None
         for mpath in sorted(raw_root.rglob("*.manifest.json")):
-            dpath = mpath.with_name(mpath.name.replace(".manifest.json", ".tsv.zst"))
-            pairs.append((dpath, mpath))
+            try:
+                mf = json.loads(mpath.read_text(encoding="utf-8"))
+                fn = mf.get("file_name")
+                if isinstance(fn, str) and fn and Path(fn).name == fn and fn.endswith(".tsv.zst"):
+                    dpath = mpath.with_name(fn)
+                else:
+                    dpath = mpath.with_name(mpath.name.replace(".manifest.json", ".tsv.zst"))
+            except Exception:
+                dpath = mpath.with_name(mpath.name.replace(".manifest.json", ".tsv.zst"))
+            items.append((dpath, mpath, None))
+    elif manifest_arg.suffix.lower() in (".sqlite", ".db"):
+        base_dir = manifest_arg.parent
+        inferred_meta_dir = base_dir / "meta" if (base_dir / "meta").exists() else None
+        with ArchiveLedger(manifest_arg) as ledger:
+            states = ("SEALED", "VERIFIED", "PRUNED") if allow_unverified_local else ("VERIFIED", "PRUNED")
+            rows = ledger.list_partitions(states=states)
+            for row in rows:
+                is_verified = bool(row["remote_data_verified"] and row["remote_manifest_verified"])
+                if not is_verified and not allow_unverified_local:
+                    errors.append(
+                        f"{manifest_arg.name}: partition not dual remote-verified ({row['rel_data_path']})"
+                    )
+                    continue
+                entry = {
+                    "remote_path": row["rel_data_path"],
+                    "remote_manifest_path": row["rel_manifest_path"],
+                    "bytes": int(row["local_bytes"]),
+                    "sha256": row["local_sha256"],
+                    "md5": row["local_md5"],
+                    "manifest_bytes": int(row["manifest_bytes"]),
+                    "manifest_sha256": row["manifest_sha256"],
+                    "verified": is_verified,
+                    "state": row["state"],
+                    "boot_id": row["boot_id"],
+                    "partition_id": row["partition_id"],
+                }
+                items.append((base_dir / row["rel_data_path"], base_dir / row["rel_manifest_path"], entry))
     elif manifest_arg.name.endswith(".jsonl"):
         # Verified archive ledger from `archive --verify-remote`
         base_dir = manifest_arg.parent
@@ -699,14 +744,22 @@ def _resolve_manifest_inputs(manifest_arg: Path, allow_unverified_local: bool) -
             seen_paths.add(rel_data)
             dpath = base_dir / rel_data
             mpath = base_dir / rel_manifest
-            pairs.append((dpath, mpath))
+            items.append((dpath, mpath, entry))
     elif manifest_arg.name.endswith(".manifest.json"):
-        dpath = manifest_arg.with_name(manifest_arg.name.replace(".manifest.json", ".tsv.zst"))
-        pairs.append((dpath, manifest_arg))
+        try:
+            mf = json.loads(manifest_arg.read_text(encoding="utf-8"))
+            fn = mf.get("file_name")
+            if isinstance(fn, str) and fn and Path(fn).name == fn and fn.endswith(".tsv.zst"):
+                dpath = manifest_arg.with_name(fn)
+            else:
+                dpath = manifest_arg.with_name(manifest_arg.name.replace(".manifest.json", ".tsv.zst"))
+        except Exception:
+            dpath = manifest_arg.with_name(manifest_arg.name.replace(".manifest.json", ".tsv.zst"))
+        items.append((dpath, manifest_arg, None))
     else:
         errors.append(f"Unsupported --manifest path: {manifest_arg}")
 
-    return pairs, inferred_meta_dir, errors
+    return items, inferred_meta_dir, errors
 
 
 def _sha256_file(path: Path) -> str:
@@ -726,17 +779,21 @@ def run_qa_convert(
     meta_dir: Path | None = None,
     allow_unverified_local: bool = False,
     strict_zero_loss: bool = False,
+    remote_backend: ArchiveBackend | None = None,
+    restore_cache_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Run full QA gatekeeper + strict-separation HBT 2.4.4 conversion."""
-    pairs, inferred_meta, resolve_errors = _resolve_manifest_inputs(manifest_arg, allow_unverified_local)
+    """Run full QA gatekeeper + strict-separation HBT 2.4.4 conversion (with PRUNED restore support)."""
+    items_resolved, inferred_meta, resolve_errors = _resolve_manifest_inputs(manifest_arg, allow_unverified_local)
     if resolve_errors:
         return {
             "status": "blocked",
             "phase": "qa_convert",
             "failed_items": resolve_errors,
-            "minimal_fixes": ["Supply a verified_archive_ledger.jsonl produced by `archive --verify-remote`"],
+            "minimal_fixes": [
+                "Supply archive_ledger.sqlite or verified_archive_ledger.jsonl produced by `archive --verify-remote`"
+            ],
         }
-    if not pairs:
+    if not items_resolved:
         return {
             "status": "blocked",
             "phase": "qa_convert",
@@ -749,105 +806,150 @@ def run_qa_convert(
     spec_isolations = load_spec_change_isolations(effective_meta)
 
     failed_items: list[str] = []
-    # Group verified partitions by exchange and sort chronologically by date/hour
+    restored_pruned_partitions: list[str] = []
+    temp_restore_ctx: tempfile.TemporaryDirectory[str] | None = None
+    active_cache_dir = restore_cache_dir
+
+    # Group verified partitions by exchange and sort chronologically by date/hour/start_wall_ns/boot_id
     by_exchange: dict[str, list[tuple[dict[str, Any], Path, Path]]] = defaultdict(list)
-    for dpath, mpath in pairs:
-        try:
-            checked = verify_local_partition(dpath, mpath)
-            mf = checked["manifest"]
-            by_exchange[mf["exchange"]].append((mf, dpath, mpath))
-        except Exception as exc:
-            failed_items.append(f"integrity_failed:{dpath.name}:{type(exc).__name__}:{exc}")
+    try:
+        for dpath, mpath, ledger_entry in items_resolved:
+            try:
+                effective_dpath = dpath
+                effective_mpath = mpath
 
-    if failed_items:
-        return {
-            "status": "blocked",
-            "phase": "qa_convert",
-            "failed_items": failed_items,
-            "minimal_fixes": ["Re-download or re-seal corrupted partitions before conversion"],
-        }
-
-    buffers: dict[tuple[str, str, str], AssetDayBuffers] = {}
-    # Per-(exchange, date_utc) structural QA tracking
-    day_gaps: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    day_local_loss: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    day_switches: dict[tuple[str, str], int] = defaultdict(int)
-    day_active_gap_start: dict[tuple[str, str], int | None] = defaultdict(lambda: None)
-    exchange_stats: dict[str, dict[str, Any]] = {}
-
-    for exchange, items in sorted(by_exchange.items()):
-        items.sort(key=lambda x: (x[0]["date_utc"], x[0]["hour_utc"], x[0].get("first_rx_seq") or 0))
-        prev_boot: str | None = None
-        prev_rx_seq: int | None = None
-        prev_mono_ns: int | None = None
-        total_records = 0
-
-        for mf, dpath, _ in items:
-            boot_id = str(mf.get("boot_id", ""))
-            records = parse_tsv_zst_records(dpath)
-            if boot_id != prev_boot:
-                prev_boot = boot_id
-                prev_rx_seq = None
-                prev_mono_ns = None
-
-            for rec in records:
-                total_records += 1
-                rx_seq = rec["rx_seq"]
-                mono_ns = rec["recv_mono_ns"]
-                wall_ns = rec["recv_wall_ns"]
-                date_utc = date_utc_from_wall_ns(wall_ns)
-
-                if prev_rx_seq is not None and rx_seq <= prev_rx_seq:
-                    failed_items.append(
-                        f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={prev_rx_seq},curr={rx_seq}"
-                    )
-                if prev_mono_ns is not None and mono_ns < prev_mono_ns:
-                    failed_items.append(
-                        f"recv_mono_ns_regressed:{exchange}:{dpath.name}:prev={prev_mono_ns},curr={mono_ns}"
-                    )
-                prev_rx_seq = rx_seq
-                prev_mono_ns = mono_ns
-
-                if rec["kind"] == "META":
-                    meta_obj = json.loads(rec["payload"])
-                    ev = meta_obj.get("event", "")
-                    if ev == "GAP_START":
-                        day_active_gap_start[(exchange, date_utc)] = wall_ns
-                        day_gaps[(exchange, date_utc)].append(
-                            {"start_wall_ns": wall_ns, "end_wall_ns": None, "reason": meta_obj.get("reason", "")}
-                        )
-                    elif ev == "GAP_END":
-                        if day_gaps[(exchange, date_utc)] and day_gaps[(exchange, date_utc)][-1]["end_wall_ns"] is None:
-                            day_gaps[(exchange, date_utc)][-1]["end_wall_ns"] = wall_ns
-                        else:
-                            day_gaps[(exchange, date_utc)].append(
-                                {"start_wall_ns": None, "end_wall_ns": wall_ns, "reason": "gap_end_cross_day"}
+                if not effective_dpath.is_file():
+                    if ledger_entry is not None and (
+                        ledger_entry.get("verified") or ledger_entry.get("state") in ("VERIFIED", "PRUNED")
+                    ):
+                        if remote_backend is None:
+                            raise FileNotFoundError(
+                                f"Partition {ledger_entry['remote_path']} is not on local disk "
+                                f"(state={ledger_entry.get('state', 'UNKNOWN')}); supply --remote to restore from archive"
                             )
-                        day_active_gap_start[(exchange, date_utc)] = None
-                    elif ev == "LOCAL_LOSS":
-                        day_local_loss[(exchange, date_utc)].append(
-                            {
-                                "wall_ns": wall_ns,
-                                "dropped": int(meta_obj.get("dropped", 1)),
-                                "reason": meta_obj.get("reason", ""),
-                            }
+                        if active_cache_dir is None:
+                            temp_restore_ctx = tempfile.TemporaryDirectory(prefix="tokyo_l2_qa_restore_")
+                            active_cache_dir = Path(temp_restore_ctx.name)
+                        if not effective_mpath.is_file() and ledger_entry.get("remote_manifest_path"):
+                            restored_m = active_cache_dir / ledger_entry["remote_manifest_path"]
+                            remote_backend.download_file(ledger_entry["remote_manifest_path"], restored_m)
+                            effective_mpath = restored_m
+                        effective_dpath = restore_pruned_partition(
+                            rel_data_path=str(ledger_entry["remote_path"]),
+                            expected_bytes=int(ledger_entry["bytes"]),
+                            expected_sha256=str(ledger_entry["sha256"]),
+                            backend=remote_backend,
+                            cache_dir=active_cache_dir,
                         )
-                    elif ev == "SWITCH":
-                        day_switches[(exchange, date_utc)] += 1
+                        restored_pruned_partitions.append(str(ledger_entry["remote_path"]))
 
-                if exchange == "binance_futures":
-                    _ingest_binance_record(rec, date_utc, buffers)
-                elif exchange == "gate_futures":
-                    _ingest_gate_record(rec, date_utc, buffers)
-                elif exchange == "bybit_linear":
-                    _ingest_bybit_record(rec, date_utc, buffers)
-                elif exchange == "bitget_v3":
-                    _ingest_bitget_record(rec, date_utc, buffers)
+                checked = verify_local_partition(effective_dpath, effective_mpath)
+                mf = checked["manifest"]
+                by_exchange[mf["exchange"]].append((mf, effective_dpath, effective_mpath))
+            except Exception as exc:
+                failed_items.append(f"integrity_failed:{dpath.name}:{type(exc).__name__}:{exc}")
 
-        exchange_stats[exchange] = {
-            "partitions_verified": len(items),
-            "records_parsed": total_records,
-        }
+        if failed_items:
+            return {
+                "status": "blocked",
+                "phase": "qa_convert",
+                "failed_items": failed_items,
+                "minimal_fixes": ["Re-download or re-seal corrupted partitions before conversion"],
+            }
+
+        buffers: dict[tuple[str, str, str], AssetDayBuffers] = {}
+        # Per-(exchange, date_utc) structural QA tracking
+        day_gaps: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        day_local_loss: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        day_switches: dict[tuple[str, str], int] = defaultdict(int)
+        day_active_gap_start: dict[tuple[str, str], int | None] = defaultdict(lambda: None)
+        exchange_stats: dict[str, dict[str, Any]] = {}
+
+        for exchange, items in sorted(by_exchange.items()):
+            items.sort(
+                key=lambda x: (
+                    x[0]["date_utc"],
+                    x[0]["hour_utc"],
+                    x[0].get("start_wall_ns") or 0,
+                    str(x[0].get("boot_id") or ""),
+                    x[0].get("first_rx_seq") or 0,
+                    x[1].name,
+                )
+            )
+            prev_boot: str | None = None
+            prev_rx_seq: int | None = None
+            prev_mono_ns: int | None = None
+            total_records = 0
+
+            for mf, dpath, _ in items:
+                boot_id = str(mf.get("boot_id", ""))
+                records = parse_tsv_zst_records(dpath)
+                if boot_id != prev_boot:
+                    prev_boot = boot_id
+                    prev_rx_seq = None
+                    prev_mono_ns = None
+
+                for rec in records:
+                    total_records += 1
+                    rx_seq = rec["rx_seq"]
+                    mono_ns = rec["recv_mono_ns"]
+                    wall_ns = rec["recv_wall_ns"]
+                    date_utc = date_utc_from_wall_ns(wall_ns)
+
+                    if prev_rx_seq is not None and rx_seq <= prev_rx_seq:
+                        failed_items.append(
+                            f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={prev_rx_seq},curr={rx_seq}"
+                        )
+                    if prev_mono_ns is not None and mono_ns < prev_mono_ns:
+                        failed_items.append(
+                            f"recv_mono_ns_regressed:{exchange}:{dpath.name}:prev={prev_mono_ns},curr={mono_ns}"
+                        )
+                    prev_rx_seq = rx_seq
+                    prev_mono_ns = mono_ns
+
+                    if rec["kind"] == "META":
+                        meta_obj = json.loads(rec["payload"])
+                        ev = meta_obj.get("event", "")
+                        if ev == "GAP_START":
+                            day_active_gap_start[(exchange, date_utc)] = wall_ns
+                            day_gaps[(exchange, date_utc)].append(
+                                {"start_wall_ns": wall_ns, "end_wall_ns": None, "reason": meta_obj.get("reason", "")}
+                            )
+                        elif ev == "GAP_END":
+                            if day_gaps[(exchange, date_utc)] and day_gaps[(exchange, date_utc)][-1]["end_wall_ns"] is None:
+                                day_gaps[(exchange, date_utc)][-1]["end_wall_ns"] = wall_ns
+                            else:
+                                day_gaps[(exchange, date_utc)].append(
+                                    {"start_wall_ns": None, "end_wall_ns": wall_ns, "reason": "gap_end_cross_day"}
+                                )
+                            day_active_gap_start[(exchange, date_utc)] = None
+                        elif ev == "LOCAL_LOSS":
+                            day_local_loss[(exchange, date_utc)].append(
+                                {
+                                    "wall_ns": wall_ns,
+                                    "dropped": int(meta_obj.get("dropped", 1)),
+                                    "reason": meta_obj.get("reason", ""),
+                                }
+                            )
+                        elif ev == "SWITCH":
+                            day_switches[(exchange, date_utc)] += 1
+
+                    if exchange == "binance_futures":
+                        _ingest_binance_record(rec, date_utc, buffers)
+                    elif exchange == "gate_futures":
+                        _ingest_gate_record(rec, date_utc, buffers)
+                    elif exchange == "bybit_linear":
+                        _ingest_bybit_record(rec, date_utc, buffers)
+                    elif exchange == "bitget_v3":
+                        _ingest_bitget_record(rec, date_utc, buffers)
+
+            exchange_stats[exchange] = {
+                "partitions_verified": len(items),
+                "records_parsed": total_records,
+            }
+    finally:
+        if temp_restore_ctx is not None:
+            temp_restore_ctx.cleanup()
 
     if strict_zero_loss and any(day_local_loss.values()):
         failed_items.append("local_loss_detected_under_strict_zero_loss_gate")
@@ -1067,6 +1169,7 @@ def run_qa_convert(
         "execution_unverified_asset_days": sum(
             1 for r in calendar_rows if r["eligibility_status"] == "execution_unverified"
         ),
+        "restored_pruned_partitions": restored_pruned_partitions,
         "artifacts": artifacts,
     }
     (out_dir / "qa_report.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1253,19 +1356,24 @@ def run_offline_e2e_hbt_replay(
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Offline QA Gatekeeper and HBT 2.4.4 Converter")
-    p.add_argument("--manifest", type=Path, required=True, help="Verified archive ledger (.jsonl), .manifest.json, or sealed root dir")
+    p.add_argument("--manifest", type=Path, required=True, help="Archive ledger (.sqlite/.jsonl), .manifest.json, or sealed root dir")
     p.add_argument("--out", type=Path, required=True, help="Output directory for HBT .npz files and eligibility calendar")
     p.add_argument("--meta-dir", type=Path, default=None, help="Optional meta/ directory with chrony/ and specs/")
     p.add_argument("--allow-unverified-local", action="store_true", help="Allow reading unverified local sealed partitions (offline tests only)")
     p.add_argument("--strict-zero-loss", action="store_true", help="Fail closed with status=blocked if any LOCAL_LOSS occurred")
+    p.add_argument("--remote", default=None, help="Optional rclone remote root to restore PRUNED partitions (e.g. gdrive_main:tokyo_l2_data)")
+    p.add_argument("--restore-cache-dir", type=Path, default=None, help="Optional local cache directory for restored PRUNED partitions")
     args = p.parse_args()
 
+    remote_backend = RcloneBackend(args.remote) if args.remote else None
     result = run_qa_convert(
         args.manifest,
         args.out,
         meta_dir=args.meta_dir,
         allow_unverified_local=args.allow_unverified_local,
         strict_zero_loss=args.strict_zero_loss,
+        remote_backend=remote_backend,
+        restore_cache_dir=args.restore_cache_dir,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2

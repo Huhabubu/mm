@@ -83,6 +83,10 @@ class _LocalMemoryRemoteBackend:
     def copy_file(self, local_path: Path, remote_rel_path: str, *, immutable: bool = True) -> None:
         self.store[remote_rel_path] = local_path.read_bytes()
 
+    def download_file(self, remote_rel_path: str, local_dest: Path) -> None:
+        local_dest.parent.mkdir(parents=True, exist_ok=True)
+        local_dest.write_bytes(self.store[remote_rel_path])
+
     def readback_sha256(self, remote_rel_path: str) -> str:
         return hashlib.sha256(self.store[remote_rel_path]).hexdigest()
 
@@ -572,18 +576,22 @@ def cmd_archive(args: argparse.Namespace) -> int:
         backend=backend,
         verify_remote=args.verify_remote,
         prune_older_than_hours=args.prune_hours,
+        upload_ledger_snapshot=not args.no_snapshot,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2
 
 
 def cmd_qa_convert(args: argparse.Namespace) -> int:
+    remote_backend = RcloneBackend(args.remote) if args.remote else None
     result = run_qa_convert(
         args.manifest,
         args.out,
         meta_dir=args.meta_dir,
         allow_unverified_local=args.allow_unverified_local,
         strict_zero_loss=args.strict_zero_loss,
+        remote_backend=remote_backend,
+        restore_cache_dir=args.restore_cache_dir,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2
@@ -613,6 +621,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_arc.add_argument("--verify-remote", action="store_true")
     p_arc.add_argument("--remote", default="gdrive_main:tokyo_l2_data")
     p_arc.add_argument("--prune-hours", type=float, default=None)
+    p_arc.add_argument("--no-snapshot", action="store_true", help="Skip uploading consistent SQLite ledger snapshot")
     p_arc.set_defaults(func=cmd_archive)
 
     p_qa = sub.add_parser("qa-convert", help="Run QA gatekeeper and HBT 2.4.4 converter")
@@ -621,6 +630,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_qa.add_argument("--meta-dir", type=Path, default=None)
     p_qa.add_argument("--allow-unverified-local", action="store_true")
     p_qa.add_argument("--strict-zero-loss", action="store_true")
+    p_qa.add_argument("--remote", default=None, help="Optional rclone remote root to restore PRUNED partitions")
+    p_qa.add_argument("--restore-cache-dir", type=Path, default=None, help="Optional cache dir for restored PRUNED files")
     p_qa.set_defaults(func=cmd_qa_convert)
 
     return parser
