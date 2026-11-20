@@ -1332,6 +1332,169 @@ def _verify_local_integrity_before_prune(row: dict[str, Any], dpath: Path) -> di
     return None
 
 
+def _verify_remote_single_before_prune(
+    *,
+    backend: ArchiveBackend,
+    target: str,
+    rel_path: str,
+    rel_data_path: str,
+    expected_remote_id: str | None,
+    expected_hashes: dict[str, Any],
+) -> tuple[dict[str, Any] | None, RemoteObjectInfo | None, str | None]:
+    """Re-verify one remote object (data or manifest) right before pruning.
+
+    Checks existence, remote object identity (`remote_id` when previously recorded), exact
+    byte size, and exact content hash (native sha256/md5, or readback SHA-256 fallback).
+    Network/API failures propagate as exceptions so callers treat them as transient errors
+    (preserving local files and retrying later) rather than permanent conflicts.
+    """
+    remote = backend.stat_remote(rel_path)
+    expected_bytes = int(expected_hashes["bytes"])
+    expected_sha256 = str(expected_hashes["sha256"]).lower()
+    expected_md5 = str(expected_hashes.get("md5") or "").lower()
+
+    if not remote.exists:
+        return (
+            {
+                "target": target,
+                "remote_path": rel_path,
+                "data_path": rel_data_path,
+                "expected_remote_id": expected_remote_id,
+                "expected_bytes": expected_bytes,
+                "expected_sha256": expected_sha256,
+                "action": "ISOLATED_REMOTE_MISSING_BEFORE_PRUNE",
+            },
+            None,
+            None,
+        )
+
+    if expected_remote_id and remote.remote_id != expected_remote_id:
+        return (
+            {
+                "target": target,
+                "remote_path": rel_path,
+                "data_path": rel_data_path,
+                "expected_remote_id": expected_remote_id,
+                "actual_remote_id": remote.remote_id,
+                "expected_bytes": expected_bytes,
+                "actual_bytes": remote.size,
+                "expected_sha256": expected_sha256,
+                "actual_sha256": remote.sha256,
+                "actual_md5": remote.md5,
+                "action": "ISOLATED_REMOTE_ID_MISMATCH_BEFORE_PRUNE",
+            },
+            None,
+            None,
+        )
+
+    if remote.size != expected_bytes:
+        return (
+            {
+                "target": target,
+                "remote_path": rel_path,
+                "data_path": rel_data_path,
+                "expected_remote_id": expected_remote_id,
+                "actual_remote_id": remote.remote_id,
+                "expected_bytes": expected_bytes,
+                "actual_bytes": remote.size,
+                "expected_sha256": expected_sha256,
+                "actual_sha256": remote.sha256,
+                "actual_md5": remote.md5,
+                "action": "ISOLATED_REMOTE_SIZE_MISMATCH_BEFORE_PRUNE",
+            },
+            None,
+            None,
+        )
+
+    hm = _hashes_match(expected_hashes, remote)
+    if hm is True:
+        return None, remote, "remote_native_hash"
+    if hm is False:
+        return (
+            {
+                "target": target,
+                "remote_path": rel_path,
+                "data_path": rel_data_path,
+                "expected_remote_id": expected_remote_id,
+                "actual_remote_id": remote.remote_id,
+                "expected_bytes": expected_bytes,
+                "actual_bytes": remote.size,
+                "expected_sha256": expected_sha256,
+                "expected_md5": expected_md5,
+                "actual_sha256": remote.sha256,
+                "actual_md5": remote.md5,
+                "action": "ISOLATED_REMOTE_HASH_MISMATCH_BEFORE_PRUNE",
+            },
+            None,
+            None,
+        )
+
+    rb = backend.readback_sha256(rel_path)
+    if rb.lower() != expected_sha256:
+        return (
+            {
+                "target": target,
+                "remote_path": rel_path,
+                "data_path": rel_data_path,
+                "expected_remote_id": expected_remote_id,
+                "actual_remote_id": remote.remote_id,
+                "expected_bytes": expected_bytes,
+                "actual_bytes": remote.size,
+                "expected_sha256": expected_sha256,
+                "actual_readback_sha256": rb,
+                "action": "ISOLATED_REMOTE_HASH_MISMATCH_BEFORE_PRUNE",
+            },
+            None,
+            None,
+        )
+    return None, remote, "remote_readback_sha256"
+
+
+def _verify_remote_integrity_before_prune(
+    row: dict[str, Any],
+    backend: ArchiveBackend,
+) -> tuple[dict[str, Any] | None, tuple[RemoteObjectInfo, str] | None, tuple[RemoteObjectInfo, str] | None]:
+    """Re-verify BOTH remote data and remote manifest (object ID, size, hash) right before pruning."""
+    rel_data = str(row["rel_data_path"])
+    rel_manifest = str(row["rel_manifest_path"])
+    expected_data = {
+        "bytes": int(row["local_bytes"]),
+        "sha256": str(row["local_sha256"]),
+        "md5": str(row["local_md5"]),
+    }
+    expected_mf = {
+        "bytes": int(row["manifest_bytes"]),
+        "sha256": str(row["manifest_sha256"]),
+        "md5": str(row["manifest_md5"]),
+    }
+
+    data_conflict, remote_data, data_method = _verify_remote_single_before_prune(
+        backend=backend,
+        target="data",
+        rel_path=rel_data,
+        rel_data_path=rel_data,
+        expected_remote_id=row.get("remote_data_id"),
+        expected_hashes=expected_data,
+    )
+    if data_conflict is not None:
+        return data_conflict, None, None
+
+    mf_conflict, remote_mf, mf_method = _verify_remote_single_before_prune(
+        backend=backend,
+        target="manifest",
+        rel_path=rel_manifest,
+        rel_data_path=rel_data,
+        expected_remote_id=row.get("remote_manifest_id"),
+        expected_hashes=expected_mf,
+    )
+    if mf_conflict is not None:
+        return mf_conflict, None, None
+
+    assert remote_data is not None and data_method is not None
+    assert remote_mf is not None and mf_method is not None
+    return None, (remote_data, data_method), (remote_mf, mf_method)
+
+
 def restore_pruned_partition(
     *,
     rel_data_path: str,
@@ -1500,30 +1663,40 @@ def sync_sealed_directory(
                 # --- Fast-path 2: Already VERIFIED (skip re-reading/re-uploading; handle prune or crash recovery) ---
                 if row is not None and row["state"] == STATE_VERIFIED:
                     if dpath.is_file():
+                        if row["has_conflict"]:
+                            # Unresolved conflict on a VERIFIED partition (e.g. pre-prune local/remote drift):
+                            # never prune and continue surfacing blocked status without redundant remote calls.
+                            try:
+                                saved_conflict = json.loads(row["conflict_detail_json"] or "{}")
+                                if not isinstance(saved_conflict, dict) or not saved_conflict.get("remote_path"):
+                                    saved_conflict = {
+                                        "remote_path": rel_data,
+                                        "action": row["last_error_message"] or "UNRESOLVED_CONFLICT",
+                                    }
+                            except Exception:
+                                saved_conflict = {
+                                    "remote_path": rel_data,
+                                    "action": row["last_error_message"] or "UNRESOLVED_CONFLICT",
+                                }
+                            conflicts.append(saved_conflict)
+                            continue
+
+                        remote_reverified_proof: tuple[RemoteObjectInfo, str, RemoteObjectInfo, str] | None = None
                         if row["last_error_code"] and not row["has_conflict"] and verify_remote:
                             try:
-                                expected_data = {
-                                    "bytes": int(row["local_bytes"]),
-                                    "sha256": row["local_sha256"],
-                                    "md5": row["local_md5"],
-                                }
-                                expected_mf = {
-                                    "bytes": int(row["manifest_bytes"]),
-                                    "sha256": row["manifest_sha256"],
-                                    "md5": row["manifest_md5"],
-                                }
-                                rd_recheck, d_m = _verify_remote_object_matches(
-                                    backend=backend,
-                                    rel_path=rel_data,
-                                    expected_hashes=expected_data,
-                                    verify_remote=True,
-                                )
-                                rm_recheck, m_m = _verify_remote_object_matches(
-                                    backend=backend,
-                                    rel_path=rel_manifest,
-                                    expected_hashes=expected_mf,
-                                    verify_remote=True,
-                                )
+                                remote_conflict, rd_pair, rm_pair = _verify_remote_integrity_before_prune(row, backend)
+                                if remote_conflict is not None:
+                                    ledger.mark_conflict(
+                                        rel_data_path=rel_data,
+                                        conflict_detail=remote_conflict,
+                                        now_iso=now_iso,
+                                        run_id=run_id,
+                                    )
+                                    conflicts.append(remote_conflict)
+                                    continue
+                                assert rd_pair is not None and rm_pair is not None
+                                rd_recheck, d_m = rd_pair
+                                rm_recheck, m_m = rm_pair
                                 row = ledger.mark_verified(
                                     rel_data_path=rel_data,
                                     remote_data=rd_recheck,
@@ -1533,6 +1706,7 @@ def sync_sealed_directory(
                                     now_iso=now_iso,
                                     run_id=run_id,
                                 )
+                                remote_reverified_proof = (rd_recheck, d_m, rm_recheck, m_m)
                             except Exception as exc:
                                 ledger.mark_error(
                                     rel_data_path=rel_data,
@@ -1554,7 +1728,7 @@ def sync_sealed_directory(
                             skipped_verified += 1
                             continue
                         try:
-                            # Re-verify exact local content SHA-256 right before deletion (never on normal
+                            # 1. Re-verify exact local content SHA-256 right before deletion (never on normal
                             # within-retention runs). Same-size tampering/corruption blocks pruning!
                             integrity_conflict = _verify_local_integrity_before_prune(row, dpath)
                             if integrity_conflict is not None:
@@ -1566,6 +1740,47 @@ def sync_sealed_directory(
                                 )
                                 conflicts.append(integrity_conflict)
                                 continue
+
+                            # 2. Re-verify BOTH remote data and remote manifest (object identity, byte size,
+                            # and hash/readback) right before deletion. Within retention, zero remote requests
+                            # are issued; on remote deletion, replacement, corruption, or API/network outage,
+                            # the local file is preserved.
+                            if remote_reverified_proof is None:
+                                try:
+                                    remote_conflict, rd_pair, rm_pair = _verify_remote_integrity_before_prune(
+                                        row, backend
+                                    )
+                                except Exception as exc:
+                                    ledger.mark_error(
+                                        rel_data_path=rel_data,
+                                        error_code="PRE_PRUNE_REMOTE_CHECK_FAILED",
+                                        error_message=f"{type(exc).__name__}: {exc}",
+                                        now_iso=now_iso,
+                                        run_id=run_id,
+                                    )
+                                    errors.append(f"{rel_data}: {type(exc).__name__}: {exc}")
+                                    continue
+                                if remote_conflict is not None:
+                                    ledger.mark_conflict(
+                                        rel_data_path=rel_data,
+                                        conflict_detail=remote_conflict,
+                                        now_iso=now_iso,
+                                        run_id=run_id,
+                                    )
+                                    conflicts.append(remote_conflict)
+                                    continue
+                                assert rd_pair is not None and rm_pair is not None
+                                remote_reverified_proof = (rd_pair[0], rd_pair[1], rm_pair[0], rm_pair[1])
+
+                            rd_ok, d_method_ok, rm_ok, m_method_ok = remote_reverified_proof
+                            prune_detail = {
+                                "prune_older_than_hours": prune_older_than_hours,
+                                "pre_prune_remote_verified": True,
+                                "remote_data_id": rd_ok.remote_id,
+                                "data_method": d_method_ok,
+                                "remote_manifest_id": rm_ok.remote_id,
+                                "manifest_method": m_method_ok,
+                            }
                             ledger.record_event(
                                 ts_utc=now_iso,
                                 run_id=run_id,
@@ -1578,7 +1793,7 @@ def sync_sealed_directory(
                                 event_type="PRUNE_INTENT",
                                 from_state=STATE_VERIFIED,
                                 to_state=STATE_PRUNED,
-                                detail={"prune_older_than_hours": prune_older_than_hours},
+                                detail=prune_detail,
                             )
                             dpath.unlink()
                             if "after_prune_unlink_before_commit" in hooks:
@@ -1588,7 +1803,7 @@ def sync_sealed_directory(
                                 now_iso=now_iso,
                                 run_id=run_id,
                                 event_type="PRUNED_OK",
-                                detail={"prune_older_than_hours": prune_older_than_hours},
+                                detail=prune_detail,
                             )
                             pruned.append(rel_data)
                         except Exception as exc:
@@ -1605,33 +1820,24 @@ def sync_sealed_directory(
                     # Local .tsv.zst is MISSING while row is VERIFIED!
                     # Distinguish interrupted prune (PRUNE_INTENT present) vs unexpected local data loss.
                     try:
-                        expected_data = {
-                            "bytes": int(row["local_bytes"]),
-                            "sha256": row["local_sha256"],
-                            "md5": row["local_md5"],
-                        }
-                        expected_mf = {
-                            "bytes": int(row["manifest_bytes"]),
-                            "sha256": row["manifest_sha256"],
-                            "md5": row["manifest_md5"],
-                        }
                         if ledger.has_pending_prune_intent(rel_data):
                             if not verify_remote:
                                 raise RuntimeError(
                                     f"Cannot recover interrupted prune for {rel_data} with verify_remote=False"
                                 )
-                            remote_d, d_method = _verify_remote_object_matches(
-                                backend=backend,
-                                rel_path=rel_data,
-                                expected_hashes=expected_data,
-                                verify_remote=True,
-                            )
-                            remote_m, m_method = _verify_remote_object_matches(
-                                backend=backend,
-                                rel_path=rel_manifest,
-                                expected_hashes=expected_mf,
-                                verify_remote=True,
-                            )
+                            remote_conflict, rd_pair, rm_pair = _verify_remote_integrity_before_prune(row, backend)
+                            if remote_conflict is not None:
+                                ledger.mark_conflict(
+                                    rel_data_path=rel_data,
+                                    conflict_detail=remote_conflict,
+                                    now_iso=now_iso,
+                                    run_id=run_id,
+                                )
+                                conflicts.append(remote_conflict)
+                                continue
+                            assert rd_pair is not None and rm_pair is not None
+                            remote_d, d_method = rd_pair
+                            remote_m, m_method = rm_pair
                             ledger.mark_pruned(
                                 rel_data_path=rel_data,
                                 now_iso=now_iso,
@@ -1650,19 +1856,10 @@ def sync_sealed_directory(
                             # Unexpected local disappearance without PRUNE_INTENT -> report critical error!
                             remote_intact = False
                             try:
-                                _verify_remote_object_matches(
-                                    backend=backend,
-                                    rel_path=rel_data,
-                                    expected_hashes=expected_data,
-                                    verify_remote=True,
+                                remote_conflict, _rd_pair, _rm_pair = _verify_remote_integrity_before_prune(
+                                    row, backend
                                 )
-                                _verify_remote_object_matches(
-                                    backend=backend,
-                                    rel_path=rel_manifest,
-                                    expected_hashes=expected_mf,
-                                    verify_remote=True,
-                                )
-                                remote_intact = True
+                                remote_intact = remote_conflict is None
                             except Exception:
                                 remote_intact = False
                             msg = (

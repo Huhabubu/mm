@@ -65,6 +65,7 @@ class InstrumentedMockBackend:
         expose_hashes: bool = True,
     ) -> None:
         self.store: dict[str, bytes] = {}
+        self.id_overrides: dict[str, str] = {}
         self.fail_on_copy = fail_on_copy
         self.fail_on_stat = fail_on_stat
         self.expose_hashes = expose_hashes
@@ -86,9 +87,13 @@ class InstrumentedMockBackend:
         blob = self.store.get(remote_rel_path)
         if blob is None:
             return RemoteObjectInfo(exists=False)
+        remote_id = self.id_overrides.get(
+            remote_rel_path,
+            f"gd:{hashlib.md5(remote_rel_path.encode()).hexdigest()[:12]}",
+        )
         return RemoteObjectInfo(
             exists=True,
-            remote_id=f"gd:{hashlib.md5(remote_rel_path.encode()).hexdigest()[:12]}",
+            remote_id=remote_id,
             size=len(blob),
             md5=hashlib.md5(blob).hexdigest() if self.expose_hashes else None,
             sha256=hashlib.sha256(blob).hexdigest() if self.expose_hashes else None,
@@ -1059,3 +1064,279 @@ def test_p1_partial_failure_still_uploads_consistent_sqlite_snapshot(tmp_path: P
         conn.close()
 
 
+def test_p1_prune_rechecks_remote_deleted_or_replaced_and_zero_calls_within_retention(
+    tmp_path: Path,
+) -> None:
+    """Pre-prune remote check: zero remote calls within retention; remote deletion/replacement blocks pruning."""
+    base_mtime = 1_700_000_000.0
+
+    def _setup_verified(name: str) -> tuple[Path, Path, Path, str, str, InstrumentedMockBackend]:
+        sealed = tmp_path / name
+        dpath, mpath, _ = _create_sealed_partition(sealed, mtime_epoch_s=base_mtime)
+        rel_data = dpath.relative_to(sealed).as_posix()
+        rel_mf = mpath.relative_to(sealed).as_posix()
+        backend = InstrumentedMockBackend()
+        r_init = sync_sealed_directory(
+            sealed,
+            backend=backend,
+            verify_remote=True,
+            prune_older_than_hours=24.0,
+            now_epoch_s=base_mtime + 3600.0,
+        )
+        assert r_init["status"] == "ok"
+        assert dpath.is_file()
+        backend.reset_counts()
+        return sealed, dpath, mpath, rel_data, rel_mf, backend
+
+    # Case A: Remote data deleted after VERIFIED -> within 24h makes ZERO remote calls; at 25h blocks & preserves!
+    sealed_a, dpath_a, _, rel_data_a, _, backend_a = _setup_verified("remote_data_deleted")
+    del backend_a.store[rel_data_a]
+
+    r_within = sync_sealed_directory(
+        sealed_a,
+        backend=backend_a,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 12 * 3600.0,
+    )
+    assert r_within["status"] == "ok"
+    assert backend_a.stat_calls == [], "Within-retention verified partitions must make ZERO remote requests"
+    assert backend_a.copy_calls == []
+    assert dpath_a.is_file()
+
+    r_aged_del = sync_sealed_directory(
+        sealed_a,
+        backend=backend_a,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_aged_del["status"] == "blocked"
+    assert dpath_a.is_file(), "Local data file MUST be preserved when remote data was deleted!"
+    assert r_aged_del["pruned_local_files"] == []
+    assert backend_a.stat_calls == [rel_data_a]
+    assert len(r_aged_del["conflicts"]) == 1
+    assert r_aged_del["conflicts"][0]["action"] == "ISOLATED_REMOTE_MISSING_BEFORE_PRUNE"
+    assert r_aged_del["conflicts"][0]["target"] == "data"
+    with ArchiveLedger(sealed_a / LEDGER_DB_FILENAME) as ledger:
+        row_a = ledger.get_partition_by_rel_data(rel_data_a)
+        assert row_a is not None
+        assert row_a["state"] == STATE_VERIFIED
+        assert row_a["has_conflict"] == 1
+
+    # Subsequent run must continue surfacing blocked conflict without pruning or hammering remote
+    backend_a.reset_counts()
+    r_repeat_conflict = sync_sealed_directory(
+        sealed_a,
+        backend=backend_a,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 26 * 3600.0,
+    )
+    assert r_repeat_conflict["status"] == "blocked"
+    assert dpath_a.is_file()
+    assert backend_a.stat_calls == []
+
+    # Case B: Remote data replaced in-place with same-size corrupted bytes (hash mismatch)
+    sealed_b, dpath_b, _, rel_data_b, _, backend_b = _setup_verified("remote_data_hash_drift")
+    tampered_data = bytearray(backend_b.store[rel_data_b])
+    tampered_data[-1] ^= 0xFF
+    backend_b.store[rel_data_b] = bytes(tampered_data)
+
+    r_aged_hash = sync_sealed_directory(
+        sealed_b,
+        backend=backend_b,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_aged_hash["status"] == "blocked"
+    assert dpath_b.is_file(), "Local data file MUST be preserved on remote hash drift!"
+    assert r_aged_hash["conflicts"][0]["action"] == "ISOLATED_REMOTE_HASH_MISMATCH_BEFORE_PRUNE"
+    assert r_aged_hash["conflicts"][0]["target"] == "data"
+
+    # Case C: Remote data replaced with different size
+    sealed_c, dpath_c, _, rel_data_c, _, backend_c = _setup_verified("remote_data_size_drift")
+    backend_c.store[rel_data_c] = b"TRUNCATED"
+
+    r_aged_size = sync_sealed_directory(
+        sealed_c,
+        backend=backend_c,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_aged_size["status"] == "blocked"
+    assert dpath_c.is_file(), "Local data file MUST be preserved on remote size drift!"
+    assert r_aged_size["conflicts"][0]["action"] == "ISOLATED_REMOTE_SIZE_MISMATCH_BEFORE_PRUNE"
+    assert r_aged_size["conflicts"][0]["target"] == "data"
+
+    # Case D: Remote data replaced with IDENTICAL bytes but DIFFERENT object ID (remote_id mismatch!)
+    sealed_d, dpath_d, _, rel_data_d, _, backend_d = _setup_verified("remote_data_id_replaced")
+    backend_d.id_overrides[rel_data_d] = "gd:replaced_object_identity"
+
+    r_aged_id = sync_sealed_directory(
+        sealed_d,
+        backend=backend_d,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_aged_id["status"] == "blocked"
+    assert dpath_d.is_file(), "Local data file MUST be preserved when remote object ID changed!"
+    assert r_aged_id["conflicts"][0]["action"] == "ISOLATED_REMOTE_ID_MISMATCH_BEFORE_PRUNE"
+    assert r_aged_id["conflicts"][0]["target"] == "data"
+    assert r_aged_id["conflicts"][0]["actual_remote_id"] == "gd:replaced_object_identity"
+
+    # Case E: Remote manifest deleted while remote data stays intact
+    sealed_e, dpath_e, _, rel_data_e, rel_mf_e, backend_e = _setup_verified("remote_manifest_deleted")
+    del backend_e.store[rel_mf_e]
+
+    r_mf_del = sync_sealed_directory(
+        sealed_e,
+        backend=backend_e,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_mf_del["status"] == "blocked"
+    assert dpath_e.is_file(), "Local data file MUST be preserved when remote manifest is missing!"
+    assert r_mf_del["conflicts"][0]["action"] == "ISOLATED_REMOTE_MISSING_BEFORE_PRUNE"
+    assert r_mf_del["conflicts"][0]["target"] == "manifest"
+    assert r_mf_del["conflicts"][0]["remote_path"] == rel_mf_e
+
+    # Case F: Remote manifest replaced with different content/ID while remote data stays intact
+    sealed_f, dpath_f, _, _, rel_mf_f, backend_f = _setup_verified("remote_manifest_replaced")
+    backend_f.store[rel_mf_f] = b'{"replaced":true}\n'
+
+    r_mf_rep = sync_sealed_directory(
+        sealed_f,
+        backend=backend_f,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_mf_rep["status"] == "blocked"
+    assert dpath_f.is_file(), "Local data file MUST be preserved when remote manifest was replaced!"
+    assert r_mf_rep["conflicts"][0]["target"] == "manifest"
+    assert r_mf_rep["conflicts"][0]["action"] in (
+        "ISOLATED_REMOTE_SIZE_MISMATCH_BEFORE_PRUNE",
+        "ISOLATED_REMOTE_HASH_MISMATCH_BEFORE_PRUNE",
+    )
+
+
+def test_p1_prune_preserves_local_on_remote_api_outage_and_recovers_safely(tmp_path: Path) -> None:
+    """Network/API outage at prune time preserves local file; recovery prunes if intact or blocks if ID changed."""
+    base_mtime = 1_700_000_000.0
+
+    # Sub-case 1: Outage at 25h -> preserves local file -> recovers & prunes cleanly at 26h when remote intact
+    sealed1 = tmp_path / "outage_recover_ok"
+    dpath1, mpath1, _ = _create_sealed_partition(sealed1, mtime_epoch_s=base_mtime)
+    rel_data1 = dpath1.relative_to(sealed1).as_posix()
+    rel_mf1 = mpath1.relative_to(sealed1).as_posix()
+
+    backend1 = InstrumentedMockBackend()
+    assert (
+        sync_sealed_directory(
+            sealed1,
+            backend=backend1,
+            verify_remote=True,
+            prune_older_than_hours=24.0,
+            now_epoch_s=base_mtime + 3600.0,
+        )["status"]
+        == "ok"
+    )
+
+    backend1.reset_counts()
+    backend1.fail_on_stat = True
+    r_outage = sync_sealed_directory(
+        sealed1,
+        backend=backend1,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_outage["status"] == "blocked"
+    assert dpath1.is_file(), "Local data file MUST be preserved when remote API is unavailable!"
+    assert r_outage["pruned_local_files"] == []
+    with ArchiveLedger(sealed1 / LEDGER_DB_FILENAME) as ledger:
+        row1 = ledger.get_partition_by_rel_data(rel_data1)
+        assert row1 is not None
+        assert row1["state"] == STATE_VERIFIED
+        assert row1["has_conflict"] == 0
+        assert row1["last_error_code"] == "PRE_PRUNE_REMOTE_CHECK_FAILED"
+
+    # Network recovers -> re-verifies remote data + manifest once (no double stat) and prunes cleanly
+    backend1.reset_counts()
+    backend1.fail_on_stat = False
+    r_recover = sync_sealed_directory(
+        sealed1,
+        backend=backend1,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 26 * 3600.0,
+    )
+    assert r_recover["status"] == "ok"
+    assert r_recover["pruned_local_files"] == [rel_data1]
+    assert not dpath1.exists()
+    assert mpath1.is_file()
+    assert backend1.stat_calls == [rel_data1, rel_mf1]
+    with ArchiveLedger(sealed1 / LEDGER_DB_FILENAME) as ledger:
+        row1_after = ledger.get_partition_by_rel_data(rel_data1)
+        assert row1_after is not None
+        assert row1_after["state"] == STATE_PRUNED
+        pruned_events = [e for e in ledger.list_events(rel_data1) if e["event_type"] == "PRUNED_OK"]
+        assert len(pruned_events) == 1
+        detail = json.loads(pruned_events[0]["detail_json"])
+        assert detail["pre_prune_remote_verified"] is True
+        assert detail["remote_data_id"] == row1_after["remote_data_id"]
+        assert detail["remote_manifest_id"] == row1_after["remote_manifest_id"]
+
+    # Sub-case 2: Outage at 25h, AND remote object ID changed before network recovery -> MUST block, NOT overwrite ID!
+    sealed2 = tmp_path / "outage_then_id_swapped"
+    dpath2, _, _ = _create_sealed_partition(sealed2, mtime_epoch_s=base_mtime)
+    rel_data2 = dpath2.relative_to(sealed2).as_posix()
+
+    backend2 = InstrumentedMockBackend()
+    assert (
+        sync_sealed_directory(
+            sealed2,
+            backend=backend2,
+            verify_remote=True,
+            prune_older_than_hours=24.0,
+            now_epoch_s=base_mtime + 3600.0,
+        )["status"]
+        == "ok"
+    )
+    with ArchiveLedger(sealed2 / LEDGER_DB_FILENAME) as ledger:
+        orig_remote_id = ledger.get_partition_by_rel_data(rel_data2)["remote_data_id"]
+
+    backend2.fail_on_stat = True
+    r_outage2 = sync_sealed_directory(
+        sealed2,
+        backend=backend2,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert r_outage2["status"] == "blocked"
+    assert dpath2.is_file()
+
+    backend2.fail_on_stat = False
+    backend2.id_overrides[rel_data2] = "gd:swapped_during_outage"
+    r_after_swap = sync_sealed_directory(
+        sealed2,
+        backend=backend2,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 26 * 3600.0,
+    )
+    assert r_after_swap["status"] == "blocked"
+    assert dpath2.is_file(), "Local file MUST NOT be pruned when remote object ID was replaced during outage!"
+    assert r_after_swap["conflicts"][0]["action"] == "ISOLATED_REMOTE_ID_MISMATCH_BEFORE_PRUNE"
+    with ArchiveLedger(sealed2 / LEDGER_DB_FILENAME) as ledger:
+        row2 = ledger.get_partition_by_rel_data(rel_data2)
+        assert row2 is not None
+        assert row2["state"] == STATE_VERIFIED
+        assert row2["has_conflict"] == 1
+        assert row2["remote_data_id"] == orig_remote_id, "Original verified remote_data_id must NOT be overwritten!"
