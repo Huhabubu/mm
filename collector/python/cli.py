@@ -570,14 +570,31 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
 
 def cmd_archive(args: argparse.Namespace) -> int:
+    from meta_daemon import notify_archive_healthcheck
+
     backend = RcloneBackend(args.remote)
-    result = sync_sealed_directory(
-        args.dir,
-        backend=backend,
-        verify_remote=args.verify_remote,
-        prune_older_than_hours=args.prune_hours,
-        upload_ledger_snapshot=not args.no_snapshot,
-    )
+    result: dict[str, Any] | None = None
+    try:
+        result = sync_sealed_directory(
+            args.dir,
+            backend=backend,
+            verify_remote=args.verify_remote,
+            prune_older_than_hours=args.prune_hours,
+            upload_ledger_snapshot=not args.no_snapshot,
+        )
+    except Exception as exc:
+        if not getattr(args, "no_healthchecks", False):
+            notify_archive_healthcheck(None, error=exc)
+        err_rep = _blocked(
+            "archive",
+            [f"{type(exc).__name__}: {exc}"],
+            ["Inspect stderr / archive logs; local source files remain preserved."],
+        )
+        print(json.dumps(err_rep, indent=2, ensure_ascii=False))
+        return 2
+
+    if not getattr(args, "no_healthchecks", False):
+        notify_archive_healthcheck(result)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2
 
@@ -622,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_arc.add_argument("--remote", default="gdrive_main:tokyo_l2_data")
     p_arc.add_argument("--prune-hours", type=float, default=None)
     p_arc.add_argument("--no-snapshot", action="store_true", help="Skip uploading consistent SQLite ledger snapshot")
+    p_arc.add_argument("--no-healthchecks", action="store_true", help="Skip Healthchecks ping after archive run")
     p_arc.set_defaults(func=cmd_archive)
 
     p_qa = sub.add_parser("qa-convert", help="Run QA gatekeeper and HBT 2.4.4 converter")
