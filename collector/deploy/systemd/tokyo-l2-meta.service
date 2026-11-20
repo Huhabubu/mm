@@ -1,0 +1,19 @@
+[Unit]
+Description=AWS Tokyo L2 Metadata, Spec, RTT, Chrony, and Disk Monitor Daemon
+After=network-online.target chrony.service
+Wants=network-online.target chrony.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/mm
+EnvironmentFile=-/etc/tokyo-l2/live.env
+ExecStart=/opt/mm/.venv/bin/python /opt/mm/collector/python/meta_daemon.py --config /etc/tokyo-l2/config.json
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

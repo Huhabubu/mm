@@ -1,0 +1,75 @@
+name: Tokyo L2 Collector Offline CI
+
+on:
+  push:
+    branches:
+      - "feat/tokyo-l2-collector"
+      - "exp/**"
+    paths:
+      - "collector/**"
+      - ".github/workflows/tokyo-l2-collector-offline-ci.yml"
+  pull_request:
+    paths:
+      - "collector/**"
+      - ".github/workflows/tokyo-l2-collector-offline-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  offline-verification:
+    name: Rust + Python Offline Protocol, Causal, Archive & HBT 2.4.4 Gates
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Explicitly keep live WS execution disabled in CI
+      TOKYO_L2_LIVE_AUTHORIZED: "0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            collector/target
+          key: ${{ runner.os }}-cargo-collector-${{ hashFiles('collector/Cargo.toml', 'collector/Cargo.lock') }}
+
+      - name: Run Rust unit & protocol/causal/storage integration tests
+        run: cargo test --manifest-path collector/Cargo.toml
+
+      - name: Build Rust collector binary
+        run: cargo build --manifest-path collector/Cargo.toml
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned Python dependencies (hftbacktest==2.4.4)
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install hftbacktest==2.4.4 numpy numba zstandard pytest
+
+      - name: Run Python offline E2E, anti-lookahead, 4-exchange & fault-injection tests
+        run: .venv/bin/pytest -v collector/tests/test_pipeline_offline.py
+
+      - name: Run single-command offline preflight (Binance+Gate BTC MVP)
+        run: ./collector/bin/preflight --config collector/specs/config.btc_gate_binance_mvp.json --offline
+
+      - name: Run single-command offline preflight (Full 24-market panel)
+        run: ./collector/bin/preflight --config collector/specs/config.example.json --offline
+
+      - name: Verify live collect fails closed without explicit authorization
+        run: |
+          set +e
+          OUT=$(./collector/bin/collect --config collector/specs/config.example.json --run-id ci_guard_test)
+          RC=$?
+          set -e
+          echo "${OUT}"
+          test "${RC}" -eq 3
+          echo "${OUT}" | grep -q '"status": "blocked"'

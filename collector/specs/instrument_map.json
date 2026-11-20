@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "spec_version": "v1.4",
+  "panel_dimensions": {
+    "exchanges": 4,
+    "assets": 6,
+    "total_markets": 24,
+    "follower_pairs": 18,
+    "leader_exchange": "binance_futures",
+    "follower_exchanges": ["bybit_linear", "bitget_v3", "gate_futures"]
+  },
+  "excluded_venues": {
+    "deribit": "London matching engine violates Tokyo co-city physical boundary",
+    "coinbase": "US-East matching engine violates Tokyo co-city physical boundary",
+    "okx": "Public non-VIP depth granularity is 100ms (10ms requires VIP 4/5), slower than 20ms follower venues"
+  },
+  "assets": [
+    {
+      "base": "BTC",
+      "quote": "USDT",
+      "liquidity_tier": "mega_cap_leader",
+      "expected_relative_tick_profile": "ultra_fine",
+      "microstructure_role": "Highest-liquidity anchor measuring lower bound of cross-venue signal",
+      "symbols": {
+        "binance_futures": "BTCUSDT",
+        "bybit_linear": "BTCUSDT",
+        "bitget_v3": "BTCUSDT",
+        "gate_futures": "BTC_USDT"
+      },
+      "known_candidate_units": {
+        "binance_futures": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bybit_linear": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bitget_v3": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "candidate_tick": 0.1, "candidate_lot": 0.0001, "live_rest_verified": false},
+        "gate_futures": {"qty_unit": "contracts", "candidate_quanto_multiplier": 0.0001, "candidate_tick": 0.1, "candidate_order_size_min": 1.0, "live_rest_verified": false}
+      }
+    },
+    {
+      "base": "ETH",
+      "quote": "USDT",
+      "liquidity_tier": "mega_cap_secondary",
+      "expected_relative_tick_profile": "ultra_fine",
+      "microstructure_role": "Mega-cap dual benchmark",
+      "symbols": {
+        "binance_futures": "ETHUSDT",
+        "bybit_linear": "ETHUSDT",
+        "bitget_v3": "ETHUSDT",
+        "gate_futures": "ETH_USDT"
+      },
+      "known_candidate_units": {
+        "binance_futures": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bybit_linear": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bitget_v3": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "candidate_tick": 0.01, "candidate_lot": 0.01, "live_rest_verified": false},
+        "gate_futures": {"qty_unit": "contracts", "candidate_quanto_multiplier": 0.01, "candidate_tick": 0.01, "candidate_order_size_min": 0.1, "live_rest_verified": false}
+      }
+    },
+    {
+      "base": "XRP",
+      "quote": "USDT",
+      "liquidity_tier": "mega_cap_high_turnover",
+      "expected_relative_tick_profile": "coarse_tick",
+      "microstructure_role": "Core decoupling control: separates liquidity scale from tick discreteness",
+      "symbols": {
+        "binance_futures": "XRPUSDT",
+        "bybit_linear": "XRPUSDT",
+        "bitget_v3": "XRPUSDT",
+        "gate_futures": "XRP_USDT"
+      },
+      "known_candidate_units": {
+        "binance_futures": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bybit_linear": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bitget_v3": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "gate_futures": {"qty_unit": "contracts", "live_rest_verified": false}
+      }
+    },
+    {
+      "base": "SOL",
+      "quote": "USDT",
+      "liquidity_tier": "tier1_high_beta_l1",
+      "expected_relative_tick_profile": "medium_coarse_tick",
+      "microstructure_role": "High-volatility trending major L1 representative",
+      "symbols": {
+        "binance_futures": "SOLUSDT",
+        "bybit_linear": "SOLUSDT",
+        "bitget_v3": "SOLUSDT",
+        "gate_futures": "SOL_USDT"
+      },
+      "known_candidate_units": {
+        "binance_futures": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bybit_linear": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bitget_v3": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "candidate_tick": 0.001, "candidate_lot": 0.1, "live_rest_verified": false},
+        "gate_futures": {"qty_unit": "contracts", "candidate_quanto_multiplier": 1.0, "candidate_tick": 0.01, "candidate_order_size_min": 0.1, "live_rest_verified": false}
+      }
+    },
+    {
+      "base": "DOGE",
+      "quote": "USDT",
+      "liquidity_tier": "high_retail_meme",
+      "expected_relative_tick_profile": "coarse_tick",
+      "microstructure_role": "Noise-trader dense and jumpy order-book boundary",
+      "symbols": {
+        "binance_futures": "DOGEUSDT",
+        "bybit_linear": "DOGEUSDT",
+        "bitget_v3": "DOGEUSDT",
+        "gate_futures": "DOGE_USDT"
+      },
+      "known_candidate_units": {
+        "binance_futures": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bybit_linear": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bitget_v3": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "candidate_tick": 0.00001, "candidate_lot": 1.0, "live_rest_verified": false},
+        "gate_futures": {"qty_unit": "contracts", "candidate_quanto_multiplier": 10.0, "candidate_tick": 0.00001, "candidate_order_size_min": 1.0, "live_rest_verified": false}
+      }
+    },
+    {
+      "base": "SUI",
+      "quote": "USDT",
+      "liquidity_tier": "mid_cap_active_l1",
+      "expected_relative_tick_profile": "medium_coarse_tick",
+      "microstructure_role": "Mid-cap secondary liquidity sample testing cross-exchange latency gradient",
+      "symbols": {
+        "binance_futures": "SUIUSDT",
+        "bybit_linear": "SUIUSDT",
+        "bitget_v3": "SUIUSDT",
+        "gate_futures": "SUI_USDT"
+      },
+      "known_candidate_units": {
+        "binance_futures": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bybit_linear": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "bitget_v3": {"qty_unit": "base_coin", "contract_multiplier": 1.0, "live_rest_verified": false},
+        "gate_futures": {"qty_unit": "contracts", "live_rest_verified": false}
+      }
+    }
+  ],
+  "live_listing_and_unit_verification_policy": {
+    "all_24_markets_verified_via_live_rest": false,
+    "pending_phase": "P2_live_preflight_in_apne1_az4",
+    "rule": "Never assume candidate ticks, lots, or contract multipliers are live-effective without capturing raw REST JSON snapshots via meta_daemon.py on the Tokyo host."
+  },
+  "client_pending_runtime_parameters": {
+    "aws_account_id": null,
+    "aws_budget_cap_usd": null,
+    "aws_ec2_instance_type_approved": null,
+    "gdrive_rclone_remote": null,
+    "gdrive_oauth_configured": false,
+    "frozen_research_sha": null,
+    "blind_collection_start_utc": null,
+    "blind_collection_end_utc": null,
+    "recommended_blind_days": "21-30 complete UTC days (minimum 14 days, starting after 2026-12-01 Bitget books50 live delta verification)"
+  }
+}

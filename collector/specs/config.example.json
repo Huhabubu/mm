@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "spec_version": "v1.4",
+  "mode": "full_24_market_panel",
+  "deployment": {
+    "aws_region": "ap-northeast-1",
+    "aws_physical_az_id": "apne1-az4",
+    "data_root": "/var/lib/tokyo_l2_data",
+    "zstd_level": 3,
+    "bounded_queue_capacity": 65536,
+    "silence_watchdog_seconds": 3,
+    "planned_rotation_utc": {
+      "A": "00:00:00",
+      "B": "12:00:00"
+    }
+  },
+  "archive": {
+    "rclone_remote": "gdrive_main:tokyo_l2_data",
+    "local_retention_hours": 24,
+    "disk_alert_pct": 70.0,
+    "verify_remote_hash": true,
+    "forbid_remote_overwrite_on_hash_mismatch": true
+  },
+  "meta_daemon": {
+    "rtt_interval_seconds": 300,
+    "chrony_interval_seconds": 60,
+    "chrony_max_error_ms": 1.0,
+    "dual_outage_alert_seconds": 5,
+    "alert_webhook_env": "TOKYO_L2_ALERT_WEBHOOK_URL"
+  },
+  "exchanges": {
+    "binance_futures": {
+      "enabled": true,
+      "public_ws_url": "wss://fstream.binance.com/public/stream",
+      "market_ws_url": "wss://fstream.binance.com/market/stream",
+      "rest_exchange_info_url": "https://fapi.binance.com/fapi/v1/exchangeInfo",
+      "rest_depth_url": "https://fapi.binance.com/fapi/v1/depth",
+      "depth_snapshot_limit": 1000,
+      "symbols": ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+      "public_channels": ["bookTicker", "depth@100ms"],
+      "market_channels": ["aggTrade"]
+    },
+    "bybit_linear": {
+      "enabled": true,
+      "ws_url": "wss://stream.bybit.com/v5/public/linear",
+      "rest_instruments_url": "https://api.bybit.com/v5/market/instruments-info?category=linear",
+      "ping_interval_seconds": 20,
+      "symbols": ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+      "channels": ["orderbook.50", "orderbook.1", "publicTrade"]
+    },
+    "bitget_v3": {
+      "enabled": true,
+      "ws_url": "wss://ws.bitget.com/v3/ws/public",
+      "rest_instruments_url": "https://api.bitget.com/api/v3/market/instruments?category=USDT-FUTURES",
+      "ping_interval_seconds": 25,
+      "symbols": ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+      "channels": ["books50", "books1", "publicTrade"]
+    },
+    "gate_futures": {
+      "enabled": true,
+      "ws_url": "wss://fx-ws.gateio.ws/v4/ws/usdt",
+      "rest_contracts_url": "https://api.gateio.ws/api/v4/futures/usdt/contracts",
+      "required_headers": {
+        "X-Gate-Size-Decimal": "1"
+      },
+      "ping_interval_seconds": 15,
+      "symbols": ["BTC_USDT", "ETH_USDT", "XRP_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT"],
+      "channels": ["futures.obu.50", "futures.book_ticker", "futures.trades"]
+    }
+  }
+}

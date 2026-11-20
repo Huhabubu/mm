@@ -1,0 +1,27 @@
+[package]
+name = "tokyo-l2-collector"
+version = "0.1.0"
+edition = "2021"
+description = "AWS Tokyo co-city dual-active causal L2 market data collector (Binance, Bybit, Bitget, Gate.io)"
+
+[[bin]]
+name = "tokyo-l2-collector"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+http = "1.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3.13"

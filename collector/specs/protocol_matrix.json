@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "spec_version": "v1.4",
+  "baseline_date_utc": "2026-11-20",
+  "deployment_topology": {
+    "cloud": "AWS",
+    "region": "ap-northeast-1",
+    "physical_az_id": "apne1-az4",
+    "observer_scope": "neutral_public_internet_observer_same_az_not_colocation_proof"
+  },
+  "reference_collector": {
+    "repository": "https://github.com/nkaz001/hftbacktest",
+    "pinned_commit_sha": "5f3ec40b2afb764e0fea112f941ed85523ef4e88",
+    "commit_date_utc": "2025-12-23T15:31:05Z",
+    "hftbacktest_py_version": "2.4.4",
+    "usage_note": "Async tokio architecture reference only; replaced with bounded mpsc channels, dual A/B causal selector, and TSV-Raw lossless format."
+  },
+  "channel_simplification_policy": {
+    "binance_no_depth_0ms": true,
+    "binance_signal_channel": "@bookTicker (0ms real-time)",
+    "binance_depth_channel": "@depth@100ms (official SLA)",
+    "gate_no_400_level_100ms": true,
+    "gate_depth_channel": "futures.obu ob.{SYM}.50 (50 levels @ 20ms)"
+  },
+  "exchanges": {
+    "binance_futures": {
+      "role": "leader_signal_source",
+      "contract_family": "USDS-M USDT Linear Perpetual",
+      "symbol_case_ws": "lower",
+      "symbol_case_rest": "upper",
+      "endpoints": {
+        "public_ws": {
+          "url": "wss://fstream.binance.com/public/stream",
+          "channels": ["<sym>@bookTicker", "<sym>@depth@100ms"],
+          "required_headers": {},
+          "active_active_ab": true,
+          "forced_disconnect_hours": 24,
+          "planned_rotation_utc": {"A": "00:00:00", "B": "12:00:00"}
+        },
+        "market_ws": {
+          "url": "wss://fstream.binance.com/market/stream",
+          "channels": ["<sym>@aggTrade"],
+          "forbidden_on_public_stream": true,
+          "required_headers": {},
+          "active_active_ab": true,
+          "forced_disconnect_hours": 24,
+          "planned_rotation_utc": {"A": "00:00:00", "B": "12:00:00"}
+        }
+      },
+      "rest": {
+        "exchange_info": "https://fapi.binance.com/fapi/v1/exchangeInfo",
+        "depth_snapshot": "https://fapi.binance.com/fapi/v1/depth?symbol={SYM}&limit=1000",
+        "required_headers": {}
+      },
+      "sequence_and_dedup": {
+        "depth_anchor_mode": "buffer_ws_then_rest_snapshot_1000",
+        "depth_drop_rule": "u < lastUpdateId",
+        "depth_first_bridge_rule": "U <= lastUpdateId <= u",
+        "depth_subsequent_rule": "pu == prev_u",
+        "depth_unbridged_state": "WAIT_ANCHOR",
+        "depth_gap_action": "mark_INVALID_and_refetch_snapshot",
+        "trade_semantics": "aggTrade_preserve_raw_a_f_l_never_split",
+        "trade_dedup_key": ["s", "a"]
+      },
+      "heartbeat": {
+        "mode": "ws_protocol_ping_pong",
+        "silence_watchdog_seconds": 3
+      },
+      "verification_status": {
+        "doc_verified_items": [
+          "2026-04-23 mandatory /public/stream vs /market/stream URL split",
+          "@bookTicker and @depth@100ms on /public/stream",
+          "@aggTrade on /market/stream",
+          "REST /fapi/v1/exchangeInfo and /fapi/v1/depth?limit=1000",
+          "U <= S <= u first bridge and pu == prev_u continuity",
+          "24h forced WS disconnect"
+        ],
+        "pending_live_first_frame_verification": [
+          "Live Tokyo apne1-az4 RTT <= 5ms",
+          "Per-symbol (6/6) subscription ACK + first valid market frame",
+          "Live REST depth snapshot bridge success rate under production load"
+        ],
+        "doc_sources": [
+          "https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Important-WebSocket-Change-Notice",
+          "https://docs.tardis.dev/historical-data-details/binance-futures"
+        ]
+      }
+    },
+    "bybit_linear": {
+      "role": "tier1_follower_venue",
+      "contract_family": "Linear USDT Perpetual (v5)",
+      "symbol_case_ws": "upper",
+      "symbol_case_rest": "upper",
+      "endpoints": {
+        "public_ws": {
+          "url": "wss://stream.bybit.com/v5/public/linear",
+          "subscribe_payload_template": {
+            "op": "subscribe",
+            "args": ["orderbook.50.{SYM}", "orderbook.1.{SYM}", "publicTrade.{SYM}"]
+          },
+          "channels": ["orderbook.50.{SYM}", "orderbook.1.{SYM}", "publicTrade.{SYM}"],
+          "rpi_excluded_natively": true,
+          "required_headers": {},
+          "active_active_ab": true,
+          "planned_rotation_utc": {"A": "00:00:00", "B": "12:00:00"}
+        }
+      },
+      "rest": {
+        "instruments_info": "https://api.bybit.com/v5/market/instruments-info?category=linear",
+        "pagination_required": true,
+        "required_headers": {}
+      },
+      "sequence_and_dedup": {
+        "depth_anchor_mode": "ws_initial_snapshot_plus_delta",
+        "depth_forbid_u_plus_one_check": true,
+        "depth_monotonic_rule": "u >= prev_u (jumps permitted within 20ms aggregation)",
+        "depth_reset_rule": "type == 'snapshot' OR u == 1 (server restart)",
+        "l1_silence_repush_seconds": 3,
+        "l1_silence_same_u_allowed": true,
+        "qa_continuity_label": "anchor_reconstructible_per_message_continuity_unprovable_by_protocol",
+        "trade_dedup_key": ["symbol", "i"],
+        "trade_same_seq_multi_frame_note": "publicTrade same seq can span multiple frames; dedup strictly by (symbol, i) while preserving batch order and T/BT/RPI flags"
+      },
+      "heartbeat": {
+        "mode": "app_json_ping",
+        "payload": {"op": "ping"},
+        "interval_seconds": 20,
+        "silence_watchdog_seconds": 3
+      },
+      "verification_status": {
+        "doc_verified_items": [
+          "wss://stream.bybit.com/v5/public/linear endpoint",
+          "orderbook.50 (20ms, no RPI), orderbook.1 (10ms, 3s same-u snapshot repush), publicTrade (real-time)",
+          "u == 1 server restart full reset semantics",
+          "publicTrade fields i, T, BT, RPI, seq",
+          "20s application ping {\"op\":\"ping\"}"
+        ],
+        "pending_live_first_frame_verification": [
+          "Live Tokyo apne1-az4 RTT <= 5ms",
+          "Per-symbol (6/6) subscription ACK + first valid market frame",
+          "REST pagination completeness for all 6 symbols"
+        ],
+        "doc_sources": [
+          "https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook",
+          "https://bybit-exchange.github.io/docs/v5/websocket/public/trade",
+          "https://bybit-exchange.github.io/docs/v5/ws/connect"
+        ]
+      }
+    },
+    "bitget_v3": {
+      "role": "tier2_follower_venue",
+      "contract_family": "UTA v3 USDT-M Perpetual",
+      "symbol_case_ws": "upper",
+      "symbol_case_rest": "upper",
+      "endpoints": {
+        "public_ws": {
+          "url": "wss://ws.bitget.com/v3/ws/public",
+          "subscribe_payload_template": {
+            "op": "subscribe",
+            "args": [
+              {"instType": "usdt-futures", "topic": "books50", "symbol": "{SYM}"},
+              {"instType": "usdt-futures", "topic": "books1", "symbol": "{SYM}"},
+              {"instType": "usdt-futures", "topic": "publicTrade", "symbol": "{SYM}"}
+            ]
+          },
+          "channels": ["books50", "books1", "publicTrade"],
+          "forbidden_legacy_trade_topic": "trade",
+          "rpi_excluded_channel": "rpi-books",
+          "required_headers": {},
+          "active_active_ab": true,
+          "planned_rotation_utc": {"A": "00:00:00", "B": "12:00:00"}
+        }
+      },
+      "rest": {
+        "instruments_info": "https://api.bitget.com/api/v3/market/instruments?category=USDT-FUTURES",
+        "required_headers": {}
+      },
+      "sequence_and_dedup": {
+        "checksum_removed_date": "2026-05",
+        "checksum_enabled": false,
+        "depth_anchor_mode": "dynamic_per_frame_action_snapshot_or_update",
+        "depth_snapshot_rule": "action == 'snapshot' replaces book and sets seq_snapshot = seq",
+        "depth_first_delta_after_snapshot_rule": "pseq <= seq_snapshot <= seq",
+        "depth_subsequent_delta_rule": "pseq == prev_seq (standalone pseq == 0 cannot bridge a gap)",
+        "books50_incremental_cutover_date_utc": "2026-12-01",
+        "blind_collection_gate": "MUST verify live books50 action='update' frames on/after 2026-12-01 before P3 blind collection",
+        "trade_dedup_key": ["symbol", "i"],
+        "trade_preserved_flags": ["T", "v", "isRPI"],
+        "trade_initial_snapshot_optional": true
+      },
+      "heartbeat": {
+        "mode": "app_text_ping",
+        "payload": "ping",
+        "expected_reply": "pong",
+        "interval_seconds": 25,
+        "silence_watchdog_seconds": 3
+      },
+      "verification_status": {
+        "doc_verified_items": [
+          "wss://ws.bitget.com/v3/ws/public endpoint",
+          "UTA v3 topics books50, books1, publicTrade (not legacy trade)",
+          "checksum removed, pseq/seq continuity check",
+          "2026-12-01 live cutover for books50 incremental updates (confirmed active on demo wspap.bitget.com/v3/ws/public)"
+        ],
+        "pending_live_first_frame_verification": [
+          "Live Tokyo apne1-az4 RTT <= 5ms",
+          "Per-symbol (6/6) subscription ACK + first valid market frame",
+          "Live production books50 post-2026-12-01 action=='update' with pseq/seq verification",
+          "Exact publicTrade isRPI field encoding on live production frames"
+        ],
+        "doc_sources": [
+          "https://www.bitget.com/docs/uta/update-preview",
+          "https://www.bitget.com/legacy-docs/uta/websocket/public/Order-Book-Channel",
+          "https://github.com/ccxt/ccxt/issues/31033"
+        ]
+      }
+    },
+    "gate_futures": {
+      "role": "tier2_3_follower_venue",
+      "contract_family": "Gate.io Futures v4 USDT Perpetual",
+      "symbol_case_ws": "upper_underscore",
+      "symbol_case_rest": "upper_underscore",
+      "endpoints": {
+        "public_ws": {
+          "url": "wss://fx-ws.gateio.ws/v4/ws/usdt",
+          "required_headers": {
+            "X-Gate-Size-Decimal": "1"
+          },
+          "missing_decimal_header_is_fatal": true,
+          "channels": [
+            {"channel": "futures.obu", "payload_template": ["ob.{SYM}.50"]},
+            {"channel": "futures.book_ticker", "payload_template": ["{SYM}"]},
+            {"channel": "futures.trades", "payload_template": ["{SYM}"]}
+          ],
+          "rpi_excluded_channel": "futures.rpi_obu",
+          "active_active_ab": true,
+          "planned_rotation_utc": {"A": "00:00:00", "B": "12:00:00"}
+        }
+      },
+      "rest": {
+        "contracts_info": "https://api.gateio.ws/api/v4/futures/usdt/contracts",
+        "required_headers": {
+          "X-Gate-Size-Decimal": "1"
+        }
+      },
+      "sequence_and_dedup": {
+        "depth_anchor_mode": "ws_obu_full_true_snapshot_plus_delta",
+        "depth_snapshot_rule": "result.full == true replaces book and sets prev_u = u (must accept full=true even before subscribe ACK)",
+        "depth_subsequent_rule": "strict U == prev_u + 1; mismatch -> INVALID + resubscribe",
+        "size_encoding": "lossless_decimal_string_required_via_X-Gate-Size-Decimal_1",
+        "trade_dedup_key": ["contract", "id"],
+        "trade_preserved_flags": ["is_internal", "size_sign_taker_direction"]
+      },
+      "heartbeat": {
+        "mode": "gate_futures_ping",
+        "channel": "futures.ping",
+        "interval_seconds": 15,
+        "protocol_pong_required": true,
+        "silence_watchdog_seconds": 3
+      },
+      "verification_status": {
+        "doc_verified_items": [
+          "wss://fx-ws.gateio.ws/v4/ws/usdt endpoint",
+          "Mandatory X-Gate-Size-Decimal: 1 header on WS and REST to avoid integer truncation (1.7 -> 1)",
+          "futures.obu ob.{SYM}.50 (50 levels @ 20ms, full=true snapshot + U/u incremental)",
+          "futures.obu snapshot may arrive prior to subscribe ACK (Oct 2026 doc notice)",
+          "futures.book_ticker and futures.trades (with is_internal flag)",
+          "futures.ping application heartbeat + protocol pong"
+        ],
+        "pending_live_first_frame_verification": [
+          "Live Tokyo apne1-az4 RTT <= 5ms",
+          "Per-symbol (6/6) subscription ACK + first valid market frame",
+          "Live verification that size fields arrive as decimal strings (not truncated ints) across all 6 symbols"
+        ],
+        "doc_sources": [
+          "https://www.gate.com/docs/developers/futures/ws/en/",
+          "https://www.gate.com/announcements/article/48788"
+        ]
+      }
+    }
+  }
+}

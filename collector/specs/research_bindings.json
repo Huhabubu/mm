@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "spec_version": "v1.4",
+  "research_repository": "Huhabubu/mm",
+  "inspected_base_commit_sha": "5634a070367ed64f23f8499c3bbe6b54f2e3f24e",
+  "inspected_base_branch": "exp/chapter5-cross-exchange",
+  "frozen_research_sha": null,
+  "frozen_research_sha_status": "PENDING_R1_R2_R3_COMPLETION_AND_CLIENT_FREEZE",
+  "freeze_policy": "P3 blind collection and P4 unblinding MUST NOT run until the client supplies a verified immutable commit SHA after R1/R2/R3 are finalized in Huhabubu/mm and seals freeze.json. Never rely on mutable branch names.",
+  "hftbacktest_runtime": {
+    "package": "hftbacktest",
+    "pinned_version": "2.4.4",
+    "event_dtype_fields": ["ev", "exch_ts", "local_ts", "px", "qty", "order_id", "ival", "fval"],
+    "matching_timestamp_source": "exchange_timestamp_ns",
+    "strategy_visibility_timestamp_source": "canonical_recv_wall_ns",
+    "atomic_ws_message_boundary": "Preserve all price-level updates from a single WS message with identical local_ts so HBT applies the full message batch before waking the strategy. Never inject fake fixed latency to mask message boundaries."
+  },
+  "strategy_entrypoints_verified_in_base_commit": {
+    "core_engine": "scripts/core_glft_engine.py::run_core_glft",
+    "core_rules": "scripts/core_glft_rules.py",
+    "physical_switch_config": "configs/core_glft_physical_robustness.json",
+    "basis_moments": "scripts/gate_basis_weighted_moments.py::exact_moments_5s",
+    "fill_markout": "scripts/analyze_gate_1645_fill_quality.py::model_day",
+    "r1_aggregator": "scripts/aggregate_cross_exchange_r1.py"
+  },
+  "strict_channel_separation": {
+    "leader_signal_feed": {
+      "exchange": "binance_futures",
+      "channel": "@bookTicker",
+      "output_artifact": "binance_bbo_{SYM}_{YYYYMMDD}.npz",
+      "extra_signal_delay_ms_policy": "Must be explicitly declared in freeze.json (default 0.0ms when using co-located Tokyo observed local_ts; sensitivity grid {0, 2.5, 5, 10, 25, 50, 100}ms declared separately to avoid double-counting real measured transport latency)."
+    },
+    "follower_matching_book": {
+      "exchanges": ["bybit_linear", "bitget_v3", "gate_futures"],
+      "depth_channels": {
+        "bybit_linear": "orderbook.50.{SYM}",
+        "bitget_v3": "books50",
+        "gate_futures": "futures.obu ob.{SYM}.50"
+      },
+      "trade_channels": {
+        "bybit_linear": "publicTrade.{SYM}",
+        "bitget_v3": "publicTrade",
+        "gate_futures": "futures.trades"
+      },
+      "l1_bbo_channels_kept_strictly_separate": {
+        "bybit_linear": "orderbook.1.{SYM}",
+        "bitget_v3": "books1",
+        "gate_futures": "futures.book_ticker"
+      },
+      "forbid_l1_overwrite_l2": true,
+      "forbid_duplicate_trade_injection": true,
+      "preserve_special_trade_flags": {
+        "bybit_linear": ["BT", "RPI"],
+        "bitget_v3": ["isRPI"],
+        "gate_futures": ["is_internal"]
+      }
+    }
+  },
+  "queue_and_gap_rules": {
+    "visible_depth_levels": 50,
+    "beyond_50_level_label": "QUEUE_UNKNOWN",
+    "forbid_queue_zero_beyond_50": true,
+    "forbid_dropping_only_losing_beyond_50_fills": true,
+    "uncovered_gap_day_status": "execution_unverified",
+    "retain_unverified_row_in_calendar": true,
+    "segment_warmup_seconds_for_appendix": 600,
+    "forbid_markout_crossing_invalid_interval": true,
+    "chrony_max_certified_error_ms": 1.0
+  },
+  "unified_evaluation_metrics": {
+    "primary_pnl": "gross_bps_per_turnover",
+    "primary_markout": "execution_price_total_markout_bps at 100ms / 500ms / 1000ms with entry/future quote age and same-quote reuse rate plus independent L1 BBO vs L2 top-of-book same-fill intersection sensitivity",
+    "inventory_risk": ["pos_std", "pos_std_over_order_qty"],
+    "net_pnl_three_way_decomposition": ["fee_saved", "vol_shrink_gross", "quality_gross"],
+    "fee_scenarios_bps": [0.0, -0.5, 2.0]
+  }
+}

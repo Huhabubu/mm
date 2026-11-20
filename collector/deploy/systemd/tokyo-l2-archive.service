@@ -1,0 +1,13 @@
+[Unit]
+Description=AWS Tokyo L2 Hourly Atomic Archive & Google Drive Remote Verifier
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/mm
+EnvironmentFile=-/etc/tokyo-l2/live.env
+ExecStart=/opt/mm/collector/bin/archive --dir /data/tokyo_l2 --remote gdrive_main:tokyo_l2_data --verify-remote --prune-hours 24
+StandardOutput=journal
+StandardError=journal

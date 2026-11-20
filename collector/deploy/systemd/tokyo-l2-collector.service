@@ -1,0 +1,24 @@
+[Unit]
+Description=AWS Tokyo Co-City Dual-Active L2 Market Data Collector
+After=network-online.target chrony.service
+Wants=network-online.target chrony.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/mm
+# Place TOKYO_L2_LIVE_AUTHORIZED=1 and TOKYO_L2_RUN_ID=... in /etc/tokyo-l2/live.env ONLY after P2/P3 signoff
+EnvironmentFile=/etc/tokyo-l2/live.env
+Environment=RUST_LOG=info
+ExecStart=/opt/mm/collector/target/release/tokyo-l2-collector collect --config /etc/tokyo-l2/config.json --run-id ${TOKYO_L2_RUN_ID}
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
