@@ -42,6 +42,7 @@ from archive_sync import (  # noqa: E402
     ARCHIVE_LOCK_FILENAME,
     LEDGER_DB_FILENAME,
     LEGACY_LEDGER_JSONL_FILENAME,
+    PROJECTION_LEDGER_JSONL_FILENAME,
     STATE_PRUNED,
     STATE_SEALED,
     STATE_VERIFIED,
@@ -691,25 +692,33 @@ os.close(fd)
 
 
 def test_p1_legacy_jsonl_migration_idempotent_no_reupload(tmp_path: Path) -> None:
-    """12a: Existing verified_archive_ledger.jsonl migrates cleanly into SQLite without re-uploading data."""
+    """12a: Existing verified_archive_ledger.jsonl is preserved verbatim while migrating into SQLite + compat projection."""
     sealed = tmp_path / "sealed"
     dpath, mpath, _ = _create_sealed_partition(sealed)
     rel_data = dpath.relative_to(sealed).as_posix()
     rel_manifest = mpath.relative_to(sealed).as_posix()
     dh = file_hashes(dpath)
 
-    # Seed legacy JSONL ledger (both 1 verified entry and 1 unverified entry) + remote already holding data+manifest
+    # Seed legacy JSONL ledger with:
+    # - 2 historical verified lines for the SAME rel_data (duplicate verification history!)
+    # - 1 unverified line
+    # - 1 malformed/invalid historical line
     legacy_path = sealed / LEGACY_LEDGER_JSONL_FILENAME
-    verified_line = {
+    verified_line_old = {
         "verified_utc": "2026-12-03T01:05:00+00:00",
         "remote_path": rel_data,
         "remote_manifest_path": rel_manifest,
-        "remote_id": "gd:legacy1234",
+        "remote_id": "gd:legacy_old",
         "bytes": dh["bytes"],
         "sha256": dh["sha256"],
         "md5": dh["md5"],
         "verification_method": "remote_native_hash",
         "verified": True,
+    }
+    verified_line_latest = {
+        **verified_line_old,
+        "verified_utc": "2026-12-03T02:05:00+00:00",
+        "remote_id": "gd:legacy_latest",
     }
     unverified_line = {
         "verified_utc": "2026-12-03T01:05:00+00:00",
@@ -719,10 +728,18 @@ def test_p1_legacy_jsonl_migration_idempotent_no_reupload(tmp_path: Path) -> Non
         "sha256": "0" * 64,
         "verified": False,
     }
-    legacy_path.write_text(
-        json.dumps(verified_line) + "\n" + json.dumps(unverified_line) + "\n",
-        encoding="utf-8",
+    original_content = (
+        json.dumps(verified_line_old)
+        + "\n"
+        + json.dumps(verified_line_latest)
+        + "\n"
+        + json.dumps(unverified_line)
+        + "\n"
+        + "{corrupted_historical_line\n"
     )
+    legacy_path.write_text(original_content, encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+    original_sha = hashlib.sha256(original_bytes).hexdigest()
 
     backend = InstrumentedMockBackend()
     backend.store[rel_data] = dpath.read_bytes()
@@ -731,7 +748,34 @@ def test_p1_legacy_jsonl_migration_idempotent_no_reupload(tmp_path: Path) -> Non
     r1 = sync_sealed_directory(sealed, backend=backend, verify_remote=True, prune_older_than_hours=24.0)
     assert r1["status"] == "ok"
     assert r1["migration"]["migrated"] == 1
+    assert r1["migration"]["total_lines"] == 4
+    assert r1["migration"]["verified_lines"] == 2
+    assert r1["migration"]["duplicate_verified_lines"] == 1
     assert r1["migration"]["skipped_unverified"] == 1
+    assert r1["migration"]["invalid_lines"] == 1
+    assert r1["migration"]["original_sha256"] == original_sha
+    assert r1["migration"]["original_bytes"] == len(original_bytes)
+
+    # Original verified_archive_ledger.jsonl MUST remain 100% byte-for-byte untouched!
+    assert legacy_path.read_bytes() == original_bytes
+    assert r1["legacy_ledger_path"] == str(legacy_path)
+
+    # Preserved immutable copy + .sha256 exist locally and were synced to remote meta/legacy_ledger/!
+    preserved_rel = r1["migration"]["preserved_backup_path"]
+    assert preserved_rel is not None and preserved_rel.startswith("meta/legacy_ledger/")
+    assert (sealed / preserved_rel).read_bytes() == original_bytes
+    assert backend.store[preserved_rel] == original_bytes
+    assert f"{preserved_rel}.sha256" in backend.store
+
+    # Compatibility projection written to a separate file (verified_archive_ledger.compat.jsonl)
+    compat_path = sealed / PROJECTION_LEDGER_JSONL_FILENAME
+    assert r1["ledger_path"] == str(compat_path)
+    assert r1["projection_ledger_path"] == str(compat_path)
+    assert compat_path.is_file()
+    compat_rows = [json.loads(l) for l in compat_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(compat_rows) == 1
+    assert compat_rows[0]["remote_path"] == rel_data
+
     # Data and manifest were already remote -> ZERO raw copy_file uploads!
     raw_copies = [p for p, _ in backend.copy_calls if p.startswith("raw/")]
     assert raw_copies == []
@@ -743,12 +787,22 @@ def test_p1_legacy_jsonl_migration_idempotent_no_reupload(tmp_path: Path) -> Non
         assert row["remote_data_verified"] == 1
         assert row["remote_manifest_verified"] == 1
         assert ledger.get_partition_by_rel_data("raw/gate_futures/2026-12-03/unverified_fake.tsv.zst") is None
+        assert ledger.get_meta("legacy_jsonl_original_sha256") == original_sha
+        assert ledger.get_meta("legacy_jsonl_total_lines") == "4"
+        assert ledger.get_meta("legacy_jsonl_duplicate_verified_lines") == "1"
+        ev_types = [e["event_type"] for e in ledger.list_events()]
+        assert "MIGRATION_HISTORICAL_VERIFIED_LINE" in ev_types
+        assert "MIGRATION_SKIPPED_UNVERIFIED" in ev_types
+        assert "MIGRATION_SKIPPED_INVALID" in ev_types
+        assert "MIGRATION_LEGACY_JSONL_SUMMARY" in ev_types
 
-    # Repeat run: migration is idempotent (already_migrated) and zero remote calls!
+    # Repeat run: migration is idempotent (already_migrated), original file still untouched, zero remote calls!
     backend.reset_counts()
     r2 = sync_sealed_directory(sealed, backend=backend, verify_remote=True, prune_older_than_hours=24.0)
     assert r2["status"] == "ok"
     assert r2["migration"]["already_migrated"] is True
+    assert r2["migration"]["original_sha256"] == original_sha
+    assert legacy_path.read_bytes() == original_bytes
     assert backend.copy_calls == []
     assert backend.stat_calls == []
 
@@ -836,10 +890,10 @@ def test_p1_pruned_partition_qa_restore_and_bit_identical_hbt_output(tmp_path: P
     after_sqlite_hashes = {a["kind"]: a["sha256"] for a in qa_from_sqlite["artifacts"]}
     assert after_sqlite_hashes == before_hashes
 
-    # Also works via backward-compatible verified_archive_ledger.jsonl (and reuses verified cache)!
+    # Also works via separate compatibility projection verified_archive_ledger.compat.jsonl (reusing verified cache)!
     backend.reset_counts()
     qa_from_jsonl = run_qa_convert(
-        sealed / LEGACY_LEDGER_JSONL_FILENAME,
+        sealed / PROJECTION_LEDGER_JSONL_FILENAME,
         tmp_path / "qa_after_jsonl",
         strict_zero_loss=True,
         remote_backend=backend,
@@ -897,4 +951,111 @@ def test_p1_rclone_download_file_atomic_partial_rename(
         backend.download_file("raw/gate_futures/2026-12-03/failed.tsv.zst", dst_fail)
     assert not dst_fail.exists()
     assert list(dst_fail.parent.glob("*.partial")) == []
+
+
+def test_p1_prune_rechecks_local_sha256_blocks_same_size_tampering_and_skips_hash_within_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 1 regression: skip local hashing within retention, but re-verify SHA-256 right before unlink."""
+    sealed = tmp_path / "sealed"
+    base_mtime = 1_700_000_000.0
+    dpath, _, _ = _create_sealed_partition(sealed, mtime_epoch_s=base_mtime)
+    rel_data = dpath.relative_to(sealed).as_posix()
+
+    backend = InstrumentedMockBackend()
+    r1 = sync_sealed_directory(
+        sealed, backend=backend, verify_remote=True, prune_older_than_hours=24.0, now_epoch_s=base_mtime + 3600.0
+    )
+    assert r1["status"] == "ok"
+
+    # Spy on file_hashes: within 24h retention, repeat run MUST NOT re-hash the verified data file!
+    hashed_paths: list[Path] = []
+    orig_file_hashes = arch_mod.file_hashes
+
+    def spy_file_hashes(path: Path) -> dict[str, Any]:
+        hashed_paths.append(path)
+        return orig_file_hashes(path)
+
+    monkeypatch.setattr(arch_mod, "file_hashes", spy_file_hashes)
+    r_within = sync_sealed_directory(
+        sealed, backend=backend, verify_remote=True, prune_older_than_hours=24.0, now_epoch_s=base_mtime + 12 * 3600.0
+    )
+    assert r_within["status"] == "ok"
+    assert dpath not in hashed_paths, "Within-retention verified files must NOT be re-hashed"
+
+    # Tamper 1 byte in-place keeping EXACT same byte length and aged mtime!
+    orig_bytes = dpath.read_bytes()
+    tampered = bytearray(orig_bytes)
+    tampered[-1] ^= 0xFF
+    assert len(tampered) == len(orig_bytes)
+    dpath.write_bytes(bytes(tampered))
+    os.utime(dpath, (base_mtime, base_mtime))
+
+    hashed_paths.clear()
+    r_aged = sync_sealed_directory(
+        sealed, backend=backend, verify_remote=True, prune_older_than_hours=24.0, now_epoch_s=base_mtime + 25 * 3600.0
+    )
+    assert r_aged["status"] == "blocked"
+    assert dpath in hashed_paths, "Must re-hash local file right before pruning"
+    assert dpath.is_file(), "Same-size tampered local file MUST NOT be deleted!"
+    assert r_aged["pruned_local_files"] == []
+    assert len(r_aged["conflicts"]) == 1
+    assert r_aged["conflicts"][0]["action"] == "ISOLATED_LOCAL_SHA256_MISMATCH_BEFORE_PRUNE"
+    assert r_aged["conflicts"][0]["expected_bytes"] == r_aged["conflicts"][0]["actual_bytes"]
+
+    with ArchiveLedger(sealed / LEDGER_DB_FILENAME) as ledger:
+        row = ledger.get_partition_by_rel_data(rel_data)
+        assert row is not None
+        assert row["state"] == STATE_VERIFIED
+        assert row["has_conflict"] == 1
+
+
+def test_p1_partial_failure_still_uploads_consistent_sqlite_snapshot(tmp_path: Path) -> None:
+    """Issue 2 regression: when 3/4 exchanges succeed (and prune) while 1/4 fails, snapshot still uploads."""
+    sealed = tmp_path / "sealed"
+    base_mtime = 1_700_000_000.0
+    exchanges = ["binance_futures", "bybit_linear", "bitget_v3", "gate_futures"]
+    paths: dict[str, Path] = {}
+    for ex in exchanges:
+        dp, _, _ = _create_sealed_partition(sealed, exchange=ex, mtime_epoch_s=base_mtime)
+        paths[ex] = dp
+
+    # Inject remote hash conflict on gate_futures ONLY; the other 3 exchanges succeed & prune!
+    backend = InstrumentedMockBackend()
+    rel_gate = paths["gate_futures"].relative_to(sealed).as_posix()
+    backend.store[rel_gate] = b"CONFLICTING_REMOTE_GATE_OBJECT"
+
+    res = sync_sealed_directory(
+        sealed,
+        backend=backend,
+        verify_remote=True,
+        prune_older_than_hours=24.0,
+        now_epoch_s=base_mtime + 25 * 3600.0,
+    )
+    assert res["status"] == "blocked", "Overall status must still be blocked due to gate_futures conflict"
+    assert len(res["pruned_local_files"]) == 3
+    assert paths["gate_futures"].is_file(), "Conflicted gate_futures local file must be preserved"
+    for ok_ex in ("binance_futures", "bybit_linear", "bitget_v3"):
+        assert not paths[ok_ex].exists()
+
+    # CRITICAL: Consistent SQLite snapshot MUST still have been uploaded despite gate_futures conflict!
+    snap_rel = res["snapshot_remote_path"]
+    assert snap_rel is not None and snap_rel in backend.store
+    assert f"{snap_rel}.sha256" in backend.store
+
+    snap_copy = tmp_path / "partial_run_snapshot.sqlite"
+    snap_copy.write_bytes(backend.store[snap_rel])
+    conn = sqlite3.connect(str(snap_copy))
+    try:
+        assert conn.execute("PRAGMA integrity_check;").fetchone()[0] == "ok"
+        states = dict(conn.execute("SELECT exchange, state FROM partitions").fetchall())
+        assert states == {
+            "binance_futures": STATE_PRUNED,
+            "bybit_linear": STATE_PRUNED,
+            "bitget_v3": STATE_PRUNED,
+            "gate_futures": STATE_SEALED,
+        }
+    finally:
+        conn.close()
+
 

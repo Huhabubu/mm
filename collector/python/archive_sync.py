@@ -54,6 +54,7 @@ RCLONE_NOT_FOUND_EXIT_CODES = {3, 4}
 
 LEDGER_DB_FILENAME = "archive_ledger.sqlite"
 LEGACY_LEDGER_JSONL_FILENAME = "verified_archive_ledger.jsonl"
+PROJECTION_LEDGER_JSONL_FILENAME = "verified_archive_ledger.compat.jsonl"
 ARCHIVE_LOCK_FILENAME = ".archive_sync.lock"
 LEDGER_SCHEMA_VERSION = "1"
 
@@ -932,53 +933,131 @@ def migrate_legacy_jsonl_ledger(
 ) -> dict[str, Any]:
     """Idempotently import historical proofs from `verified_archive_ledger.jsonl` into SQLite.
 
-    Preserves all verified data hashes and remote IDs without losing history. Because the legacy
-    JSONL format did not record independent manifest remote verification, imported rows start in
-    `SEALED` with `remote_data_verified=1` and `remote_manifest_verified=0` until the archive loop
-    verifies the remote manifest (requiring zero re-upload of already-verified data files).
+    Preserves the pre-migration `verified_archive_ledger.jsonl` byte-for-byte untouched in place AND
+    stores an immutable backup copy (+ .sha256) under `meta/legacy_ledger/` so historical duplicate
+    verifications and non-verified lines are never lost. Records verifiable original SHA-256 and
+    complete line counts in `schema_meta` and `archive_events`.
+
+    Because the legacy JSONL format did not record independent manifest remote verification,
+    imported rows start in `SEALED` with `remote_data_verified=1` and `remote_manifest_verified=0`
+    until the archive loop verifies the remote manifest (requiring zero re-upload of data files).
     """
     legacy_path = sealed_root / LEGACY_LEDGER_JSONL_FILENAME
     if not legacy_path.is_file():
-        return {"migrated": 0, "skipped_existing": 0, "skipped_unverified": 0, "legacy_present": False}
-
-    raw_bytes = legacy_path.read_bytes()
-    current_sha = hashlib.sha256(raw_bytes).hexdigest()
-    prev_sha = ledger.get_meta("legacy_jsonl_sha256")
-    if prev_sha == current_sha:
         return {
             "migrated": 0,
             "skipped_existing": 0,
             "skipped_unverified": 0,
+            "duplicate_verified_lines": 0,
+            "invalid_lines": 0,
+            "total_lines": 0,
+            "verified_lines": 0,
+            "legacy_present": False,
+        }
+
+    raw_bytes = legacy_path.read_bytes()
+    current_sha = hashlib.sha256(raw_bytes).hexdigest()
+    prev_sha = ledger.get_meta("legacy_jsonl_original_sha256")
+    if prev_sha == current_sha:
+        return {
+            "migrated": 0,
+            "skipped_existing": 0,
+            "skipped_unverified": int(ledger.get_meta("legacy_jsonl_unverified_lines") or 0),
+            "duplicate_verified_lines": int(ledger.get_meta("legacy_jsonl_duplicate_verified_lines") or 0),
+            "invalid_lines": int(ledger.get_meta("legacy_jsonl_invalid_lines") or 0),
+            "total_lines": int(ledger.get_meta("legacy_jsonl_total_lines") or 0),
+            "verified_lines": int(ledger.get_meta("legacy_jsonl_verified_lines") or 0),
+            "original_sha256": current_sha,
+            "original_bytes": len(raw_bytes),
+            "preserved_backup_path": ledger.get_meta("legacy_jsonl_preserved_rel_path"),
             "legacy_present": True,
             "already_migrated": True,
         }
 
-    now_iso = _iso_utc(time.time() if now_s is None else now_s)
-    latest_by_rel: dict[str, dict[str, Any]] = {}
+    eff_now_s = time.time() if now_s is None else now_s
+    now_iso = _iso_utc(eff_now_s)
+
+    # Preserve an immutable byte-for-byte backup of the original pre-migration JSONL under
+    # meta/legacy_ledger/ so it is also synced to Google Drive meta/ (original file stays untouched).
+    ts_tag = datetime.fromtimestamp(eff_now_s, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = sealed_root / "meta" / "legacy_ledger"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_name = f"verified_archive_ledger.pre_migration_{ts_tag}_{current_sha[:8]}.jsonl"
+    backup_path = backup_dir / backup_name
+    backup_sha_path = backup_dir / f"{backup_name}.sha256"
+    if not backup_path.exists():
+        fd = os.open(str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            with os.fdopen(fd, "wb") as bf:
+                bf.write(raw_bytes)
+                bf.flush()
+                os.fsync(bf.fileno())
+        except Exception:
+            if backup_path.exists():
+                backup_path.unlink()
+            raise
+        backup_sha_path.write_text(f"{current_sha}  {backup_name}\n", encoding="utf-8")
+    preserved_rel_path = backup_path.relative_to(sealed_root).as_posix()
+
+    latest_by_rel: dict[str, tuple[int, dict[str, Any]]] = {}
+    total_lines = 0
+    verified_lines = 0
+    duplicate_verified_lines = 0
     skipped_unverified = 0
-    for line_no, raw_line in enumerate(raw_bytes.decode("utf-8").splitlines(), start=1):
+    invalid_lines = 0
+
+    for line_no, raw_line in enumerate(raw_bytes.decode("utf-8", errors="replace").splitlines(), start=1):
         line = raw_line.strip()
         if not line:
             continue
-        entry = json.loads(line)
-        rel_data = entry.get("remote_path")
-        if not rel_data:
+        total_lines += 1
+        try:
+            entry = json.loads(line)
+        except Exception as exc:
+            invalid_lines += 1
+            ledger.record_event(
+                ts_utc=now_iso,
+                run_id=run_id,
+                event_type="MIGRATION_SKIPPED_INVALID",
+                detail={"line_no": line_no, "error": str(exc), "raw_line": line[:512]},
+            )
             continue
+        if not isinstance(entry, dict) or not entry.get("remote_path"):
+            invalid_lines += 1
+            ledger.record_event(
+                ts_utc=now_iso,
+                run_id=run_id,
+                event_type="MIGRATION_SKIPPED_INVALID",
+                detail={"line_no": line_no, "error": "missing_remote_path", "entry": entry},
+            )
+            continue
+        rel_data = str(entry["remote_path"])
         if not entry.get("verified"):
             skipped_unverified += 1
             ledger.record_event(
                 ts_utc=now_iso,
                 run_id=run_id,
-                rel_data_path=str(rel_data),
+                rel_data_path=rel_data,
                 event_type="MIGRATION_SKIPPED_UNVERIFIED",
-                detail={"line_no": line_no},
+                detail={"line_no": line_no, "entry": entry},
             )
             continue
-        latest_by_rel[str(rel_data)] = entry
+        verified_lines += 1
+        if rel_data in latest_by_rel:
+            prev_line_no, prev_entry = latest_by_rel[rel_data]
+            duplicate_verified_lines += 1
+            ledger.record_event(
+                ts_utc=now_iso,
+                run_id=run_id,
+                rel_data_path=rel_data,
+                event_type="MIGRATION_HISTORICAL_VERIFIED_LINE",
+                detail={"line_no": prev_line_no, "superseded_by_line_no": line_no, "entry": prev_entry},
+            )
+        latest_by_rel[rel_data] = (line_no, entry)
 
     migrated = 0
     skipped_existing = 0
-    for rel_data, entry in sorted(latest_by_rel.items()):
+    for rel_data, (line_no, entry) in sorted(latest_by_rel.items()):
         if ledger.get_partition_by_rel_data(rel_data) is not None:
             skipped_existing += 1
             continue
@@ -1078,6 +1157,7 @@ def migrate_legacy_jsonl_ledger(
                     initial_state,
                     json.dumps(
                         {
+                            "line_no": line_no,
                             "legacy_verified_utc": entry.get("verified_utc"),
                             "remote_id": entry.get("remote_id"),
                             "sha256": entry.get("sha256"),
@@ -1090,11 +1170,43 @@ def migrate_legacy_jsonl_ledger(
         migrated += 1
 
     ledger.set_meta("legacy_jsonl_migrated_at", now_iso)
-    ledger.set_meta("legacy_jsonl_sha256", current_sha)
+    ledger.set_meta("legacy_jsonl_original_sha256", current_sha)
+    ledger.set_meta("legacy_jsonl_original_bytes", str(len(raw_bytes)))
+    ledger.set_meta("legacy_jsonl_preserved_rel_path", preserved_rel_path)
+    ledger.set_meta("legacy_jsonl_total_lines", str(total_lines))
+    ledger.set_meta("legacy_jsonl_verified_lines", str(verified_lines))
+    ledger.set_meta("legacy_jsonl_duplicate_verified_lines", str(duplicate_verified_lines))
+    ledger.set_meta("legacy_jsonl_unverified_lines", str(skipped_unverified))
+    ledger.set_meta("legacy_jsonl_invalid_lines", str(invalid_lines))
+    ledger.set_meta("legacy_jsonl_migrated_partitions", str(migrated))
+    ledger.record_event(
+        ts_utc=now_iso,
+        run_id=run_id,
+        event_type="MIGRATION_LEGACY_JSONL_SUMMARY",
+        detail={
+            "original_sha256": current_sha,
+            "original_bytes": len(raw_bytes),
+            "preserved_backup_path": preserved_rel_path,
+            "total_lines": total_lines,
+            "verified_lines": verified_lines,
+            "duplicate_verified_lines": duplicate_verified_lines,
+            "skipped_unverified": skipped_unverified,
+            "invalid_lines": invalid_lines,
+            "migrated_partitions": migrated,
+            "skipped_existing": skipped_existing,
+        },
+    )
     return {
         "migrated": migrated,
         "skipped_existing": skipped_existing,
         "skipped_unverified": skipped_unverified,
+        "duplicate_verified_lines": duplicate_verified_lines,
+        "invalid_lines": invalid_lines,
+        "total_lines": total_lines,
+        "verified_lines": verified_lines,
+        "original_sha256": current_sha,
+        "original_bytes": len(raw_bytes),
+        "preserved_backup_path": preserved_rel_path,
         "legacy_present": True,
         "already_migrated": False,
     }
@@ -1125,8 +1237,11 @@ def _row_to_jsonl_entry(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def export_verified_jsonl_projection(sealed_root: Path, ledger: ArchiveLedger) -> Path:
-    """Atomically write backward-compatible `verified_archive_ledger.jsonl` from SQLite."""
-    out_path = sealed_root / LEGACY_LEDGER_JSONL_FILENAME
+    """Atomically write SQLite compatibility projection to `verified_archive_ledger.compat.jsonl`.
+
+    Never overwrites or modifies any pre-existing legacy `verified_archive_ledger.jsonl`.
+    """
+    out_path = sealed_root / PROJECTION_LEDGER_JSONL_FILENAME
     rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
     lines = [json.dumps(_row_to_jsonl_entry(r), sort_keys=False) for r in rows]
     payload = ("\n".join(lines) + "\n") if lines else ""
@@ -1137,7 +1252,8 @@ def export_verified_jsonl_projection(sealed_root: Path, ledger: ArchiveLedger) -
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp_path, out_path)
-    ledger.set_meta("legacy_jsonl_sha256", hashlib.sha256(payload.encode("utf-8")).hexdigest())
+    ledger.set_meta("projection_jsonl_sha256", hashlib.sha256(payload.encode("utf-8")).hexdigest())
+    ledger.set_meta("projection_jsonl_row_count", str(len(rows)))
     return out_path
 
 
@@ -1177,7 +1293,7 @@ def _can_safely_prune(
     prune_older_than_hours: float | None,
     now_s: float,
 ) -> tuple[bool, str]:
-    """Check ALL mandatory pruning safety invariants before unlinking a local .tsv.zst."""
+    """Check pruning eligibility guards BEFORE computing local SHA-256 (zero disk read if ineligible)."""
     if not verify_remote or prune_older_than_hours is None:
         return False, "pruning_disabled"
     if row["state"] != STATE_VERIFIED:
@@ -1193,12 +1309,27 @@ def _can_safely_prune(
     if not dpath.is_file():
         return False, "local_file_missing"
     st = dpath.stat()
-    if st.st_size != int(row["local_bytes"]):
-        return False, f"local_size_changed:{st.st_size}!={row['local_bytes']}"
     age_hours = (now_s - st.st_mtime) / 3600.0
     if age_hours < prune_older_than_hours:
         return False, f"within_retention:{age_hours:.3f}h<{prune_older_than_hours}h"
     return True, "eligible"
+
+
+def _verify_local_integrity_before_prune(row: dict[str, Any], dpath: Path) -> dict[str, Any] | None:
+    """Recompute local byte size + SHA-256 right before pruning; return conflict dict on mismatch, else None."""
+    actual = file_hashes(dpath)
+    expected_bytes = int(row["local_bytes"])
+    expected_sha256 = str(row["local_sha256"]).lower()
+    if actual["bytes"] != expected_bytes or actual["sha256"].lower() != expected_sha256:
+        return {
+            "remote_path": row["rel_data_path"],
+            "expected_bytes": expected_bytes,
+            "actual_bytes": actual["bytes"],
+            "expected_sha256": expected_sha256,
+            "actual_sha256": actual["sha256"],
+            "action": "ISOLATED_LOCAL_SHA256_MISMATCH_BEFORE_PRUNE",
+        }
+    return None
 
 
 def restore_pruned_partition(
@@ -1268,7 +1399,8 @@ def sync_sealed_directory(
     hooks = fault_hooks or {}
 
     ledger_db_path = sealed_root / LEDGER_DB_FILENAME
-    ledger_jsonl_path = sealed_root / LEGACY_LEDGER_JSONL_FILENAME
+    ledger_jsonl_path = sealed_root / PROJECTION_LEDGER_JSONL_FILENAME
+    legacy_jsonl_path = sealed_root / LEGACY_LEDGER_JSONL_FILENAME
     lock_path = sealed_root / ARCHIVE_LOCK_FILENAME
     raw_root = sealed_root / "raw"
 
@@ -1284,6 +1416,8 @@ def sync_sealed_directory(
             "minimal_fixes": ["Wait for the active archive run to finish; never run concurrent archive jobs."],
             "ledger_db_path": str(ledger_db_path),
             "ledger_path": str(ledger_jsonl_path),
+            "projection_ledger_path": str(ledger_jsonl_path),
+            "legacy_ledger_path": str(legacy_jsonl_path) if legacy_jsonl_path.is_file() else None,
         }
 
     try:
@@ -1296,6 +1430,8 @@ def sync_sealed_directory(
                 "minimal_fixes": ["Seal at least one hourly partition before invoking archive"],
                 "ledger_db_path": str(ledger_db_path),
                 "ledger_path": str(ledger_jsonl_path),
+                "projection_ledger_path": str(ledger_jsonl_path),
+                "legacy_ledger_path": str(legacy_jsonl_path) if legacy_jsonl_path.is_file() else None,
             }
 
         with ArchiveLedger(ledger_db_path) as ledger:
@@ -1418,6 +1554,18 @@ def sync_sealed_directory(
                             skipped_verified += 1
                             continue
                         try:
+                            # Re-verify exact local content SHA-256 right before deletion (never on normal
+                            # within-retention runs). Same-size tampering/corruption blocks pruning!
+                            integrity_conflict = _verify_local_integrity_before_prune(row, dpath)
+                            if integrity_conflict is not None:
+                                ledger.mark_conflict(
+                                    rel_data_path=rel_data,
+                                    conflict_detail=integrity_conflict,
+                                    now_iso=now_iso,
+                                    run_id=run_id,
+                                )
+                                conflicts.append(integrity_conflict)
+                                continue
                             ledger.record_event(
                                 ts_utc=now_iso,
                                 run_id=run_id,
@@ -1731,6 +1879,16 @@ def sync_sealed_directory(
                             now_s=now_s,
                         )
                         if can_prune:
+                            integrity_conflict = _verify_local_integrity_before_prune(row, dpath)
+                            if integrity_conflict is not None:
+                                ledger.mark_conflict(
+                                    rel_data_path=rel_data,
+                                    conflict_detail=integrity_conflict,
+                                    now_iso=now_iso,
+                                    run_id=run_id,
+                                )
+                                conflicts.append(integrity_conflict)
+                                continue
                             ledger.record_event(
                                 ts_utc=now_iso,
                                 run_id=run_id,
@@ -1794,23 +1952,29 @@ def sync_sealed_directory(
                     except Exception as exc:
                         errors.append(f"{rel}: {type(exc).__name__}: {exc}")
 
-            # Atomically export backward-compatible verified_archive_ledger.jsonl from SQLite
+            # Atomically export compatibility projection to verified_archive_ledger.compat.jsonl
+            # (never overwriting any pre-existing legacy verified_archive_ledger.jsonl).
             export_verified_jsonl_projection(sealed_root, ledger)
 
             # Create consistent SQLite snapshot (sqlite3.Connection.backup) and upload to remote meta/
-            # whenever state changed or no prior snapshot has been uploaded (avoids redundant uploads
-            # on unchanged repeat runs while guaranteeing every state transition is backed up).
+            # whenever ANY committed local ledger state changed (even if other unrelated partitions
+            # failed or conflicted in this run!) so cloud backup never lags behind committed VERIFIED/
+            # PRUNED state. When zero state changed and an error/conflict blocked all work (e.g. API
+            # outage), skip snapshot upload; on clean unchanged repeat runs with an existing snapshot,
+            # also skip redundant uploads.
             snapshot_remote_path: str | None = None
             snapshot_sha256: str | None = None
-            snapshot_needed = bool(
+            committed_state_changed = bool(
                 newly_verified_entries
                 or pruned
                 or recovered_pruned
                 or migration_summary.get("migrated")
                 or meta_uploaded
-                or ledger.get_meta("last_snapshot_remote_path") is None
             )
-            if upload_ledger_snapshot and snapshot_needed and not errors and not conflicts:
+            snapshot_needed = committed_state_changed or (
+                ledger.get_meta("last_snapshot_remote_path") is None and not errors and not conflicts
+            )
+            if upload_ledger_snapshot and snapshot_needed:
                 ts_tag = datetime.fromtimestamp(now_s, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 snap_name = f"archive_ledger_{ts_tag}_{run_id[-6:]}.sqlite"
                 snap_rel = f"meta/archive_ledger/{snap_name}"
@@ -1839,6 +2003,7 @@ def sync_sealed_directory(
                                 "remote_path": snap_rel,
                                 "bytes": snap_info["bytes"],
                                 "sha256": snap_info["sha256"],
+                                "partial_run_had_errors": bool(errors or conflicts),
                             },
                         )
                 except Exception as exc:
@@ -1851,6 +2016,7 @@ def sync_sealed_directory(
                 STATE_VERIFIED: len(ledger.list_partitions(states=(STATE_VERIFIED,))),
                 STATE_PRUNED: len(ledger.list_partitions(states=(STATE_PRUNED,))),
             }
+            legacy_out = str(legacy_jsonl_path) if legacy_jsonl_path.is_file() else None
 
             if conflicts or errors:
                 return {
@@ -1872,6 +2038,8 @@ def sync_sealed_directory(
                     "pruned_local_files": pruned,
                     "ledger_db_path": str(ledger_db_path),
                     "ledger_path": str(ledger_jsonl_path),
+                    "projection_ledger_path": str(ledger_jsonl_path),
+                    "legacy_ledger_path": legacy_out,
                     "snapshot_remote_path": snapshot_remote_path,
                     "snapshot_sha256": snapshot_sha256,
                 }
@@ -1892,6 +2060,8 @@ def sync_sealed_directory(
                 "pruned_local_files": pruned,
                 "ledger_db_path": str(ledger_db_path),
                 "ledger_path": str(ledger_jsonl_path),
+                "projection_ledger_path": str(ledger_jsonl_path),
+                "legacy_ledger_path": legacy_out,
                 "snapshot_remote_path": snapshot_remote_path,
                 "snapshot_sha256": snapshot_sha256,
                 "entries": all_entries,
