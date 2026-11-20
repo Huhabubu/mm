@@ -89,9 +89,31 @@ def source_l2_grid_check(path,raw_tick,legal_tick):
     total=offlegal=offraw=0
     min_px,max_px=math.inf,0.
     unusual=[]
+    bid_levels,ask_levels={},{}
+    prev_local=None
+    snap_in_progress=False
+    has_snapshot=False
+    snapshot_bids=snapshot_asks=0
+    first_snapshot_complete=False
+    checked_group_ns=-1
+    full_group_checks=crossed_full_groups=0
     with Path(path).open(newline="",encoding="utf-8") as file:
         for row in csv.DictReader(file):
             p=float(row["price"])
+            local=int(row["local_timestamp"])*1000
+            if prev_local is not None and local!=prev_local:
+                # A Tardis WebSocket update is often split across many L2
+                # price-level CSV rows at the SAME local timestamp. Only
+                # check the completed previous message, never its transient
+                # partially applied intermediate book.
+                if (has_snapshot and not snap_in_progress
+                        and local-checked_group_ns>=30_000_000):
+                    checked_group_ns=prev_local
+                    if bid_levels and ask_levels:
+                        full_group_checks+=1
+                        if max(bid_levels)>=min(ask_levels):
+                            crossed_full_groups+=1
+            prev_local=local
             total+=1
             if p<=0 or not math.isfinite(p):
                 raise ValueError("Invalid L2 source price")
@@ -102,14 +124,45 @@ def source_l2_grid_check(path,raw_tick,legal_tick):
                 offlegal+=1
                 if len(unusual)<20:
                     unusual.append(row["price"])
+            snap=row["is_snapshot"]=="true"
+            side=row["side"]
+            if snap and not snap_in_progress:
+                bid_levels.clear();ask_levels.clear()
+                snapshot_bids=snapshot_asks=0
+                snap_in_progress=True
+            elif not snap and snap_in_progress:
+                if not (snapshot_bids and snapshot_asks):
+                    raise ValueError("Bitget raw initial/resubscribe snapshot missing a side")
+                has_snapshot=True
+                first_snapshot_complete=True
+                snap_in_progress=False
+            if snap:
+                if side=="bid": snapshot_bids+=1
+                elif side=="ask":snapshot_asks+=1
+            if side not in ("bid","ask"):
+                raise ValueError("Unexpected L2 side")
+            book=bid_levels if side=="bid" else ask_levels
+            size=float(row["amount"])
+            if size<0 or not math.isfinite(size):
+                raise ValueError("Invalid L2 depth")
+            if size>0: book[p]=size
+            else: book.pop(p,None)
+    if snap_in_progress and snapshot_bids and snapshot_asks:
+        first_snapshot_complete=True
     if offraw or total<1:
         raise ValueError(f"Lossless raw L2 grid rejected: {offraw}/{total}")
+    if not first_snapshot_complete or full_group_checks<1 or crossed_full_groups:
+        raise ValueError("Crossed or incomplete grouped Bitget L2 replay state")
     return {
         "rows":total,"price_min":min_px,"price_max":max_px,
         "off_legal_quote_grid_rows":offlegal,
         "off_raw_hbt_grid_rows":offraw,
         "first_20_off_legal_prices_raw_string":unusual,
         "source_rows_preserved_as_raw_ticks":True,
+        "l2_post_message_book_checks":full_group_checks,
+        "l2_crossed_post_message_book_checks":crossed_full_groups,
+        "initial_snapshot_complete":first_snapshot_complete,
+        "grouping_rule":"only completed raw local_timestamp WS message, sampled at 30ms maximum frequency",
     }
 
 def hbt_asset(parts,spec,low,high,fee_maker,fee_taker):
