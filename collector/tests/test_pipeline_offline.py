@@ -802,7 +802,7 @@ def test_four_exchange_protocol_edge_cases_and_channel_separation(tmp_path: Path
             "payload": json.dumps(
                 {
                     "action": "snapshot",
-                    "arg": {"instType": "usdt-futures", "channel": "books50", "instId": "BTCUSDT"},
+                    "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"},
                     "data": [{"a": [["95000.1", "2.0"]], "b": [["95000.0", "2.0"]], "ts": str(base_ms + 10), "seq": 800, "pseq": 0}],
                     "ts": base_ms + 10,
                 }
@@ -818,7 +818,7 @@ def test_four_exchange_protocol_edge_cases_and_channel_separation(tmp_path: Path
             "payload": json.dumps(
                 {
                     "action": "update",
-                    "arg": {"instType": "usdt-futures", "channel": "books50", "instId": "BTCUSDT"},
+                    "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"},
                     "data": [{"a": [["95000.1", "2.5"]], "b": [], "ts": str(base_ms + 11), "seq": 801, "pseq": 800}],
                     "ts": base_ms + 11,
                 }
@@ -834,7 +834,7 @@ def test_four_exchange_protocol_edge_cases_and_channel_separation(tmp_path: Path
             "payload": json.dumps(
                 {
                     "action": "snapshot",
-                    "arg": {"instType": "usdt-futures", "channel": "books1", "instId": "BTCUSDT"},
+                    "arg": {"instType": "usdt-futures", "topic": "books1", "symbol": "BTCUSDT"},
                     "data": [{"a": [["66666.7", "1.0"]], "b": [["66666.6", "1.0"]], "ts": str(base_ms + 11), "seq": 1, "pseq": 0}],
                     "ts": base_ms + 11,
                 }
@@ -850,7 +850,7 @@ def test_four_exchange_protocol_edge_cases_and_channel_separation(tmp_path: Path
             "payload": json.dumps(
                 {
                     "action": "update",
-                    "arg": {"instType": "usdt-futures", "channel": "publicTrade", "instId": "BTCUSDT"},
+                    "arg": {"instType": "usdt-futures", "topic": "publicTrade", "symbol": "BTCUSDT"},
                     "data": [
                         {"T": str(base_ms + 12), "P": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": True},
                         {"T": str(base_ms + 12), "P": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": True},

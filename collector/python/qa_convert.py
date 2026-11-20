@@ -523,8 +523,8 @@ def _ingest_bitget_record(
     arg = obj.get("arg")
     if not isinstance(arg, dict):
         return
-    channel = str(arg.get("channel") or "")
-    inst_id = str(arg.get("instId") or "")
+    channel = str(arg.get("topic") or arg.get("channel") or "")
+    inst_id = str(arg.get("symbol") or arg.get("instId") or "")
     action = str(obj.get("action") or "")
     data_list = obj.get("data")
     if not isinstance(data_list, list):
