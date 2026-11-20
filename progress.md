@@ -599,3 +599,12 @@
 - [x] 本轮工程结果详见 docs/bitget_4b_adapter_50m_20261120.md，两份50分钟模型JSON与6份官方HBT成交NPZ已保存到 Actions artifact。Gate冻结报告和此前Bitget/OKX数据门禁报告没有更改。
 - [ ] **Bitget四币种×六日正式24资产日HBT任务尚未创建或启动**。下一阶段需确认ETH的历史可执行数量步长，且正式全日需附带额外快照/大于1000ms L2间隔前后±5s、10月1日01—02UTC剔除、DOGE严格3日/无损6日对照。仅在事后删成交不能据此重算自洽组合净收益。
 
+## 2026-11-20 第5章跨所 R1 前置修复与 Gate 延迟补审（Bitget 24资产日继续冻结）
+
+- [x] 在实验分支 `exp/chapter5-cross-exchange` 提交R1引擎/适配器/离线测试/数据审计与独立汇总脚本，初始提交[`a4311bb`](https://github.com/Huhabubu/mm/commit/a4311bb29a849933ea61d20d8612af8dc7bff53c)。旧BTC论文主文、第5章归档报告和已冻结历史结果均未改动。R1协议位于 `docs/chapter5_r1_preflight_protocol_20261120.md`。
+- [x] **ETH及四币数量规则更新**：以Gate每日冻结合约数量×乘数对应的基础币量为目标，按Bitget候选合法步长最近取整、满足最小委托量；`max_pos/order_qty`倍数保持与Gate一致，记录目标、实量、基础币差和同一Gate参照价格下名义额差。不再用ETH严格基础币数量相等阻断工程适配；Bitget历史数量步长仍属未独立核验的候选规则。
+- [x] C1将同微秒冲突判断改为在不改变Binance原先`+1ns`事件排序的条件下比较两市场最近已消费Feed与信号可见时间的`//1000`；`cross_timestamp_tie_mode=legacy_ns`默认保留旧回归，新物理模式显式启用`microsecond`。C2库存多头退买价、空头退卖价、零库存在理论中心附近对称外扩；修复DOGE双层报价网格。C3正式`forced_start_ns`之前不采100ms零库存，STD、RMS、平均绝对持仓统一有效交易段。
+- [x] 本轮两条真实CI均Success：R1/24日Gate采集审计 [#44659938146](https://github.com/Huhabubu/mm/actions/runs/44659938146)；Bitget BTC/DOGE各50m HBT、冻结Gate动作/成交/净权益Golden、离线单测及新增6行等价盈亏拆解 [#44659937956](https://github.com/Huhabubu/mm/actions/runs/44659937956)。新统一汇总包括Gross/turnover bps、成交价基准500/1000ms Total Markout、STD和STD/单笔数量、0/-0.5/+2bps相同成交记录费率情景，逐日检验三项收益变化严格相加。
+- [x] Gate四币×2026年6—11月每月1日共24/24日**真实**Tardis归一化BBO采集时间差P50/P95/P99与同日Binance原生BBO逐日并列，审计工作流全部成功，详见 `reports/chapter5_r1_preflight_20261120/`。前5日100ms/20档快照数据与11月原生增量明确标记；采集时间差含行情发布与时钟，不等于单程网络延迟，P99边际分位数差不作逐笔因果延迟解释。
+- [!] **C1真实非零阻断计数验收尚未完成**：Gate BTC 2026-11-01 50分钟真实HBT在GLFT和both_1p0两模式各观测到1次真实同微秒Binance变价/目标所feed碰撞，但`same_timestamp_ties_blocked`均为**0**（当时不满足完整潜在激活条件）。人工确定性测试证明守卫在满足条件时会拦截；尚需发现真实可激活的同微秒事件才满足严格R1门禁。因此**R1工程/单测/Golden/24行延迟表完成；真实门禁未全通过**。
+- [ ] **Bitget 24资产日完整HBT工作流仍未创建或启动，禁止放行**。维持全部原始BTC第5章和旧报告冻结，OKX继续冻结。额外快照/L2>1秒窗口、DOGE严格3日与无损6日、10月异常时段的下一轮敏感性仍待正式批量阶段处理。
