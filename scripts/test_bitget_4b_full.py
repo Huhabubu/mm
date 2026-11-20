@@ -1,14 +1,18 @@
 """Deterministic synthetic R1-to-4B full-day gates; NOT empirical market results."""
 import csv
+import gzip
+import io
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from bitget_4b_posthoc import source_risk_events, merged_windows, included_mask
 from aggregate_bitget_4b_full import assert_report, group_means, DAYS, MODELS
+from run_gate_btc_origin_glft import safe_gate_csv
 
 
 def toy_report():
@@ -45,6 +49,28 @@ def toy_report():
 
 
 class FullDaySafetyTests(unittest.TestCase):
+    def test_bitget_partial_trade_print_under_new_order_step(self):
+        # Market trades are partial executions, not necessarily new orders.
+        from check_okx_hft_data import SCHEMAS
+        day="2026-08-01";begin=1785542400000000
+        buffer=io.StringIO()
+        writer=csv.DictWriter(buffer,fieldnames=SCHEMAS["trades"])
+        writer.writeheader()
+        writer.writerow({"exchange":"bitget-futures","symbol":"BTCUSDT",
+                         "timestamp":begin+100,"local_timestamp":begin+200,
+                         "id":"1","side":"buy","price":"100.0","amount":"0.00003"})
+        data=gzip.compress(buffer.getvalue().encode("utf-8"))
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/"print.csv"
+            with patch("run_gate_btc_origin_glft.urllib.request.urlopen",
+                       lambda _req,timeout=240:io.BytesIO(data)):
+                audit=safe_gate_csv("trades",day,begin+1000,path,10,
+                    symbol="BTCUSDT",historical_tick=.1,
+                    historical_lot=None,source_exchange="bitget-futures")
+            self.assertEqual(audit["rows"],1)
+            self.assertEqual(audit["invalid_rows"],0)
+            self.assertIn("0.00003",path.read_text())
+
     def test_report_accepts_realistic_compatible_schema(self):
         self.assertTrue(assert_report(toy_report(),"DOGEUSDT","2026-08-01"))
         d=toy_report()

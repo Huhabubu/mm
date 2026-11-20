@@ -100,7 +100,12 @@ def safe_gate_csv(kind, day, end_us, path, max_rows, symbol=GATE_SYMBOL,
                             amt=float(row["amount"])
                             if not (math.isfinite(px) and px>0 and math.isfinite(amt) and amt>=0):
                                 metadata["invalid_rows"]+=1
-                            if kind=="trades":
+                            if kind=="trades" and not (
+                                    source_exchange=="bitget-futures"
+                                    and historical_lot is None):
+                                # Gate's frozen lot validation is unchanged.
+                                # Bitget market prints can include a partial fill
+                                # smaller than its minimum NEW order quantity.
                                 unit = 1.0 if historical_lot is None else historical_lot
                                 if abs(amt/unit-round(amt/unit))>1e-6:
                                     metadata["invalid_rows"]+=1
