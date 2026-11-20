@@ -37,13 +37,16 @@ UA={"User-Agent":"mm-gate-glft-btc-hbt/1.0"}
 
 
 def safe_gate_csv(kind, day, end_us, path, max_rows, symbol=GATE_SYMBOL,
-                  historical_tick=None, historical_lot=None):
+                  historical_tick=None, historical_lot=None,
+                  source_exchange=GATE_EXCHANGE):
     """Stream losslessly into HBT Tardis CSV schema; no custom orderbook merge."""
     if kind not in SCHEMAS:
         raise ValueError(kind)
     source_kind="quotes" if kind=="book_ticker" else kind
     y,m,d=day.split("-")
-    url=f"{ROOT}/{GATE_EXCHANGE}/{source_kind}/{y}/{m}/{d}/{symbol}.csv.gz"
+    if source_exchange not in (GATE_EXCHANGE,"bitget-futures"):
+        raise ValueError("Unapproved target exchange for standardized Tardis CSV loader")
+    url=f"{ROOT}/{source_exchange}/{source_kind}/{y}/{m}/{d}/{symbol}.csv.gz"
     fields=SCHEMAS[kind]
     metadata={"rows":0,"snapshot_rows":0,"initial_snapshot_bid":0,
               "initial_snapshot_ask":0,"initial_snapshot_complete":False,
