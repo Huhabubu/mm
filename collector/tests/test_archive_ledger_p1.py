@@ -1340,3 +1340,110 @@ def test_p1_prune_preserves_local_on_remote_api_outage_and_recovers_safely(tmp_p
         assert row2["state"] == STATE_VERIFIED
         assert row2["has_conflict"] == 1
         assert row2["remote_data_id"] == orig_remote_id, "Original verified remote_data_id must NOT be overwritten!"
+
+
+def test_hourly_archive_detects_missing_exchange_and_orphan(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+
+    _create_sealed_partition(tmp_path, date_utc="2026-12-03", hour_utc="23")
+    orphan, manifest, _ = _create_sealed_partition(
+        tmp_path, exchange="bybit_linear", date_utc="2026-12-03", hour_utc="23",
+    )
+    manifest.unlink()
+    now = datetime(2026, 12, 4, 0, 5, tzinfo=timezone.utc).timestamp()
+    result = sync_sealed_directory(
+        tmp_path, InstrumentedMockBackend(), now_epoch_s=now,
+        expected_hourly_exchanges={"gate_futures", "bybit_linear"},
+    )
+    assert result["status"] == "blocked"
+    assert result["verified_count"] == 1
+    assert "expected_hour_not_verified:bybit_linear:2026-12-03T23Z" in result["failed_items"]
+    assert f"sealed_file_without_manifest:{orphan.relative_to(tmp_path).as_posix()}" in result["failed_items"]
+
+
+def test_failed_new_snapshot_retries_without_new_partitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_sealed_partition(tmp_path, hour_utc="00")
+    backend = InstrumentedMockBackend()
+    assert sync_sealed_directory(tmp_path, backend)["snapshot_remote_path"]
+
+    _create_sealed_partition(tmp_path, hour_utc="01")
+    original_copy = backend.copy_file
+
+    def fail_snapshot(local: Path, remote: str, *, immutable: bool = True) -> None:
+        if remote.endswith(".sqlite.sha256"):
+            raise IOError("simulated snapshot checksum upload failure")
+        original_copy(local, remote, immutable=immutable)
+
+    monkeypatch.setattr(backend, "copy_file", fail_snapshot)
+    failed = sync_sealed_directory(tmp_path, backend)
+    assert failed["status"] == "blocked"
+    assert failed["verified_count"] == 1
+
+    monkeypatch.setattr(backend, "copy_file", original_copy)
+    recovered = sync_sealed_directory(tmp_path, backend)
+    assert recovered["status"] == "ok"
+    assert recovered["newly_verified_count"] == 0
+    assert recovered["snapshot_remote_path"]
+    assert recovered["snapshot_remote_path"] + ".sha256" in backend.store
+
+
+def test_complete_day_gate_rejects_single_verified_partition(tmp_path: Path) -> None:
+    _create_sealed_partition(tmp_path)
+    archived = sync_sealed_directory(tmp_path, InstrumentedMockBackend())
+    assert archived["status"] == "ok"
+    config = {"exchanges": {"gate_futures": {
+        "enabled": True, "symbols": ["BTC_USDT"],
+        "channels": ["futures.obu.50", "futures.trades"],
+    }}}
+    result = run_qa_convert(
+        Path(archived["ledger_db_path"]), tmp_path / "out",
+        coverage_config=config, coverage_date_utc="2026-12-03",
+    )
+    assert result["status"] == "blocked"
+    assert result["coverage"]["clock_certified_minutes"] == 0
+    assert len(result["coverage"]["missing_partitions"]) == 23
+    assert "incomplete_utc_day_coverage" in result["failed_items"]
+    assert not (tmp_path / "out").exists()
+
+
+def test_complete_day_coverage_checks_intrahour_gaps(tmp_path: Path) -> None:
+    from data_coverage import CompleteDayCoverage
+
+    config = {"exchanges": {"binance_futures": {
+        "enabled": True, "symbols": ["BTCUSDT"],
+        "public_channels": ["bookTicker"], "market_channels": [],
+    }}}
+    coverage = CompleteDayCoverage(config, "2026-12-03")
+    clock = tmp_path / "chrony"
+    clock.mkdir()
+    (clock / "chrony_20261203.csv").write_text(
+        "wall_ns,certified_le_1ms\n" + "".join(
+            f"{(coverage.start_s + minute * 60) * 10**9},True\n" for minute in range(1440)
+        ),
+        encoding="utf-8",
+    )
+    for hour in range(24):
+        coverage.observe_partition({
+            "date_utc": coverage.date, "hour_utc": hour, "exchange": "binance_futures",
+        })
+    raw = json.dumps({"e": "bookTicker", "s": "BTCUSDT"})
+    for minute in range(0, 1440, 60):
+        coverage.observe_record("binance_futures", {
+            "kind": "DATA", "recv_wall_ns": (coverage.start_s + minute * 60) * 10**9, "payload": raw,
+        })
+    result = coverage.report(tmp_path)
+    assert result["status"] == "incomplete"
+    assert result["missing_partitions"] == []
+    assert result["missing_stream_hours"] == []
+    assert result["clock_certified_minutes"] == 1440
+    assert len(result["stream_gaps"]) == 1
+
+    # In production the timestamps arrive in order. Rebuild coverage for the complete stream.
+    coverage.timing.clear()
+    for minute in range(0, 1440, 5):
+        coverage.observe_record("binance_futures", {
+            "kind": "DATA", "recv_wall_ns": (coverage.start_s + minute * 60) * 10**9, "payload": raw,
+        })
+    assert coverage.report(tmp_path)["status"] == "complete"

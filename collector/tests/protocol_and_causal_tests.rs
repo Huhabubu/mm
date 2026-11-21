@@ -422,8 +422,12 @@ fn test_ab_causal_switch_gap_and_utc_midnight_rollover() {
     assert_eq!(writer.sealed_partitions().len(), 2);
 
     // Now test failover when standby is NOT LIVE -> MUST emit GAP_START and later GAP_END
-    sel.on_disconnect(ConnId::A, t_after_midnight + 100_000_000, 700_000_000, "planned_close");
+    let disconnected = sel.on_disconnect(ConnId::A, t_after_midnight + 100_000_000, 700_000_000, "planned_close");
     assert_eq!(sel.conn_state(ConnId::A), ConnState::Invalid);
+    assert!(!disconnected.actions.iter().any(|action| matches!(
+        action, SelectorAction::Reconnect { conn_id: ConnId::A, .. }
+    )));
+    assert!(sel.on_planned_rotation(ConnId::A, t_after_midnight + 110_000_000, 710_000_000).actions.is_empty());
     let gap_out = sel.on_disconnect(ConnId::B, t_after_midnight + 200_000_000, 800_000_000, "network_drop");
     assert!(sel.in_gap());
     assert!(gap_out.records.iter().any(|r| r.payload.contains("\"GAP_START\"")));

@@ -531,6 +531,7 @@ def test_p5_meta_daemon_tunnel_monitoring_opt_in_only(
 
     data_root = tmp_path / "tokyo_l2"
     cfg = json.loads((COLLECTOR_DIR / "specs" / "config.example.json").read_text(encoding="utf-8"))
+    cfg["meta_daemon"]["require_stream_activity"] = False  # proxy-status fixture
     cfg["deployment"]["data_root"] = str(data_root)
     cfg_path = tmp_path / "p5_meta_cfg.json"
     cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")

@@ -852,8 +852,8 @@ def test_four_exchange_protocol_edge_cases_and_channel_separation(tmp_path: Path
                     "action": "update",
                     "arg": {"instType": "usdt-futures", "topic": "publicTrade", "symbol": "BTCUSDT"},
                     "data": [
-                        {"T": str(base_ms + 12), "P": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": True},
-                        {"T": str(base_ms + 12), "P": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": True},
+                        {"T": str(base_ms + 12), "p": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": "yes"},
+                        {"T": str(base_ms + 12), "p": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": "yes"},
                     ],
                     "ts": base_ms + 12,
                 }
@@ -978,12 +978,20 @@ def test_gap_local_loss_chrony_and_spec_change_mark_execution_unverified(tmp_pat
     # Under strict_zero_loss -> must fail closed with status=blocked!
     qa_strict = run_qa_convert(Path(arch["ledger_path"]), tmp_path / "out_strict", meta_dir=meta_dir, strict_zero_loss=True)
     assert qa_strict["status"] == "blocked"
+    assert qa_strict["failed_items"] == ["local_loss_detected_under_strict_zero_loss_gate"]
+    [damage] = qa_strict["local_loss_partitions"]
+    assert damage["exchange"] == "gate_futures"
+    assert (damage["date_utc"], damage["hour_utc"]) == ("2026-12-03", "00")
+    assert damage["manifest_file"].endswith(".manifest.json")
+    assert damage["manifest_local_loss_lines"] == damage["recorded_local_loss_lines"] == 1
+    assert damage["recorded_dropped_frames"] == 1
 
     # Normal calendar mode -> must NOT drop the day; must retain with execution_unverified + all 4 reasons!
     out_dir = tmp_path / "out_cal"
     qa = run_qa_convert(Path(arch["ledger_path"]), out_dir, meta_dir=meta_dir, strict_zero_loss=False)
     assert qa["status"] == "ok"
     assert qa["execution_unverified_asset_days"] == 1
+    assert qa["local_loss_partitions"] == [damage]
     cal = json.loads((out_dir / "eligibility_calendar.json").read_text(encoding="utf-8"))
     assert len(cal) == 1
     row = cal[0]

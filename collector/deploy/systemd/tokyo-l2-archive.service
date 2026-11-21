@@ -11,6 +11,6 @@ EnvironmentFile=-/etc/tokyo-l2/live.env
 EnvironmentFile=-/etc/tokyo-l2/notify.env
 # Safe default: auto-pruning stays OFF until fault-injection + real Google Drive readback tests pass.
 # Only after user signoff, enable `--prune-hours 24` via a systemd drop-in override.
-ExecStart=/opt/mm/collector/bin/archive --dir /data/tokyo_l2 --remote gdrive_main:tokyo_l2_data --verify-remote
+ExecStart=/opt/mm/collector/bin/archive --dir /data/tokyo_l2 --config /etc/tokyo-l2/config.json --remote gdrive_main:tokyo_l2_data --verify-remote --run-id ${TOKYO_L2_RUN_ID}
 StandardOutput=journal
 StandardError=journal

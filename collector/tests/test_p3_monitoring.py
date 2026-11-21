@@ -61,6 +61,7 @@ def _write_test_config(tmp_path: Path, data_root: Path) -> Path:
     cfg = json.loads((SPECS_DIR / "config.example.json").read_text(encoding="utf-8"))
     cfg["deployment"]["data_root"] = str(data_root)
     cfg["meta_daemon"]["collector_stale_seconds"] = 300
+    cfg["meta_daemon"]["require_stream_activity"] = False  # legacy monitor fixtures
     cfg["meta_daemon"]["collector_hc_interval_seconds"] = 300
     cfg["meta_daemon"]["alert_cooldown_seconds"] = 1800
     cfg["meta_daemon"]["restart_recovery_seconds"] = 600
@@ -300,12 +301,12 @@ def test_p3_healthy_run_hourly_battle_report_and_zero_zstd_decompression(
     assert r1["hourly_report"]["sent"] is True
     assert len(transport.tg_messages) == 1
     report = transport.tg_messages[0]["text"]
-    assert "东京 L2 小时战报" in report
-    assert "归档状态: VERIFIED" in report
-    assert "深度数据质量: PENDING（待后续 GitHub 深度 QA 验证）" in report
-    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+    assert "东京 L2｜小时采集报告" in report
+    assert "云端归档：VERIFIED" in report
+    assert "深度数据质量：PENDING" in report
+    for ex in ("Binance", "Bybit", "Bitget", "Gate"):
         assert ex in report
-    assert "当前异常: 无" in report
+    assert "当前没有监控告警" in report
 
     # Second sweep 60s later in SAME hour: ZERO duplicate battle report, ZERO HC ping (<300s)
     r2 = mon.run_sweep(now_epoch_s=t0 + 60.0)
@@ -323,10 +324,13 @@ def test_p3_healthy_run_hourly_battle_report_and_zero_zstd_decompression(
     assert len(transport.hc_calls) == 2
     assert len(transport.tg_messages) == 1
 
-    # Next UTC hour (+3600s, minute=12): sends next hourly battle report!
+    # Next UTC hour (+3600s, minute=12): a fresh complete-hour manifest
+    # exists, so DATA volume stays healthy and only one report is sent.
     for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
-        p_path = next((data_root / "raw" / ex / "2026-12-03").glob("*.partial"))
-        os.utime(p_path, (t0 + 3600.0, t0 + 3600.0))
+        _seed_exchange_files(
+            data_root, ex, now_s=t0 + 3600.0,
+            hour_utc="10", data_lines=12000,
+        )
     r4 = mon.run_sweep(now_epoch_s=t0 + 3605.0)
     assert r4["hourly_report"]["sent"] is True
     assert len(transport.tg_messages) == 2
@@ -385,7 +389,7 @@ def test_p3_collector_stopped_abnormal_restart_and_data_stale_alerts_and_recover
     r_down = mon.run_sweep(now_epoch_s=t0 + 301.0)
     assert "collector_stopped" in r_down["active_alerts"]
     assert "collector_abnormal_restart" in r_down["active_alerts"]
-    assert any("collector_stopped" in m["text"] for m in transport.tg_messages)
+    assert any("采集程序停止" in m["text"] for m in transport.tg_messages)
     assert transport.hc_calls[-1]["is_fail"] is True
     assert "collector_stopped" in transport.hc_calls[-1]["body"]
 
@@ -399,7 +403,7 @@ def test_p3_collector_stopped_abnormal_restart_and_data_stale_alerts_and_recover
     r_up = mon.run_sweep(now_epoch_s=t0 + 610.0)
     assert "collector_stopped" not in r_up["active_alerts"]
     assert "collector_stopped" in r_up["alert_dispatch"]["sent_recoveries"]
-    assert any("[已恢复] collector_stopped" in m["text"] for m in transport.tg_messages)
+    assert any("[已恢复]" in m["text"] and "采集程序停止" in m["text"] for m in transport.tg_messages)
     # abnormal_restart stays firing during 600s stabilization window, then recovers!
     assert "collector_abnormal_restart" in r_up["active_alerts"]
     for pp in partials.values():
@@ -576,8 +580,8 @@ def test_p3_archive_errors_conflicts_and_cli_archive_healthchecks(
     assert "archive_upload_or_verify_failed" in r_bad["active_alerts"]
     assert "archive_ledger_conflict" in r_bad["active_alerts"]
     assert r_bad["hourly_report"]["text"] is not None
-    assert "归档状态: CONFLICT" in r_bad["hourly_report"]["text"]
-    assert "深度数据质量: PENDING（待后续 GitHub 深度 QA 验证）" in r_bad["hourly_report"]["text"]
+    assert "云端归档：CONFLICT" in r_bad["hourly_report"]["text"]
+    assert "深度数据质量：PENDING" in r_bad["hourly_report"]["text"]
 
     # Resolve both in SQLite -> monitor fires recovery alerts cleanly
     _seed_ledger_row(data_root, *refs["bybit_linear"], exchange="bybit_linear", state="VERIFIED", last_error_code=None)
@@ -726,7 +730,7 @@ def test_p3_alert_dedup_cooldown_network_failure_and_secret_redaction(
     alert_msgs = [
         m
         for m in transport.tg_messages
-        if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "disk_usage_high" in m["text"]
+        if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "磁盘使用率过高" in m["text"]
     ]
     assert len(alert_msgs) == 1
 
@@ -740,7 +744,7 @@ def test_p3_alert_dedup_cooldown_network_failure_and_secret_redaction(
             [
                 m
                 for m in transport.tg_messages
-                if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "disk_usage_high" in m["text"]
+                if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "磁盘使用率过高" in m["text"]
             ]
         )
         == 1
@@ -751,7 +755,7 @@ def test_p3_alert_dedup_cooldown_network_failure_and_secret_redaction(
     assert "disk_usage_high" in r_rem["alert_dispatch"]["sent_alerts"]
     reminders = [m for m in transport.tg_messages if "持续告警" in m["text"]]
     assert len(reminders) == 1
-    assert "去重抑制: 4 次" in reminders[0]["text"]
+    assert "去重抑制 4 次" in reminders[0]["text"]
 
     # Check redact_secrets helper directly against generic HC / Telegram strings
     sample_err = (
@@ -1130,11 +1134,13 @@ def test_p3_hourly_report_prev_hour_vs_cumulative_metrics(tmp_path: Path) -> Non
     report = r["hourly_report"]["text"]
     assert report is not None
 
-    # Verify explicit separation: previous hour (2026-12-03T09) vs historical cumulative!
-    assert "上小时(2026-12-03T09): 封口=1 DATA=12,000" in report
-    assert "SW=1 GAP=1 LOSS=0" in report
-    assert "历史累计: 封口=2(V=1/P=1) DATA=62,000 LOSS=7" in report
-    assert "账本累计分区: SEALED=0 / VERIFIED=4 / PRUNED=4" in report
+    # Previous-hour market data is visible; detailed historical totals stay in the state.
+    assert "统计：2026-12-03T09 UTC" in report
+    assert "Gate: 12,000 行 · GAP 1 · LOSS 0" in report
+    assert "云端归档：VERIFIED" in report
+    assert "V=4 / P=4" in report
+    assert r["data_tree"]["per_exchange"]["gate_futures"]["cumulative_data_lines"] == 62000
+    assert r["data_tree"]["per_exchange"]["gate_futures"]["cumulative_local_loss_lines"] == 7
 
     # Verify UTC midnight boundary: at 2026-12-04T00:12:00 UTC -> prev_hour_key = 2026-12-03T23
     t_midnight = 1_796_343_120.0
@@ -1151,7 +1157,8 @@ def test_p3_hourly_report_prev_hour_vs_cumulative_metrics(tmp_path: Path) -> Non
     r_mid = mon.run_sweep(now_epoch_s=t_midnight, force_hourly_report=True)
     mid_report = r_mid["hourly_report"]["text"]
     assert mid_report is not None
-    assert "上小时(2026-12-03T23): 封口=1 DATA=9,999" in mid_report
+    assert "统计：2026-12-03T23 UTC" in mid_report
+    assert "Binance: 9,999 行" in mid_report
 
 
 def _ws_encode_frame(opcode: int, payload: bytes) -> bytes:
@@ -1652,7 +1659,7 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
         assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
         assert r_outage["collector_healthcheck"]["healthy"] is False
         assert transport.hc_calls[-1]["is_fail"] is True
-        assert any("dual_ab_outage_gt_5s" in m["text"] for m in transport.tg_messages)
+        assert any("行情双连接中断" in m["text"] for m in transport.tg_messages)
         transport.tg_messages.clear()
 
         # Stage 3: binance_public WS reconnects cleanly (`silent_connected` = Connected logged, ZERO frames),
@@ -1738,7 +1745,7 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
         assert r_acked["active_alerts"] == []
         assert r_acked["outage_acks_applied"][0]["cleared_endpoints"] == ["binance_public"]
         assert r_acked["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
-        assert any("[已恢复]" in m["text"] and "dual_ab_outage_gt_5s" in m["text"] for m in transport.tg_messages)
+        assert any("[已恢复]" in m["text"] and "行情双连接中断" in m["text"] for m in transport.tg_messages)
         assert r_acked["collector_healthcheck"]["healthy"] is True
         assert transport.hc_calls[-1]["is_fail"] is False
 
@@ -2068,5 +2075,227 @@ def test_p3_ack_outage_idempotent_on_crash_after_state_save_before_unlink(
     assert transport2.hc_calls[-1]["is_fail"] is True
 
 
+def test_p3_no_late_hourly_backfill_after_restart_and_next_window(tmp_path: Path) -> None:
+    """13:50 startup does not send a stale report; the next UTC :10 window sends once."""
+    from datetime import datetime, timezone
+
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t_late = datetime(2026, 12, 3, 10, 50, tzinfo=timezone.utc).timestamp()
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t_late, data_lines=5000)
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    first = mon.run_sweep(now_epoch_s=t_late)
+    assert first["hourly_report"]["due"] is False
+    assert not any("小时采集报告" in m["text"] for m in t.tg_messages)
+
+    # State-backed restart still cannot backfill after the fixed delivery window.
+    restarted = _build_monitor(cfg, t)
+    next_try = restarted.run_sweep(now_epoch_s=t_late + 30.0)
+    assert next_try["hourly_report"]["due"] is False
+
+    # At UTC 11:10 the last complete hour is 10.
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t_late + 1200, hour_utc="10", data_lines=6000)
+    in_window = restarted.run_sweep(now_epoch_s=t_late + 1200.0)
+    assert in_window["hourly_report"]["sent"] is True
+    assert sum("小时采集报告" in m["text"] for m in t.tg_messages) == 1
+    again = restarted.run_sweep(now_epoch_s=t_late + 1230.0)
+    assert again["hourly_report"]["due"] is False
 
 
+def test_p3_meta_still_writing_but_zero_data_blocks_healthy_hc(tmp_path: Path) -> None:
+    """Recent .partial activity cannot establish health when Bybit's sealed DATA is zero."""
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t0 = 1_796_292_720.0  # UTC 10:12, previous complete hour 09
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(
+            root, ex, now_s=t0,
+            data_lines=0 if ex == "bybit_linear" else 10000,
+        )
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    result = mon.run_sweep(now_epoch_s=t0)
+    assert result["collector_healthcheck"]["healthy"] is False
+    assert t.hc_calls[-1]["is_fail"] is True
+    assert "collector_data_volume_abnormal" in result["active_alerts"]
+    assert result["data_tree"]["per_exchange"]["bybit_linear"]["last_activity_age_s"] < 300
+    msg = next(m["text"] for m in t.tg_messages if "有效行情量异常" in m["text"])
+    assert "Bybit" in msg and "0 行" in msg
+    assert "{" not in msg and "current_sha256" not in msg
+    report = result["hourly_report"]["text"]
+    assert "🔴 Bybit: 0 行" in report
+
+    # Later valid complete hour removes the operational alarm; deep QA stays pending.
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t0 + 3600, hour_utc="10", data_lines=11000)
+    recovered = mon.run_sweep(now_epoch_s=t0 + 3600.0, force_collector_hc=True)
+    assert "collector_data_volume_abnormal" not in recovered["active_alerts"]
+    assert "collector_data_volume_abnormal" in recovered["alert_dispatch"]["sent_recoveries"]
+
+
+def test_p3_very_low_data_ratio_vs_prior_hours_blocks_healthy(tmp_path: Path) -> None:
+    """223 rows against three earlier healthy 10,000-row hours must fail initial screening."""
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t0 = 1_796_292_720.0
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        for hour in ("06", "07", "08"):
+            _seed_exchange_files(root, ex, now_s=t0, hour_utc=hour, data_lines=10000)
+        _seed_exchange_files(
+            root, ex, now_s=t0, hour_utc="09",
+            data_lines=223 if ex == "binance_futures" else 10000,
+        )
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    result = mon.run_sweep(now_epoch_s=t0)
+    issue = result["data_tree"]["hourly_volume_assessment"]["affected"]
+    assert issue["binance_futures"]["data_lines"] == 223
+    assert issue["binance_futures"]["reference_data_lines"] == 10000
+    assert "bybit_linear" not in issue
+    assert result["collector_healthcheck"]["healthy"] is False
+
+
+def test_p3_raw_spec_body_changes_are_audited_without_unverified_tg_alarm(tmp_path: Path) -> None:
+    """Raw REST body change does not prove tick size / multiplier changed."""
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t0 = 1_796_292_720.0
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t0, data_lines=10000)
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    version = [1]
+    mon.spec_fetcher = lambda _url, _headers: json.dumps({"dynamic": version[0]}).encode()
+    mon.run_sweep(now_epoch_s=t0, run_specs=True)
+    version[0] = 2
+    result = mon.run_sweep(now_epoch_s=t0 + 30, run_specs=True)
+    assert "raw_spec_response_changed_unverified" in result["spec_change_alerts"]
+    assert not any("合约规格变更" in m["text"] for m in t.tg_messages)
+    assert (root / "meta" / "specs" / "spec_changes.jsonl").is_file()
+
+
+def test_p3_local_loss_expiry_message_preserves_historical_gap() -> None:
+    msg = md_mod.format_recovery_message(
+        alert_key="local_loss_detected",
+        summary="旧告警已清除",
+        started_at_s=1000.0,
+        now_s=1600.0,
+        last_loss_detected_at_s=1300.0,
+    )
+    assert "[无新增]" in msg
+    assert "过去 300 秒未检测到新增本地丢数或写盘异常" in msg
+    assert "历史丢数记录继续保留" in msg
+    assert "[已恢复]" not in msg
+
+
+def test_stream_activity_does_not_count_an_active_sibling(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    meta = data_root / "meta"
+    meta.mkdir(parents=True)
+    now_s = 1_800_000_000
+    expected = {
+        ("binance_futures", "BTCUSDT", "bookTicker"),
+        ("binance_futures", "BTCUSDT", "aggTrade"),
+    }
+    sample = {
+        "sampled_wall_ns": now_s * 10**9,
+        "max_sampled_queue_depth": 11,
+        "streams": [{
+            "exchange": "binance_futures", "symbol": "BTCUSDT", "channel": "bookTicker",
+            "last_written_wall_ns": now_s * 10**9, "written_frames": 9,
+        }],
+    }
+    path = meta / "stream_activity.json"
+    path.write_text(json.dumps(sample), encoding="utf-8")
+    stats = md_mod.inspect_stream_activity(data_root, expected, now_s=now_s, stale_seconds=300)
+    assert stats["missing_or_stale"] == ["binance_futures/BTCUSDT/aggTrade"]
+    assert not stats["healthy"]
+    assert stats["max_sampled_queue_depth"] == 11
+    sample["streams"].append({**sample["streams"][0], "channel": "aggTrade"})
+    path.write_text(json.dumps(sample), encoding="utf-8")
+    assert md_mod.inspect_stream_activity(data_root, expected, now_s=now_s, stale_seconds=300)["healthy"]
+    assert not md_mod.inspect_stream_activity(data_root, expected, now_s=now_s + 61, stale_seconds=300)["healthy"]
+
+
+def test_stream_activity_drives_collector_healthcheck(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, data_root)
+    config = json.loads(cfg.read_text(encoding="utf-8"))
+    config["meta_daemon"]["require_stream_activity"] = True
+    for exchange, spec in config["exchanges"].items():
+        spec["enabled"] = exchange == "binance_futures"
+    config["exchanges"]["binance_futures"]["symbols"] = ["BTCUSDT"]
+    cfg.write_text(json.dumps(config), encoding="utf-8")
+
+    now_s = 1_800_000_000
+    _seed_exchange_files(data_root, "binance_futures", now_s=now_s)
+    monitor = CollectorMonitor(
+        cfg,
+        service_probe=lambda unit: {"available": True, "active_state": "active", "sub_state": "running"},
+        journal_reader=lambda unit, cursor: ([], cursor),
+        chrony_runner=lambda: GOOD_CHRONY_OUTPUT,
+        disk_checker=lambda path: 10.0,
+        allow_notify=False,
+    )
+    def sweep():
+        return monitor.run_sweep(
+            now_epoch_s=now_s, run_chrony=True, run_specs=False, run_rtt=False, force_collector_hc=True,
+        )
+
+    first = sweep()
+    assert "collector_stream_stale" in first["active_alerts"]
+    assert first["collector_healthcheck"]["healthy"] is False
+
+    sample = {"sampled_wall_ns": now_s * 10**9, "streams": [
+        {"exchange": "binance_futures", "symbol": "BTCUSDT", "channel": channel,
+         "written_frames": 1, "last_written_wall_ns": now_s * 10**9}
+        for channel in ("bookTicker", "depth@100ms", "aggTrade")
+    ]}
+    (data_root / "meta" / "stream_activity.json").write_text(json.dumps(sample), encoding="utf-8")
+    assert sweep()["collector_healthcheck"]["healthy"] is True
+
+
+def test_p3_loss_report_keeps_manifest_evidence_after_alert_expires(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, data_root)
+    t0 = 1_796_292_720.0
+    partials = []
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        partial, _, _ = _seed_exchange_files(
+            data_root, ex, now_s=t0, data_lines=10000, local_loss_lines=2 if ex == "gate_futures" else 0,
+        )
+        partials.append(partial)
+
+    journal: list[str] = []
+
+    def read_journal(_unit: str, cursor: str | None) -> tuple[list[str], str | None]:
+        messages = journal[:]
+        journal.clear()
+        return messages, cursor
+
+    transport = FakeTransport()
+    monitor = _build_monitor(cfg, transport, journal_reader=read_journal)
+    assert "local_loss_detected" in monitor.run_sweep(now_epoch_s=t0)["active_alerts"]
+
+    journal.append("ERROR [ALERT CRITICAL] LOCAL_LOSS on gate_futures: dropped=1")
+    monitor.run_sweep(now_epoch_s=t0 + 120.0)
+    for path in partials:
+        os.utime(path, (t0 + 419.0, t0 + 419.0))
+    before = monitor.run_sweep(now_epoch_s=t0 + 419.0)
+    assert "local_loss_detected" in before["active_alerts"]
+    assert not any("[无新增]" in message["text"] for message in transport.tg_messages)
+
+    after = monitor.run_sweep(now_epoch_s=t0 + 420.0, force_hourly_report=True)
+    assert "local_loss_detected" not in after["active_alerts"]
+    assert "local_loss_detected" in after["alert_dispatch"]["sent_recoveries"]
+    quiet_message = next(message["text"] for message in transport.tg_messages if "[无新增]" in message["text"])
+    assert "过去 300 秒" in quiet_message and "历史丢数记录继续保留" in quiet_message
+    assert "[已恢复]" not in quiet_message
+    assert len(after["data_tree"]["manifests_with_local_loss"]) == 1
+    report = after["hourly_report"]["text"]
+    assert "历史丢数证据（累计）：1 个分区" in report
+    assert "上一完整小时有本地丢数" in report
+    assert "2026-12-03T09 UTC · gate_futures_20261203_09.manifest.json · LOSS 2" in report

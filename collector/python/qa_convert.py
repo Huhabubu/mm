@@ -80,7 +80,7 @@ def canonical_asset(exchange: str, raw_symbol: str) -> str:
 
 
 def date_utc_from_wall_ns(wall_ns: int) -> str:
-    dt = datetime.fromtimestamp(wall_ns / 1e9, tz=timezone.utc)
+    dt = datetime.fromtimestamp(wall_ns // 1_000_000_000, tz=timezone.utc)
     return dt.strftime("%Y-%m-%d")
 
 
@@ -219,6 +219,9 @@ class AssetDayBuffers:
     exch_ahead_of_local_count: int = 0
     edge_samples: list[tuple[int, float, float, float, float, int, int]] = field(default_factory=list)
     last_book_local_ts: int = -1
+    binance_depth_anchor: dict[str, Any] | None = None
+    depth_unavailable_intervals: list[dict[str, Any]] = field(default_factory=list)
+    bridged_delta_records: list[dict[str, Any]] = field(default_factory=list)
 
     def apply_levels(self, is_snapshot: bool, bid_levels: list[tuple[float, float]], ask_levels: list[tuple[float, float]], local_ts: int) -> None:
         if is_snapshot:
@@ -408,17 +411,120 @@ def _ingest_binance_record(
     obj = json.loads(rec["payload"])
 
     if kind == "META":
-        if obj.get("event") == "REST_SNAPSHOT" and isinstance(obj.get("raw"), dict):
+        ev_name = obj.get("event")
+        snapshot = {
+            "REST_SNAPSHOT": obj.get("raw"),
+            "REST_SNAPSHOT_ANCHOR": obj.get("snapshot"),
+        }.get(ev_name)
+        if isinstance(snapshot, dict):
             sym = canonical_asset("binance_futures", str(obj.get("symbol", "")))
-            raw = obj["raw"]
-            exch_ts = int(raw.get("E") or raw.get("T") or (local_ts // 1_000_000)) * 1_000_000
+            raw = snapshot
+            ready_local_ts = int(obj.get("snapshot_ready_wall_ns") or local_ts)
+            exch_ts = int(raw.get("E") or raw.get("T") or (ready_local_ts // 1_000_000)) * 1_000_000
             bids = _parse_price_qty_pairs(raw.get("bids") or [])
             asks = _parse_price_qty_pairs(raw.get("asks") or [])
             buf = buffers.setdefault(
                 ("binance_futures", sym, date_utc),
                 AssetDayBuffers("binance_futures", sym, date_utc),
             )
-            _emit_depth_batch(buf, True, exch_ts, local_ts, bids, asks)
+            if buf.depth_unavailable_intervals and buf.depth_unavailable_intervals[-1].get("end_wall_ns") is None:
+                buf.depth_unavailable_intervals[-1]["end_wall_ns"] = ready_local_ts
+            last_uid = int(obj.get("lastUpdateId") or raw.get("lastUpdateId") or 0)
+            buf.binance_depth_anchor = {
+                "conn_id": str(obj.get("conn_id") or rec.get("conn_id") or ""),
+                "epoch": int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0)),
+                "last_update_id": last_uid,
+                "last_u": None,
+                "awaiting_first_delta": True,
+            }
+            _emit_depth_batch(buf, True, exch_ts, ready_local_ts, bids, asks)
+        elif ev_name == "DEPTH_BRIDGED_DELTA":
+            sym = canonical_asset("binance_futures", str(obj.get("symbol", "")))
+            buf = buffers.setdefault(
+                ("binance_futures", sym, date_utc),
+                AssetDayBuffers("binance_futures", sym, date_utc),
+            )
+            conn_id = str(obj.get("conn_id") or rec.get("conn_id") or "")
+            epoch = int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0))
+            anchor = buf.binance_depth_anchor
+            if anchor is None or anchor["conn_id"] != conn_id or anchor["epoch"] != epoch:
+                raise ValueError(
+                    f"Binance DEPTH_BRIDGED_DELTA conn/epoch mismatch for {sym}: "
+                    f"delta=({conn_id},{epoch}) anchor={anchor}"
+                )
+            raw_ws = obj.get("raw")
+            raw_obj = json.loads(raw_ws) if isinstance(raw_ws, str) else raw_ws
+            if not isinstance(raw_obj, dict):
+                raise ValueError(f"Binance DEPTH_BRIDGED_DELTA missing raw WS payload for {sym}")
+            data = raw_obj.get("data") if isinstance(raw_obj.get("data"), dict) else raw_obj
+            first_u = int(data.get("U") if data.get("U") is not None else obj["first_u"])
+            last_u = int(data.get("u") if data.get("u") is not None else obj["last_u"])
+            prev_u = int(data.get("pu") if data.get("pu") is not None else obj["prev_u"])
+            snap_uid = int(anchor["last_update_id"])
+            if anchor["awaiting_first_delta"]:
+                if not (first_u <= snap_uid <= last_u):
+                    raise ValueError(
+                        f"Binance bridged first delta violates U<=S<=u for {sym}: "
+                        f"U={first_u}, S={snap_uid}, u={last_u}"
+                    )
+                anchor["awaiting_first_delta"] = False
+            elif anchor["last_u"] is not None and prev_u != anchor["last_u"]:
+                raise ValueError(
+                    f"Binance bridged delta pu break for {sym}: pu={prev_u} != prev_u={anchor['last_u']}"
+                )
+            anchor["last_u"] = last_u
+            orig_wall_ns = int(obj.get("orig_recv_wall_ns") or 0)
+            ready_wall_ns = int(obj.get("ready_wall_ns") or local_ts)
+            if orig_wall_ns > 0 and ready_wall_ns < orig_wall_ns:
+                raise ValueError(
+                    f"Binance bridged delta lookahead timestamp for {sym}: "
+                    f"ready={ready_wall_ns} < orig={orig_wall_ns}"
+                )
+            exch_ms = int(data.get("T") or data.get("E") or (ready_wall_ns // 1_000_000))
+            exch_ts = exch_ms * 1_000_000
+            bids = _parse_price_qty_pairs(data.get("b") or [])
+            asks = _parse_price_qty_pairs(data.get("a") or [])
+            buf.bridged_delta_records.append(
+                {
+                    "conn_id": conn_id,
+                    "epoch": epoch,
+                    "bridge_index": int(obj.get("bridge_index") or 0),
+                    "orig_recv_wall_ns": orig_wall_ns,
+                    "orig_recv_mono_ns": int(obj.get("orig_recv_mono_ns") or 0),
+                    "ready_wall_ns": ready_wall_ns,
+                    "ready_mono_ns": int(obj.get("ready_mono_ns") or rec.get("recv_mono_ns", 0)),
+                    "first_u": first_u,
+                    "last_u": last_u,
+                    "prev_u": prev_u,
+                }
+            )
+            _emit_depth_batch(buf, False, exch_ts, ready_wall_ns, bids, asks)
+        elif ev_name in ("DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"):
+            raw_sym = str(obj.get("symbol") or "")
+            if raw_sym:
+                sym = canonical_asset("binance_futures", raw_sym)
+                buf = buffers.setdefault(
+                    ("binance_futures", sym, date_utc),
+                    AssetDayBuffers("binance_futures", sym, date_utc),
+                )
+                buf.binance_depth_anchor = None
+                since_ns = int(obj.get("unavailable_since_wall_ns") or local_ts)
+                if not buf.depth_unavailable_intervals or buf.depth_unavailable_intervals[-1].get("end_wall_ns") is not None:
+                    buf.depth_unavailable_intervals.append(
+                        {
+                            "start_wall_ns": since_ns,
+                            "end_wall_ns": None,
+                            "reason": str(obj.get("reason") or ev_name),
+                            "conn_id": str(obj.get("conn_id") or rec.get("conn_id") or ""),
+                            "epoch": int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0)),
+                        }
+                    )
+        elif ev_name == "SWITCH":
+            to_conn = str(obj.get("to") or "")
+            for (ex, _sym, d_utc), b in buffers.items():
+                if ex == "binance_futures" and d_utc == date_utc and b.binance_depth_anchor is not None:
+                    if not to_conn or b.binance_depth_anchor.get("conn_id") != to_conn:
+                        b.binance_depth_anchor = None
         return
 
     stream = obj.get("stream", "")
@@ -451,6 +557,33 @@ def _ingest_binance_record(
             ("binance_futures", sym, date_utc),
             AssetDayBuffers("binance_futures", sym, date_utc),
         )
+        anchor = buf.binance_depth_anchor
+        if anchor is not None and "U" in data and "u" in data:
+            rec_conn = str(rec.get("conn_id") or "")
+            rec_epoch = int(rec.get("epoch", 0))
+            if anchor["conn_id"] != rec_conn or anchor["epoch"] != rec_epoch:
+                raise ValueError(
+                    f"Binance live depthUpdate cross-connection splice for {sym}: "
+                    f"delta=({rec_conn},{rec_epoch}) anchor=({anchor['conn_id']},{anchor['epoch']})"
+                )
+            first_u = int(data["U"])
+            last_u = int(data["u"])
+            prev_u = int(data["pu"]) if "pu" in data else None
+            snap_uid = int(anchor["last_update_id"])
+            if anchor["awaiting_first_delta"]:
+                if last_u < snap_uid:
+                    return
+                if not (first_u <= snap_uid <= last_u):
+                    raise ValueError(
+                        f"Binance first live delta violates U<=S<=u for {sym}: "
+                        f"U={first_u}, S={snap_uid}, u={last_u}"
+                    )
+                anchor["awaiting_first_delta"] = False
+            elif anchor["last_u"] is not None and prev_u is not None and prev_u != anchor["last_u"]:
+                raise ValueError(
+                    f"Binance live depthUpdate pu break for {sym}: pu={prev_u} != prev_u={anchor['last_u']}"
+                )
+            anchor["last_u"] = last_u
         _emit_depth_batch(buf, False, exch_ts, local_ts, bids, asks)
     elif ev == "aggTrade" or stream.endswith("@aggTrade"):
         # Preserve raw aggTrade without splitting!
@@ -470,6 +603,213 @@ def _ingest_binance_record(
         if exch_ts > local_ts:
             buf.exch_ahead_of_local_count += 1
         buf.agg_trade_rows.append((local_ts, exch_ts, agg_id, first_id, last_id, px, qty, is_buyer_maker))
+
+
+def reconstruct_binance_depth_book(
+    records: list[dict[str, Any]],
+    symbol: str,
+) -> dict[str, Any]:
+    """Strictly reconstruct one Binance symbol's L2 book from canonical TSV-Raw archive records.
+
+    Enforces:
+    - Same-connection `(conn_id, epoch)` between `REST_SNAPSHOT_ANCHOR`, `DEPTH_BRIDGED_DELTA`,
+      and live `depth@100ms` DATA records (zero cross-connection splicing).
+    - Official USDS-M Futures bridging invariant (`U <= S <= u` then `pu == prev_u`).
+    - Distinction between `orig_recv_wall_ns` and strategy-visible `ready_wall_ns` (`ready >= orig`).
+    """
+    target = symbol.upper()
+    target_canon = canonical_asset("binance_futures", target)
+    bids: dict[float, float] = {}
+    asks: dict[float, float] = {}
+    anchor: dict[str, Any] | None = None
+    snapshot_count = 0
+    bridged_deltas: list[dict[str, Any]] = []
+    live_delta_count = 0
+    unavailable_intervals: list[dict[str, Any]] = []
+
+    def _matches(raw_sym: str) -> bool:
+        up = raw_sym.upper()
+        return up == target or canonical_asset("binance_futures", up) == target_canon
+
+    def _apply(is_snapshot: bool, b_levels: list[tuple[float, float]], a_levels: list[tuple[float, float]]) -> None:
+        if is_snapshot:
+            bids.clear()
+            asks.clear()
+        for px, qty in b_levels:
+            if qty <= 0.0:
+                bids.pop(px, None)
+            else:
+                bids[px] = qty
+        for px, qty in a_levels:
+            if qty <= 0.0:
+                asks.pop(px, None)
+            else:
+                asks[px] = qty
+
+    for rec in records:
+        kind = rec["kind"]
+        wall_ns = int(rec["recv_wall_ns"])
+        obj = json.loads(rec["payload"])
+        if kind == "META":
+            ev_name = obj.get("event")
+            if ev_name in ("REST_SNAPSHOT", "REST_SNAPSHOT_ANCHOR"):
+                raw_sym = str(obj.get("symbol") or "")
+                if not _matches(raw_sym):
+                    continue
+                snap = obj.get("snapshot") if ev_name == "REST_SNAPSHOT_ANCHOR" else obj.get("raw")
+                if not isinstance(snap, dict):
+                    raise ValueError(f"Malformed {ev_name} for {raw_sym}")
+                conn_id = str(obj.get("conn_id") or rec.get("conn_id") or "")
+                epoch = int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0))
+                last_uid = int(obj.get("lastUpdateId") or snap.get("lastUpdateId") or 0)
+                ready_ns = int(obj.get("snapshot_ready_wall_ns") or wall_ns)
+                if unavailable_intervals and unavailable_intervals[-1]["end_wall_ns"] is None:
+                    unavailable_intervals[-1]["end_wall_ns"] = ready_ns
+                anchor = {
+                    "conn_id": conn_id,
+                    "epoch": epoch,
+                    "last_update_id": last_uid,
+                    "last_u": None,
+                    "awaiting_first_delta": True,
+                    "ready_wall_ns": ready_ns,
+                }
+                _apply(
+                    True,
+                    _parse_price_qty_pairs(snap.get("bids") or []),
+                    _parse_price_qty_pairs(snap.get("asks") or []),
+                )
+                snapshot_count += 1
+            elif ev_name == "DEPTH_BRIDGED_DELTA":
+                raw_sym = str(obj.get("symbol") or "")
+                if not _matches(raw_sym):
+                    continue
+                conn_id = str(obj.get("conn_id") or rec.get("conn_id") or "")
+                epoch = int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0))
+                if anchor is None or anchor["conn_id"] != conn_id or anchor["epoch"] != epoch:
+                    raise ValueError(
+                        f"DEPTH_BRIDGED_DELTA without matching same-connection anchor for {raw_sym}: "
+                        f"delta=({conn_id},{epoch}) anchor={anchor}"
+                    )
+                raw_ws = obj.get("raw")
+                raw_obj = json.loads(raw_ws) if isinstance(raw_ws, str) else raw_ws
+                data = raw_obj.get("data") if isinstance(raw_obj.get("data"), dict) else raw_obj
+                first_u = int(data["U"])
+                last_u = int(data["u"])
+                prev_u = int(data["pu"])
+                snap_uid = int(anchor["last_update_id"])
+                if anchor["awaiting_first_delta"]:
+                    if not (first_u <= snap_uid <= last_u):
+                        raise ValueError(
+                            f"Bridged first delta violates U<=S<=u for {raw_sym}: "
+                            f"U={first_u}, S={snap_uid}, u={last_u}"
+                        )
+                    anchor["awaiting_first_delta"] = False
+                elif prev_u != anchor["last_u"]:
+                    raise ValueError(
+                        f"Bridged delta pu break for {raw_sym}: pu={prev_u} != prev_u={anchor['last_u']}"
+                    )
+                anchor["last_u"] = last_u
+                orig_wall_ns = int(obj["orig_recv_wall_ns"])
+                ready_wall_ns = int(obj["ready_wall_ns"])
+                if ready_wall_ns < orig_wall_ns:
+                    raise ValueError(
+                        f"Bridged delta ready_wall_ns < orig_recv_wall_ns: {ready_wall_ns} < {orig_wall_ns}"
+                    )
+                _apply(
+                    False,
+                    _parse_price_qty_pairs(data.get("b") or []),
+                    _parse_price_qty_pairs(data.get("a") or []),
+                )
+                bridged_deltas.append(
+                    {
+                        "conn_id": conn_id,
+                        "epoch": epoch,
+                        "bridge_index": int(obj.get("bridge_index") or 0),
+                        "orig_recv_wall_ns": orig_wall_ns,
+                        "orig_recv_mono_ns": int(obj.get("orig_recv_mono_ns") or 0),
+                        "ready_wall_ns": ready_wall_ns,
+                        "ready_mono_ns": int(obj.get("ready_mono_ns") or 0),
+                        "first_u": first_u,
+                        "last_u": last_u,
+                        "prev_u": prev_u,
+                    }
+                )
+            elif ev_name in ("DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"):
+                raw_sym = str(obj.get("symbol") or "")
+                if raw_sym and _matches(raw_sym):
+                    anchor = None
+                    since_ns = int(obj.get("unavailable_since_wall_ns") or wall_ns)
+                    if not unavailable_intervals or unavailable_intervals[-1]["end_wall_ns"] is not None:
+                        unavailable_intervals.append(
+                            {
+                                "start_wall_ns": since_ns,
+                                "end_wall_ns": None,
+                                "reason": str(obj.get("reason") or ev_name),
+                                "conn_id": str(obj.get("conn_id") or rec.get("conn_id") or ""),
+                                "epoch": int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0)),
+                            }
+                        )
+            elif ev_name == "SWITCH":
+                to_conn = str(obj.get("to") or "")
+                if anchor is not None and (not to_conn or anchor["conn_id"] != to_conn):
+                    anchor = None
+            continue
+
+        stream = obj.get("stream", "")
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+        if data.get("e") == "depthUpdate" or "@depth" in stream:
+            raw_sym = str(data.get("s") or "")
+            if not _matches(raw_sym):
+                continue
+            rec_conn = str(rec.get("conn_id") or "")
+            rec_epoch = int(rec.get("epoch", 0))
+            if anchor is None:
+                raise ValueError(f"Unanchored live Binance depthUpdate for {raw_sym} at wall_ns={wall_ns}")
+            if anchor["conn_id"] != rec_conn or anchor["epoch"] != rec_epoch:
+                raise ValueError(
+                    f"Cross-connection Binance depthUpdate for {raw_sym}: "
+                    f"delta=({rec_conn},{rec_epoch}) anchor=({anchor['conn_id']},{anchor['epoch']})"
+                )
+            first_u = int(data["U"])
+            last_u = int(data["u"])
+            prev_u = int(data["pu"])
+            snap_uid = int(anchor["last_update_id"])
+            if anchor["awaiting_first_delta"]:
+                if last_u < snap_uid:
+                    continue
+                if not (first_u <= snap_uid <= last_u):
+                    raise ValueError(
+                        f"First live delta violates U<=S<=u for {raw_sym}: U={first_u}, S={snap_uid}, u={last_u}"
+                    )
+                anchor["awaiting_first_delta"] = False
+            elif prev_u != anchor["last_u"]:
+                raise ValueError(
+                    f"Live delta pu break for {raw_sym}: pu={prev_u} != prev_u={anchor['last_u']}"
+                )
+            anchor["last_u"] = last_u
+            _apply(
+                False,
+                _parse_price_qty_pairs(data.get("b") or []),
+                _parse_price_qty_pairs(data.get("a") or []),
+            )
+            live_delta_count += 1
+
+    return {
+        "symbol": target,
+        "active_conn_id": anchor["conn_id"] if anchor else None,
+        "active_epoch": anchor["epoch"] if anchor else None,
+        "last_update_id": anchor["last_update_id"] if anchor else None,
+        "last_u": anchor["last_u"] if anchor else None,
+        "snapshot_count": snapshot_count,
+        "bridged_delta_count": len(bridged_deltas),
+        "live_delta_count": live_delta_count,
+        "bridged_deltas": bridged_deltas,
+        "unavailable_intervals": unavailable_intervals,
+        "bids": dict(bids),
+        "asks": dict(asks),
+        "sorted_bids": sorted(bids.items(), key=lambda kv: kv[0], reverse=True),
+        "sorted_asks": sorted(asks.items(), key=lambda kv: kv[0]),
+    }
 
 
 def _ingest_gate_record(
@@ -712,10 +1052,12 @@ def _ingest_bitget_record(
                 buf.exch_ahead_of_local_count += 1
             side_str = str(tr.get("S") or tr.get("side") or "").lower()
             side_flag = BUY_EVENT if side_str == "buy" else SELL_EVENT
-            px = float(tr.get("P") if "P" in tr else tr["px"])
+            price = tr["p"] if "p" in tr else tr["P"] if "P" in tr else tr["px"]
+            px = float(price)
             qty = float(tr.get("v") if "v" in tr else tr["sz"])
             ival = 0
-            if bool(tr.get("isRPI", False)):
+            is_rpi = tr.get("isRPI")
+            if is_rpi is True or str(is_rpi).strip().lower() in {"yes", "true", "1"}:
                 ival |= TRADE_FLAG_RPI
                 buf.special_flag_counts["RPI"] += 1
             buf.hbt_rows.append(
@@ -795,6 +1137,7 @@ def evaluate_50_level_coverage(
 def _resolve_manifest_inputs(
     manifest_arg: Path,
     allow_unverified_local: bool,
+    date_utc: str | None = None,
 ) -> tuple[list[tuple[Path, Path, dict[str, Any] | None]], Path | None, list[str]]:
     """Resolve input manifest/SQLite ledger/JSONL ledger/directory into [(data_path, manifest_path, ledger_entry), ...]."""
     errors: list[str] = []
@@ -822,6 +1165,8 @@ def _resolve_manifest_inputs(
             states = ("SEALED", "VERIFIED", "PRUNED") if allow_unverified_local else ("VERIFIED", "PRUNED")
             rows = ledger.list_partitions(states=states)
             for row in rows:
+                if date_utc is not None and row["date_utc"] != date_utc:
+                    continue
                 is_verified = bool(row["remote_data_verified"] and row["remote_manifest_verified"])
                 if not is_verified and not allow_unverified_local:
                     errors.append(
@@ -852,6 +1197,8 @@ def _resolve_manifest_inputs(
             if not line:
                 continue
             entry = json.loads(line)
+            if date_utc is not None and entry.get("date_utc") not in (None, date_utc):
+                continue
             if not entry.get("verified") and not allow_unverified_local:
                 errors.append(f"{manifest_arg.name}:{line_no}: ledger entry not remote-verified ({entry.get('remote_path')})")
                 continue
@@ -899,9 +1246,25 @@ def run_qa_convert(
     strict_zero_loss: bool = False,
     remote_backend: ArchiveBackend | None = None,
     restore_cache_dir: Path | None = None,
+    coverage_config: dict[str, Any] | None = None,
+    coverage_date_utc: str | None = None,
 ) -> dict[str, Any]:
     """Run full QA gatekeeper + strict-separation HBT 2.4.4 conversion (with PRUNED restore support)."""
-    items_resolved, inferred_meta, resolve_errors = _resolve_manifest_inputs(manifest_arg, allow_unverified_local)
+    from data_coverage import CompleteDayCoverage
+
+    if (coverage_config is None) != (coverage_date_utc is None):
+        return {"status": "blocked", "phase": "qa_convert", "failed_items": ["coverage_config_and_date_required_together"]}
+    try:
+        coverage = (
+            CompleteDayCoverage(coverage_config, coverage_date_utc)
+            if coverage_config is not None and coverage_date_utc is not None
+            else None
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        return {"status": "blocked", "phase": "qa_convert", "failed_items": [f"invalid_coverage_config:{exc}"]}
+    items_resolved, inferred_meta, resolve_errors = _resolve_manifest_inputs(
+        manifest_arg, allow_unverified_local, coverage.date if coverage is not None else None
+    )
     if resolve_errors:
         return {
             "status": "blocked",
@@ -933,6 +1296,10 @@ def run_qa_convert(
     try:
         for dpath, mpath, ledger_entry in items_resolved:
             try:
+                if coverage is not None and mpath.is_file():
+                    input_manifest = json.loads(mpath.read_text(encoding="utf-8"))
+                    if input_manifest["date_utc"] != coverage.date:
+                        continue
                 effective_dpath = dpath
                 effective_mpath = mpath
 
@@ -963,7 +1330,10 @@ def run_qa_convert(
 
                 checked = verify_local_partition(effective_dpath, effective_mpath)
                 mf = checked["manifest"]
-                by_exchange[mf["exchange"]].append((mf, effective_dpath, effective_mpath))
+                if coverage is None or mf["date_utc"] == coverage.date:
+                    by_exchange[mf["exchange"]].append((mf, effective_dpath, effective_mpath))
+                    if coverage is not None:
+                        coverage.observe_partition(mf)
             except Exception as exc:
                 failed_items.append(f"integrity_failed:{dpath.name}:{type(exc).__name__}:{exc}")
 
@@ -979,15 +1349,17 @@ def run_qa_convert(
         # Per-(exchange, date_utc) structural QA tracking
         day_gaps: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         day_local_loss: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        local_loss_partitions: list[dict[str, Any]] = []
         day_switches: dict[tuple[str, str], int] = defaultdict(int)
         day_active_gap_start: dict[tuple[str, str], int | None] = defaultdict(lambda: None)
         exchange_stats: dict[str, dict[str, Any]] = {}
 
+        from data_coverage import normalize_manifest_window, record_monotonic_producer_key
+
         for exchange, items in sorted(by_exchange.items()):
             items.sort(
                 key=lambda x: (
-                    x[0]["date_utc"],
-                    x[0]["hour_utc"],
+                    normalize_manifest_window(x[0], fallback_file_name=x[1].name)["planned_start_wall_ns"],
                     x[0].get("start_wall_ns") or 0,
                     str(x[0].get("boot_id") or ""),
                     x[0].get("first_rx_seq") or 0,
@@ -995,38 +1367,75 @@ def run_qa_convert(
                 )
             )
             prev_boot: str | None = None
-            prev_rx_seq: int | None = None
-            prev_mono_ns: int | None = None
+            prev_file_last_rx_seq: int | None = None
+            prev_file_had_late_frames = False
+            boot_seen_rx_seqs: set[int] = set()
+            producer_prev_mono: dict[tuple[str, str, int], int] = {}
             total_records = 0
 
-            for mf, dpath, _ in items:
-                boot_id = str(mf.get("boot_id", ""))
+            for mf, dpath, mpath in items:
+                norm_mf = normalize_manifest_window(mf, fallback_file_name=dpath.name)
+                boot_id = norm_mf["boot_id"]
                 records = parse_tsv_zst_records(dpath)
+                recorded_local_loss = 0
+                dropped_frames = 0
                 if boot_id != prev_boot:
                     prev_boot = boot_id
-                    prev_rx_seq = None
-                    prev_mono_ns = None
+                    prev_file_last_rx_seq = None
+                    prev_file_had_late_frames = False
+                    boot_seen_rx_seqs.clear()
+                    producer_prev_mono.clear()
 
+                file_prev_rx_seq: int | None = None
+                file_first_rx_seq: int | None = None
                 for rec in records:
+                    if coverage is not None:
+                        coverage.observe_record(exchange, rec)
                     total_records += 1
                     rx_seq = rec["rx_seq"]
                     mono_ns = rec["recv_mono_ns"]
                     wall_ns = rec["recv_wall_ns"]
                     date_utc = date_utc_from_wall_ns(wall_ns)
 
-                    if prev_rx_seq is not None and rx_seq <= prev_rx_seq:
+                    if file_first_rx_seq is None:
+                        file_first_rx_seq = rx_seq
+                        if (
+                            prev_file_last_rx_seq is not None
+                            and not prev_file_had_late_frames
+                            and rx_seq <= prev_file_last_rx_seq
+                        ):
+                            failed_items.append(
+                                f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={prev_file_last_rx_seq},curr={rx_seq}"
+                            )
+
+                    if file_prev_rx_seq is not None and rx_seq <= file_prev_rx_seq:
                         failed_items.append(
-                            f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={prev_rx_seq},curr={rx_seq}"
+                            f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={file_prev_rx_seq},curr={rx_seq}"
                         )
-                    if prev_mono_ns is not None and mono_ns < prev_mono_ns:
+                    if rx_seq in boot_seen_rx_seqs:
                         failed_items.append(
-                            f"recv_mono_ns_regressed:{exchange}:{dpath.name}:prev={prev_mono_ns},curr={mono_ns}"
+                            f"rx_seq_duplicate_in_boot:{exchange}:{dpath.name}:boot={boot_id},rx_seq={rx_seq}"
                         )
-                    prev_rx_seq = rx_seq
-                    prev_mono_ns = mono_ns
+                    boot_seen_rx_seqs.add(rx_seq)
+                    file_prev_rx_seq = rx_seq
+
+                    payload_obj: Any = None
+                    try:
+                        payload_obj = json.loads(rec["payload"])
+                    except Exception:
+                        payload_obj = None
+                    prod_key = record_monotonic_producer_key(
+                        exchange, rec["kind"], str(rec["conn_id"]), int(rec["epoch"]), payload_obj
+                    )
+                    prev_prod_mono = producer_prev_mono.get(prod_key)
+                    if prev_prod_mono is not None and mono_ns < prev_prod_mono:
+                        failed_items.append(
+                            f"recv_mono_ns_regressed:{exchange}:{dpath.name}:producer={prod_key[0]}:{prod_key[1]}:{prod_key[2]}:prev={prev_prod_mono},curr={mono_ns}"
+                        )
+                    producer_prev_mono[prod_key] = mono_ns
 
                     if rec["kind"] == "META":
-                        meta_obj = json.loads(rec["payload"])
+                        meta_obj = payload_obj if isinstance(payload_obj, dict) else json.loads(rec["payload"])
                         ev = meta_obj.get("event", "")
                         if ev == "GAP_START":
                             day_active_gap_start[(exchange, date_utc)] = wall_ns
@@ -1042,11 +1451,23 @@ def run_qa_convert(
                                 )
                             day_active_gap_start[(exchange, date_utc)] = None
                         elif ev == "LOCAL_LOSS":
+                            dropped = int(meta_obj.get("dropped_frames", meta_obj.get("dropped", 1)))
+                            recorded_local_loss += 1
+                            dropped_frames += dropped
                             day_local_loss[(exchange, date_utc)].append(
+                                {"wall_ns": wall_ns, "dropped": dropped, "reason": meta_obj.get("reason", "")}
+                            )
+                        elif ev == "LATE_FRAME_REJECTED":
+                            dropped = int(meta_obj.get("dropped_frames", 1))
+                            target_wid = str(meta_obj.get("target_window_id") or meta_obj.get("loss_attributed_window_id") or "")
+                            target_date = target_wid[:10] if len(target_wid) >= 10 else date_utc
+                            recorded_local_loss += 1
+                            dropped_frames += dropped
+                            day_local_loss[(exchange, target_date)].append(
                                 {
-                                    "wall_ns": wall_ns,
-                                    "dropped": int(meta_obj.get("dropped", 1)),
-                                    "reason": meta_obj.get("reason", ""),
+                                    "wall_ns": int(meta_obj.get("orig_recv_wall_ns") or wall_ns),
+                                    "dropped": dropped,
+                                    "reason": f"late_frame_rejected_for_{target_wid or 'prior_window'}",
                                 }
                             )
                         elif ev == "SWITCH":
@@ -1061,6 +1482,30 @@ def run_qa_convert(
                     elif exchange == "bitget_v3":
                         _ingest_bitget_record(rec, date_utc, buffers)
 
+                if file_prev_rx_seq is not None:
+                    prev_file_last_rx_seq = (
+                        max(prev_file_last_rx_seq, file_prev_rx_seq)
+                        if prev_file_last_rx_seq is not None
+                        else file_prev_rx_seq
+                    )
+                prev_file_had_late_frames = norm_mf["late_frames_accepted"] > 0
+
+                manifest_local_loss = int(mf.get("local_loss_lines") or 0) + int(mf.get("late_frames_rejected") or 0)
+                if recorded_local_loss or manifest_local_loss:
+                    local_loss_partitions.append({
+                        "exchange": exchange,
+                        "date_utc": mf["date_utc"],
+                        "hour_utc": mf["hour_utc"],
+                        "window_id": norm_mf["window_id"],
+                        "boot_id": boot_id,
+                        "manifest_file": mpath.name,
+                        "data_file": dpath.name,
+                        "data_sha256": mf["sha256"],
+                        "manifest_local_loss_lines": manifest_local_loss,
+                        "recorded_local_loss_lines": recorded_local_loss,
+                        "recorded_dropped_frames": dropped_frames,
+                    })
+
             exchange_stats[exchange] = {
                 "partitions_verified": len(items),
                 "records_parsed": total_records,
@@ -1069,20 +1514,28 @@ def run_qa_convert(
         if temp_restore_ctx is not None:
             temp_restore_ctx.cleanup()
 
-    if strict_zero_loss and any(day_local_loss.values()):
+    coverage_report = coverage.report(effective_meta) if coverage is not None else {"status": "not_assessed"}
+    if coverage is not None and coverage_report["status"] != "complete":
+        failed_items.append("incomplete_utc_day_coverage")
+    if (strict_zero_loss or coverage is not None) and local_loss_partitions:
         failed_items.append("local_loss_detected_under_strict_zero_loss_gate")
+    if coverage is not None and (any(day_gaps.values()) or chrony_uncertified.get(coverage.date)):
+        failed_items.append("complete_day_gap_or_uncertified_clock")
 
     if failed_items:
         return {
             "status": "blocked",
             "phase": "qa_convert",
             "failed_items": failed_items,
-            "minimal_fixes": ["Fix monotonic sequence/clock errors or local loss before converting"],
+            "coverage": coverage_report,
+            "local_loss_partitions": local_loss_partitions,
+            "minimal_fixes": ["Review missing hours, uncertified clock, sequence errors, and local loss before converting"],
         }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     artifacts: list[dict[str, Any]] = []
     calendar_rows: list[dict[str, Any]] = []
+    loss_partition_days = {(row["exchange"], row["date_utc"]) for row in local_loss_partitions}
 
     for (exchange, sym, date_utc), buf in sorted(buffers.items()):
         ymd = yyyymmdd_from_date(date_utc)
@@ -1094,7 +1547,7 @@ def run_qa_convert(
 
         if gaps:
             reasons.append("uncovered_gap")
-        if losses:
+        if losses or (exchange, date_utc) in loss_partition_days:
             reasons.append("local_loss")
         if clock_issues:
             reasons.append("clock_uncertified_gt_1ms")
@@ -1307,6 +1760,8 @@ def run_qa_convert(
         "exchanges": exchange_stats,
         "calendar_path": str(cal_json),
         "calendar_csv_path": str(cal_csv),
+        "coverage": coverage_report,
+        "local_loss_partitions": local_loss_partitions,
         "eligible_asset_days": sum(1 for r in calendar_rows if r["eligibility_status"] == "eligible"),
         "execution_unverified_asset_days": sum(
             1 for r in calendar_rows if r["eligibility_status"] == "execution_unverified"
@@ -1501,6 +1956,8 @@ def main() -> int:
     p.add_argument("--manifest", type=Path, required=True, help="Archive ledger (.sqlite/.jsonl), .manifest.json, or sealed root dir")
     p.add_argument("--out", type=Path, required=True, help="Output directory for HBT .npz files and eligibility calendar")
     p.add_argument("--meta-dir", type=Path, default=None, help="Optional meta/ directory with chrony/ and specs/")
+    p.add_argument("--coverage-config", type=Path, help="Collector configuration for complete-day coverage")
+    p.add_argument("--date-utc", help="UTC day (YYYY-MM-DD) to certify with --coverage-config")
     p.add_argument("--allow-unverified-local", action="store_true", help="Allow reading unverified local sealed partitions (offline tests only)")
     p.add_argument("--strict-zero-loss", action="store_true", help="Fail closed with status=blocked if any LOCAL_LOSS occurred")
     p.add_argument("--remote", default=None, help="Optional rclone remote root to restore PRUNED partitions (e.g. gdrive_main:tokyo_l2_data)")
@@ -1516,6 +1973,8 @@ def main() -> int:
         strict_zero_loss=args.strict_zero_loss,
         remote_backend=remote_backend,
         restore_cache_dir=args.restore_cache_dir,
+        coverage_config=json.loads(args.coverage_config.read_text(encoding="utf-8")) if args.coverage_config else None,
+        coverage_date_utc=args.date_utc,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2
