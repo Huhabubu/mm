@@ -270,6 +270,58 @@ def verify_zstd_integrity(path: Path) -> None:
                     break
 
 
+def _scan_market_data_timestamps(path: Path) -> dict[str, Any]:
+    """Decompress a `.tsv.zst` partition and extract timestamp bounds and internal gaps
+    strictly from real market data rows (`DATA` / `DATA_ESCAPED`), ignoring `META` control records.
+    """
+    import io
+
+    dctx = zstd.ZstdDecompressor()
+    parsed_tsv = False
+    data_count = 0
+    meta_count = 0
+    data_start_ns: int | None = None
+    data_end_ns: int | None = None
+    prev_data_ns: int | None = None
+    max_internal_gap_ns = 0
+
+    with path.open("rb") as f:
+        with dctx.stream_reader(f) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+            for raw_line in text_stream:
+                line = raw_line.rstrip("\r\n")
+                if not line:
+                    continue
+                parts = line.split("\t", 6)
+                if len(parts) != 7:
+                    continue
+                try:
+                    wall_ns = int(parts[0])
+                except ValueError:
+                    continue
+                kind = parts[5]
+                if kind in ("DATA", "DATA_ESCAPED"):
+                    parsed_tsv = True
+                    data_count += 1
+                    data_start_ns = wall_ns if data_start_ns is None else min(data_start_ns, wall_ns)
+                    data_end_ns = wall_ns if data_end_ns is None else max(data_end_ns, wall_ns)
+                    if prev_data_ns is not None and wall_ns > prev_data_ns:
+                        max_internal_gap_ns = max(max_internal_gap_ns, wall_ns - prev_data_ns)
+                    prev_data_ns = wall_ns
+                elif kind == "META":
+                    parsed_tsv = True
+                    meta_count += 1
+
+    return {
+        "parsed_tsv": parsed_tsv,
+        "data_lines": data_count,
+        "meta_lines": meta_count,
+        "start_wall_ns": data_start_ns,
+        "end_wall_ns": data_end_ns,
+        "max_internal_gap_ns": max_internal_gap_ns,
+    }
+
+
 def verify_local_partition(data_path: Path, manifest_path: Path) -> dict[str, Any]:
     if not data_path.is_file():
         raise FileNotFoundError(f"Missing sealed data file: {data_path}")
@@ -277,12 +329,13 @@ def verify_local_partition(data_path: Path, manifest_path: Path) -> dict[str, An
         raise FileNotFoundError(f"Missing manifest file: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     verify_zstd_integrity(data_path)
+    market_data = _scan_market_data_timestamps(data_path)
     hashes = file_hashes(data_path)
     if hashes["bytes"] != int(manifest["bytes"]):
         raise ValueError(f"Byte mismatch for {data_path.name}: local={hashes['bytes']} manifest={manifest['bytes']}")
     if hashes["sha256"] != manifest["sha256"]:
         raise ValueError(f"SHA-256 mismatch for {data_path.name}: local={hashes['sha256']} manifest={manifest['sha256']}")
-    return {"manifest": manifest, "hashes": hashes}
+    return {"manifest": manifest, "hashes": hashes, "market_data": market_data}
 
 
 def _hashes_match(local_hashes: dict[str, Any], remote: RemoteObjectInfo) -> bool | None:
@@ -315,6 +368,9 @@ def _derive_partition_identity(
     norm = normalize_manifest_window(manifest, fallback_file_name=data_path.name)
     partition_id = str(manifest.get("partition_id") or norm["segment_id"] or stem)
     data_lines = int(manifest.get("data_lines") or 0) + int(manifest.get("data_escaped_lines") or 0)
+    local_loss_lines = int(manifest.get("local_loss_lines") or 0)
+    gap_start_lines = int(manifest.get("gap_start_lines") or 0)
+    late_frames_rejected = int(manifest.get("late_frames_rejected") or 0)
 
     return {
         "exchange": norm["exchange"],
@@ -337,6 +393,9 @@ def _derive_partition_identity(
         "start_wall_ns": manifest.get("start_wall_ns"),
         "end_wall_ns": manifest.get("end_wall_ns"),
         "data_lines": data_lines,
+        "local_loss_lines": local_loss_lines,
+        "gap_start_lines": gap_start_lines,
+        "late_frames_rejected": late_frames_rejected,
         "data_path": data_path,
         "manifest_path": manifest_path,
         "rel_data_path": data_path.relative_to(sealed_root).as_posix(),
@@ -389,6 +448,9 @@ _PARTITION_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("start_wall_ns", "INTEGER"),
     ("end_wall_ns", "INTEGER"),
     ("data_lines", "INTEGER NOT NULL DEFAULT 0"),
+    ("local_loss_lines", "INTEGER NOT NULL DEFAULT 0"),
+    ("gap_start_lines", "INTEGER NOT NULL DEFAULT 0"),
+    ("late_frames_rejected", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -779,6 +841,9 @@ class ArchiveLedger:
         start_wall_ns = ident.get("start_wall_ns")
         end_wall_ns = ident.get("end_wall_ns")
         data_lines = int(ident.get("data_lines") or 0)
+        local_loss_lines = int(ident.get("local_loss_lines") or 0)
+        gap_start_lines = int(ident.get("gap_start_lines") or 0)
+        late_frames_rejected = int(ident.get("late_frames_rejected") or 0)
         with self.conn:
             if existing is None:
                 self.conn.execute(
@@ -793,8 +858,9 @@ class ArchiveLedger:
                         planned_start_wall_ns, planned_end_wall_ns,
                         collection_run_id, segment_id,
                         is_startup_stub, settled_by_timer, coverage_incomplete,
-                        first_rx_seq, last_rx_seq, start_wall_ns, end_wall_ns, data_lines
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'SEALED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        first_rx_seq, last_rx_seq, start_wall_ns, end_wall_ns, data_lines,
+                        local_loss_lines, gap_start_lines, late_frames_rejected
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'SEALED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ident["exchange"],
@@ -829,6 +895,9 @@ class ArchiveLedger:
                         start_wall_ns,
                         end_wall_ns,
                         data_lines,
+                        local_loss_lines,
+                        gap_start_lines,
+                        late_frames_rejected,
                     ),
                 )
                 self.conn.execute(
@@ -865,9 +934,12 @@ class ArchiveLedger:
                         is_startup_stub = ?, settled_by_timer = ?, coverage_incomplete = ?,
                         first_rx_seq = COALESCE(?, first_rx_seq),
                         last_rx_seq = COALESCE(?, last_rx_seq),
-                        start_wall_ns = COALESCE(?, start_wall_ns),
-                        end_wall_ns = COALESCE(?, end_wall_ns),
+                        start_wall_ns = ?,
+                        end_wall_ns = ?,
                         data_lines = ?,
+                        local_loss_lines = ?,
+                        gap_start_lines = ?,
+                        late_frames_rejected = ?,
                         updated_at_utc = ?
                     WHERE rel_data_path = ?
                     """,
@@ -894,6 +966,9 @@ class ArchiveLedger:
                         start_wall_ns,
                         end_wall_ns,
                         data_lines,
+                        local_loss_lines,
+                        gap_start_lines,
+                        late_frames_rejected,
                         now_iso,
                         ident["rel_data_path"],
                     ),
@@ -1478,10 +1553,28 @@ def migrate_legacy_jsonl_ledger(
     }
 
 
-def _row_to_jsonl_entry(row: dict[str, Any]) -> dict[str, Any]:
+def _row_to_jsonl_entry(row: dict[str, Any], sealed_root: Path | None = None) -> dict[str, Any]:
     minute_utc = str(row.get("minute_utc") or "00").zfill(2)
     partition_minutes = int(row.get("partition_minutes") or 60)
     window_id = row.get("window_id") or f"{row['date_utc']}T{row['hour_utc']}:{minute_utc}Z"
+    local_loss_lines = int(row.get("local_loss_lines") or 0)
+    gap_start_lines = int(row.get("gap_start_lines") or 0)
+    late_frames_rejected = int(row.get("late_frames_rejected") or 0)
+
+    # Enrich from local sidecar manifest when a legacy v1 migrated SQLite row had 0 in new columns
+    if sealed_root is not None and local_loss_lines == 0 and gap_start_lines == 0 and late_frames_rejected == 0:
+        rel_mf = row.get("rel_manifest_path")
+        if rel_mf:
+            mf_path = sealed_root / str(rel_mf)
+            if mf_path.is_file():
+                try:
+                    mf_obj = json.loads(mf_path.read_text(encoding="utf-8"))
+                    local_loss_lines = int(mf_obj.get("local_loss_lines") or 0)
+                    gap_start_lines = int(mf_obj.get("gap_start_lines") or 0)
+                    late_frames_rejected = int(mf_obj.get("late_frames_rejected") or 0)
+                except Exception:
+                    pass
+
     return {
         "verified_utc": row["verified_at_utc"] or row["updated_at_utc"],
         "remote_path": row["rel_data_path"],
@@ -1519,6 +1612,9 @@ def _row_to_jsonl_entry(row: dict[str, Any]) -> dict[str, Any]:
         "start_wall_ns": row.get("start_wall_ns"),
         "end_wall_ns": row.get("end_wall_ns"),
         "data_lines": int(row.get("data_lines") or 0),
+        "local_loss_lines": local_loss_lines,
+        "gap_start_lines": gap_start_lines,
+        "late_frames_rejected": late_frames_rejected,
     }
 
 
@@ -1529,7 +1625,7 @@ def export_verified_jsonl_projection(sealed_root: Path, ledger: ArchiveLedger) -
     """
     out_path = sealed_root / PROJECTION_LEDGER_JSONL_FILENAME
     rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
-    lines = [json.dumps(_row_to_jsonl_entry(r), sort_keys=False) for r in rows]
+    lines = [json.dumps(_row_to_jsonl_entry(r, sealed_root), sort_keys=False) for r in rows]
     payload = ("\n".join(lines) + "\n") if lines else ""
 
     tmp_path = out_path.with_name(f"{out_path.name}.tmp.{os.getpid()}")
@@ -1543,7 +1639,12 @@ def export_verified_jsonl_projection(sealed_root: Path, ledger: ArchiveLedger) -
     return out_path
 
 
-def export_archive_manifest_index(sealed_root: Path, ledger: ArchiveLedger) -> Path | None:
+def export_archive_manifest_index(
+    sealed_root: Path,
+    ledger: ArchiveLedger,
+    *,
+    effective_run_id: str | None = None,
+) -> Path | None:
     """Atomically write content-deterministic cloud-readable index of remotely verified partitions.
 
     Only contains dual-remote-verified (`VERIFIED` or `PRUNED`) records and deterministic expected-window
@@ -1561,9 +1662,30 @@ def export_archive_manifest_index(sealed_root: Path, ledger: ArchiveLedger) -> P
     out_path = sealed_root / ARCHIVE_MANIFEST_INDEX_RELPATH
     out_path.parent.mkdir(parents=True, exist_ok=True)
     entries = sorted(
-        (_row_to_jsonl_entry(r) for r in rows),
+        (_row_to_jsonl_entry(r, sealed_root) for r in rows),
         key=lambda e: (e["date_utc"], e["window_id"], e["exchange"], e["remote_path"]),
     )
+    historical_loss_manifests = [
+        {
+            "remote_manifest_path": e["remote_manifest_path"],
+            "remote_path": e["remote_path"],
+            "exchange": e["exchange"],
+            "date_utc": e["date_utc"],
+            "hour_utc": e["hour_utc"],
+            "minute_utc": e["minute_utc"],
+            "partition_minutes": e["partition_minutes"],
+            "window_id": e["window_id"],
+            "collection_run_id": e.get("collection_run_id"),
+            "boot_id": e["boot_id"],
+            "sha256": e["sha256"],
+            "manifest_sha256": e["manifest_sha256"],
+            "local_loss_lines": int(e.get("local_loss_lines") or 0),
+            "late_frames_rejected": int(e.get("late_frames_rejected") or 0),
+            "gap_start_lines": int(e.get("gap_start_lines") or 0),
+        }
+        for e in entries
+        if int(e.get("local_loss_lines") or 0) > 0 or int(e.get("late_frames_rejected") or 0) > 0
+    ]
     window_ledger = [
         {
             "window_key": wr["window_key"],
@@ -1589,8 +1711,10 @@ def export_archive_manifest_index(sealed_root: Path, ledger: ArchiveLedger) -> P
     ]
     doc: dict[str, Any] = {
         "schema_version": 2,
+        "effective_run_id": effective_run_id,
         "verified_count": len(entries),
         "entries": entries,
+        "historical_loss_manifests": historical_loss_manifests,
     }
     if window_ledger:
         doc["window_ledger"] = window_ledger
@@ -2000,6 +2124,7 @@ def _reconcile_single_window(
     seal_wait_attempts: int = 0,
     seal_waited_seconds: float = 0.0,
     verify_remote: bool = True,
+    market_scan_cache: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate BOTH file verification and whole-window data coverage for one expected UTC window."""
     expected_date = win_desc["date_utc"]
@@ -2010,6 +2135,7 @@ def _reconcile_single_window(
     p_end_ns = int(win_desc["planned_end_wall_ns"])
     window_label = f"{expected_date}T{expected_hour}Z" if expected_pm == 60 else expected_window_id
     max_gap_ns = int(max_coverage_gap_seconds * 1_000_000_000)
+    scan_cache = market_scan_cache if market_scan_cache is not None else {}
 
     win_errors: list[str] = []
     if not verify_remote:
@@ -2027,10 +2153,32 @@ def _reconcile_single_window(
         matches_win, eff_batch = _row_matches_window_and_batch(row, win_desc, expected_run_id)
         if not matches_win:
             continue
-        has_data = int(row.get("data_lines") or 0) > 0 or row["rel_manifest_path"] in manifests_with_data
+
+        r_eff = dict(row)
+        rel_data = str(r_eff.get("rel_data_path") or "")
+        if rel_data:
+            dpath = sealed_root / rel_data
+            if dpath.is_file():
+                cached = scan_cache.get(rel_data)
+                if cached is None:
+                    try:
+                        cached = _scan_market_data_timestamps(dpath)
+                    except Exception:
+                        cached = {"parsed_tsv": False}
+                    scan_cache[rel_data] = cached
+                if cached.get("parsed_tsv"):
+                    r_eff["data_lines"] = int(cached["data_lines"])
+                    r_eff["start_wall_ns"] = cached["start_wall_ns"]
+                    r_eff["end_wall_ns"] = cached["end_wall_ns"]
+                    r_eff["_max_internal_gap_ns"] = int(cached.get("max_internal_gap_ns") or 0)
+
+        has_data = int(r_eff.get("data_lines") or 0) > 0 or (
+            not (rel_data and (sealed_root / rel_data).is_file())
+            and r_eff.get("rel_manifest_path") in manifests_with_data
+        )
         if not has_data:
             continue
-        matching_verified.append((row, eff_batch or "__default__"))
+        matching_verified.append((r_eff, eff_batch or "__default__"))
 
     # Enforce strict batch isolation: never merge segments across different collection_run_id batches
     distinct_batches = sorted({b for _, b in matching_verified})
@@ -2080,6 +2228,7 @@ def _reconcile_single_window(
     coverage_gaps: dict[str, dict[str, Any]] = {}
     segment_summaries: dict[str, dict[str, Any]] = {}
     overlaps: list[dict[str, Any]] = []
+    startup_stub_segments: list[dict[str, Any]] = []
 
     for ex in sorted(expected_exchanges):
         segs = sorted(
@@ -2090,7 +2239,23 @@ def _reconcile_single_window(
                 r["rel_data_path"],
             ),
         )
-        ex_has_seq_overlap = False
+        for r in segs:
+            if bool(r.get("is_startup_stub")):
+                startup_stub_segments.append(
+                    {
+                        "exchange": ex,
+                        "window_id": expected_window_id,
+                        "rel_data_path": r["rel_data_path"],
+                        "rel_manifest_path": r.get("rel_manifest_path"),
+                        "boot_id": r["boot_id"],
+                        "collection_run_id": r.get("collection_run_id"),
+                        "start_wall_ns": r.get("start_wall_ns"),
+                        "end_wall_ns": r.get("end_wall_ns"),
+                        "data_lines": int(r.get("data_lines") or 0),
+                    }
+                )
+
+        ex_has_overlap = False
         for prev_r, cur_r in zip(segs, segs[1:]):
             same_boot_seq_overlap = (
                 prev_r["boot_id"] == cur_r["boot_id"]
@@ -2113,31 +2278,38 @@ def _reconcile_single_window(
                     "wall_overlap": wall_overlap,
                 }
                 overlaps.append(ov)
+                ex_has_overlap = True
                 if same_boot_seq_overlap:
-                    ex_has_seq_overlap = True
                     win_errors.append(
                         f"segment_seq_overlap_in_expected_window:{ex}:{expected_window_id}"
                     )
+                if wall_overlap:
+                    win_errors.append(
+                        f"segment_wall_overlap_in_expected_window:{ex}:{expected_window_id}"
+                    )
 
-        if segs and ex not in exchanges_with_unverified_local and not ex_has_seq_overlap:
+        if segs and ex not in exchanges_with_unverified_local and not ex_has_overlap:
             file_verified.add(ex)
 
+        total_ex_data_lines = sum(int(r.get("data_lines") or 0) for r in segs)
         starts = [int(r["start_wall_ns"]) for r in segs if r.get("start_wall_ns") is not None]
         ends = [int(r["end_wall_ns"]) for r in segs if r.get("end_wall_ns") is not None]
         head_gap_ns = max(0, min(starts) - p_start_ns) if starts else (p_end_ns - p_start_ns)
         tail_gap_ns = max(0, p_end_ns - max(ends)) if ends else (p_end_ns - p_start_ns)
-        internal_gaps_ns = [
+        inter_gaps_ns = [
             max(0, int(cur["start_wall_ns"]) - int(prev["end_wall_ns"]))
             for prev, cur in zip(segs, segs[1:])
             if prev.get("end_wall_ns") is not None and cur.get("start_wall_ns") is not None
         ]
-        max_internal_gap_ns = max(internal_gaps_ns, default=0)
+        max_internal_gap_ns = max(inter_gaps_ns, default=0)
 
         gap_reasons: list[str] = []
         if segs:
             if not starts or not ends:
                 gap_reasons.append("missing_segment_timestamps")
             else:
+                if total_ex_data_lines < 2 or max(ends) <= min(starts):
+                    gap_reasons.append("insufficient_market_data_records")
                 if head_gap_ns > max_gap_ns or bool(segs[0].get("is_startup_stub")):
                     gap_reasons.append(f"head_gap_{head_gap_ns / 1e9:.1f}s")
                 if tail_gap_ns > max_gap_ns or bool(segs[-1].get("settled_by_timer")):
@@ -2167,12 +2339,12 @@ def _reconcile_single_window(
             "segments": [r["rel_data_path"] for r in segs],
             "boot_ids": sorted({str(r["boot_id"]) for r in segs}),
             "collection_run_ids": sorted({str(r.get("collection_run_id") or "") for r in segs if r.get("collection_run_id")}),
-            "total_data_lines": sum(int(r.get("data_lines") or 0) for r in segs),
+            "total_data_lines": total_ex_data_lines,
             "merged_start_wall_ns": min(starts) if starts else None,
             "merged_end_wall_ns": max(ends) if ends else None,
             "head_gap_seconds": round(head_gap_ns / 1e9, 3) if starts else None,
             "tail_gap_seconds": round(tail_gap_ns / 1e9, 3) if ends else None,
-            "max_internal_gap_seconds": round(max_internal_gap_ns / 1e9, 3) if len(segs) > 1 else 0.0,
+            "max_internal_gap_seconds": round(max_internal_gap_ns / 1e9, 3) if starts else 0.0,
             "has_startup_stub": any(bool(r.get("is_startup_stub")) for r in segs),
             "settled_by_timer": any(bool(r.get("settled_by_timer")) for r in segs),
             "file_verified": ex in file_verified,
@@ -2209,6 +2381,37 @@ def _reconcile_single_window(
         if (file_verification_status == "verified" and window_coverage_status == "complete")
         else "PENDING"
     )
+    if window_status != "COMPLETE" and not win_errors:
+        win_errors.append(
+            f"expected_window_not_complete:{window_label}:file={file_verification_status},coverage={window_coverage_status}"
+        )
+
+    # Check if this window is a verified initial startup-stub window (all local files verified,
+    # contains startup stub segment(s), no unsealed partials/overlaps/mixed batches, and no
+    # non-stub exchange suffered a tail/internal outage).
+    is_startup_stub_candidate = bool(
+        len(file_verified) > 0
+        and len(startup_stub_segments) > 0
+        and not unsealed_partials
+        and not sealed_without_manifest
+        and not overlaps
+        and not mixed_batches
+        and not exchanges_with_unverified_local
+        and verify_remote
+        and all(
+            (ex in covered_exchanges)
+            or (
+                segment_summaries[ex]["has_startup_stub"]
+                and not segment_summaries[ex]["settled_by_timer"]
+                and all(
+                    not r.startswith("internal_gap_")
+                    and (not r.startswith("tail_gap_") or segment_summaries[ex]["total_data_lines"] < 2)
+                    for r in coverage_gaps.get(ex, {}).get("reasons", [])
+                )
+            )
+            for ex in file_verified
+        )
+    )
 
     return {
         "expected_hour_utc": window_label,
@@ -2230,6 +2433,8 @@ def _reconcile_single_window(
         "file_verification_status": file_verification_status,
         "window_coverage_status": window_coverage_status,
         "window_status": window_status,
+        "is_startup_stub_candidate": is_startup_stub_candidate,
+        "startup_stub_segments": startup_stub_segments,
         "per_exchange_segments": segment_summaries,
         "overlaps": overlaps,
         "unsealed_partials": unsealed_partials,
@@ -2252,6 +2457,7 @@ def sync_sealed_directory(
     expected_hourly_exchanges: set[str] | None = None,
     partition_minutes: int = 60,
     expected_run_id: str | None = None,
+    cutover_window_utc: str | None = None,
     max_coverage_gap_seconds: float | None = None,
     seal_wait_seconds: float = 0.0,
     seal_poll_interval_seconds: float = 1.0,
@@ -2668,6 +2874,11 @@ def sync_sealed_directory(
                     local_hashes = checked["hashes"]
                     manifest_hashes = file_hashes(mpath)
                     local_mtime = dpath.stat().st_mtime
+                    mdata = checked.get("market_data") or {}
+                    if mdata.get("parsed_tsv"):
+                        ident["data_lines"] = int(mdata["data_lines"])
+                        ident["start_wall_ns"] = mdata["start_wall_ns"]
+                        ident["end_wall_ns"] = mdata["end_wall_ns"]
 
                     row = ledger.upsert_sealed(
                         ident=ident,
@@ -2892,7 +3103,7 @@ def sync_sealed_directory(
 
             expected_hour_reconciliation: dict[str, Any] | None = None
             if expected_hourly_exchanges is not None and expected_win_desc is not None:
-                from data_coverage import window_descriptor
+                from data_coverage import format_window_id, parse_window_start_s, window_descriptor
 
                 expected_pm = int(expected_win_desc["partition_minutes"])
                 step_s = expected_pm * 60
@@ -2901,10 +3112,15 @@ def sync_sealed_directory(
                     if max_coverage_gap_seconds is not None
                     else min(300.0, float(step_s) / 3.0)
                 )
+                cutover_start_s: int | None = None
+                if cutover_window_utc:
+                    cutover_start_s = (parse_window_start_s(cutover_window_utc) // step_s) * step_s
 
                 # Discover earliest window start to track contiguously (from existing expected_windows,
-                # matching partitions in ledger, or the current expected window).
+                # matching partitions in ledger, cutover_window_utc, or the current expected window).
                 candidate_starts: list[int] = [int(expected_win_desc["planned_start_s"])]
+                if cutover_start_s is not None and cutover_start_s <= int(expected_win_desc["planned_start_s"]):
+                    candidate_starts.append(cutover_start_s)
                 for ew in ledger.list_expected_windows(
                     partition_minutes=expected_pm, collection_run_id=expected_run_id
                 ):
@@ -2927,9 +3143,8 @@ def sync_sealed_directory(
 
                 earliest_start_s = min(candidate_starts)
                 cur_s = earliest_start_s
-                pending_prior_windows: list[str] = []
-                pending_prior_window_details: list[dict[str, Any]] = []
-                current_rec: dict[str, Any] | None = None
+                market_scan_cache: dict[str, dict[str, Any]] = {}
+                reconciled_windows: list[tuple[dict[str, Any], dict[str, Any], bool]] = []
 
                 while cur_s <= int(expected_win_desc["planned_start_s"]):
                     w_desc = window_descriptor(cur_s, expected_pm)
@@ -2947,7 +3162,74 @@ def sync_sealed_directory(
                         seal_wait_attempts=seal_wait_attempts if is_current_target else 0,
                         seal_waited_seconds=seal_waited_seconds if is_current_target else 0.0,
                         verify_remote=verify_remote,
+                        market_scan_cache=market_scan_cache,
                     )
+                    reconciled_windows.append((w_desc, rec, is_current_target))
+                    cur_s += step_s
+
+                pending_prior_windows: list[str] = []
+                pending_prior_window_details: list[dict[str, Any]] = []
+                startup_stub_windows: list[str] = []
+                startup_stub_window_details: list[dict[str, Any]] = []
+                current_rec: dict[str, Any] | None = None
+                still_in_leading_startup = True
+                first_full_window_start_s: int | None = cutover_start_s
+
+                for w_desc, rec, is_current_target in reconciled_windows:
+                    w_start_s = int(w_desc["planned_start_s"])
+                    is_pre_cutover = cutover_start_s is not None and w_start_s < cutover_start_s
+                    is_leading_prior_stub = (
+                        still_in_leading_startup
+                        and not is_current_target
+                        and (
+                            (is_pre_cutover and not rec["unsealed_partials"] and not rec["sealed_without_manifest"] and not rec["overlaps"] and not rec["mixed_batches"])
+                            or (cutover_start_s is None and rec["is_startup_stub_candidate"])
+                        )
+                    )
+                    if is_leading_prior_stub:
+                        if rec["file_verified_exchanges"] or rec["startup_stub_segments"]:
+                            rec["window_coverage_status"] = "startup_stub"
+                            rec["window_status"] = "STARTUP_STUB"
+                            rec["errors"] = []
+                            startup_stub_windows.append(w_desc["window_id"])
+                            startup_stub_window_details.append(
+                                {
+                                    "window_id": w_desc["window_id"],
+                                    "window_span_id": w_desc.get("window_span_id"),
+                                    "file_verified_exchanges": rec["file_verified_exchanges"],
+                                    "startup_stub_segments": rec["startup_stub_segments"],
+                                }
+                            )
+                        else:
+                            # Pre-cutover empty window before cutover_window_utc
+                            rec["window_coverage_status"] = "pre_cutover_ignored"
+                            rec["window_status"] = "STARTUP_STUB"
+                            rec["errors"] = []
+                    else:
+                        if is_current_target and still_in_leading_startup and rec["is_startup_stub_candidate"]:
+                            # Collector started in this current expected window; stub files are verified,
+                            # single-list as startup stub, and await the first full window before reporting COMPLETE.
+                            rec["window_coverage_status"] = "startup_stub"
+                            rec["window_status"] = "STARTUP_STUB"
+                            rec["errors"] = [
+                                f"expected_window_is_startup_stub_awaiting_first_full_window:{w_desc['window_id']}"
+                            ]
+                            startup_stub_windows.append(w_desc["window_id"])
+                            startup_stub_window_details.append(
+                                {
+                                    "window_id": w_desc["window_id"],
+                                    "window_span_id": w_desc.get("window_span_id"),
+                                    "file_verified_exchanges": rec["file_verified_exchanges"],
+                                    "startup_stub_segments": rec["startup_stub_segments"],
+                                }
+                            )
+                            if first_full_window_start_s is None:
+                                first_full_window_start_s = w_start_s + step_s
+                        else:
+                            if first_full_window_start_s is None:
+                                first_full_window_start_s = w_start_s
+                        still_in_leading_startup = False
+
                     w_key = (
                         f"{expected_run_id or ''}|{w_desc['planned_start_wall_ns']}|"
                         f"{w_desc['planned_end_wall_ns']}|{expected_pm}"
@@ -2970,12 +3252,13 @@ def sync_sealed_directory(
                             "overlaps": rec["overlaps"],
                             "unsealed_partials": rec["unsealed_partials"],
                             "sealed_without_manifest": rec["sealed_without_manifest"],
+                            "startup_stub_segments": rec["startup_stub_segments"],
                         },
                         now_iso=now_iso,
                     )
                     if is_current_target:
                         current_rec = rec
-                    elif rec["window_status"] != "COMPLETE":
+                    elif rec["window_status"] not in ("COMPLETE", "STARTUP_STUB"):
                         pending_prior_windows.append(w_desc["window_id"])
                         pending_prior_window_details.append(
                             {
@@ -2988,10 +3271,14 @@ def sync_sealed_directory(
                                 "coverage_gaps": rec["coverage_gaps"],
                             }
                         )
-                    cur_s += step_s
 
                 # Also include any other unverified rows in STATE_SEALED not in the contiguous range
+                # (matching the active batch/duration if specified)
                 for prow in pending_unverified_rows:
+                    if int(prow.get("partition_minutes") or 60) != expected_pm:
+                        continue
+                    if expected_run_id is not None and prow.get("collection_run_id") not in (None, "", expected_run_id):
+                        continue
                     pwid = str(prow.get("window_id") or f"{prow['date_utc']}T{prow['hour_utc']}:00Z")
                     if pwid != expected_win_desc["window_id"] and pwid not in pending_prior_windows:
                         pending_prior_windows.append(pwid)
@@ -2999,19 +3286,36 @@ def sync_sealed_directory(
 
                 assert current_rec is not None
                 errors.extend(current_rec["errors"])
+                # Directly constrain outer archive result by current expected window status!
+                if current_rec["window_status"] != "COMPLETE":
+                    fallback_err = (
+                        f"expected_window_not_complete:{current_rec['expected_window_id']}:"
+                        f"status={current_rec['window_status']},file={current_rec['file_verification_status']},"
+                        f"coverage={current_rec['window_coverage_status']}"
+                    )
+                    if not current_rec["errors"] and fallback_err not in errors:
+                        errors.append(fallback_err)
                 if verify_remote:
                     for pwid in pending_prior_windows:
                         errors.append(f"pending_prior_window_unverified:{pwid}")
 
-                expected_hour_reconciliation = {
-                    k: v for k, v in current_rec.items() if k != "errors"
-                }
+                eff_first_full_s = (
+                    first_full_window_start_s
+                    if first_full_window_start_s is not None
+                    else int(expected_win_desc["planned_start_s"])
+                )
+                expected_hour_reconciliation = dict(current_rec)
+                expected_hour_reconciliation["first_full_window_id"] = format_window_id(eff_first_full_s)
+                expected_hour_reconciliation["startup_stub_windows"] = startup_stub_windows
+                expected_hour_reconciliation["startup_stub_window_details"] = startup_stub_window_details
                 expected_hour_reconciliation["pending_prior_windows"] = pending_prior_windows
                 expected_hour_reconciliation["pending_prior_window_details"] = pending_prior_window_details
 
             # Atomically export deterministic cloud-readable verified archive index BEFORE meta/ sync
             # so GitHub Incremental QA discovers only remotely verified partitions and window states.
-            archive_index_path = export_archive_manifest_index(sealed_root, ledger)
+            archive_index_path = export_archive_manifest_index(
+                sealed_root, ledger, effective_run_id=expected_run_id
+            )
 
             # Upload changed meta/ files incrementally (excluding WAL/SHM/lock/partial files)
             meta_uploaded: list[str] = []
@@ -3111,6 +3415,7 @@ def sync_sealed_directory(
                     "status": "blocked",
                     "phase": "archive",
                     "run_id": run_id,
+                    "effective_run_id": expected_run_id,
                     "proxy": proxy_info,
                     "verified_count": len(newly_verified_entries),
                     "total_verified_or_pruned_count": len(all_verified_rows),
@@ -3140,6 +3445,7 @@ def sync_sealed_directory(
                 "status": "ok",
                 "phase": "archive",
                 "run_id": run_id,
+                "effective_run_id": expected_run_id,
                 "proxy": proxy_info,
                 "verified_count": len(all_verified_rows),
                 "newly_verified_count": len(newly_verified_entries),
@@ -3221,6 +3527,7 @@ def audit_effective_archive_service(
     has_expected_config = False
     has_verify_remote = False
     has_prune_hours = False
+    has_run_id_flag = False
     parsed_tokens: list[list[str]] = []
 
     if not effective_exec_starts:
@@ -3240,6 +3547,8 @@ def audit_effective_archive_service(
                 has_expected_config = True
             if tok == "--prune-hours" or tok.startswith("--prune-hours="):
                 has_prune_hours = True
+            if tok == "--run-id" or tok.startswith("--run-id="):
+                has_run_id_flag = True
 
     if effective_exec_starts and not has_expected_config:
         issues.append(f"missing_expected_config:{expected_config_path}")
@@ -3256,12 +3565,20 @@ def audit_effective_archive_service(
         "drop_in_replaced_exec_start": drop_in_replaced_exec_start,
         "has_expected_config": has_expected_config,
         "has_verify_remote": has_verify_remote,
+        "has_run_id_flag": has_run_id_flag,
         "auto_prune_disabled": not has_prune_hours,
         "issues": issues,
     }
 
 
 def main() -> int:
+    from data_coverage import (
+        configured_partition_minutes,
+        enabled_exchanges,
+        resolve_cutover_window_utc,
+        resolve_effective_run_id,
+    )
+
     p = argparse.ArgumentParser(description="Incremental SQLite archive ledger and Google Drive verifier")
     p.add_argument("--dir", type=Path, required=True, help="Root directory containing raw/ and meta/")
     p.add_argument(
@@ -3275,6 +3592,7 @@ def main() -> int:
     p.add_argument("--prune-hours", type=float, default=None, help="Optional safe local retention hours after remote verify")
     p.add_argument("--no-snapshot", action="store_true", help="Skip uploading consistent SQLite ledger snapshot to meta/")
     p.add_argument("--run-id", default=None, help="Optional collection batch run_id filter for window reconciliation")
+    p.add_argument("--cutover-window", default=None, help="Optional first full acceptance UTC window (YYYY-MM-DDTHH:MMZ)")
     p.add_argument("--seal-wait-seconds", type=float, default=None, help="Override bounded wait for async partition sealing")
     p.add_argument("--proxy-url", default=None, help="Optional SOCKS5 URL scoped to rclone only")
     p.add_argument(
@@ -3289,13 +3607,12 @@ def main() -> int:
         backend = RcloneBackend(args.remote, proxy_url=args.proxy_url, proxy_mode=args.proxy_mode)
     else:
         backend = RcloneBackend(args.remote)
+    cfg_obj: dict[str, Any] | None = None
     expected = None
     partition_minutes = 60
     seal_wait_seconds = 0.0
     seal_poll_interval = 1.0
     if args.config is not None:
-        from data_coverage import configured_partition_minutes, enabled_exchanges
-
         cfg_obj = json.loads(args.config.read_text(encoding="utf-8"))
         expected = set(enabled_exchanges(cfg_obj))
         partition_minutes = configured_partition_minutes(cfg_obj)
@@ -3304,6 +3621,8 @@ def main() -> int:
         seal_poll_interval = float(arch_cfg.get("seal_poll_interval_seconds", 1.0))
     if args.seal_wait_seconds is not None:
         seal_wait_seconds = float(args.seal_wait_seconds)
+    effective_run_id = resolve_effective_run_id(cfg_obj, args.run_id)
+    cutover_window_utc = resolve_cutover_window_utc(cfg_obj, args.cutover_window)
     result = sync_sealed_directory(
         args.dir,
         backend=backend,
@@ -3312,7 +3631,8 @@ def main() -> int:
         upload_ledger_snapshot=not args.no_snapshot,
         expected_hourly_exchanges=expected,
         partition_minutes=partition_minutes,
-        expected_run_id=args.run_id,
+        expected_run_id=effective_run_id,
+        cutover_window_utc=cutover_window_utc,
         seal_wait_seconds=seal_wait_seconds,
         seal_poll_interval_seconds=seal_poll_interval,
     )

@@ -1578,3 +1578,505 @@ def test_review_p2_5_qa_heartbeat_separates_job_current_window_and_historical_da
         assert len(r3["historical_damaged_partitions"]) == 1
 
 
+# ---------------------------------------------------------------------------
+# 6. User Review Round 2 Reproductions (3 P1 + 2 Report Consistency Fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_review_round2_p1_1_unified_run_id_across_collector_archive_and_qa():
+    """Reproduces Review Round 2 P1 #1:
+    Verify that collector, archive service, and GitHub incremental QA all resolve
+    `effective_run_id` from the same unified sources (`--run-id`, `TOKYO_L2_RUN_ID`,
+    and `deployment.run_id` in `config.json`), fail closed on any conflict, and verify
+    the actual `run_id` across archive manifests and `meta/archive_manifest_index.json`.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    collector_unit = (repo_root / "deploy" / "systemd" / "tokyo-l2-collector.service").read_text(encoding="utf-8")
+    archive_unit = (repo_root / "deploy" / "systemd" / "tokyo-l2-archive.service").read_text(encoding="utf-8")
+    assert "/etc/tokyo-l2/live.env" in collector_unit
+    assert "/etc/tokyo-l2/live.env" in archive_unit
+    assert "--config /etc/tokyo-l2/config.json" in collector_unit
+    assert "--config /etc/tokyo-l2/config.json" in archive_unit
+    assert "--run-id ${TOKYO_L2_RUN_ID}" in collector_unit
+    assert "--run-id ${TOKYO_L2_RUN_ID}" in archive_unit
+
+    cfg = _make_config(partition_minutes=15, exchanges=("binance_futures",), stale_seconds=900)
+    cfg["deployment"]["run_id"] = "trial_15m_unified_01"
+    cfg["deployment"]["cutover_window_utc"] = "2026-11-21T00:00Z"
+
+    # 1. Unexpanded systemd literal `${TOKYO_L2_RUN_ID}` falls back to config `deployment.run_id`
+    assert (
+        dc.resolve_effective_run_id(cfg, "${TOKYO_L2_RUN_ID}", env={"TOKYO_L2_RUN_ID": ""})
+        == "trial_15m_unified_01"
+    )
+    # 2. Matching env + config + CLI resolves cleanly
+    assert (
+        dc.resolve_effective_run_id(
+            cfg,
+            "trial_15m_unified_01",
+            env={"TOKYO_L2_RUN_ID": "trial_15m_unified_01"},
+        )
+        == "trial_15m_unified_01"
+    )
+    # 3. Conflict between `live.env` TOKYO_L2_RUN_ID and `config.json` deployment.run_id MUST fail closed!
+    with pytest.raises(ValueError, match="conflicting run_id"):
+        dc.resolve_effective_run_id(
+            cfg,
+            None,
+            env={"TOKYO_L2_RUN_ID": "old_60m_boot_id"},
+        )
+
+    # 4. End-to-end verification across manifest -> archive index -> QA run using config's deployment.run_id
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive_root = root / "data"
+        state_dir = root / "state"
+        cfg_path = root / "config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+
+        _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="b_unified",
+            run_id="trial_15m_unified_01",
+        )
+        backend = _MemoryArchiveBackend()
+        sync_res = arch.sync_sealed_directory(
+            archive_root,
+            backend,
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges={"binance_futures"},
+            partition_minutes=15,
+            expected_run_id=dc.resolve_effective_run_id(cfg, None, env={}),
+            cutover_window_utc=dc.resolve_cutover_window_utc(cfg, None, env={}),
+        )
+        assert sync_res["status"] == "ok"
+        assert sync_res["effective_run_id"] == "trial_15m_unified_01"
+        assert sync_res["expected_window_reconciliation"]["expected_run_id"] == "trial_15m_unified_01"
+
+        idx_obj = json.loads(backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH].decode("utf-8"))
+        assert idx_obj["effective_run_id"] == "trial_15m_unified_01"
+        assert idx_obj["entries"][0]["collection_run_id"] == "trial_15m_unified_01"
+
+        # QA run with run_id=None and since_window=None automatically resolves both from config.json!
+        fake_run, fake_dl = _wire_mock_drive(archive_root, backend)
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            qa_res = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                now_epoch_s=w0 + 16 * 60,
+            )
+        assert qa_res["status"] == "ok"
+        assert qa_res["effective_run_id"] == "trial_15m_unified_01"
+        assert qa_res["index_effective_run_id"] == "trial_15m_unified_01"
+        assert qa_res["effective_since_window"] == "2026-11-21T00:00Z"
+
+
+def test_review_round2_p1_2_archive_market_data_only_coverage_cross_process_overlap_and_startup_stub_progression():
+    """Reproduces all 3 user cases in Review Round 2 P1 #2:
+    (a) 1 real market-data record (`DATA`) stretched across the window by head and tail `META` control
+        records must NOT return COMPLETE; it must return `window_coverage_status == "incomplete"`,
+        `window_status == "PENDING"`, and outer `status == "blocked"`.
+    (b) Overlapping segments from different processes (`boot_id_1 != boot_id_2`, `wall_overlap=True`)
+        must populate `errors` with `segment_wall_overlap_in_expected_window:...` and force outer
+        `sync_sealed_directory["status"] == "blocked"`.
+    (c) An initial mid-window startup stub in `W0` must be single-listed in `startup_stub_windows`
+        (`window_status == "STARTUP_STUB"`), and full-window acceptance must start from `first_full_window_id`
+        (`W1`) so subsequent complete windows return `status == "ok"` instead of being permanently blocked.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        w1 = w0 + 15 * 60
+        start_ns = w0 * 1_000_000_000
+
+        # Case (a): 1 real DATA record at +450s, flanked by head META (+1s) and tail META (+899s)
+        dir_meta_stretch = root / "case_meta_stretch"
+        rows_meta_stretch = [
+            (start_ns + 1_000_000_000, 100, "A", 1, 1, "META", {"event": "HEAD_CONTROL"}),
+            (
+                start_ns + 450_000_000_000,
+                200,
+                "A",
+                1,
+                2,
+                "DATA",
+                {"stream": "btcusdt@bookTicker", "data": {"e": "bookTicker", "s": "BTCUSDT"}},
+            ),
+            (start_ns + 899_000_000_000, 300, "A", 1, 3, "META", {"event": "TAIL_CONTROL"}),
+        ]
+        _, mf_path_a, mf_a = _write_sealed_partition(
+            dir_meta_stretch,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            custom_rows=rows_meta_stretch,
+            boot_id="b_meta",
+        )
+        # Even if manifest start_wall_ns/end_wall_ns claimed [w0+1s, w0+899s] and data_lines=3,
+        # archive_sync scans real DATA/DATA_ESCAPED rows from the compressed file and catches it!
+        mf_a["start_wall_ns"] = start_ns + 1_000_000_000
+        mf_a["end_wall_ns"] = start_ns + 899_000_000_000
+        mf_a["data_lines"] = 1
+        mf_a["meta_lines"] = 2
+        mf_path_a.write_text(json.dumps(mf_a, indent=2) + "\n", encoding="utf-8")
+
+        res_a = arch.sync_sealed_directory(
+            dir_meta_stretch,
+            _MemoryArchiveBackend(),
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges={"binance_futures"},
+            partition_minutes=15,
+        )
+        assert res_a["status"] == "blocked"
+        rec_a = res_a["expected_window_reconciliation"]
+        assert rec_a["window_status"] == "PENDING"
+        assert rec_a["window_coverage_status"] == "incomplete"
+        assert "insufficient_market_data_records" in rec_a["coverage_gaps"]["binance_futures"]["reasons"]
+
+        # Case (b): Two segments from DIFFERENT processes (`boot_p1` != `boot_p2`) with overlapping wall timestamps
+        dir_overlap = root / "case_cross_process_overlap"
+        _write_sealed_partition(
+            dir_overlap,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="boot_p1",
+            first_rx_seq=1,
+            offset_start_s=1,
+            offset_end_s=600,
+        )
+        _write_sealed_partition(
+            dir_overlap,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="boot_p2",
+            first_rx_seq=1,
+            offset_start_s=400,  # overlaps [400s, 600s] with boot_p1!
+            offset_end_s=898,
+        )
+        res_b = arch.sync_sealed_directory(
+            dir_overlap,
+            _MemoryArchiveBackend(),
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges={"binance_futures"},
+            partition_minutes=15,
+        )
+        assert res_b["status"] == "blocked"
+        rec_b = res_b["expected_window_reconciliation"]
+        assert rec_b["window_status"] == "PENDING"
+        assert any("segment_wall_overlap_in_expected_window:binance_futures:2026-11-21T00:00Z" in e for e in rec_b["errors"])
+        assert any("segment_wall_overlap_in_expected_window:binance_futures:2026-11-21T00:00Z" in e for e in res_b["failed_items"])
+
+        # Case (c): Initial startup stub in W0 (started 600s into W0), followed by complete full window W1
+        dir_stub = root / "case_startup_stub"
+        backend_stub = _MemoryArchiveBackend()
+        for ex in EXCHANGES_4:
+            _write_sealed_partition(
+                dir_stub,
+                exchange=ex,
+                window_start_s=w0,
+                partition_minutes=15,
+                boot_id="boot_init",
+                run_id="batch_init",
+                offset_start_s=600,
+                offset_end_s=898,
+                is_startup_stub=True,
+            )
+        # At 00:16Z (only W0 startup stub exists so far): W0 is single-listed as STARTUP_STUB, outer status is blocked
+        # because no full window has completed yet
+        res_c0 = arch.sync_sealed_directory(
+            dir_stub,
+            backend_stub,
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges=set(EXCHANGES_4),
+            partition_minutes=15,
+            expected_run_id="batch_init",
+        )
+        assert res_c0["status"] == "blocked"
+        assert res_c0["expected_window_reconciliation"]["window_status"] == "STARTUP_STUB"
+        assert res_c0["expected_window_reconciliation"]["startup_stub_windows"] == ["2026-11-21T00:00Z"]
+
+        # Now full window W1 (00:15Z) completes for all 4 exchanges -> at 00:31Z, W0 remains single-listed
+        # in startup_stub_windows, first_full_window_id is 2026-11-21T00:15Z, pending_prior_windows is empty,
+        # and outer sync_sealed_directory returns status == "ok"!
+        for ex in EXCHANGES_4:
+            _write_sealed_partition(
+                dir_stub,
+                exchange=ex,
+                window_start_s=w1,
+                partition_minutes=15,
+                boot_id="boot_init",
+                run_id="batch_init",
+                first_rx_seq=10,
+            )
+        res_c1 = arch.sync_sealed_directory(
+            dir_stub,
+            backend_stub,
+            verify_remote=True,
+            now_epoch_s=w1 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges=set(EXCHANGES_4),
+            partition_minutes=15,
+            expected_run_id="batch_init",
+        )
+        assert res_c1["status"] == "ok", res_c1["failed_items"]
+        rec_c1 = res_c1["expected_window_reconciliation"]
+        assert rec_c1["expected_window_id"] == "2026-11-21T00:15Z"
+        assert rec_c1["window_status"] == "COMPLETE"
+        assert rec_c1["first_full_window_id"] == "2026-11-21T00:15Z"
+        assert rec_c1["startup_stub_windows"] == ["2026-11-21T00:00Z"]
+        assert rec_c1["pending_prior_windows"] == []
+
+
+def test_review_round2_p1_3_historical_missing_overdue_window_does_not_fail_latest_passed_window_heartbeat():
+    """Reproduces Review Round 2 P1 #3:
+    When previous window W0 (00:00Z) has 0 files and is overdue, while latest window W1 (00:15Z)
+    has all expected exchanges and passes verification:
+    - `job_execution_status == "ok"`
+    - `current_window_id == "2026-11-21T00:15Z"`
+    - `current_window_completed is True`
+    - `current_window_verification_status == "passed"`
+    - `heartbeat_status == "ok"` and overall `status == "ok"` (so the workflow does NOT send `/fail`)
+    - `historical_data_quality_status == "has_historical_damage"`
+    - `historical_overdue_windows == ["2026-11-21T00:00Z"]` and `historical_damaged_windows == ["2026-11-21T00:00Z"]`
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive_root = root / "data"
+        state_dir = root / "state"
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        w1 = w0 + 15 * 60
+        cfg = _make_config(partition_minutes=15, exchanges=EXCHANGES_4, stale_seconds=900)
+        cfg_path = root / "config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        # W0 (00:00Z) has ZERO files! W1 (00:15Z) has all 4 exchanges and is healthy.
+        for ex in EXCHANGES_4:
+            _write_sealed_partition(
+                archive_root,
+                exchange=ex,
+                window_start_s=w1,
+                partition_minutes=15,
+                boot_id="b_p1_3",
+                run_id="batch_p1_3",
+            )
+        backend = _MemoryArchiveBackend()
+        arch.sync_sealed_directory(
+            archive_root,
+            backend,
+            verify_remote=True,
+            now_epoch_s=w1 + 19 * 60,
+            upload_ledger_snapshot=False,
+        )
+        fake_run, fake_dl = _wire_mock_drive(archive_root, backend)
+
+        # At w1 + 19m (00:34Z): W0 ended 19m ago (>10m SLA -> overdue), W1 is the latest complete window [00:15Z, 00:30Z)
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            res = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_p1_3",
+                now_epoch_s=w1 + 19 * 60,
+                sla_grace_minutes=10.0,
+            )
+        assert res["job_execution_status"] == "ok"
+        assert res["current_window_id"] == "2026-11-21T00:15Z"
+        assert res["current_window_completed"] is True
+        assert res["current_window_verification_status"] == qa.QA_STATUS_PASSED
+        assert res["heartbeat_status"] == "ok"
+        assert res["qa_status"] == qa.QA_STATUS_PASSED
+        assert res["status"] == "ok"
+        assert res["historical_data_quality_status"] == "has_historical_damage"
+        assert res["historical_overdue_windows"] == ["2026-11-21T00:00Z"]
+        assert res["historical_damaged_windows"] == ["2026-11-21T00:00Z"]
+
+
+def test_review_round2_report_fixes_multi_segment_late_frame_no_double_count_and_four_historical_loss_manifests_preserved():
+    """Reproduces Review Round 2 Report Consistency Fixes #1 and #2:
+    (a) When target window W0 has 2 segments (`seg1`, `seg2`) for `binance_futures`, a single
+        `LATE_FRAME_REJECTED` (`dropped_frames=1`) in W1 targeting W0 must be counted ONCE
+        (`local_loss_events == 1`, `dropped_frames == 1`, `attributed_late_frames_rejected == 1`),
+        never double-counted as 2.
+    (b) The 4 historical 60-minute loss-marked manifests must be preserved in a standalone queryable
+        record (`qa_reports/historical_loss_manifests.json`) and automatically included in
+        `res["historical_loss_manifests"]` and `res["historical_damaged_partitions"]` even after
+        switching QA to a 15-minute config and a new `--run-id` / `--since-window`.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive_root = root / "data"
+        state_dir = root / "state"
+        w_hist_base = int(datetime(2026, 11, 20, 0, 0, tzinfo=timezone.utc).timestamp())
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        w1 = w0 + 15 * 60
+        w2 = w1 + 15 * 60
+
+        cfg = _make_config(partition_minutes=15, exchanges=("binance_futures",), stale_seconds=900)
+        cfg_path = root / "config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        # 1. Seed 4 historical 60-minute loss-marked manifests from before the 15m cutover
+        for idx, ex in enumerate(EXCHANGES_4):
+            _, mf_h_path, mf_h = _write_sealed_partition(
+                archive_root,
+                exchange=ex,
+                window_start_s=w_hist_base + idx * 3600,
+                partition_minutes=60,
+                legacy_v1=True,
+                boot_id=f"legacy_loss_boot_{idx}",
+                extra_meta=[{"event": "LOCAL_LOSS", "dropped_frames": idx + 2}],
+            )
+            mf_h["local_loss_lines"] = 1
+            mf_h_path.write_text(json.dumps(mf_h, indent=2) + "\n", encoding="utf-8")
+
+        # 2. Target window W0 (00:00Z) has TWO segments for binance_futures in batch_multi_seg
+        _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="boot_seg1",
+            run_id="batch_multi_seg",
+            first_rx_seq=1,
+            offset_start_s=1,
+            offset_end_s=440,
+        )
+        _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="boot_seg2",
+            run_id="batch_multi_seg",
+            first_rx_seq=1,
+            offset_start_s=445,
+            offset_end_s=898,
+        )
+
+        # 3. Window W1 (00:15Z) has ONE rejected late frame targeting W0 (00:00Z)
+        _, mf_w1_path, mf_w1 = _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w1,
+            partition_minutes=15,
+            boot_id="boot_seg2",
+            run_id="batch_multi_seg",
+            first_rx_seq=7,
+            extra_meta=[
+                {
+                    "event": "LATE_FRAME_REJECTED",
+                    "dropped_frames": 1,
+                    "orig_recv_wall_ns": w1 * 1_000_000_000 - 5_000_000,
+                    "orig_recv_mono_ns": 500,
+                    "orig_rx_seq": 6,
+                    "orig_kind": "DATA",
+                    "target_window_id": "2026-11-21T00:00Z",
+                    "loss_attributed_window_id": "2026-11-21T00:00Z",
+                    "target_planned_start_wall_ns": w0 * 1_000_000_000,
+                    "target_planned_end_wall_ns": w1 * 1_000_000_000,
+                    "target_partition_minutes": 15,
+                }
+            ],
+        )
+        mf_w1["late_frames_rejected"] = 1
+        mf_w1_path.write_text(json.dumps(mf_w1, indent=2) + "\n", encoding="utf-8")
+
+        # 4. Window W2 (00:30Z) is a clean new cutover batch `batch_cutover_clean`
+        _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w2,
+            partition_minutes=15,
+            boot_id="boot_cutover",
+            run_id="batch_cutover_clean",
+            first_rx_seq=1,
+        )
+
+        backend = _MemoryArchiveBackend()
+        arch.sync_sealed_directory(
+            archive_root,
+            backend,
+            verify_remote=True,
+            now_epoch_s=w2 + 16 * 60,
+            upload_ledger_snapshot=False,
+        )
+        fake_run, fake_dl = _wire_mock_drive(archive_root, backend)
+
+        # Verify Fix #1: Run QA for `batch_multi_seg` across W0 and W1 -> W0 must count the late frame ONCE (1, not 2!)
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            res_multi = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_multi_seg",
+                now_epoch_s=w1 + 16 * 60,
+            )
+        w0_rep = json.loads(
+            (state_dir / "qa_reports" / "windows" / "2026-11-21" / "2026-11-21T0000Z.window.qa.json").read_text()
+        )
+        assert w0_rep["qa_status"] == qa.QA_STATUS_FAILED
+        assert w0_rep["attributed_late_frames_rejected"] == 1
+        assert w0_rep["local_loss_events"] == 1
+        assert w0_rep["dropped_frames"] == 1
+        assert len(w0_rep["damaged_segments"]) == 1
+
+        # Verify Fix #2: Switch QA to new batch `batch_cutover_clean` starting at W2 (2026-11-21T00:30Z)
+        # All 4 prior 60m loss-marked manifests (plus the prior batch's loss-marked manifest) MUST remain preserved
+        # in `historical_loss_manifests`, `historical_damaged_partitions`, and `qa_reports/historical_loss_manifests.json`!
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            res_cutover = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:30Z",
+                run_id="batch_cutover_clean",
+                now_epoch_s=w2 + 16 * 60,
+            )
+        assert res_cutover["status"] == "ok"
+        assert res_cutover["heartbeat_status"] == "ok"
+        assert res_cutover["current_window_id"] == "2026-11-21T00:30Z"
+        assert res_cutover["current_window_verification_status"] == qa.QA_STATUS_PASSED
+        assert res_cutover["historical_data_quality_status"] == "has_historical_damage"
+        hist_60m = [
+            m for m in res_cutover["historical_loss_manifests"] if int(m.get("partition_minutes") or 0) == 60
+        ]
+        assert len(hist_60m) == 4
+        damaged_60m = [
+            p for p in res_cutover["historical_damaged_partitions"] if int(p.get("partition_minutes") or 0) == 60
+        ]
+        assert len(damaged_60m) == 4
+        persisted_hist_file = state_dir / "qa_reports" / "historical_loss_manifests.json"
+        assert persisted_hist_file.is_file()
+        persisted_hist_obj = json.loads(persisted_hist_file.read_text(encoding="utf-8"))
+        assert persisted_hist_obj["count"] >= 4
+
+

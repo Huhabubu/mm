@@ -697,6 +697,7 @@ pub async fn run_live_collector(
     run_id: String,
     duration_secs: Option<u64>,
 ) -> Result<(), String> {
+    let run_id = config.resolve_effective_run_id(Some(&run_id), None)?;
     // Register OS shutdown signal listeners BEFORE spawning any network tasks and keep
     // them alive through the entire sealing phase so SIGINT/SIGTERM never revert to SIG_DFL.
     #[cfg(unix)]

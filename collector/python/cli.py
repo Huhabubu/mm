@@ -553,6 +553,24 @@ def cmd_collect(args: argparse.Namespace) -> int:
         print(json.dumps(rep, indent=2, ensure_ascii=False))
         return 3
 
+    from data_coverage import resolve_effective_run_id
+
+    try:
+        cfg_obj = json.loads(args.config.read_text(encoding="utf-8"))
+        eff_run_id = resolve_effective_run_id(cfg_obj, getattr(args, "run_id", None), require=True)
+    except Exception as exc:
+        print(
+            json.dumps(
+                _blocked(
+                    "collect",
+                    [str(exc)],
+                    ["Align TOKYO_L2_RUN_ID in /etc/tokyo-l2/live.env, deployment.run_id in config.json, and --run-id"],
+                ),
+                indent=2,
+            )
+        )
+        return 2
+
     rust_bin = _find_or_build_rust_binary()
     cmd = [
         str(rust_bin),
@@ -560,7 +578,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "--config",
         str(args.config),
         "--run-id",
-        args.run_id,
+        str(eff_run_id),
         "--allow-live-run",
     ]
     if args.duration_secs is not None:
@@ -570,7 +588,12 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
 
 def cmd_archive(args: argparse.Namespace) -> int:
-    from data_coverage import configured_partition_minutes, enabled_exchanges
+    from data_coverage import (
+        configured_partition_minutes,
+        enabled_exchanges,
+        resolve_cutover_window_utc,
+        resolve_effective_run_id,
+    )
     from meta_daemon import notify_archive_healthcheck
 
     proxy_url = getattr(args, "proxy_url", None)
@@ -582,6 +605,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
     result: dict[str, Any] | None = None
     try:
         archive_config = getattr(args, "config", None)
+        cfg_obj: dict[str, Any] | None = None
         expected = None
         partition_minutes = 60
         seal_wait_seconds = 0.0
@@ -595,6 +619,8 @@ def cmd_archive(args: argparse.Namespace) -> int:
             seal_poll_interval = float(arch_cfg.get("seal_poll_interval_seconds", 1.0))
         if getattr(args, "seal_wait_seconds", None) is not None:
             seal_wait_seconds = float(args.seal_wait_seconds)
+        effective_run_id = resolve_effective_run_id(cfg_obj, getattr(args, "run_id", None))
+        cutover_window_utc = resolve_cutover_window_utc(cfg_obj, getattr(args, "cutover_window", None))
         result = sync_sealed_directory(
             args.dir,
             backend=backend,
@@ -603,7 +629,8 @@ def cmd_archive(args: argparse.Namespace) -> int:
             upload_ledger_snapshot=not args.no_snapshot,
             expected_hourly_exchanges=expected,
             partition_minutes=partition_minutes,
-            expected_run_id=getattr(args, "run_id", None),
+            expected_run_id=effective_run_id,
+            cutover_window_utc=cutover_window_utc,
             seal_wait_seconds=seal_wait_seconds,
             seal_poll_interval_seconds=seal_poll_interval,
         )
@@ -663,7 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_col = sub.add_parser("collect", help="Run live dual-active collector (guarded for P2/P3)")
     p_col.add_argument("--config", type=Path, required=True)
-    p_col.add_argument("--run-id", required=True)
+    p_col.add_argument("--run-id", default=None)
     p_col.add_argument("--allow-live-run", action="store_true")
     p_col.add_argument("--duration-secs", type=int, default=None, help="Optional clean internal run duration in seconds")
     p_col.set_defaults(func=cmd_collect)
@@ -677,6 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_arc.add_argument("--no-snapshot", action="store_true", help="Skip uploading consistent SQLite ledger snapshot")
     p_arc.add_argument("--no-healthchecks", action="store_true", help="Skip Healthchecks ping after archive run")
     p_arc.add_argument("--run-id", default=None, help="Optional collection batch run_id filter")
+    p_arc.add_argument("--cutover-window", default=None, help="Optional first full acceptance UTC window (YYYY-MM-DDTHH:MMZ)")
     p_arc.add_argument("--seal-wait-seconds", type=float, default=None, help="Override bounded async seal wait")
     p_arc.add_argument("--proxy-url", default=None, help="Optional SOCKS5 proxy URL scoped ONLY to rclone")
     p_arc.add_argument(

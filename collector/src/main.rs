@@ -36,7 +36,7 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
-        run_id: String,
+        run_id: Option<String>,
         #[arg(long, default_value_t = false)]
         allow_live_run: bool,
         /// Optional clean internal duration timer (seconds) for bounded P2 smoke/first-frame runs.
@@ -187,6 +187,8 @@ async fn main() -> ExitCode {
                 "spec_version": cfg.spec_version,
                 "partition_minutes": cfg.deployment.partition_minutes,
                 "late_frame_grace_ms": cfg.deployment.late_frame_grace_ms,
+                "run_id": cfg.deployment.run_id,
+                "cutover_window_utc": cfg.deployment.cutover_window_utc,
                 "enabled_exchanges": {
                     "binance_futures": cfg.exchanges.binance_futures.enabled,
                     "bybit_linear": cfg.exchanges.bybit_linear.enabled,
@@ -231,7 +233,20 @@ async fn main() -> ExitCode {
                 println!("{}", serde_json::to_string_pretty(&rep).unwrap());
                 return ExitCode::from(2);
             }
-            match run_live_collector(cfg, run_id, duration_secs).await {
+            let env_run_id = std::env::var("TOKYO_L2_RUN_ID").ok();
+            let effective_run_id = match cfg.resolve_effective_run_id(run_id.as_deref(), env_run_id.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let rep = BlockedReport::new(
+                        "collect",
+                        vec![e],
+                        vec!["Align TOKYO_L2_RUN_ID in /etc/tokyo-l2/live.env, deployment.run_id in config.json, and --run-id".to_string()],
+                    );
+                    println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+                    return ExitCode::from(2);
+                }
+            };
+            match run_live_collector(cfg, effective_run_id, duration_secs).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     let rep = BlockedReport::new("collect", vec![e], vec!["Inspect runtime error".to_string()]);

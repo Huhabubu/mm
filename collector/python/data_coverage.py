@@ -261,6 +261,110 @@ def configured_partition_minutes(config: dict[str, Any] | None) -> int:
     return mins
 
 
+def resolve_effective_run_id(
+    config: dict[str, Any] | None = None,
+    cli_run_id: str | None = None,
+    env: Mapping[str, str] | None = None,
+    *,
+    require: bool = False,
+) -> str | None:
+    """Resolve the unified collection batch `run_id` across CLI (`--run-id`), `TOKYO_L2_RUN_ID`
+    (from `/etc/tokyo-l2/live.env`), and `config.json` (`deployment.run_id` / `archive.run_id`).
+
+    Fails closed (`ValueError`) if multiple non-empty values are provided and disagree,
+    preventing collector, archive, and GitHub QA from operating on mismatched batch IDs.
+    """
+    import os
+
+    env_map = os.environ if env is None else env
+    cli_clean = str(cli_run_id).strip() if cli_run_id is not None else ""
+    # Guard against unexpanded systemd variable literal `${TOKYO_L2_RUN_ID}` when unset
+    if cli_clean in ("${TOKYO_L2_RUN_ID}", "$TOKYO_L2_RUN_ID"):
+        cli_clean = ""
+
+    env_clean = str(env_map.get("TOKYO_L2_RUN_ID") or "").strip()
+
+    dep = (config or {}).get("deployment", {}) if isinstance(config, dict) else {}
+    arch = (config or {}).get("archive", {}) if isinstance(config, dict) else {}
+    dep_clean = str(dep.get("run_id") or "").strip() if isinstance(dep, dict) else ""
+    arch_clean = str(arch.get("run_id") or "").strip() if isinstance(arch, dict) else ""
+
+    sources: list[tuple[str, str]] = []
+    if cli_clean:
+        sources.append(("cli(--run-id)", cli_clean))
+    if env_clean:
+        sources.append(("env(TOKYO_L2_RUN_ID)", env_clean))
+    if dep_clean:
+        sources.append(("config(deployment.run_id)", dep_clean))
+    if arch_clean:
+        sources.append(("config(archive.run_id)", arch_clean))
+
+    if not sources:
+        if require:
+            raise ValueError(
+                "missing effective run_id: specify --run-id, TOKYO_L2_RUN_ID in /etc/tokyo-l2/live.env, "
+                "or deployment.run_id in /etc/tokyo-l2/config.json"
+            )
+        return None
+
+    distinct_vals = {v for _, v in sources}
+    if len(distinct_vals) > 1:
+        detail = ", ".join(f"{k}={v}" for k, v in sources)
+        raise ValueError(f"conflicting run_id across entrypoints ({detail})")
+
+    return sources[0][1]
+
+
+def resolve_cutover_window_utc(
+    config: dict[str, Any] | None = None,
+    cli_cutover_window: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve the unified first full acceptance window (`cutover_window_utc`) across CLI,
+    environment (`TOKYO_L2_CUTOVER_WINDOW` / `TOKYO_L2_QA_SINCE_WINDOW`), and `config.json`
+    (`deployment.cutover_window_utc` / `archive.cutover_window_utc`).
+    """
+    import os
+
+    env_map = os.environ if env is None else env
+    cli_clean = str(cli_cutover_window).strip() if cli_cutover_window is not None else ""
+    env_clean = str(
+        env_map.get("TOKYO_L2_CUTOVER_WINDOW")
+        or env_map.get("TOKYO_L2_QA_SINCE_WINDOW")
+        or ""
+    ).strip()
+    dep = (config or {}).get("deployment", {}) if isinstance(config, dict) else {}
+    arch = (config or {}).get("archive", {}) if isinstance(config, dict) else {}
+    dep_clean = str(dep.get("cutover_window_utc") or "").strip() if isinstance(dep, dict) else ""
+    arch_clean = str(arch.get("cutover_window_utc") or "").strip() if isinstance(arch, dict) else ""
+
+    sources: list[tuple[str, str]] = []
+    if cli_clean:
+        sources.append(("cli(--cutover-window)", cli_clean))
+    if env_clean:
+        sources.append(("env(TOKYO_L2_CUTOVER_WINDOW)", env_clean))
+    if dep_clean:
+        sources.append(("config(deployment.cutover_window_utc)", dep_clean))
+    if arch_clean:
+        sources.append(("config(archive.cutover_window_utc)", arch_clean))
+
+    if not sources:
+        return None
+
+    pm = configured_partition_minutes(config)
+    normalized: list[tuple[str, str]] = []
+    for label, raw_spec in sources:
+        start_s = parse_window_start_s(raw_spec)
+        wd = window_descriptor(start_s, pm)
+        normalized.append((label, wd["window_id"]))
+
+    if len({v for _, v in normalized}) > 1:
+        detail = ", ".join(f"{k}={v}" for k, v in normalized)
+        raise ValueError(f"conflicting cutover_window_utc across entrypoints ({detail})")
+
+    return normalized[0][1]
+
+
 def format_window_id(start_epoch_s: int) -> str:
     dt = datetime.fromtimestamp(start_epoch_s, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%MZ")

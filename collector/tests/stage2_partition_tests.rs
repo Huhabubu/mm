@@ -482,3 +482,106 @@ async fn test_live_15m_config_writes_v2_manifest_with_single_ws_epoch() {
         "expected single WS epoch == 1 without spurious reconnects"
     );
 }
+
+#[test]
+fn test_review_round2_unified_run_id_resolution_and_fail_closed_conflict() {
+    let trial_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs/config.trial_15m.json");
+    let mut cfg = CollectorConfig::load(&trial_path).unwrap();
+
+    // 1. All empty -> error
+    cfg.deployment.run_id = None;
+    assert!(cfg.resolve_effective_run_id(None, None).is_err());
+
+    // 2. Config deployment.run_id only -> resolves cleanly
+    cfg.deployment.run_id = Some("trial_15m_20261121".to_string());
+    assert_eq!(
+        cfg.resolve_effective_run_id(None, None).unwrap(),
+        "trial_15m_20261121"
+    );
+
+    // 3. CLI, env, and config all match -> resolves cleanly
+    assert_eq!(
+        cfg.resolve_effective_run_id(
+            Some("trial_15m_20261121"),
+            Some("trial_15m_20261121")
+        )
+        .unwrap(),
+        "trial_15m_20261121"
+    );
+
+    // 4. Env TOKYO_L2_RUN_ID conflicts with config deployment.run_id -> fails closed!
+    let err = cfg
+        .resolve_effective_run_id(None, Some("legacy_boot_old"))
+        .unwrap_err();
+    assert!(err.contains("conflicting run_id"), "err={}", err);
+}
+
+#[test]
+fn test_review_round2_meta_records_never_stretch_partition_market_data_timestamps() {
+    let dir = TempDir::new().unwrap();
+    let w_start: i64 = 1_795_219_200 * NS_PER_SEC; // 2026-11-21T00:00:00Z
+    let mut writer = HourlyTsvZstWriter::with_options(
+        dir.path().to_path_buf(),
+        ExchangeId::BinanceFutures,
+        "boot_meta_only".to_string(),
+        1,
+        WriterOptions {
+            partition_minutes: 15,
+            run_id: Some("trial_meta_check".to_string()),
+            allow_segmented_restart: true,
+            late_frame_grace_ns: 2 * NS_PER_SEC,
+            process_start_wall_ns: Some(w_start),
+        },
+    );
+
+    // Head META control record at +1s
+    writer
+        .write_record(&CanonicalRecord {
+            recv_wall_ns: w_start + NS_PER_SEC,
+            recv_mono_ns: 100,
+            conn_id: ConnId::A,
+            epoch: 1,
+            rx_seq: 1,
+            kind: RecordKind::Meta,
+            payload: r#"{"event":"CONTROL_HEAD"}"#.to_string(),
+        })
+        .unwrap();
+
+    // Only 1 real DATA market-data record at +450s (mid-window)
+    writer
+        .write_record(&mk_rec(
+            w_start + 450 * NS_PER_SEC,
+            200,
+            ConnId::A,
+            2,
+            r#"{"stream":"btcusdt@bookTicker","data":{"s":"BTCUSDT"}}"#,
+        ))
+        .unwrap();
+
+    // Tail META control record at +899s
+    writer
+        .write_record(&CanonicalRecord {
+            recv_wall_ns: w_start + 899 * NS_PER_SEC,
+            recv_mono_ns: 300,
+            conn_id: ConnId::A,
+            epoch: 1,
+            rx_seq: 3,
+            kind: RecordKind::Meta,
+            payload: r#"{"event":"CONTROL_TAIL"}"#.to_string(),
+        })
+        .unwrap();
+
+    let sealed = writer.seal_all().unwrap();
+    assert_eq!(sealed.len(), 1);
+    let mf = &sealed[0].manifest;
+    assert_eq!(mf.data_lines, 1);
+    assert_eq!(mf.meta_lines, 2);
+    // start_wall_ns and end_wall_ns MUST reflect only the real DATA record (+450s), never the META records!
+    assert_eq!(mf.start_wall_ns, Some(w_start + 450 * NS_PER_SEC));
+    assert_eq!(mf.end_wall_ns, Some(w_start + 450 * NS_PER_SEC));
+    assert!(
+        mf.coverage_incomplete,
+        "1 DATA record stretched by META records must be marked coverage_incomplete"
+    );
+}
+

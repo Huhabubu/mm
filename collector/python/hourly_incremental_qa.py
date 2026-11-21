@@ -414,8 +414,10 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
         "head_gap_seconds": head_gap_s,
         "tail_gap_seconds": tail_gap_s,
         "local_loss_events": total_loss_events,
+        "intrinsic_local_loss_events": total_loss_events,
         "in_window_local_loss_events": loss_events,
         "dropped_frames": total_dropped_frames,
+        "intrinsic_dropped_frames": total_dropped_frames,
         "gap_start_events": gap_events,
         "depth_unavailable_events": depth_unavailable_events,
         "max_gap_by_category": max_gap_by_category,
@@ -451,12 +453,17 @@ def _discover_verified_candidates(
     download_retries: int,
     sleeper: Callable[[float], None],
     meta_files: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], str, list[str]]:
+    state_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], str, list[str], list[dict[str, Any]], str | None]:
     """Discover candidate manifests strictly from a trusted remotely-verified archive index.
 
     Formal QA NEVER bypasses the verified index by scanning unverified `raw/` directories.
     If the primary `meta/archive_manifest_index.json` (and fallback verified JSONL ledger under `meta/`)
     cannot be downloaded or parsed, returns `discovery_mode="verified_index_unavailable"`.
+
+    Also collects all historical loss-marked manifests across ALL batches, dates, and partition
+    durations (including the 4 historical loss-marked manifests from pre-cutover 60m collection)
+    so batch/config cutovers never drop historical loss evidence.
     """
     enabled = set(enabled_exchanges(config))
     config_pm = configured_partition_minutes(config)
@@ -465,7 +472,59 @@ def _discover_verified_candidates(
     warnings: list[str] = []
 
     raw_entries: list[dict[str, Any]] | None = None
+    index_historical_losses: list[dict[str, Any]] = []
+    index_effective_run_id: str | None = None
     discovery_mode = "verified_index_unavailable"
+
+    hist_cache_path = (state_dir / "qa_reports" / "historical_loss_manifests.json") if state_dir is not None else None
+    cached_checked_shas: set[str] = set()
+    historical_loss_by_path: dict[str, dict[str, Any]] = {}
+    if hist_cache_path is not None and hist_cache_path.is_file():
+        try:
+            cached_obj = json.loads(hist_cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached_obj, dict):
+                for s in cached_obj.get("checked_manifest_sha256s") or ():
+                    if isinstance(s, str) and s:
+                        cached_checked_shas.add(s)
+                for item in cached_obj.get("manifests") or ():
+                    if isinstance(item, dict) and item.get("source_manifest"):
+                        historical_loss_by_path[str(item["source_manifest"])] = item
+        except Exception:
+            pass
+
+    # Also seed historical_loss_by_path from any existing per-file .qa.json reports under state_dir
+    if state_dir is not None and (state_dir / "qa_reports" / "raw").is_dir():
+        for qpath in sorted((state_dir / "qa_reports" / "raw").rglob("*.qa.json")):
+            try:
+                qobj = json.loads(qpath.read_text(encoding="utf-8"))
+                rel_m = str(qobj.get("source_manifest") or "")
+                if not rel_m:
+                    rel_m = qpath.relative_to(state_dir / "qa_reports").as_posix().removesuffix(".qa.json")
+                loss_ev = int(qobj.get("local_loss_events") or 0)
+                late_ev = int(qobj.get("late_frames_rejected") or 0)
+                if loss_ev > 0 or late_ev > 0:
+                    historical_loss_by_path.setdefault(
+                        rel_m,
+                        {
+                            "source_manifest": rel_m,
+                            "file_name": qobj.get("file_name"),
+                            "exchange": qobj.get("exchange"),
+                            "date_utc": qobj.get("date_utc"),
+                            "window_id": qobj.get("window_id"),
+                            "partition_minutes": int(qobj.get("partition_minutes") or 60),
+                            "run_id": qobj.get("run_id"),
+                            "boot_id": qobj.get("boot_id"),
+                            "sha256": qobj.get("sha256"),
+                            "manifest_sha256": qobj.get("manifest_sha256"),
+                            "local_loss_events": loss_ev,
+                            "dropped_frames": int(qobj.get("dropped_frames") or 0),
+                            "late_frames_rejected": late_ev,
+                        },
+                    )
+                if qobj.get("manifest_sha256"):
+                    cached_checked_shas.add(str(qobj["manifest_sha256"]))
+            except Exception:
+                pass
 
     with tempfile.TemporaryDirectory(prefix="tokyo_qa_idx_") as tmpdir:
         idx_path = Path(tmpdir) / "archive_manifest_index.json"
@@ -480,6 +539,10 @@ def _discover_verified_candidates(
             parsed = json.loads(idx_path.read_text(encoding="utf-8"))
             if isinstance(parsed, dict) and isinstance(parsed.get("entries"), list):
                 raw_entries = parsed["entries"]
+                if isinstance(parsed.get("historical_loss_manifests"), list):
+                    index_historical_losses = parsed["historical_loss_manifests"]
+                if parsed.get("effective_run_id") not in (None, ""):
+                    index_effective_run_id = str(parsed["effective_run_id"])
                 discovery_mode = "archive_manifest_index"
         except Exception as exc:
             warnings.append(f"archive_manifest_index_download_or_parse_failed:{type(exc).__name__}")
@@ -509,89 +572,189 @@ def _discover_verified_candidates(
                     except Exception as exc:
                         warnings.append(f"trusted_ledger_fallback_failed:{type(exc).__name__}")
 
-    if raw_entries is None:
-        warnings.append("verified_archive_index_unavailable")
-        return [], "verified_index_unavailable", warnings
+        if raw_entries is None:
+            warnings.append("verified_archive_index_unavailable")
+            return [], "verified_index_unavailable", warnings, sorted(historical_loss_by_path.values(), key=lambda x: str(x.get("source_manifest") or "")), None
 
-    for entry in raw_entries:
-        if not isinstance(entry, dict):
-            continue
-        if not (entry.get("verified") is True and entry.get("remote_manifest_verified", True) is True):
-            continue
-        ex = str(entry.get("exchange") or "")
-        day = str(entry.get("date_utc") or "")
-        rel_mf = str(entry.get("remote_manifest_path") or entry.get("rel_manifest_path") or "")
-        if ex not in enabled or not rel_mf or day < since_date:
-            continue
-
-        entry_run_id = entry.get("collection_run_id")
-        if entry_run_id in (None, ""):
-            entry_run_id = entry.get("run_id")
-        eff_run_id = str(entry_run_id) if entry_run_id not in (None, "") else None
-        if run_id_filter is not None and eff_run_id != run_id_filter:
-            continue
-
-        pm = int(entry.get("partition_minutes") or 60)
-        if pm != config_pm:
-            warnings.append(f"skipped_mismatched_partition_minutes:{rel_mf}:{pm}m!=config_{config_pm}m")
-            continue
-
-        planned_start_ns = entry.get("planned_start_wall_ns")
-        planned_end_ns = entry.get("planned_end_wall_ns")
-        if planned_start_ns is not None and planned_end_ns is not None:
-            span_s = (int(planned_end_ns) - int(planned_start_ns)) // 1_000_000_000
-            if span_s != expected_span_s:
-                warnings.append(f"skipped_mismatched_window_span:{rel_mf}:{span_s}s!=expected_{expected_span_s}s")
+        for h_item in index_historical_losses:
+            if not isinstance(h_item, dict):
                 continue
-            planned_start_s = int(planned_start_ns) // 1_000_000_000
-            wd = window_descriptor(planned_start_s, pm)
-        elif planned_start_ns is not None:
-            planned_start_s = int(planned_start_ns) // 1_000_000_000
-            wd = window_descriptor(planned_start_s, pm)
-        else:
-            hh = str(entry.get("hour_utc") or "00").zfill(2)
-            mm = str(entry.get("minute_utc") or "00").zfill(2)
-            planned_start_s = parse_window_start_s(f"{day}T{hh}:{mm}Z")
-            wd = window_descriptor(planned_start_s, pm)
+            rel_m = str(h_item.get("remote_manifest_path") or h_item.get("source_manifest") or "")
+            if not rel_m:
+                continue
+            loss_l = int(h_item.get("local_loss_lines") or h_item.get("local_loss_events") or 0)
+            late_l = int(h_item.get("late_frames_rejected") or 0)
+            if loss_l > 0 or late_l > 0:
+                historical_loss_by_path[rel_m] = {
+                    "source_manifest": rel_m,
+                    "file_name": Path(str(h_item.get("remote_path") or rel_m.removesuffix(".manifest.json") + ".tsv.zst")).name,
+                    "exchange": h_item.get("exchange"),
+                    "date_utc": h_item.get("date_utc"),
+                    "window_id": h_item.get("window_id"),
+                    "partition_minutes": int(h_item.get("partition_minutes") or 60),
+                    "run_id": h_item.get("collection_run_id") or h_item.get("run_id"),
+                    "boot_id": h_item.get("boot_id"),
+                    "sha256": h_item.get("sha256"),
+                    "manifest_sha256": h_item.get("manifest_sha256"),
+                    "local_loss_events": loss_l + late_l,
+                    "dropped_frames": int(h_item.get("dropped_frames") or (loss_l + late_l)),
+                    "late_frames_rejected": late_l,
+                }
 
-        if since_start_s is not None and wd["planned_start_s"] < since_start_s:
-            continue
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            if not (entry.get("verified") is True and entry.get("remote_manifest_verified", True) is True):
+                continue
+            ex = str(entry.get("exchange") or "")
+            day = str(entry.get("date_utc") or "")
+            rel_mf = str(entry.get("remote_manifest_path") or entry.get("rel_manifest_path") or "")
+            if not rel_mf:
+                continue
 
-        data_sha = str(entry.get("sha256") or entry.get("data_sha256") or "").strip()
-        mf_sha = str(entry.get("manifest_sha256") or "").strip()
-        data_bytes = entry.get("bytes") if entry.get("bytes") is not None else entry.get("data_bytes")
-        mf_bytes = entry.get("manifest_bytes")
+            entry_run_id = entry.get("collection_run_id")
+            if entry_run_id in (None, ""):
+                entry_run_id = entry.get("run_id")
+            eff_run_id = str(entry_run_id) if entry_run_id not in (None, "") else None
+            pm = int(entry.get("partition_minutes") or 60)
+            mf_sha = str(entry.get("manifest_sha256") or "").strip()
+            data_sha = str(entry.get("sha256") or entry.get("data_sha256") or "").strip()
 
-        candidates.append(
-            {
-                "source_manifest": rel_mf,
-                "source_data": str(
-                    entry.get("remote_path")
-                    or entry.get("rel_data_path")
-                    or rel_mf.removesuffix(".manifest.json") + ".tsv.zst"
-                ),
-                "exchange": ex,
-                "date_utc": wd["date_utc"],
-                "window_id": wd["window_id"],
-                "planned_end_id": wd["planned_end_id"],
-                "window_span_id": wd["window_span_id"],
-                "partition_minutes": pm,
-                "planned_start_s": wd["planned_start_s"],
-                "planned_end_s": wd["planned_end_s"],
-                "run_id": eff_run_id,
-                "boot_id": entry.get("boot_id"),
-                "segment_id": entry.get("segment_id") or entry.get("partition_id"),
-                "data_sha256": data_sha or None,
-                "manifest_sha256": mf_sha or None,
-                "data_bytes": int(data_bytes) if data_bytes is not None else None,
-                "manifest_bytes": int(mf_bytes) if mf_bytes is not None else None,
-                "is_startup_stub": bool(entry.get("is_startup_stub", False)),
-                "discovery_source": discovery_mode,
-            }
-        )
+            # Check if this index entry (from ANY batch, date, or partition duration) is a loss-marked manifest
+            if "local_loss_lines" in entry or "late_frames_rejected" in entry:
+                loss_l = int(entry.get("local_loss_lines") or 0)
+                late_l = int(entry.get("late_frames_rejected") or 0)
+                if loss_l > 0 or late_l > 0:
+                    historical_loss_by_path[rel_mf] = {
+                        "source_manifest": rel_mf,
+                        "file_name": Path(str(entry.get("remote_path") or entry.get("rel_data_path") or rel_mf.removesuffix(".manifest.json") + ".tsv.zst")).name,
+                        "exchange": ex,
+                        "date_utc": day,
+                        "window_id": entry.get("window_id") or f"{day}T{str(entry.get('hour_utc') or '00').zfill(2)}:{str(entry.get('minute_utc') or '00').zfill(2)}Z",
+                        "partition_minutes": pm,
+                        "run_id": eff_run_id,
+                        "boot_id": entry.get("boot_id"),
+                        "sha256": data_sha or None,
+                        "manifest_sha256": mf_sha or None,
+                        "local_loss_events": loss_l + late_l,
+                        "dropped_frames": int(entry.get("dropped_frames") or (loss_l + late_l)),
+                        "late_frames_rejected": late_l,
+                    }
+                if mf_sha:
+                    cached_checked_shas.add(mf_sha)
+            elif (
+                (run_id_filter is not None and eff_run_id != run_id_filter)
+                or pm != config_pm
+                or day < since_date
+            ) and mf_sha and mf_sha not in cached_checked_shas and rel_mf not in historical_loss_by_path:
+                # Legacy index entry without local_loss_lines field from a prior batch/duration:
+                # inspect its lightweight sidecar manifest once so historical loss manifests are never missed.
+                probe_mf_path = Path(tmpdir) / f"hist_{hashlib.sha1(rel_mf.encode()).hexdigest()[:12]}.manifest.json"
+                try:
+                    _download_with_retry(remote, rel_mf, probe_mf_path, retries=1, sleeper=sleeper)
+                    mf_obj = json.loads(probe_mf_path.read_text(encoding="utf-8"))
+                    loss_l = int(mf_obj.get("local_loss_lines") or 0)
+                    late_l = int(mf_obj.get("late_frames_rejected") or 0)
+                    cached_checked_shas.add(mf_sha)
+                    if loss_l > 0 or late_l > 0:
+                        historical_loss_by_path[rel_mf] = {
+                            "source_manifest": rel_mf,
+                            "file_name": mf_obj.get("file_name") or Path(rel_mf.removesuffix(".manifest.json") + ".tsv.zst").name,
+                            "exchange": ex,
+                            "date_utc": day,
+                            "window_id": mf_obj.get("window_id") or entry.get("window_id") or f"{day}T{str(entry.get('hour_utc') or '00').zfill(2)}:00Z",
+                            "partition_minutes": pm,
+                            "run_id": eff_run_id,
+                            "boot_id": mf_obj.get("boot_id") or entry.get("boot_id"),
+                            "sha256": data_sha or mf_obj.get("sha256"),
+                            "manifest_sha256": mf_sha,
+                            "local_loss_events": loss_l + late_l,
+                            "dropped_frames": loss_l + late_l,
+                            "late_frames_rejected": late_l,
+                        }
+                except Exception:
+                    pass
+
+            if ex not in enabled or day < since_date:
+                continue
+            if run_id_filter is not None and eff_run_id != run_id_filter:
+                continue
+            if pm != config_pm:
+                warnings.append(f"skipped_mismatched_partition_minutes:{rel_mf}:{pm}m!=config_{config_pm}m")
+                continue
+
+            planned_start_ns = entry.get("planned_start_wall_ns")
+            planned_end_ns = entry.get("planned_end_wall_ns")
+            if planned_start_ns is not None and planned_end_ns is not None:
+                span_s = (int(planned_end_ns) - int(planned_start_ns)) // 1_000_000_000
+                if span_s != expected_span_s:
+                    warnings.append(f"skipped_mismatched_window_span:{rel_mf}:{span_s}s!=expected_{expected_span_s}s")
+                    continue
+                planned_start_s = int(planned_start_ns) // 1_000_000_000
+                wd = window_descriptor(planned_start_s, pm)
+            elif planned_start_ns is not None:
+                planned_start_s = int(planned_start_ns) // 1_000_000_000
+                wd = window_descriptor(planned_start_s, pm)
+            else:
+                hh = str(entry.get("hour_utc") or "00").zfill(2)
+                mm = str(entry.get("minute_utc") or "00").zfill(2)
+                planned_start_s = parse_window_start_s(f"{day}T{hh}:{mm}Z")
+                wd = window_descriptor(planned_start_s, pm)
+
+            if since_start_s is not None and wd["planned_start_s"] < since_start_s:
+                continue
+
+            data_bytes = entry.get("bytes") if entry.get("bytes") is not None else entry.get("data_bytes")
+            mf_bytes = entry.get("manifest_bytes")
+
+            candidates.append(
+                {
+                    "source_manifest": rel_mf,
+                    "source_data": str(
+                        entry.get("remote_path")
+                        or entry.get("rel_data_path")
+                        or rel_mf.removesuffix(".manifest.json") + ".tsv.zst"
+                    ),
+                    "exchange": ex,
+                    "date_utc": wd["date_utc"],
+                    "window_id": wd["window_id"],
+                    "planned_end_id": wd["planned_end_id"],
+                    "window_span_id": wd["window_span_id"],
+                    "partition_minutes": pm,
+                    "planned_start_s": wd["planned_start_s"],
+                    "planned_end_s": wd["planned_end_s"],
+                    "run_id": eff_run_id,
+                    "boot_id": entry.get("boot_id"),
+                    "segment_id": entry.get("segment_id") or entry.get("partition_id"),
+                    "data_sha256": data_sha or None,
+                    "manifest_sha256": mf_sha or None,
+                    "data_bytes": int(data_bytes) if data_bytes is not None else None,
+                    "manifest_bytes": int(mf_bytes) if mf_bytes is not None else None,
+                    "is_startup_stub": bool(entry.get("is_startup_stub", False)),
+                    "discovery_source": discovery_mode,
+                }
+            )
+
+    historical_loss_list = sorted(
+        historical_loss_by_path.values(),
+        key=lambda x: (str(x.get("date_utc") or ""), str(x.get("window_id") or ""), str(x.get("source_manifest") or "")),
+    )
+    if hist_cache_path is not None:
+        try:
+            _atomic_write_json(
+                hist_cache_path,
+                {
+                    "schema_version": 1,
+                    "count": len(historical_loss_list),
+                    "manifests": historical_loss_list,
+                    "checked_manifest_sha256s": sorted(cached_checked_shas),
+                },
+            )
+        except OSError:
+            pass
 
     candidates.sort(key=lambda c: (c["planned_start_s"], c["date_utc"], c["exchange"], c["source_manifest"]))
-    return candidates, discovery_mode, warnings
+    return candidates, discovery_mode, warnings, historical_loss_list, index_effective_run_id
 
 
 def _verify_three_way_index_manifest_data(
@@ -600,6 +763,7 @@ def _verify_three_way_index_manifest_data(
     manifest_path: Path,
     manifest: dict[str, Any],
     data_path: Path,
+    run_id_filter: str | None = None,
 ) -> None:
     """Strictly verify 3-way cryptographic and metadata consistency across:
     1) Trusted verified archive index entry (`cand`)
@@ -660,6 +824,12 @@ def _verify_three_way_index_manifest_data(
         raise ValueError(
             f"three-way verification failed: manifest run_id ({norm['run_id']}) != index ({cand['run_id']})"
         )
+    if run_id_filter is not None and (
+        cand.get("run_id") != run_id_filter or norm["run_id"] != run_id_filter
+    ):
+        raise ValueError(
+            f"three-way verification failed: effective run_id ({run_id_filter}) != index ({cand.get('run_id')}) / manifest ({norm['run_id']})"
+        )
 
 
 def _is_memoized_up_to_date(
@@ -709,6 +879,12 @@ def _build_window_reports(
     expected_span_ns = config_pm * 60 * 1_000_000_000
     unchecked = unchecked_windows or set()
 
+    for rep in file_reports.values():
+        if "intrinsic_local_loss_events" not in rep:
+            rep["intrinsic_local_loss_events"] = int(rep.get("local_loss_events") or 0)
+        if "intrinsic_dropped_frames" not in rep:
+            rep["intrinsic_dropped_frames"] = int(rep.get("dropped_frames") or 0)
+
     # 1. Attribute late-frame rejections from subsequent files back to their target windows
     #    Keyed by (batch_key, target_window_id) -> list of attribution dicts
     attributed_late_losses: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -738,32 +914,42 @@ def _build_window_reports(
                         "dropped_frames": cnt,
                     }
                 )
-                # Also update the target window's single-file report on disk if present
-                for t_rel, t_rep in file_reports.items():
-                    t_b = str(t_rep.get("run_id") or (run_id_filter or "__default__"))
-                    if (
-                        t_b == b_key
-                        and t_rep.get("window_id") == str(target_wid)
-                        and t_rep.get("exchange") == rep.get("exchange")
-                    ):
-                        msg = (
-                            f"attributed late-frame data loss recorded in subsequent partition "
-                            f"{rep.get('file_name')} ({rep.get('window_id')}): dropped={cnt}"
-                        )
-                        probs = list(t_rep.get("problems") or [])
-                        if msg not in probs:
-                            probs.append(msg)
-                            t_rep["problems"] = probs
-                            t_rep["attributed_late_dropped_frames"] = int(
-                                t_rep.get("attributed_late_dropped_frames") or 0
-                            ) + cnt
-                            t_rep["local_loss_events"] = int(t_rep.get("local_loss_events") or 0) + 1
-                            t_rep["dropped_frames"] = int(t_rep.get("dropped_frames") or 0) + cnt
-                            t_rep["qa_status"] = QA_STATUS_FAILED
-                            t_rep["status"] = "blocked"
-                            t_path = state_dir / "qa_reports" / (t_rel + ".qa.json")
-                            if t_path.parent.exists():
-                                _atomic_write_json(t_path, t_rep)
+                # Update at most ONE target segment on disk (the latest segment of that exchange in the target window)
+                # so a multi-segment target window never double-counts a single rejected late frame!
+                matching_target_segs = [
+                    (t_rel, t_rep)
+                    for t_rel, t_rep in file_reports.items()
+                    if str(t_rep.get("run_id") or (run_id_filter or "__default__")) == b_key
+                    and t_rep.get("window_id") == str(target_wid)
+                    and t_rep.get("exchange") == rep.get("exchange")
+                ]
+                if matching_target_segs:
+                    t_rel, t_rep = max(
+                        matching_target_segs,
+                        key=lambda item: (
+                            int(item[1].get("last_wall_ns") or 0),
+                            int(item[1].get("first_wall_ns") or 0),
+                            str(item[1].get("file_name") or ""),
+                        ),
+                    )
+                    msg = (
+                        f"attributed late-frame data loss recorded in subsequent partition "
+                        f"{rep.get('file_name')} ({rep.get('window_id')}): dropped={cnt}"
+                    )
+                    probs = list(t_rep.get("problems") or [])
+                    if msg not in probs:
+                        probs.append(msg)
+                        t_rep["problems"] = probs
+                        t_rep["attributed_late_dropped_frames"] = int(
+                            t_rep.get("attributed_late_dropped_frames") or 0
+                        ) + cnt
+                        t_rep["local_loss_events"] = int(t_rep.get("local_loss_events") or 0) + 1
+                        t_rep["dropped_frames"] = int(t_rep.get("dropped_frames") or 0) + cnt
+                        t_rep["qa_status"] = QA_STATUS_FAILED
+                        t_rep["status"] = "blocked"
+                        t_path = state_dir / "qa_reports" / (t_rel + ".qa.json")
+                        if t_path.parent.exists():
+                            _atomic_write_json(t_path, t_rep)
 
     # 2. Group eligible file reports by (batch_key, planned_start_wall_ns, planned_end_wall_ns, partition_minutes)
     SpanKey = tuple[int, int, int]
@@ -866,8 +1052,18 @@ def _build_window_reports(
                 )
 
             for r in reps:
-                total_loss += int(r.get("local_loss_events") or 0)
-                total_dropped += int(r.get("dropped_frames") or 0)
+                intrinsic_loss = int(
+                    r.get("intrinsic_local_loss_events")
+                    if r.get("intrinsic_local_loss_events") is not None
+                    else r.get("local_loss_events") or 0
+                )
+                intrinsic_dropped = int(
+                    r.get("intrinsic_dropped_frames")
+                    if r.get("intrinsic_dropped_frames") is not None
+                    else r.get("dropped_frames") or 0
+                )
+                total_loss += intrinsic_loss
+                total_dropped += intrinsic_dropped
                 total_gaps += int(r.get("gap_start_events") or 0)
                 total_depth_unavail += int(r.get("depth_unavailable_events") or 0)
                 for p in r.get("problems") or ():
@@ -911,16 +1107,15 @@ def _build_window_reports(
                         cur["last_ns"] = max(cur["last_ns"], l_ns)
                         cur["max_internal_gap_ns"] = max(cur["max_internal_gap_ns"], int_gap_ns, inter_gap_ns)
 
-            # Apply attributed late-frame data loss belonging to this target window
+            # Apply attributed late-frame data loss belonging to this target window ONCE per event
             attr_losses = attributed_late_losses.get((b_key, wid), [])
             for al in attr_losses:
                 hard_problems.append(
                     f"attributed late-frame data loss from {al['source_file']} ({al['exchange']}): dropped={al['dropped_frames']}"
                 )
-                # Ensure total_loss reflects attributed loss even if target file wasn't in `reps` yet
+                total_loss += 1
+                total_dropped += int(al["dropped_frames"])
                 if not any(r.get("exchange") == al["exchange"] and r.get("attributed_late_dropped_frames") for r in reps):
-                    total_loss += 1
-                    total_dropped += int(al["dropped_frames"])
                     damaged_segments.append(
                         {
                             "exchange": al["exchange"],
@@ -1307,16 +1502,22 @@ def run(
 
     Separates:
       1) `job_execution_status`: whether the QA runner itself executed cleanly (`"ok"` vs `"failed"`)
-      2) `current_window_completed` & `current_window_verification_status`: whether the latest expected/due
-         window completed verification and passed/failed/is pending
-      3) `historical_data_quality_status`, `historical_damaged_windows`, `historical_damaged_partitions`:
-         persistent historical damaged window/partition evidence (never lost, never confused with current window).
+      2) `current_window_completed`, `current_window_verification_status`, & `heartbeat_status`:
+         whether the latest expected/due window completed verification and passed/failed/is pending
+      3) `historical_data_quality_status`, `historical_damaged_windows`, `historical_overdue_windows`,
+         `historical_damaged_partitions`, & `historical_loss_manifests`:
+         persistent historical damaged/missing window and loss-marked manifest evidence across batch cutovers.
     """
-    from data_coverage import previous_complete_window
+    from data_coverage import (
+        previous_complete_window,
+        resolve_cutover_window_utc,
+        resolve_effective_run_id,
+    )
 
-    effective_since_spec = since_window or since_hour
-    since_start_s = parse_window_start_s(effective_since_spec) if effective_since_spec is not None else None
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    effective_run_id = resolve_effective_run_id(config, run_id)
+    effective_since_spec = resolve_cutover_window_utc(config, since_window or since_hour)
+    since_start_s = parse_window_start_s(effective_since_spec) if effective_since_spec is not None else None
     pm = configured_partition_minutes(config)
     cfg_hash = effective_config_hash(config)
     commit_sha = _resolve_checker_commit(checker_commit)
@@ -1329,16 +1530,31 @@ def run(
     sla_grace_seconds = max(0.0, eff_sla_min * 60.0)
     meta_files = _list_meta_files(remote)
 
-    candidates, discovery_mode, discovery_warnings = _discover_verified_candidates(
+    (
+        candidates,
+        discovery_mode,
+        discovery_warnings,
+        historical_loss_manifests,
+        index_effective_run_id,
+    ) = _discover_verified_candidates(
         remote,
         config,
         since_date=since_date,
         since_start_s=since_start_s,
-        run_id_filter=run_id,
+        run_id_filter=effective_run_id,
         download_retries=download_retries,
         sleeper=sleeper,
         meta_files=meta_files,
+        state_dir=state_dir,
     )
+    if (
+        effective_run_id is not None
+        and index_effective_run_id is not None
+        and index_effective_run_id != effective_run_id
+    ):
+        discovery_warnings.append(
+            f"verified index effective_run_id ({index_effective_run_id}) differs from requested effective_run_id ({effective_run_id})"
+        )
 
     index_available = discovery_mode != "verified_index_unavailable"
     attempted = ok = blocked = review_cnt = skipped = transient = 0
@@ -1408,6 +1624,7 @@ def run(
                     manifest_path=manifest_path,
                     manifest=manifest,
                     data_path=data_path,
+                    run_id_filter=effective_run_id,
                 )
                 result = check_partition(data_path, manifest, config)
             except (ValueError, TypeError, KeyError, UnicodeError, zstd.ZstdError, RuntimeError) as exc:
@@ -1493,7 +1710,7 @@ def run(
         expected_windows=expected_windows,
         now_s=now_s,
         sla_grace_seconds=sla_grace_seconds,
-        run_id_filter=run_id,
+        run_id_filter=effective_run_id,
         unchecked_windows=unchecked_windows,
     )
     day_reports = _build_day_reports(
@@ -1508,14 +1725,89 @@ def run(
         sla_grace_seconds=sla_grace_seconds,
         download_retries=download_retries,
         sleeper=sleeper,
-        run_id_filter=run_id,
+        run_id_filter=effective_run_id,
         meta_files=meta_files,
     )
 
+    # Consolidate queryable historical loss-marked manifests across ALL batches and durations
+    # (from archive index, previously cached historical_loss_manifests.json, any prior .qa.json on state_dir,
+    # and any partition checked in this run with local_loss_events / late_frames_rejected > 0).
+    historical_loss_by_manifest: dict[str, dict[str, Any]] = {
+        str(m["source_manifest"]): dict(m)
+        for m in historical_loss_manifests
+        if isinstance(m, dict) and m.get("source_manifest")
+    }
+    raw_reports_root = state_dir / "qa_reports" / "raw"
+    if raw_reports_root.is_dir():
+        for r_path in sorted(raw_reports_root.rglob("*.manifest.json.qa.json")):
+            try:
+                r_obj = json.loads(r_path.read_text(encoding="utf-8"))
+                src_mf = str(
+                    r_obj.get("source_manifest")
+                    or r_path.relative_to(state_dir / "qa_reports").as_posix().removesuffix(".qa.json")
+                )
+                loss_ev = int(r_obj.get("local_loss_events") or 0)
+                dropped_fr = int(r_obj.get("dropped_frames") or 0)
+                late_rej = int(r_obj.get("late_frames_rejected") or 0)
+                if loss_ev > 0 or dropped_fr > 0 or late_rej > 0:
+                    existing = historical_loss_by_manifest.get(src_mf, {})
+                    historical_loss_by_manifest[src_mf] = {
+                        "source_manifest": src_mf,
+                        "source_data": existing.get("source_data")
+                        or src_mf.removesuffix(".manifest.json") + ".tsv.zst",
+                        "file_name": r_obj.get("file_name") or existing.get("file_name") or Path(src_mf).name,
+                        "exchange": r_obj.get("exchange") or existing.get("exchange"),
+                        "date_utc": r_obj.get("date_utc") or existing.get("date_utc"),
+                        "window_id": r_obj.get("window_id") or existing.get("window_id"),
+                        "window_span_id": r_obj.get("window_span_id") or existing.get("window_span_id"),
+                        "partition_minutes": int(
+                            r_obj.get("partition_minutes") or existing.get("partition_minutes") or 60
+                        ),
+                        "run_id": r_obj.get("run_id") if r_obj.get("run_id") is not None else existing.get("run_id"),
+                        "boot_id": r_obj.get("boot_id") or existing.get("boot_id"),
+                        "local_loss_events": max(loss_ev, int(existing.get("local_loss_events") or 0)),
+                        "local_loss_lines": max(
+                            int(existing.get("local_loss_lines") or 0),
+                            int(r_obj.get("intrinsic_local_loss_events") or loss_ev),
+                        ),
+                        "dropped_frames": max(dropped_fr, int(existing.get("dropped_frames") or 0)),
+                        "late_frames_rejected": max(late_rej, int(existing.get("late_frames_rejected") or 0)),
+                        "gap_start_events": max(
+                            int(r_obj.get("gap_start_events") or 0),
+                            int(existing.get("gap_start_events") or 0),
+                        ),
+                        "sha256": r_obj.get("sha256") or existing.get("sha256"),
+                        "manifest_sha256": r_obj.get("manifest_sha256") or existing.get("manifest_sha256"),
+                        "problems": r_obj.get("problems") or existing.get("problems") or [],
+                        "qa_status": QA_STATUS_FAILED,
+                        "status": "blocked",
+                    }
+            except (ValueError, OSError):
+                pass
+    historical_loss_manifests_out = sorted(
+        historical_loss_by_manifest.values(),
+        key=lambda x: (
+            str(x.get("date_utc") or ""),
+            str(x.get("window_id") or ""),
+            str(x.get("source_manifest") or ""),
+        ),
+    )
+    try:
+        _atomic_write_json(
+            state_dir / "qa_reports" / "historical_loss_manifests.json",
+            {
+                "schema_version": 1,
+                "count": len(historical_loss_manifests_out),
+                "manifests": historical_loss_manifests_out,
+            },
+        )
+    except OSError:
+        pass
+
     # Separate:
     # 1) Job execution status
-    # 2) Current due/expected window completion & status
-    # 3) Historical damaged windows & partitions
+    # 2) Current due/expected window completion, status, and independent heartbeat
+    # 3) Historical damaged/overdue windows & partitions (including prior 4 loss-marked manifests across batches)
     job_execution_status = "ok" if (index_available and transient == 0) else "failed"
 
     latest_complete_wd = previous_complete_window(now_s, pm)
@@ -1553,20 +1845,27 @@ def run(
     failed_win_ids = [w["window_id"] for w in sorted_win_reports if w["qa_status"] == QA_STATUS_FAILED]
     review_win_ids = [w["window_id"] for w in sorted_win_reports if w["qa_status"] == QA_STATUS_NEEDS_REVIEW]
 
+    current_overdue_windows = [wid for wid in overdue_windows if wid == current_window_id]
+    historical_overdue_windows = [wid for wid in overdue_windows if wid != current_window_id]
+    current_pending_windows = [wid for wid in pending_windows if wid == current_window_id]
+
     current_damaged_windows = [
-        wid for wid in failed_win_ids if wid == current_window_id or wid in newly_failed_windows
+        wid for wid in failed_win_ids if wid == current_window_id
     ]
-    historical_damaged_windows = [
-        wid for wid in failed_win_ids if wid not in current_damaged_windows
-    ]
+    historical_damaged_windows = sorted(
+        set(wid for wid in failed_win_ids if wid != current_window_id)
+        | set(historical_overdue_windows)
+    )
 
     all_damaged_partitions = [
         {
             "source_manifest": r.get("source_manifest"),
             "file_name": r.get("file_name"),
             "exchange": r.get("exchange"),
+            "date_utc": r.get("date_utc"),
             "window_id": r.get("window_id"),
             "window_span_id": r.get("window_span_id"),
+            "partition_minutes": r.get("partition_minutes"),
             "run_id": r.get("run_id"),
             "local_loss_events": r.get("local_loss_events", 0),
             "dropped_frames": r.get("dropped_frames", 0),
@@ -1579,55 +1878,122 @@ def run(
     current_damaged_partitions = [
         p
         for p in all_damaged_partitions
-        if p["window_id"] == current_window_id or p["window_id"] in newly_failed_windows
+        if p["window_id"] == current_window_id
     ]
-    historical_damaged_partitions = [
-        p for p in all_damaged_partitions if p not in current_damaged_partitions
-    ]
+    historical_damaged_by_manifest: dict[str, dict[str, Any]] = {
+        str(p["source_manifest"]): p
+        for p in all_damaged_partitions
+        if p not in current_damaged_partitions and p.get("source_manifest")
+    }
+    current_damaged_manifest_set = {
+        str(p["source_manifest"]) for p in current_damaged_partitions if p.get("source_manifest")
+    }
+    for hm in historical_loss_manifests_out:
+        src_mf = str(hm.get("source_manifest") or "")
+        if src_mf and src_mf not in current_damaged_manifest_set and src_mf not in historical_damaged_by_manifest:
+            historical_damaged_by_manifest[src_mf] = {
+                "source_manifest": src_mf,
+                "file_name": hm.get("file_name"),
+                "exchange": hm.get("exchange"),
+                "date_utc": hm.get("date_utc"),
+                "window_id": hm.get("window_id"),
+                "window_span_id": hm.get("window_span_id"),
+                "partition_minutes": hm.get("partition_minutes"),
+                "run_id": hm.get("run_id"),
+                "local_loss_events": hm.get("local_loss_events", hm.get("local_loss_lines", 0)),
+                "dropped_frames": hm.get("dropped_frames", 0),
+                "gap_start_events": hm.get("gap_start_events", 0),
+                "problems": hm.get("problems", []),
+            }
+    historical_damaged_partitions = sorted(
+        historical_damaged_by_manifest.values(),
+        key=lambda x: str(x.get("source_manifest") or ""),
+    )
     historical_data_quality_status = (
         "has_historical_damage"
-        if (historical_damaged_windows or historical_damaged_partitions)
+        if (
+            historical_damaged_windows
+            or historical_overdue_windows
+            or historical_damaged_partitions
+            or historical_loss_manifests_out
+        )
         else "clean"
     )
 
-    # Overall QA status for this run:
-    # - Fails if index is unavailable, transient download error occurred, any newly checked file failed,
-    #   or the current window failed.
-    # - Overdue if any expected window is overdue.
-    # - Pending archive if any expected window is still pending archive (NEVER reported as passed/ok!).
-    # - Needs review if current window or newly checked files need review.
-    # - Passed if current window completed and passed (even if older historical windows had damage, which
-    #   is preserved and reported in `historical_damaged_windows` / `historical_damaged_partitions`).
-    if not index_available or transient or blocked or current_damaged_windows or current_window_verification_status == QA_STATUS_FAILED:
+    current_window_failed_files = [
+        rel
+        for rel, rep in file_reports.items()
+        if rep.get("window_id") == current_window_id and rep.get("qa_status") == QA_STATUS_FAILED
+    ]
+    current_window_review_files = [
+        rel
+        for rel, rep in file_reports.items()
+        if rep.get("window_id") == current_window_id and rep.get("qa_status") == QA_STATUS_NEEDS_REVIEW
+    ]
+
+    # Latest window QA status & heartbeat determination:
+    # Determined independently by job execution status and the current due window's verification status,
+    # while historical damaged or historical missing/overdue windows are preserved and reported separately!
+    if (
+        not index_available
+        or transient
+        or current_damaged_windows
+        or current_window_failed_files
+        or current_window_verification_status == QA_STATUS_FAILED
+    ):
         overall_qa_status = QA_STATUS_FAILED
-    elif overdue_windows or current_window_verification_status == QA_STATUS_OVERDUE:
+    elif (
+        current_overdue_windows
+        or current_window_verification_status == QA_STATUS_OVERDUE
+        or (not current_window_completed and overdue_windows)
+    ):
         overall_qa_status = QA_STATUS_OVERDUE
-    elif pending_windows or current_window_verification_status == QA_STATUS_PENDING_ARCHIVE or not current_window_completed:
+    elif (
+        current_pending_windows
+        or current_window_verification_status == QA_STATUS_PENDING_ARCHIVE
+        or not current_window_completed
+    ):
         overall_qa_status = QA_STATUS_PENDING_ARCHIVE
-    elif review_cnt or current_window_verification_status == QA_STATUS_NEEDS_REVIEW:
+    elif current_window_review_files or current_window_verification_status == QA_STATUS_NEEDS_REVIEW:
         overall_qa_status = QA_STATUS_NEEDS_REVIEW
     else:
         overall_qa_status = QA_STATUS_PASSED
 
-    overall_status = "ok" if (job_execution_status == "ok" and overall_qa_status == QA_STATUS_PASSED and current_window_completed) else "blocked"
+    heartbeat_status = (
+        "ok"
+        if (
+            job_execution_status == "ok"
+            and current_window_completed
+            and current_window_verification_status == QA_STATUS_PASSED
+            and overall_qa_status == QA_STATUS_PASSED
+        )
+        else "failed"
+    )
+    overall_status = "ok" if heartbeat_status == "ok" else "blocked"
 
     out_summary = {
         "status": overall_status,
         "qa_status": overall_qa_status,
+        "heartbeat_status": heartbeat_status,
         "job_execution_status": job_execution_status,
         "current_window_id": current_window_id,
         "current_window_completed": current_window_completed,
         "current_window_verification_status": current_window_verification_status,
         "historical_data_quality_status": historical_data_quality_status,
         "historical_damaged_windows": historical_damaged_windows,
+        "historical_overdue_windows": historical_overdue_windows,
         "historical_damaged_partitions": historical_damaged_partitions,
+        "historical_loss_manifests": historical_loss_manifests_out,
         "current_damaged_windows": current_damaged_windows,
         "current_damaged_partitions": current_damaged_partitions,
         "qa_version": QA_VERSION,
         "checker_commit_sha": commit_sha,
         "effective_config_sha256": cfg_hash,
         "partition_minutes": pm,
-        "run_id": run_id,
+        "run_id": effective_run_id,
+        "effective_run_id": effective_run_id,
+        "index_effective_run_id": index_effective_run_id,
+        "effective_since_window": effective_since_spec,
         "discovery_mode": discovery_mode,
         "discovery_warnings": discovery_warnings,
         "attempted": attempted,

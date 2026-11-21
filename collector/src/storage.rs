@@ -195,9 +195,12 @@ impl WriterOptions {
         allow_segmented_restart: bool,
         process_start_wall_ns: Option<i64>,
     ) -> Self {
+        let eff_run_id = run_id
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| cfg.deployment.run_id.clone().filter(|s| !s.trim().is_empty()));
         Self {
             partition_minutes: cfg.deployment.partition_minutes,
-            run_id,
+            run_id: eff_run_id,
             allow_segmented_restart,
             late_frame_grace_ns: (cfg.deployment.late_frame_grace_ms as i64)
                 .saturating_mul(1_000_000),
@@ -315,6 +318,7 @@ struct OpenPartition {
     local_loss_lines: u64,
     gap_start_lines: u64,
     switch_lines: u64,
+    is_first_window: bool,
     is_startup_stub: bool,
     settled_by_timer: bool,
     late_frames_accepted: u64,
@@ -670,14 +674,16 @@ impl HourlyTsvZstWriter {
             .write_all(line.as_bytes())
             .map_err(|e| format!("zstd write failed: {}", e))?;
 
-        open.start_wall_ns = Some(
-            open.start_wall_ns
-                .map_or(disk_rec.recv_wall_ns, |prev| prev.min(disk_rec.recv_wall_ns)),
-        );
-        open.end_wall_ns = Some(
-            open.end_wall_ns
-                .map_or(disk_rec.recv_wall_ns, |prev| prev.max(disk_rec.recv_wall_ns)),
-        );
+        if matches!(rec.kind, RecordKind::Data | RecordKind::DataEscaped) {
+            open.start_wall_ns = Some(
+                open.start_wall_ns
+                    .map_or(disk_rec.recv_wall_ns, |prev| prev.min(disk_rec.recv_wall_ns)),
+            );
+            open.end_wall_ns = Some(
+                open.end_wall_ns
+                    .map_or(disk_rec.recv_wall_ns, |prev| prev.max(disk_rec.recv_wall_ns)),
+            );
+        }
         open.max_mono_ns = open.max_mono_ns.max(disk_rec.recv_mono_ns);
         if open.first_rx_seq.is_none() {
             open.first_rx_seq = Some(disk_rec.rx_seq);
@@ -833,18 +839,20 @@ impl HourlyTsvZstWriter {
                 / 1_000_000
         });
         let is_startup_stub = open.is_startup_stub
-            || (open.start_wall_ns.is_some_and(|s| {
-                s > open
-                    .key
-                    .planned_start_wall_ns
-                    .saturating_add(STARTUP_STUB_GRACE_NS)
-            }) && open.is_startup_stub);
+            || (open.is_first_window
+                && open.start_wall_ns.is_some_and(|s| {
+                    s > open
+                        .key
+                        .planned_start_wall_ns
+                        .saturating_add(STARTUP_STUB_GRACE_NS)
+                }));
         let tail_incomplete = open.settled_by_timer
             && open.end_wall_ns.map_or(true, |e| {
                 open.key.planned_end_wall_ns.saturating_sub(e) > INCOMPLETE_TAIL_THRESHOLD_NS
             });
-        let zero_market_data = open.data_lines + open.data_escaped_lines == 0;
-        let coverage_incomplete = is_startup_stub || tail_incomplete || zero_market_data;
+        let market_data_records = open.data_lines + open.data_escaped_lines;
+        let insufficient_market_data = market_data_records < 2;
+        let coverage_incomplete = is_startup_stub || tail_incomplete || insufficient_market_data;
 
         let manifest = PartitionManifest {
             schema_version: 2,
@@ -1013,6 +1021,7 @@ impl HourlyTsvZstWriter {
             local_loss_lines: 0,
             gap_start_lines: 0,
             switch_lines: 0,
+            is_first_window,
             is_startup_stub,
             settled_by_timer: false,
             late_frames_accepted: 0,
