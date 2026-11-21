@@ -356,6 +356,10 @@ def resolve_cutover_window_utc(
     for label, raw_spec in sources:
         start_s = parse_window_start_s(raw_spec)
         wd = window_descriptor(start_s, pm)
+        if start_s != wd["planned_start_s"]:
+            raise ValueError(
+                f"{label} must be the start of a complete {pm}-minute UTC window: {raw_spec}"
+            )
         normalized.append((label, wd["window_id"]))
 
     if len({v for _, v in normalized}) > 1:

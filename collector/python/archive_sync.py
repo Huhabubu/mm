@@ -592,6 +592,11 @@ class ArchiveLedger:
 
                 CREATE INDEX IF NOT EXISTS idx_expected_windows_status
                     ON expected_windows(window_status, partition_minutes);
+
+                CREATE TABLE IF NOT EXISTS archive_market_scan_stats (
+                    data_sha256 TEXT PRIMARY KEY,
+                    stats_json TEXT NOT NULL
+                );
                 """
             )
             self._migrate_window_columns()
@@ -2156,21 +2161,26 @@ def _reconcile_single_window(
 
         r_eff = dict(row)
         rel_data = str(r_eff.get("rel_data_path") or "")
-        if rel_data:
+        data_sha = r_eff.get("local_sha256")
+        scan_key = str(data_sha or rel_data)
+        cached = scan_cache.get(scan_key)
+        if cached is None and rel_data:
             dpath = sealed_root / rel_data
             if dpath.is_file():
-                cached = scan_cache.get(rel_data)
-                if cached is None:
-                    try:
-                        cached = _scan_market_data_timestamps(dpath)
-                    except Exception:
-                        cached = {"parsed_tsv": False}
-                    scan_cache[rel_data] = cached
-                if cached.get("parsed_tsv"):
-                    r_eff["data_lines"] = int(cached["data_lines"])
-                    r_eff["start_wall_ns"] = cached["start_wall_ns"]
-                    r_eff["end_wall_ns"] = cached["end_wall_ns"]
-                    r_eff["_max_internal_gap_ns"] = int(cached.get("max_internal_gap_ns") or 0)
+                try:
+                    if data_sha and file_hashes(dpath)["sha256"] != data_sha:
+                        win_errors.append(f"market_scan_local_hash_mismatch:{rel_data}")
+                        continue
+                    cached = _scan_market_data_timestamps(dpath)
+                    scan_cache[scan_key] = cached
+                except (OSError, zstd.ZstdError) as exc:
+                    win_errors.append(f"market_scan_failed:{rel_data}:{type(exc).__name__}")
+                    continue
+        if cached and cached.get("parsed_tsv"):
+            r_eff["data_lines"] = int(cached["data_lines"])
+            r_eff["start_wall_ns"] = cached["start_wall_ns"]
+            r_eff["end_wall_ns"] = cached["end_wall_ns"]
+            r_eff["_max_internal_gap_ns"] = int(cached["max_internal_gap_ns"])
 
         has_data = int(r_eff.get("data_lines") or 0) > 0 or (
             not (rel_data and (sealed_root / rel_data).is_file())
@@ -2301,7 +2311,8 @@ def _reconcile_single_window(
             for prev, cur in zip(segs, segs[1:])
             if prev.get("end_wall_ns") is not None and cur.get("start_wall_ns") is not None
         ]
-        max_internal_gap_ns = max(inter_gaps_ns, default=0)
+        intra_gaps_ns = [int(seg.get("_max_internal_gap_ns") or 0) for seg in segs]
+        max_internal_gap_ns = max(inter_gaps_ns + intra_gaps_ns, default=0)
 
         gap_reasons: list[str] = []
         if segs:
@@ -3143,7 +3154,11 @@ def sync_sealed_directory(
 
                 earliest_start_s = min(candidate_starts)
                 cur_s = earliest_start_s
-                market_scan_cache: dict[str, dict[str, Any]] = {}
+                market_scan_cache = {
+                    row["data_sha256"]: json.loads(row["stats_json"])
+                    for row in ledger.conn.execute("SELECT data_sha256, stats_json FROM archive_market_scan_stats")
+                }
+                previously_scanned = set(market_scan_cache)
                 reconciled_windows: list[tuple[dict[str, Any], dict[str, Any], bool]] = []
 
                 while cur_s <= int(expected_win_desc["planned_start_s"]):
@@ -3166,6 +3181,16 @@ def sync_sealed_directory(
                     )
                     reconciled_windows.append((w_desc, rec, is_current_target))
                     cur_s += step_s
+
+                with ledger.conn:
+                    ledger.conn.executemany(
+                        "INSERT OR IGNORE INTO archive_market_scan_stats(data_sha256, stats_json) VALUES (?, ?)",
+                        (
+                            (sha, json.dumps(stats))
+                            for sha, stats in market_scan_cache.items()
+                            if len(sha) == 64 and sha not in previously_scanned and stats.get("parsed_tsv")
+                        ),
+                    )
 
                 pending_prior_windows: list[str] = []
                 pending_prior_window_details: list[dict[str, Any]] = []

@@ -150,6 +150,7 @@ def _write_sealed_partition(
     extra_meta: list[dict] | None = None,
     custom_rows: list[tuple[int, int, str, int, int, str, dict]] | None = None,
     segment_suffix: str | None = None,
+    dense: bool = False,
 ) -> tuple[Path, Path, dict]:
     wd = dc.window_descriptor(window_start_s, partition_minutes)
     date_utc = wd["date_utc"]
@@ -195,9 +196,10 @@ def _write_sealed_partition(
         payloads = _sample_payloads(exchange, include_depth=include_depth, include_trade=include_trade)
         seq = first_rx_seq
         mono = 1000
-        # Emit at window head and window tail so stream gaps stay small
         tail_offset = offset_end_s if offset_end_s is not None else max(offset_start_s + 2, partition_minutes * 60 - 2)
-        times = [start_ns + offset_start_s * 1_000_000_000, start_ns + tail_offset * 1_000_000_000]
+        offsets = list(range(offset_start_s, tail_offset, 120)) if dense else [offset_start_s]
+        offsets.append(tail_offset)
+        times = [start_ns + offset * 1_000_000_000 for offset in offsets]
         for t_idx, base_t in enumerate(times):
             for p_idx, payload in enumerate(payloads):
                 w = base_t + p_idx * 1_000_000
@@ -493,7 +495,7 @@ def test_archive_15m_bounded_seal_wait_and_multi_segment_reconciliation():
 
         # Create sealed segments for 3 exchanges; binance_futures still sealing as `.partial`
         for ex in ("bitget_v3", "gate_futures"):
-            _write_sealed_partition(root, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b1")
+            _write_sealed_partition(root, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b1", dense=True)
 
         # Mid-window restart produced 2 strictly non-overlapping segments for bybit_linear
         _write_sealed_partition(
@@ -505,6 +507,7 @@ def test_archive_15m_bounded_seal_wait_and_multi_segment_reconciliation():
             first_rx_seq=1,
             offset_start_s=1,
             offset_end_s=440,
+            dense=True,
         )
         _write_sealed_partition(
             root,
@@ -515,6 +518,7 @@ def test_archive_15m_bounded_seal_wait_and_multi_segment_reconciliation():
             first_rx_seq=1,
             offset_start_s=450,
             offset_end_s=895,
+            dense=True,
         )
 
         # Pending partial for binance_futures in 00:00Z
@@ -530,7 +534,7 @@ def test_archive_15m_bounded_seal_wait_and_multi_segment_reconciliation():
             if len(sleeps) == 2:
                 partial.unlink()
                 _write_sealed_partition(
-                    root, exchange="binance_futures", window_start_s=w0, partition_minutes=15, boot_id="b1"
+                    root, exchange="binance_futures", window_start_s=w0, partition_minutes=15, boot_id="b1", dense=True
                 )
 
         backend = _MemoryArchiveBackend()
@@ -563,6 +567,7 @@ def test_archive_15m_bounded_seal_wait_and_multi_segment_reconciliation():
             boot_id="b1",
             first_rx_seq=2,
             segment_suffix="dup_overlap",
+            dense=True,
         )
         res_ov = arch.sync_sealed_directory(
             root,
@@ -594,7 +599,7 @@ def test_archive_window_n_partial_failure_still_tracked_and_retried_after_window
 
         w0_paths: dict[str, Path] = {}
         for ex in EXCHANGES_4:
-            d, _, _ = _write_sealed_partition(root, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b1")
+            d, _, _ = _write_sealed_partition(root, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b1", dense=True)
             w0_paths[ex] = d
         rel_fail = w0_paths["binance_futures"].relative_to(root).as_posix()
 
@@ -616,7 +621,7 @@ def test_archive_window_n_partial_failure_still_tracked_and_retried_after_window
 
         # Window W1 arrives for all 4 exchanges; binance W0 STILL failing on Run 2 (at 00:31Z)
         for ex in EXCHANGES_4:
-            _write_sealed_partition(root, exchange=ex, window_start_s=w1, partition_minutes=15, boot_id="b1", first_rx_seq=10)
+            _write_sealed_partition(root, exchange=ex, window_start_s=w1, partition_minutes=15, boot_id="b1", first_rx_seq=10, dense=True)
 
         r2 = arch.sync_sealed_directory(
             root,
@@ -1347,7 +1352,7 @@ def test_review_p1_3_archive_separates_file_verification_from_window_coverage_an
         # Run 2 at 00:31Z (expected W1 = 00:15Z): W1 has all 4 exchanges with full coverage,
         # while W0 STILL has 0 files on disk -> W0 MUST remain in pending_prior_windows and block status="ok"!
         for ex in EXCHANGES_4:
-            _write_sealed_partition(root, exchange=ex, window_start_s=w1, partition_minutes=15, boot_id="b1")
+            _write_sealed_partition(root, exchange=ex, window_start_s=w1, partition_minutes=15, boot_id="b1", dense=True)
 
         r_w1 = arch.sync_sealed_directory(
             root,
@@ -1369,7 +1374,7 @@ def test_review_p1_3_archive_separates_file_verification_from_window_coverage_an
         # Run 3: Backfill W0 for all 4 exchanges, BUT gate_futures only covers seconds [1..60] of the 900s window
         # (leaving an 840s tail gap > max_coverage_gap_seconds)!
         for ex in ("binance_futures", "bybit_linear", "bitget_v3"):
-            _write_sealed_partition(root, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b0")
+            _write_sealed_partition(root, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b0", dense=True)
         _write_sealed_partition(
             root,
             exchange="gate_futures",
@@ -1377,7 +1382,7 @@ def test_review_p1_3_archive_separates_file_verification_from_window_coverage_an
             partition_minutes=15,
             boot_id="b0",
             offset_start_s=1,
-            offset_end_s=60,  # 840s tail gap!
+            offset_end_s=60,  # 840s tail gap!, dense=True
         )
 
         r_gap = arch.sync_sealed_directory(
@@ -1642,6 +1647,7 @@ def test_review_round2_p1_1_unified_run_id_across_collector_archive_and_qa():
             partition_minutes=15,
             boot_id="b_unified",
             run_id="trial_15m_unified_01",
+            dense=True,
         )
         backend = _MemoryArchiveBackend()
         sync_res = arch.sync_sealed_directory(
@@ -1825,6 +1831,7 @@ def test_review_round2_p1_2_archive_market_data_only_coverage_cross_process_over
                 boot_id="boot_init",
                 run_id="batch_init",
                 first_rx_seq=10,
+                dense=True,
             )
         res_c1 = arch.sync_sealed_directory(
             dir_stub,
@@ -2080,3 +2087,56 @@ def test_review_round2_report_fixes_multi_segment_late_frame_no_double_count_and
         assert persisted_hist_obj["count"] >= 4
 
 
+
+
+def test_15m_archive_blocks_intra_file_silence_and_reuses_verified_scan(tmp_path):
+    w0 = dc.parse_window_start_s("2026-11-21T00:00Z")
+    _write_sealed_partition(tmp_path, exchange="binance_futures", window_start_s=w0)
+    backend = _MemoryArchiveBackend()
+    opts = dict(
+        verify_remote=True,
+        now_epoch_s=w0 + 16 * 60,
+        upload_ledger_snapshot=False,
+        expected_hourly_exchanges={"binance_futures"},
+        partition_minutes=15,
+    )
+    result = arch.sync_sealed_directory(tmp_path, backend, **opts)
+    assert result["status"] == "blocked"
+    coverage = result["expected_window_reconciliation"]["coverage_gaps"]["binance_futures"]
+    assert coverage["max_internal_gap_seconds"] > 890
+    with patch.object(arch, "_scan_market_data_timestamps", wraps=arch._scan_market_data_timestamps) as scan:
+        repeated = arch.sync_sealed_directory(tmp_path, backend, **opts)
+    scan.assert_not_called()
+    assert repeated["expected_window_reconciliation"]["coverage_gaps"]["binance_futures"] == coverage
+
+
+def test_cutover_rejects_mid_window_start():
+    cfg = _make_config(partition_minutes=15)
+    with pytest.raises(ValueError, match="start of a complete 15-minute UTC window"):
+        dc.resolve_cutover_window_utc(cfg, "2026-11-21T00:07Z", env={})
+    assert dc.resolve_cutover_window_utc(cfg, "2026-11-21T00:15Z", env={}) == "2026-11-21T00:15Z"
+
+
+def test_qa_blocks_mismatched_index_batch_even_when_matching_files_exist(tmp_path):
+    w0 = dc.parse_window_start_s("2026-11-21T00:00Z")
+    cfg = _make_config(partition_minutes=15, exchanges=("binance_futures",))
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    _write_sealed_partition(tmp_path, exchange="binance_futures", window_start_s=w0, run_id="batch_new")
+    backend = _MemoryArchiveBackend()
+    arch.sync_sealed_directory(
+        tmp_path, backend, verify_remote=True, now_epoch_s=w0 + 16 * 60, upload_ledger_snapshot=False
+    )
+    idx = json.loads(backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH])
+    idx["effective_run_id"] = "batch_old"
+    backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH] = json.dumps(idx).encode()
+    fake_run, fake_dl = _wire_mock_drive(tmp_path, backend)
+    with patch.object(qa, "_run", side_effect=fake_run), patch.object(qa, "_download", side_effect=fake_dl):
+        result = qa.run(
+            "qa:", cfg_path, tmp_path / "state", limit=16, since_date="2026-11-21",
+            since_window="2026-11-21T00:00Z", run_id="batch_new", now_epoch_s=w0 + 16 * 60,
+        )
+    assert result["status"] == "blocked"
+    assert result["heartbeat_status"] == "failed"
+    assert result["attempted"] == 0
+    assert any("verified_archive_index_batch_mismatch" in detail for detail in result["details"])

@@ -1547,16 +1547,18 @@ def run(
         meta_files=meta_files,
         state_dir=state_dir,
     )
-    if (
+    wrong_index_batch = (
         effective_run_id is not None
         and index_effective_run_id is not None
         and index_effective_run_id != effective_run_id
-    ):
+    )
+    if wrong_index_batch:
         discovery_warnings.append(
             f"verified index effective_run_id ({index_effective_run_id}) differs from requested effective_run_id ({effective_run_id})"
         )
 
-    index_available = discovery_mode != "verified_index_unavailable"
+        candidates = []
+    index_available = discovery_mode != "verified_index_unavailable" and not wrong_index_batch
     attempted = ok = blocked = review_cnt = skipped = transient = 0
     remaining_backlog = 0
     unchecked_windows: set[str] = set()
@@ -1564,7 +1566,9 @@ def run(
     summary: list[str] = []
     file_reports: dict[str, dict[str, Any]] = {}
 
-    if not index_available:
+    if wrong_index_batch:
+        summary.append("ERROR verified_archive_index_batch_mismatch: " + discovery_warnings[-1])
+    elif not index_available:
         summary.append(
             "ERROR verified_archive_index_unavailable: trusted meta/archive_manifest_index.json could not be downloaded or parsed"
         )
