@@ -301,11 +301,11 @@ def test_p3_healthy_run_hourly_battle_report_and_zero_zstd_decompression(
     assert len(transport.tg_messages) == 1
     report = transport.tg_messages[0]["text"]
     assert "东京 L2 小时战报" in report
-    assert "归档状态: VERIFIED" in report
-    assert "深度数据质量: PENDING（待后续 GitHub 深度 QA 验证）" in report
-    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+    assert "云端归档：VERIFIED" in report
+    assert "深度数据质量：PENDING" in report
+    for ex in ("Binance", "Bybit", "Bitget", "Gate"):
         assert ex in report
-    assert "当前异常: 无" in report
+    assert "当前没有监控告警" in report
 
     # Second sweep 60s later in SAME hour: ZERO duplicate battle report, ZERO HC ping (<300s)
     r2 = mon.run_sweep(now_epoch_s=t0 + 60.0)
@@ -385,7 +385,7 @@ def test_p3_collector_stopped_abnormal_restart_and_data_stale_alerts_and_recover
     r_down = mon.run_sweep(now_epoch_s=t0 + 301.0)
     assert "collector_stopped" in r_down["active_alerts"]
     assert "collector_abnormal_restart" in r_down["active_alerts"]
-    assert any("collector_stopped" in m["text"] for m in transport.tg_messages)
+    assert any("采集程序停止" in m["text"] for m in transport.tg_messages)
     assert transport.hc_calls[-1]["is_fail"] is True
     assert "collector_stopped" in transport.hc_calls[-1]["body"]
 
@@ -399,7 +399,7 @@ def test_p3_collector_stopped_abnormal_restart_and_data_stale_alerts_and_recover
     r_up = mon.run_sweep(now_epoch_s=t0 + 610.0)
     assert "collector_stopped" not in r_up["active_alerts"]
     assert "collector_stopped" in r_up["alert_dispatch"]["sent_recoveries"]
-    assert any("[已恢复] collector_stopped" in m["text"] for m in transport.tg_messages)
+    assert any("[已恢复]" in m["text"] and "采集程序停止" in m["text"] for m in transport.tg_messages)
     # abnormal_restart stays firing during 600s stabilization window, then recovers!
     assert "collector_abnormal_restart" in r_up["active_alerts"]
     for pp in partials.values():
@@ -576,8 +576,8 @@ def test_p3_archive_errors_conflicts_and_cli_archive_healthchecks(
     assert "archive_upload_or_verify_failed" in r_bad["active_alerts"]
     assert "archive_ledger_conflict" in r_bad["active_alerts"]
     assert r_bad["hourly_report"]["text"] is not None
-    assert "归档状态: CONFLICT" in r_bad["hourly_report"]["text"]
-    assert "深度数据质量: PENDING（待后续 GitHub 深度 QA 验证）" in r_bad["hourly_report"]["text"]
+    assert "云端归档：CONFLICT" in r_bad["hourly_report"]["text"]
+    assert "深度数据质量：PENDING" in r_bad["hourly_report"]["text"]
 
     # Resolve both in SQLite -> monitor fires recovery alerts cleanly
     _seed_ledger_row(data_root, *refs["bybit_linear"], exchange="bybit_linear", state="VERIFIED", last_error_code=None)
@@ -726,7 +726,7 @@ def test_p3_alert_dedup_cooldown_network_failure_and_secret_redaction(
     alert_msgs = [
         m
         for m in transport.tg_messages
-        if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "disk_usage_high" in m["text"]
+        if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "磁盘使用率过高" in m["text"]
     ]
     assert len(alert_msgs) == 1
 
@@ -740,7 +740,7 @@ def test_p3_alert_dedup_cooldown_network_failure_and_secret_redaction(
             [
                 m
                 for m in transport.tg_messages
-                if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "disk_usage_high" in m["text"]
+                if ("[告警" in m["text"] or "[持续告警" in m["text"]) and "磁盘使用率过高" in m["text"]
             ]
         )
         == 1
@@ -751,7 +751,7 @@ def test_p3_alert_dedup_cooldown_network_failure_and_secret_redaction(
     assert "disk_usage_high" in r_rem["alert_dispatch"]["sent_alerts"]
     reminders = [m for m in transport.tg_messages if "持续告警" in m["text"]]
     assert len(reminders) == 1
-    assert "去重抑制: 4 次" in reminders[0]["text"]
+    assert "去重抑制 4 次" in reminders[0]["text"]
 
     # Check redact_secrets helper directly against generic HC / Telegram strings
     sample_err = (
@@ -1130,11 +1130,13 @@ def test_p3_hourly_report_prev_hour_vs_cumulative_metrics(tmp_path: Path) -> Non
     report = r["hourly_report"]["text"]
     assert report is not None
 
-    # Verify explicit separation: previous hour (2026-12-03T09) vs historical cumulative!
-    assert "上小时(2026-12-03T09): 封口=1 DATA=12,000" in report
-    assert "SW=1 GAP=1 LOSS=0" in report
-    assert "历史累计: 封口=2(V=1/P=1) DATA=62,000 LOSS=7" in report
-    assert "账本累计分区: SEALED=0 / VERIFIED=4 / PRUNED=4" in report
+    # Previous-hour market data is visible; detailed historical totals stay in the state.
+    assert "统计：2026-12-03T09 UTC" in report
+    assert "Gate: 12,000 行 · GAP 1 · LOSS 0" in report
+    assert "云端归档：VERIFIED" in report
+    assert "V=4 / P=4" in report
+    assert r["data_tree"]["per_exchange"]["gate_futures"]["cumulative_data_lines"] == 62000
+    assert r["data_tree"]["per_exchange"]["gate_futures"]["cumulative_local_loss_lines"] == 7
 
     # Verify UTC midnight boundary: at 2026-12-04T00:12:00 UTC -> prev_hour_key = 2026-12-03T23
     t_midnight = 1_796_343_120.0
@@ -1151,7 +1153,8 @@ def test_p3_hourly_report_prev_hour_vs_cumulative_metrics(tmp_path: Path) -> Non
     r_mid = mon.run_sweep(now_epoch_s=t_midnight, force_hourly_report=True)
     mid_report = r_mid["hourly_report"]["text"]
     assert mid_report is not None
-    assert "上小时(2026-12-03T23): 封口=1 DATA=9,999" in mid_report
+    assert "统计：2026-12-03T23 UTC" in mid_report
+    assert "Binance: 9,999 行" in mid_report
 
 
 def _ws_encode_frame(opcode: int, payload: bytes) -> bytes:
@@ -1738,7 +1741,7 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
         assert r_acked["active_alerts"] == []
         assert r_acked["outage_acks_applied"][0]["cleared_endpoints"] == ["binance_public"]
         assert r_acked["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
-        assert any("[已恢复]" in m["text"] and "dual_ab_outage_gt_5s" in m["text"] for m in transport.tg_messages)
+        assert any("[已恢复]" in m["text"] and "行情双连接中断" in m["text"] for m in transport.tg_messages)
         assert r_acked["collector_healthcheck"]["healthy"] is True
         assert transport.hc_calls[-1]["is_fail"] is False
 
