@@ -14,6 +14,14 @@ pub struct CollectorConfig {
     pub exchanges: ExchangesConfig,
 }
 
+fn default_partition_minutes() -> u32 {
+    60
+}
+
+fn default_late_frame_grace_ms() -> u64 {
+    2000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentConfig {
     pub aws_region: String,
@@ -22,6 +30,10 @@ pub struct DeploymentConfig {
     pub zstd_level: i32,
     pub bounded_queue_capacity: usize,
     pub silence_watchdog_seconds: u64,
+    #[serde(default = "default_partition_minutes")]
+    pub partition_minutes: u32,
+    #[serde(default = "default_late_frame_grace_ms")]
+    pub late_frame_grace_ms: u64,
     pub planned_rotation_utc: BTreeMap<String, String>,
 }
 
@@ -123,6 +135,21 @@ impl CollectorConfig {
             errs.push(format!(
                 "bounded_queue_capacity too small: {}",
                 self.deployment.bounded_queue_capacity
+            ));
+        }
+        if !matches!(self.deployment.partition_minutes, 5 | 15 | 30 | 60) {
+            errs.push(format!(
+                "Invalid deployment.partition_minutes: {} (must be one of 5, 15, 30, 60)",
+                self.deployment.partition_minutes
+            ));
+        }
+        let max_grace_ms = (self.deployment.partition_minutes as u64)
+            .saturating_mul(30_000)
+            .min(60_000);
+        if self.deployment.late_frame_grace_ms > max_grace_ms {
+            errs.push(format!(
+                "Invalid deployment.late_frame_grace_ms: {} (must be <= {} ms)",
+                self.deployment.late_frame_grace_ms, max_grace_ms
             ));
         }
         if !self.archive.forbid_remote_overwrite_on_hash_mismatch {

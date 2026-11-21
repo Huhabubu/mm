@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use tokyo_l2_collector::causal_selector::CausalSelector;
 use tokyo_l2_collector::config::CollectorConfig;
 use tokyo_l2_collector::live::run_live_collector;
-use tokyo_l2_collector::storage::HourlyTsvZstWriter;
+use tokyo_l2_collector::storage::{HourlyTsvZstWriter, WriterOptions};
 use tokyo_l2_collector::types::{BlockedReport, ConnId, EndpointKind, ExchangeId, RawFrame};
 
 #[derive(Parser, Debug)]
@@ -185,6 +185,8 @@ async fn main() -> ExitCode {
                 "phase": "preflight_offline_rust",
                 "mode": cfg.mode,
                 "spec_version": cfg.spec_version,
+                "partition_minutes": cfg.deployment.partition_minutes,
+                "late_frame_grace_ms": cfg.deployment.late_frame_grace_ms,
                 "enabled_exchanges": {
                     "binance_futures": cfg.exchanges.binance_futures.enabled,
                     "bybit_linear": cfg.exchanges.bybit_linear.enabled,
@@ -273,14 +275,22 @@ fn run_replay_fixture(
     let mut selectors: HashMap<EndpointKind, CausalSelector> = HashMap::new();
     let mut writers: HashMap<ExchangeId, HourlyTsvZstWriter> = HashMap::new();
 
+    let writer_opts = WriterOptions::from_config(
+        &cfg,
+        Some(boot_id.to_string()),
+        cfg.deployment.partition_minutes < 60,
+        None,
+    );
+
     let mut add_ep = |ep: EndpointKind, syms: Vec<String>| {
         let ex = ep.exchange();
         writers.entry(ex).or_insert_with(|| {
-            HourlyTsvZstWriter::new(
+            HourlyTsvZstWriter::with_options(
                 out_dir.clone(),
                 ex,
                 boot_id.to_string(),
                 cfg.deployment.zstd_level,
+                writer_opts.clone(),
             )
         });
         selectors.insert(
@@ -450,7 +460,7 @@ fn run_replay_fixture(
 
     let mut manifests = Vec::new();
     for writer in writers.values_mut() {
-        writer.seal_current()?;
+        writer.seal_all()?;
         for s in writer.sealed_partitions() {
             manifests.push(s.manifest_path.to_string_lossy().to_string());
         }

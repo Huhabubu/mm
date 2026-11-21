@@ -8,7 +8,7 @@ use crate::protocol::{
     binance::BinanceValidator, bitget::BitgetValidator, bybit::BybitValidator,
     gate::GateValidator,
 };
-use crate::storage::HourlyTsvZstWriter;
+use crate::storage::{HourlyTsvZstWriter, WriterOptions};
 use crate::types::{ConnId, EndpointKind, ExchangeId, RawFrame};
 use chrono::{Timelike, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -691,7 +691,8 @@ pub async fn run_live_collector(
     };
 
     let mono_origin = Instant::now();
-    let boot_id = format!("{}_{}", run_id, wall_clock_ns());
+    let process_start_wall_ns = wall_clock_ns();
+    let boot_id = format!("{}_{}", run_id, process_start_wall_ns);
     let data_root = PathBuf::from(&config.deployment.data_root);
     let cap = config.deployment.bounded_queue_capacity;
     let (tx, mut rx) = mpsc::channel::<EngineEvent>(cap);
@@ -738,15 +739,22 @@ pub async fn run_live_collector(
     }
 
     let cfg_arc = Arc::new(config.clone());
+    let writer_opts = WriterOptions::from_config(
+        &config,
+        Some(run_id.clone()),
+        true,
+        Some(process_start_wall_ns),
+    );
 
     for (ep, syms) in endpoints_to_spawn {
         let ex = ep.exchange();
         writers.entry(ex).or_insert_with(|| {
-            let mut writer = HourlyTsvZstWriter::new(
+            let mut writer = HourlyTsvZstWriter::with_options(
                 data_root.clone(),
                 ex,
                 boot_id.clone(),
                 config.deployment.zstd_level,
+                writer_opts.clone(),
             );
             writer.enable_background_sealing(Arc::clone(&seal_limit));
             writer
@@ -1068,34 +1076,39 @@ pub async fn run_live_collector(
             }
             info!("Sealing active partition for {}...", ex);
             flush_stderr();
-            match writer.seal_current() {
-                Ok(Some(s)) => {
+            match writer.seal_all() {
+                Ok(sealed_list) if !sealed_list.is_empty() => {
                     let elapsed_ms = ex_start.elapsed().as_millis() as u64;
-                    info!(
-                        "Sealed {} -> {} (bytes={}, data_lines={}, meta_lines={}, sha256={}, elapsed_ms={})",
-                        ex,
-                        s.data_path.display(),
-                        s.manifest.bytes,
-                        s.manifest.data_lines,
-                        s.manifest.meta_lines,
-                        s.manifest.sha256,
-                        elapsed_ms
-                    );
-                    flush_stderr();
-                    sealed_records.push(serde_json::json!({
-                        "exchange": ex.as_dir_name(),
-                        "data_path": s.data_path.to_string_lossy(),
-                        "manifest_path": s.manifest_path.to_string_lossy(),
-                        "bytes": s.manifest.bytes,
-                        "data_lines": s.manifest.data_lines,
-                        "data_escaped_lines": s.manifest.data_escaped_lines,
-                        "meta_lines": s.manifest.meta_lines,
-                        "local_loss_lines": s.manifest.local_loss_lines,
-                        "sha256": s.manifest.sha256,
-                        "elapsed_ms": elapsed_ms
-                    }));
+                    for s in sealed_list {
+                        info!(
+                            "Sealed {} -> {} (window={}, bytes={}, data_lines={}, meta_lines={}, sha256={}, elapsed_ms={})",
+                            ex,
+                            s.data_path.display(),
+                            s.manifest.window_id,
+                            s.manifest.bytes,
+                            s.manifest.data_lines,
+                            s.manifest.meta_lines,
+                            s.manifest.sha256,
+                            elapsed_ms
+                        );
+                        flush_stderr();
+                        sealed_records.push(serde_json::json!({
+                            "exchange": ex.as_dir_name(),
+                            "window_id": s.manifest.window_id,
+                            "partition_minutes": s.manifest.partition_minutes,
+                            "data_path": s.data_path.to_string_lossy(),
+                            "manifest_path": s.manifest_path.to_string_lossy(),
+                            "bytes": s.manifest.bytes,
+                            "data_lines": s.manifest.data_lines,
+                            "data_escaped_lines": s.manifest.data_escaped_lines,
+                            "meta_lines": s.manifest.meta_lines,
+                            "local_loss_lines": s.manifest.local_loss_lines,
+                            "sha256": s.manifest.sha256,
+                            "elapsed_ms": elapsed_ms
+                        }));
+                    }
                 }
-                Ok(None) => {
+                Ok(_) => {
                     empty_exchanges.push(ex.as_dir_name().to_string());
                 }
                 Err(e) => {
@@ -1376,12 +1389,16 @@ fn process_engine_event(
                     selectors,
                 );
                 for (exchange, writer) in writers.iter_mut() {
+                    if let Err(error) = writer.settle_expired_windows(wall_ns) {
+                        error!("Failed settling expired window for {}: {}", exchange, error);
+                    }
                     for result in writer.poll_background_seals() {
                         match result {
                             Ok(sealed) => info!(
-                                "Rolled and sealed {} -> {} (bytes={}, data_lines={}, sha256={})",
+                                "Rolled and sealed {} -> {} (window={}, bytes={}, data_lines={}, sha256={})",
                                 exchange,
                                 sealed.data_path.display(),
+                                sealed.manifest.window_id,
                                 sealed.manifest.bytes,
                                 sealed.manifest.data_lines,
                                 sealed.manifest.sha256

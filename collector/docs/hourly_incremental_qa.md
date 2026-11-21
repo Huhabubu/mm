@@ -1,41 +1,33 @@
-# Tokyo L2 incremental Google Drive QA (every 3 hours)
+# Tokyo L2 incremental Google Drive QA (configurable 60m / 15m)
 
 This is a separate, **read-only** analysis pipeline. It never restarts the EC2 collector or alters archived market data.
 
 ## Architecture / activation
 
-- EC2 seals and uploads a per-exchange UTC-hour `*.tsv.zst` and `*.manifest.json`.
-- `.github/workflows/tokyo-l2-incremental-qa.yml` lives on the repository's **default `main` branch**. Scheduled GitHub Actions only run from that branch.
-- The workflow checks out the Python checker from `feat/tokyo-l2-reliability-fixes` (merge the checker PR into that branch **before** enabling the schedule).
-- QA results are committed to the dedicated `tokyo-l2-qa-state` branch in `qa_reports/raw/<exchange>/<date>/<manifest>.qa.json`.
-- Both `ok` and `blocked` outcomes skip future reprocessing for the same immutable manifest path and `QA_VERSION`. Cloud download/auth failures are **not** recorded as checked, so they can retry. To re-run a stored result, use manual `force` or increment `QA_VERSION` after material logic changes.
-- The schedule is `17 */3 * * *` (UTC); 16 partitions maximum per invocation, sequentially, one compressed partition in local scratch space at a time. It scans for new sealed manifests, not currently open `.partial` data. New files continue to accumulate while the workflow runs.
-- Initial scan starts at UTC date 2026-11-21. Adjust `since_date` for manual backfill.
+- EC2 seals and uploads per-exchange UTC-aligned partitions (`5`, `15`, `30`, or `60` minutes; legacy hourly `*.tsv.zst` and restart-safe segmented `*_p15m_<tag>.tsv.zst` files are both supported) along with `*.manifest.json` and a remotely verified index `meta/archive_manifest_index.json`.
+- `.github/workflows/tokyo-l2-incremental-qa.yml` lives on the repository's **default `main` branch** (delivered via a separate PR targeting `main`). Scheduled GitHub Actions only run from `main`.
+- In 15-minute trial mode, the workflow triggers approximately every 15 minutes (`3,18,33,48 * * * *` UTC) and preserves manual `workflow_dispatch` inputs (`config_path`, `since_window`, `run_id`, `limit`, `force`, `sla_grace_minutes`). If GitHub queues, delays, or drops a scheduled run, subsequent runs catch up automatically from verified archive records.
+- The workflow checks out the Python checker from `feat/tokyo-l2-reliability-fixes` and records `checker_commit_sha` (`git -C source rev-parse HEAD`) on every single report and run summary.
+- QA summary reports (zero raw market data, zero credentials) are committed to the dedicated `tokyo-l2-qa-state` branch at three levels:
+  1. **Single-file report**: `qa_reports/raw/<exchange>/<date>/<manifest>.qa.json`
+  2. **Whole-window report**: `qa_reports/windows/<date>/<window_id>.window.qa.json` (merges multi-segment restarts per exchange, checks all 4 exchanges & 72 expected channels, separates startup stubs, lists damaged segments)
+  3. **Complete UTC day report**: `qa_reports/days/<date>.day.qa.json` (checks all expected windows in the UTC day, cross-window `rx_seq` continuity per `boot_id`, cross-restart tracking, `chrony` 1,440 certified minutes, and protocol continuity)
+- **Memoization & re-check key**: `(source_manifest, data_sha256, manifest_sha256, QA_VERSION, effective_config_sha256)`. Identical verified objects skip without re-downloading; content, manifest, rule-version, or collector-config changes automatically trigger re-check.
+- **Five explicit states**: `passed`, `failed`, `pending_archive`, `needs_review`, `overdue`.
+  - When an expected window is past delivery SLA (`--sla-grace-minutes`) with missing files, missing QA results, or persistence failure, the job exits non-zero (`overdue` / `failed`) and **never** reports zero-file success.
+  - When all due windows already have valid up-to-date results and no new files arrived, the run skips cleanly (`passed`, `attempted=0`, `already_checked>0`).
+  - Transient download/timeout failures retry with bounded backoff and do not corrupt stored state.
 
 ## Required GitHub repository Secrets
 
-Add these via **Settings → Secrets and variables → Actions → New repository secret**.
+Add these via **Settings → Secrets and variables → Actions → New repository secret**:
 
-1. `TOKYO_L2_QA_GDRIVE_SA_JSON`: complete JSON key of a dedicated Google service account with **Viewer-only** access to the target folder.
-2. `TOKYO_L2_QA_GDRIVE_FOLDER_ID`: folder ID of `tokyo_l2_data` in Google Drive (not the account's entire Drive). Share this folder with the service account's `client_email` as Viewer.
+1. `TOKYO_L2_QA_GDRIVE_SA_JSON`: complete JSON key of a dedicated Google service account with **Viewer-only** (`drive.readonly`) access to the target Drive folder.
+2. `TOKYO_L2_QA_GDRIVE_FOLDER_ID`: folder ID of `tokyo_l2_data` in Google Drive.
+3. `TOKYO_L2_QA_HEALTHCHECKS_URL` *(currently NOT configured in Huhabubu/mm — recommended before enabling scheduled 15m QA)*: dedicated QA Healthchecks ping URL, strictly separate from EC2 collector and archive heartbeat URLs. When absent, the workflow prints a warning naming this missing secret and completes without pinging Healthchecks.
 
-Optional: `TOKYO_L2_QA_HEALTHCHECKS_URL` for dedicated QA heartbeat; don't reuse the EC2 collector or archive heartbeat URL. Never commit credentials, secrets, or production OAuth tokens.
+## Ordering & validation rules
 
-The action builds a temporary `rclone` config with `scope = drive.readonly`, uses it to list manifests and fetch the selected raw partitions, and deletes temporary credentials when the GitHub runner terminates. It writes only to its GitHub QA-state branch. `GITHUB_TOKEN` must have contents write permission for that branch; if branch protection prevents updates, the persistence step fails.
-
-## First verification
-
-1. Merge the checker PR into `feat/tokyo-l2-reliability-fixes`.
-2. Configure service-account Viewer sharing and the two secrets.
-3. Merge the workflow PR into `main`.
-4. Open **Actions → Tokyo L2 incremental hourly QA (3h) → Run workflow**. Use `limit=1` for the first run.
-5. Verify the action reads exactly one raw exchange-hour and writes a JSON report under the state branch. Run again: `attempted=0`, `already_checked>=1`.
-6. Increase the limit to 16 and inspect the first real quality results.
-
-## QA scope and limitations
-
-This check does full Zstd decompression, compressed SHA-256 + size verification, record parsing, timestamp range, within-partition sequence/clock monotonicity, manifest counts, recorded local loss/gap, expected symbol/channel presence, and channel inactivity windows. A low-activity trade feed can be flagged for manual review by the generic 300-second threshold.
-
-**Each hourly report is a per-partition preliminary qualification**, not a certificate that the entire UTC day is continuous. Full-day certification still needs cross-hour sequence/continuity, all 96 expected exchange-hour partitions, 1,440 clock-certified minutes, source-specific exchange sequence integrity, and the existing HBT event-order validation. An hour with zero unexpected-error flags is not proof that the venue published every expected market event.
-
-The workflow does not upload HBT NPZ files or raw market data to GitHub. A runner is capped at 8 GiB *compressed* per individual file as a disk-safety measure; adjust only after measuring available disk. Results contain summary metadata only.
+- **File write order**: `rx_seq` MUST be strictly monotonic inside every file; across windows of the same `boot_id`, bounded cross-window late frames are accounted for without allowing duplicate `rx_seq` or unrecorded gaps.
+- **Receive monotonic clock**: `recv_mono_ns` is checked per `(producer, conn_id, epoch)` within each `boot_id` so multi-endpoint / multi-connection Tokio producers (`binance_public` A/B, `binance_market` A/B, REST snapshots) do not trigger false clock regressions while true per-producer regressions fail closed.
+- **Channel taxonomy**: Shared with live `meta_daemon.py` (`continuous_quote`, `depth`, `event_trade`). Silent event-driven trade channels are routed to `needs_review` rather than falsely assumed healthy from active sibling channels.

@@ -570,7 +570,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
 
 def cmd_archive(args: argparse.Namespace) -> int:
-    from data_coverage import enabled_exchanges
+    from data_coverage import configured_partition_minutes, enabled_exchanges
     from meta_daemon import notify_archive_healthcheck
 
     proxy_url = getattr(args, "proxy_url", None)
@@ -582,10 +582,19 @@ def cmd_archive(args: argparse.Namespace) -> int:
     result: dict[str, Any] | None = None
     try:
         archive_config = getattr(args, "config", None)
-        expected = (
-            set(enabled_exchanges(json.loads(archive_config.read_text(encoding="utf-8"))))
-            if archive_config else None
-        )
+        expected = None
+        partition_minutes = 60
+        seal_wait_seconds = 0.0
+        seal_poll_interval = 1.0
+        if archive_config:
+            cfg_obj = json.loads(archive_config.read_text(encoding="utf-8"))
+            expected = set(enabled_exchanges(cfg_obj))
+            partition_minutes = configured_partition_minutes(cfg_obj)
+            arch_cfg = cfg_obj.get("archive", {})
+            seal_wait_seconds = float(arch_cfg.get("seal_wait_seconds", 0.0))
+            seal_poll_interval = float(arch_cfg.get("seal_poll_interval_seconds", 1.0))
+        if getattr(args, "seal_wait_seconds", None) is not None:
+            seal_wait_seconds = float(args.seal_wait_seconds)
         result = sync_sealed_directory(
             args.dir,
             backend=backend,
@@ -593,6 +602,10 @@ def cmd_archive(args: argparse.Namespace) -> int:
             prune_older_than_hours=args.prune_hours,
             upload_ledger_snapshot=not args.no_snapshot,
             expected_hourly_exchanges=expected,
+            partition_minutes=partition_minutes,
+            expected_run_id=getattr(args, "run_id", None),
+            seal_wait_seconds=seal_wait_seconds,
+            seal_poll_interval_seconds=seal_poll_interval,
         )
     except Exception as exc:
         if not getattr(args, "no_healthchecks", False):
@@ -657,12 +670,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_arc = sub.add_parser("archive", help="Verify sealed partitions and upload to single Google Drive Pro")
     p_arc.add_argument("--dir", type=Path, required=True)
-    p_arc.add_argument("--config", type=Path, help="Require verified partitions for all configured exchanges in the previous UTC hour")
+    p_arc.add_argument("--config", type=Path, help="Require verified partitions for all configured exchanges in the previous UTC window")
     p_arc.add_argument("--verify-remote", action="store_true")
     p_arc.add_argument("--remote", default="gdrive_main:tokyo_l2_data")
     p_arc.add_argument("--prune-hours", type=float, default=None)
     p_arc.add_argument("--no-snapshot", action="store_true", help="Skip uploading consistent SQLite ledger snapshot")
     p_arc.add_argument("--no-healthchecks", action="store_true", help="Skip Healthchecks ping after archive run")
+    p_arc.add_argument("--run-id", default=None, help="Optional collection batch run_id filter")
+    p_arc.add_argument("--seal-wait-seconds", type=float, default=None, help="Override bounded async seal wait")
     p_arc.add_argument("--proxy-url", default=None, help="Optional SOCKS5 proxy URL scoped ONLY to rclone")
     p_arc.add_argument(
         "--proxy-mode",

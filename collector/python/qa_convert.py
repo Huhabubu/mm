@@ -1354,11 +1354,12 @@ def run_qa_convert(
         day_active_gap_start: dict[tuple[str, str], int | None] = defaultdict(lambda: None)
         exchange_stats: dict[str, dict[str, Any]] = {}
 
+        from data_coverage import normalize_manifest_window, record_monotonic_producer_key
+
         for exchange, items in sorted(by_exchange.items()):
             items.sort(
                 key=lambda x: (
-                    x[0]["date_utc"],
-                    x[0]["hour_utc"],
+                    normalize_manifest_window(x[0], fallback_file_name=x[1].name)["planned_start_wall_ns"],
                     x[0].get("start_wall_ns") or 0,
                     str(x[0].get("boot_id") or ""),
                     x[0].get("first_rx_seq") or 0,
@@ -1366,20 +1367,27 @@ def run_qa_convert(
                 )
             )
             prev_boot: str | None = None
-            prev_rx_seq: int | None = None
-            prev_mono_ns: int | None = None
+            prev_file_last_rx_seq: int | None = None
+            prev_file_had_late_frames = False
+            boot_seen_rx_seqs: set[int] = set()
+            producer_prev_mono: dict[tuple[str, str, int], int] = {}
             total_records = 0
 
             for mf, dpath, mpath in items:
-                boot_id = str(mf.get("boot_id", ""))
+                norm_mf = normalize_manifest_window(mf, fallback_file_name=dpath.name)
+                boot_id = norm_mf["boot_id"]
                 records = parse_tsv_zst_records(dpath)
                 recorded_local_loss = 0
                 dropped_frames = 0
                 if boot_id != prev_boot:
                     prev_boot = boot_id
-                    prev_rx_seq = None
-                    prev_mono_ns = None
+                    prev_file_last_rx_seq = None
+                    prev_file_had_late_frames = False
+                    boot_seen_rx_seqs.clear()
+                    producer_prev_mono.clear()
 
+                file_prev_rx_seq: int | None = None
+                file_first_rx_seq: int | None = None
                 for rec in records:
                     if coverage is not None:
                         coverage.observe_record(exchange, rec)
@@ -1389,19 +1397,45 @@ def run_qa_convert(
                     wall_ns = rec["recv_wall_ns"]
                     date_utc = date_utc_from_wall_ns(wall_ns)
 
-                    if prev_rx_seq is not None and rx_seq <= prev_rx_seq:
+                    if file_first_rx_seq is None:
+                        file_first_rx_seq = rx_seq
+                        if (
+                            prev_file_last_rx_seq is not None
+                            and not prev_file_had_late_frames
+                            and rx_seq <= prev_file_last_rx_seq
+                        ):
+                            failed_items.append(
+                                f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={prev_file_last_rx_seq},curr={rx_seq}"
+                            )
+
+                    if file_prev_rx_seq is not None and rx_seq <= file_prev_rx_seq:
                         failed_items.append(
-                            f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={prev_rx_seq},curr={rx_seq}"
+                            f"rx_seq_non_monotonic:{exchange}:{dpath.name}:prev={file_prev_rx_seq},curr={rx_seq}"
                         )
-                    if prev_mono_ns is not None and mono_ns < prev_mono_ns:
+                    if rx_seq in boot_seen_rx_seqs:
                         failed_items.append(
-                            f"recv_mono_ns_regressed:{exchange}:{dpath.name}:prev={prev_mono_ns},curr={mono_ns}"
+                            f"rx_seq_duplicate_in_boot:{exchange}:{dpath.name}:boot={boot_id},rx_seq={rx_seq}"
                         )
-                    prev_rx_seq = rx_seq
-                    prev_mono_ns = mono_ns
+                    boot_seen_rx_seqs.add(rx_seq)
+                    file_prev_rx_seq = rx_seq
+
+                    payload_obj: Any = None
+                    try:
+                        payload_obj = json.loads(rec["payload"])
+                    except Exception:
+                        payload_obj = None
+                    prod_key = record_monotonic_producer_key(
+                        exchange, rec["kind"], str(rec["conn_id"]), int(rec["epoch"]), payload_obj
+                    )
+                    prev_prod_mono = producer_prev_mono.get(prod_key)
+                    if prev_prod_mono is not None and mono_ns < prev_prod_mono:
+                        failed_items.append(
+                            f"recv_mono_ns_regressed:{exchange}:{dpath.name}:producer={prod_key[0]}:{prod_key[1]}:{prod_key[2]}:prev={prev_prod_mono},curr={mono_ns}"
+                        )
+                    producer_prev_mono[prod_key] = mono_ns
 
                     if rec["kind"] == "META":
-                        meta_obj = json.loads(rec["payload"])
+                        meta_obj = payload_obj if isinstance(payload_obj, dict) else json.loads(rec["payload"])
                         ev = meta_obj.get("event", "")
                         if ev == "GAP_START":
                             day_active_gap_start[(exchange, date_utc)] = wall_ns
@@ -1434,6 +1468,14 @@ def run_qa_convert(
                         _ingest_bybit_record(rec, date_utc, buffers)
                     elif exchange == "bitget_v3":
                         _ingest_bitget_record(rec, date_utc, buffers)
+
+                if file_prev_rx_seq is not None:
+                    prev_file_last_rx_seq = (
+                        max(prev_file_last_rx_seq, file_prev_rx_seq)
+                        if prev_file_last_rx_seq is not None
+                        else file_prev_rx_seq
+                    )
+                prev_file_had_late_frames = norm_mf["late_frames_accepted"] > 0
 
                 manifest_local_loss = int(mf.get("local_loss_lines") or 0)
                 if recorded_local_loss or manifest_local_loss:

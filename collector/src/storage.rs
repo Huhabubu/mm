@@ -1,3 +1,4 @@
+use crate::config::CollectorConfig;
 use crate::types::{CanonicalRecord, ConnId, ExchangeId, RecordKind};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,11 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+const NS_PER_SEC: i64 = 1_000_000_000;
+const NS_PER_MIN: i64 = 60 * NS_PER_SEC;
+const STARTUP_STUB_GRACE_NS: i64 = 5 * NS_PER_SEC;
+const INCOMPLETE_TAIL_THRESHOLD_NS: i64 = 5 * NS_PER_SEC;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HourPartitionKey {
     pub date: String,     // YYYY-MM-DD
@@ -18,8 +24,8 @@ pub struct HourPartitionKey {
 
 impl HourPartitionKey {
     pub fn from_wall_ns(wall_ns: i64) -> Self {
-        let secs = wall_ns.div_euclid(1_000_000_000);
-        let nsecs = wall_ns.rem_euclid(1_000_000_000) as u32;
+        let secs = wall_ns.div_euclid(NS_PER_SEC);
+        let nsecs = wall_ns.rem_euclid(NS_PER_SEC) as u32;
         let dt = DateTime::<Utc>::from_timestamp(secs, nsecs)
             .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
         Self {
@@ -30,12 +36,92 @@ impl HourPartitionKey {
     }
 }
 
+/// UTC-aligned half-open `[planned_start_wall_ns, planned_end_wall_ns)` partition window key
+/// supporting 5, 15, 30, and 60 minute windows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartitionWindowKey {
+    pub partition_minutes: u32,
+    pub planned_start_wall_ns: i64,
+    pub planned_end_wall_ns: i64,
+    pub date: String,      // YYYY-MM-DD
+    pub yyyymmdd: String,  // YYYYMMDD
+    pub hour: String,      // HH (00..23)
+    pub minute: String,    // MM (00, 15, 30, 45, ...)
+    pub window_id: String, // YYYY-MM-DDTHH:MMZ
+}
+
+impl PartitionWindowKey {
+    pub fn from_wall_ns(wall_ns: i64, partition_minutes: u32) -> Self {
+        let mins = match partition_minutes {
+            5 | 15 | 30 | 60 => partition_minutes,
+            _ => 60,
+        };
+        let window_ns = (mins as i64) * NS_PER_MIN;
+        let planned_start_wall_ns = wall_ns.div_euclid(window_ns) * window_ns;
+        let planned_end_wall_ns = planned_start_wall_ns.saturating_add(window_ns);
+        let secs = planned_start_wall_ns.div_euclid(NS_PER_SEC);
+        let dt = DateTime::<Utc>::from_timestamp(secs, 0)
+            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let date = format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day());
+        let yyyymmdd = format!("{:04}{:02}{:02}", dt.year(), dt.month(), dt.day());
+        let hour = format!("{:02}", dt.hour());
+        let minute = format!("{:02}", dt.minute());
+        let window_id = format!("{}T{}:{}Z", date, hour, minute);
+        Self {
+            partition_minutes: mins,
+            planned_start_wall_ns,
+            planned_end_wall_ns,
+            date,
+            yyyymmdd,
+            hour,
+            minute,
+            window_id,
+        }
+    }
+}
+
+impl Ord for PartitionWindowKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.planned_start_wall_ns
+            .cmp(&other.planned_start_wall_ns)
+            .then_with(|| self.partition_minutes.cmp(&other.partition_minutes))
+    }
+}
+
+impl PartialOrd for PartitionWindowKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn default_manifest_partition_minutes() -> u32 {
+    60
+}
+
+fn default_minute_utc() -> String {
+    "00".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartitionManifest {
     pub schema_version: u32,
     pub exchange: String,
     pub date_utc: String,
     pub hour_utc: String,
+    #[serde(default = "default_minute_utc")]
+    pub minute_utc: String,
+    #[serde(default = "default_manifest_partition_minutes")]
+    pub partition_minutes: u32,
+    #[serde(default)]
+    pub window_id: String,
+    #[serde(default)]
+    pub planned_start_wall_ns: Option<i64>,
+    #[serde(default)]
+    pub planned_end_wall_ns: Option<i64>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub segment_id: String,
     pub boot_id: String,
     pub file_name: String,
     pub bytes: u64,
@@ -51,6 +137,20 @@ pub struct PartitionManifest {
     pub local_loss_lines: u64,
     pub gap_start_lines: u64,
     pub switch_lines: u64,
+    #[serde(default)]
+    pub is_startup_stub: bool,
+    #[serde(default)]
+    pub settled_by_timer: bool,
+    #[serde(default)]
+    pub coverage_incomplete: bool,
+    #[serde(default)]
+    pub late_frames_accepted: u64,
+    #[serde(default)]
+    pub late_frames_rejected: u64,
+    #[serde(default)]
+    pub head_gap_ms: Option<i64>,
+    #[serde(default)]
+    pub tail_gap_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +158,68 @@ pub struct SealedPartition {
     pub data_path: PathBuf,
     pub manifest_path: PathBuf,
     pub manifest: PartitionManifest,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriterOptions {
+    pub partition_minutes: u32,
+    pub run_id: Option<String>,
+    pub allow_segmented_restart: bool,
+    pub late_frame_grace_ns: i64,
+    pub process_start_wall_ns: Option<i64>,
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        Self {
+            partition_minutes: 60,
+            run_id: None,
+            allow_segmented_restart: false,
+            late_frame_grace_ns: 0,
+            process_start_wall_ns: None,
+        }
+    }
+}
+
+impl WriterOptions {
+    pub fn from_config(
+        cfg: &CollectorConfig,
+        run_id: Option<String>,
+        allow_segmented_restart: bool,
+        process_start_wall_ns: Option<i64>,
+    ) -> Self {
+        Self {
+            partition_minutes: cfg.deployment.partition_minutes,
+            run_id,
+            allow_segmented_restart,
+            late_frame_grace_ns: (cfg.deployment.late_frame_grace_ms as i64)
+                .saturating_mul(1_000_000),
+            process_start_wall_ns,
+        }
+    }
+}
+
+fn sanitize_tag(raw: &str, max_len: usize) -> String {
+    let mut out = String::with_capacity(raw.len().min(max_len));
+    let mut prev_underscore = false;
+    for ch in raw.chars() {
+        if out.len() >= max_len {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            out.push(ch);
+            prev_underscore = false;
+        } else if !prev_underscore && !out.is_empty() {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "seg".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// Format a CanonicalRecord into a lossless single TSV-Raw line (no Base64).
@@ -128,14 +290,16 @@ pub fn decode_tsv_line(line: &str) -> Result<(CanonicalRecord, String), String> 
     ))
 }
 
-struct OpenHour {
-    key: HourPartitionKey,
+struct OpenPartition {
+    key: PartitionWindowKey,
+    segment_id: String,
     partial_path: PathBuf,
     final_path: PathBuf,
     manifest_path: PathBuf,
     encoder: zstd::stream::write::Encoder<'static, BufWriter<File>>,
     start_wall_ns: Option<i64>,
     end_wall_ns: Option<i64>,
+    max_mono_ns: u64,
     first_rx_seq: Option<u64>,
     last_rx_seq: Option<u64>,
     data_lines: u64,
@@ -144,6 +308,10 @@ struct OpenHour {
     local_loss_lines: u64,
     gap_start_lines: u64,
     switch_lines: u64,
+    is_startup_stub: bool,
+    settled_by_timer: bool,
+    late_frames_accepted: u64,
+    late_frames_rejected: u64,
 }
 
 struct BackgroundSeal {
@@ -151,14 +319,19 @@ struct BackgroundSeal {
     task: JoinHandle<Result<SealedPartition, String>>,
 }
 
-/// Seamless UTC-hourly TSV-Raw Zstd writer with atomic .partial -> verify -> rename + manifest.
+/// Seamless UTC-aligned TSV-Raw Zstd writer (5/15/30/60m) with bounded cross-window late-frame
+/// handling, quiet-exchange boundary settlement, restart-safe immutable segments, and atomic
+/// `.partial` -> verify -> rename + manifest sealing.
 pub struct HourlyTsvZstWriter {
     data_root: PathBuf,
     exchange: ExchangeId,
     boot_id: String,
     zstd_level: i32,
+    options: WriterOptions,
+    opened_window_count: u64,
     next_rx_seq: u64,
-    current: Option<OpenHour>,
+    current: Option<OpenPartition>,
+    draining: Option<OpenPartition>,
     sealed: Vec<SealedPartition>,
     seal_limit: Option<Arc<Semaphore>>,
     background_seals: Vec<BackgroundSeal>,
@@ -166,14 +339,36 @@ pub struct HourlyTsvZstWriter {
 }
 
 impl HourlyTsvZstWriter {
+    /// Legacy 60-minute single-file constructor (preserves exact legacy naming & overwrite refusal).
     pub fn new(data_root: PathBuf, exchange: ExchangeId, boot_id: String, zstd_level: i32) -> Self {
+        Self::with_options(
+            data_root,
+            exchange,
+            boot_id,
+            zstd_level,
+            WriterOptions::default(),
+        )
+    }
+
+    /// Configurable partition writer supporting 5/15/30/60m windows, bounded late frames,
+    /// quiet-exchange settlement, and restart-safe segment naming.
+    pub fn with_options(
+        data_root: PathBuf,
+        exchange: ExchangeId,
+        boot_id: String,
+        zstd_level: i32,
+        options: WriterOptions,
+    ) -> Self {
         Self {
             data_root,
             exchange,
             boot_id,
             zstd_level,
+            options,
+            opened_window_count: 0,
             next_rx_seq: 0,
             current: None,
+            draining: None,
             sealed: Vec::new(),
             seal_limit: None,
             background_seals: Vec::new(),
@@ -186,7 +381,15 @@ impl HourlyTsvZstWriter {
     }
 
     pub fn has_open_partition(&self) -> bool {
-        self.current.is_some()
+        self.current.is_some() || self.draining.is_some()
+    }
+
+    pub fn has_draining_partition(&self) -> bool {
+        self.draining.is_some()
+    }
+
+    pub fn partition_minutes(&self) -> u32 {
+        self.options.partition_minutes
     }
 
     pub fn enable_background_sealing(&mut self, limit: Arc<Semaphore>) {
@@ -201,9 +404,12 @@ impl HourlyTsvZstWriter {
         for mut seal in self.background_seals.drain(..) {
             match (&mut seal.task).now_or_never() {
                 Some(result) => {
-                    let result = result.map_err(|e| format!("seal task failed: {e}")).and_then(|r| r);
+                    let result = result
+                        .map_err(|e| format!("seal task failed: {e}"))
+                        .and_then(|r| r);
                     if result.is_err() {
-                        self.pending_write_loss = self.pending_write_loss.saturating_add(seal.records);
+                        self.pending_write_loss =
+                            self.pending_write_loss.saturating_add(seal.records);
                     }
                     completed.push(result);
                 }
@@ -215,7 +421,10 @@ impl HourlyTsvZstWriter {
     }
 
     pub fn take_background_seals(&mut self) -> Vec<JoinHandle<Result<SealedPartition, String>>> {
-        self.background_seals.drain(..).map(|seal| seal.task).collect()
+        self.background_seals
+            .drain(..)
+            .map(|seal| seal.task)
+            .collect()
     }
 
     pub fn note_write_loss(&mut self) {
@@ -226,40 +435,166 @@ impl HourlyTsvZstWriter {
         self.pending_write_loss
     }
 
-    pub fn write_record(&mut self, rec: &CanonicalRecord) -> Result<Option<SealedPartition>, String> {
-        let key = HourPartitionKey::from_wall_ns(rec.recv_wall_ns);
-        let mut just_sealed = None;
-
-        let need_rotate = match &self.current {
-            Some(open) => open.key != key,
-            None => false,
-        };
-        if need_rotate {
-            if self.seal_limit.is_some() && self.current.as_ref().is_some_and(|open| key < open.key) {
-                return Err("late frame for an earlier UTC hour".into());
+    fn dispatch_seal(&mut self, open: OpenPartition) -> Result<Option<SealedPartition>, String> {
+        if let Some(limit) = self.seal_limit.clone() {
+            if self.background_seals.len() >= 8 {
+                return Err("partition seal backlog exceeded eight partitions".into());
             }
-            if let Some(limit) = self.seal_limit.clone() {
-                if self.background_seals.len() >= 4 {
-                    return Err("hourly seal backlog exceeded four partitions".into());
+            let records = open.data_lines + open.data_escaped_lines + open.meta_lines;
+            let exchange = self.exchange;
+            let boot_id = self.boot_id.clone();
+            let run_id = self.options.run_id.clone();
+            let task = tokio::spawn(async move {
+                let _permit = limit.acquire_owned().await.map_err(|e| e.to_string())?;
+                tokio::task::spawn_blocking(move || {
+                    Self::seal_partition(open, exchange, &boot_id, run_id.as_deref())
+                })
+                .await
+                .map_err(|e| format!("blocking seal failed: {e}"))?
+            });
+            self.background_seals.push(BackgroundSeal { records, task });
+            Ok(None)
+        } else {
+            let sealed =
+                Self::seal_partition(open, self.exchange, &self.boot_id, self.options.run_id.as_deref())?;
+            self.sealed.push(sealed.clone());
+            Ok(Some(sealed))
+        }
+    }
+
+    /// Settle expired draining windows (past late-frame grace) and quiet-exchange active windows
+    /// whose boundary + late-frame grace has elapsed with no new post-boundary frames.
+    pub fn settle_expired_windows(
+        &mut self,
+        now_wall_ns: i64,
+    ) -> Result<Vec<SealedPartition>, String> {
+        let grace = self.options.late_frame_grace_ns;
+        let mut sealed_now = Vec::new();
+
+        let drain_expired = self
+            .draining
+            .as_ref()
+            .is_some_and(|d| now_wall_ns >= d.key.planned_end_wall_ns.saturating_add(grace));
+        if drain_expired {
+            if let Some(open) = self.draining.take() {
+                if let Some(s) = self.dispatch_seal(open)? {
+                    sealed_now.push(s);
                 }
-                let open = self.current.take().expect("rotation requires an open partition");
-                let records = open.data_lines + open.data_escaped_lines + open.meta_lines;
-                let exchange = self.exchange;
-                let boot_id = self.boot_id.clone();
-                let task = tokio::spawn(async move {
-                    let _permit = limit.acquire_owned().await.map_err(|e| e.to_string())?;
-                    tokio::task::spawn_blocking(move || Self::seal_partition(open, exchange, &boot_id))
-                        .await.map_err(|e| format!("blocking seal failed: {e}"))?
-                });
-                self.background_seals.push(BackgroundSeal { records, task });
-            } else {
-                just_sealed = self.seal_current()?;
             }
         }
-        if self.current.is_none() {
-            self.open_hour(key)?;
+
+        let current_expired = self
+            .current
+            .as_ref()
+            .is_some_and(|c| now_wall_ns >= c.key.planned_end_wall_ns.saturating_add(grace));
+        if current_expired {
+            if let Some(mut open) = self.current.take() {
+                open.settled_by_timer = true;
+                if let Some(s) = self.dispatch_seal(open)? {
+                    sealed_now.push(s);
+                }
+            }
         }
 
+        Ok(sealed_now)
+    }
+
+    pub fn write_record(&mut self, rec: &CanonicalRecord) -> Result<Option<SealedPartition>, String> {
+        let key = PartitionWindowKey::from_wall_ns(rec.recv_wall_ns, self.options.partition_minutes);
+        let grace = self.options.late_frame_grace_ns;
+        let mut just_sealed: Option<SealedPartition> = None;
+
+        // First flush any draining previous window whose bounded grace period has elapsed.
+        if self
+            .draining
+            .as_ref()
+            .is_some_and(|d| rec.recv_wall_ns >= d.key.planned_end_wall_ns.saturating_add(grace))
+        {
+            if let Some(old_drain) = self.draining.take() {
+                if let Some(s) = self.dispatch_seal(old_drain)? {
+                    just_sealed = Some(s);
+                }
+            }
+        }
+
+        match self.current.as_ref().map(|c| key.cmp(&c.key)) {
+            None => {
+                self.open_window(key)?;
+                self.flush_pending_loss_into_current(rec)?;
+                self.append_to_current(rec)?;
+                return Ok(just_sealed);
+            }
+            Some(std::cmp::Ordering::Equal) => {
+                self.flush_pending_loss_into_current(rec)?;
+                self.append_to_current(rec)?;
+                return Ok(just_sealed);
+            }
+            Some(std::cmp::Ordering::Greater) => {
+                // Rollover into newer UTC window: keep previous window open in `draining` while
+                // within bounded grace, otherwise hand off to background/sync seal immediately.
+                if let Some(prev_drain) = self.draining.take() {
+                    if let Some(s) = self.dispatch_seal(prev_drain)? {
+                        just_sealed = Some(s);
+                    }
+                }
+                let prev_current = self.current.take().expect("current must exist on rollover");
+                if grace > 0
+                    && rec.recv_wall_ns < prev_current.key.planned_end_wall_ns.saturating_add(grace)
+                {
+                    self.draining = Some(prev_current);
+                } else if let Some(s) = self.dispatch_seal(prev_current)? {
+                    just_sealed = Some(s);
+                }
+                self.open_window(key)?;
+                self.flush_pending_loss_into_current(rec)?;
+                self.append_to_current(rec)?;
+                return Ok(just_sealed);
+            }
+            Some(std::cmp::Ordering::Less) => {
+                // Late frame belonging to an earlier UTC window.
+                let fits_draining = self.draining.as_ref().is_some_and(|d| d.key == key);
+                if fits_draining {
+                    self.append_to_draining(rec)?;
+                    return Ok(just_sealed);
+                }
+                if grace == 0 && self.seal_limit.is_some() {
+                    return Err("late frame for an earlier UTC window".into());
+                }
+                // Bounded late-frame rejection: record explicit auditable META inside `current`
+                // without violating `current`'s `[planned_start, planned_end)` timestamp invariant.
+                let (cur_window_id, meta_wall_ns, meta_mono_ns) = {
+                    let cur = self.current.as_mut().expect("current must exist");
+                    cur.late_frames_rejected = cur.late_frames_rejected.saturating_add(1);
+                    let w_ns = cur
+                        .end_wall_ns
+                        .unwrap_or(cur.key.planned_start_wall_ns)
+                        .clamp(cur.key.planned_start_wall_ns, cur.key.planned_end_wall_ns - 1);
+                    (cur.key.window_id.clone(), w_ns, cur.max_mono_ns.max(rec.recv_mono_ns))
+                };
+                let rejected_meta = CanonicalRecord {
+                    recv_wall_ns: meta_wall_ns,
+                    recv_mono_ns: meta_mono_ns,
+                    conn_id: rec.conn_id,
+                    epoch: rec.epoch,
+                    rx_seq: 0,
+                    kind: RecordKind::Meta,
+                    payload: serde_json::json!({
+                        "event": "LATE_FRAME_REJECTED",
+                        "orig_recv_wall_ns": rec.recv_wall_ns,
+                        "orig_recv_mono_ns": rec.recv_mono_ns,
+                        "target_window_id": key.window_id,
+                        "current_window_id": cur_window_id,
+                        "grace_ms": grace / 1_000_000,
+                    })
+                    .to_string(),
+                };
+                self.append_to_current(&rejected_meta)?;
+                return Ok(just_sealed);
+            }
+        }
+    }
+
+    fn flush_pending_loss_into_current(&mut self, rec: &CanonicalRecord) -> Result<(), String> {
         if self.pending_write_loss > 0 {
             let marker = CanonicalRecord {
                 kind: RecordKind::Meta,
@@ -267,35 +602,47 @@ impl HourlyTsvZstWriter {
                     "event": "LOCAL_LOSS",
                     "dropped_frames": self.pending_write_loss,
                     "reason": "disk_write_or_seal_failed"
-                }).to_string(),
+                })
+                .to_string(),
                 ..rec.clone()
             };
-            self.append_record(&marker)?;
+            self.append_to_current(&marker)?;
             self.pending_write_loss = 0;
         }
-        self.append_record(rec)?;
-        Ok(just_sealed)
+        Ok(())
     }
 
-    fn append_record(&mut self, rec: &CanonicalRecord) -> Result<(), String> {
-        self.next_rx_seq += 1;
+    fn append_to_open(
+        next_rx_seq: &mut u64,
+        open: &mut OpenPartition,
+        rec: &CanonicalRecord,
+        is_late_accepted: bool,
+    ) -> Result<(), String> {
+        *next_rx_seq += 1;
         let mut disk_rec = rec.clone();
-        disk_rec.rx_seq = self.next_rx_seq;
+        disk_rec.rx_seq = *next_rx_seq;
 
-        let open = self.current.as_mut().expect("current hour must be open");
         let line = encode_tsv_line(&disk_rec);
         open.encoder
             .write_all(line.as_bytes())
             .map_err(|e| format!("zstd write failed: {}", e))?;
 
-        if open.start_wall_ns.is_none() {
-            open.start_wall_ns = Some(disk_rec.recv_wall_ns);
-        }
-        open.end_wall_ns = Some(disk_rec.recv_wall_ns);
+        open.start_wall_ns = Some(
+            open.start_wall_ns
+                .map_or(disk_rec.recv_wall_ns, |prev| prev.min(disk_rec.recv_wall_ns)),
+        );
+        open.end_wall_ns = Some(
+            open.end_wall_ns
+                .map_or(disk_rec.recv_wall_ns, |prev| prev.max(disk_rec.recv_wall_ns)),
+        );
+        open.max_mono_ns = open.max_mono_ns.max(disk_rec.recv_mono_ns);
         if open.first_rx_seq.is_none() {
             open.first_rx_seq = Some(disk_rec.rx_seq);
         }
         open.last_rx_seq = Some(disk_rec.rx_seq);
+        if is_late_accepted {
+            open.late_frames_accepted = open.late_frames_accepted.saturating_add(1);
+        }
 
         match rec.kind {
             RecordKind::Data => open.data_lines += 1,
@@ -317,19 +664,78 @@ impl HourlyTsvZstWriter {
         Ok(())
     }
 
+    fn append_to_current(&mut self, rec: &CanonicalRecord) -> Result<(), String> {
+        let open = self.current.as_mut().expect("current partition must be open");
+        Self::append_to_open(&mut self.next_rx_seq, open, rec, false)
+    }
+
+    fn append_to_draining(&mut self, rec: &CanonicalRecord) -> Result<(), String> {
+        let open = self
+            .draining
+            .as_mut()
+            .expect("draining partition must be open");
+        Self::append_to_open(&mut self.next_rx_seq, open, rec, true)
+    }
+
+    /// Flush, fsync, verify zstd integrity, hash SHA-256, atomically rename, and emit manifest
+    /// for all open partitions (`draining` first, then `current`).
+    pub fn seal_all(&mut self) -> Result<Vec<SealedPartition>, String> {
+        let mut out = Vec::new();
+        if let Some(drain) = self.draining.take() {
+            let s = Self::seal_partition(
+                drain,
+                self.exchange,
+                &self.boot_id,
+                self.options.run_id.as_deref(),
+            )?;
+            self.sealed.push(s.clone());
+            out.push(s);
+        }
+        if let Some(cur) = self.current.take() {
+            let s = Self::seal_partition(
+                cur,
+                self.exchange,
+                &self.boot_id,
+                self.options.run_id.as_deref(),
+            )?;
+            self.sealed.push(s.clone());
+            out.push(s);
+        }
+        Ok(out)
+    }
+
     /// Flush, fsync, verify zstd integrity, hash SHA-256, atomically rename, and emit manifest.
     /// On any failure, leaves the `.partial` file untouched (never promotes corrupt/unverified data).
     pub fn seal_current(&mut self) -> Result<Option<SealedPartition>, String> {
+        if let Some(drain) = self.draining.take() {
+            let s = Self::seal_partition(
+                drain,
+                self.exchange,
+                &self.boot_id,
+                self.options.run_id.as_deref(),
+            )?;
+            self.sealed.push(s);
+        }
         let Some(open) = self.current.take() else {
             return Ok(None);
         };
 
-        let sealed = Self::seal_partition(open, self.exchange, &self.boot_id)?;
+        let sealed = Self::seal_partition(
+            open,
+            self.exchange,
+            &self.boot_id,
+            self.options.run_id.as_deref(),
+        )?;
         self.sealed.push(sealed.clone());
         Ok(Some(sealed))
     }
 
-    fn seal_partition(open: OpenHour, exchange: ExchangeId, boot_id: &str) -> Result<SealedPartition, String> {
+    fn seal_partition(
+        open: OpenPartition,
+        exchange: ExchangeId,
+        boot_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<SealedPartition, String> {
         let mut buf_writer = open
             .encoder
             .finish()
@@ -370,11 +776,45 @@ impl HourlyTsvZstWriter {
             .unwrap()
             .to_string_lossy()
             .to_string();
+
+        let head_gap_ms = open.start_wall_ns.map(|s| {
+            s.saturating_sub(open.key.planned_start_wall_ns)
+                .max(0)
+                / 1_000_000
+        });
+        let tail_gap_ms = open.end_wall_ns.map(|e| {
+            open.key
+                .planned_end_wall_ns
+                .saturating_sub(e)
+                .max(0)
+                / 1_000_000
+        });
+        let is_startup_stub = open.is_startup_stub
+            || (open.start_wall_ns.is_some_and(|s| {
+                s > open
+                    .key
+                    .planned_start_wall_ns
+                    .saturating_add(STARTUP_STUB_GRACE_NS)
+            }) && open.is_startup_stub);
+        let tail_incomplete = open.settled_by_timer
+            && open.end_wall_ns.map_or(true, |e| {
+                open.key.planned_end_wall_ns.saturating_sub(e) > INCOMPLETE_TAIL_THRESHOLD_NS
+            });
+        let zero_market_data = open.data_lines + open.data_escaped_lines == 0;
+        let coverage_incomplete = is_startup_stub || tail_incomplete || zero_market_data;
+
         let manifest = PartitionManifest {
-            schema_version: 1,
+            schema_version: 2,
             exchange: exchange.as_dir_name().to_string(),
             date_utc: open.key.date.clone(),
             hour_utc: open.key.hour.clone(),
+            minute_utc: open.key.minute.clone(),
+            partition_minutes: open.key.partition_minutes,
+            window_id: open.key.window_id.clone(),
+            planned_start_wall_ns: Some(open.key.planned_start_wall_ns),
+            planned_end_wall_ns: Some(open.key.planned_end_wall_ns),
+            run_id: run_id.map(str::to_string),
+            segment_id: open.segment_id,
             boot_id: boot_id.to_string(),
             file_name,
             bytes,
@@ -390,6 +830,13 @@ impl HourlyTsvZstWriter {
             local_loss_lines: open.local_loss_lines,
             gap_start_lines: open.gap_start_lines,
             switch_lines: open.switch_lines,
+            is_startup_stub,
+            settled_by_timer: open.settled_by_timer,
+            coverage_incomplete,
+            late_frames_accepted: open.late_frames_accepted,
+            late_frames_rejected: open.late_frames_rejected,
+            head_gap_ms,
+            tail_gap_ms,
         };
 
         let manifest_tmp = open.manifest_path.with_extension("json.partial");
@@ -415,7 +862,70 @@ impl HourlyTsvZstWriter {
         })
     }
 
-    fn open_hour(&mut self, key: HourPartitionKey) -> Result<(), String> {
+    fn resolve_segment_paths(
+        &self,
+        dir: &Path,
+        key: &PartitionWindowKey,
+    ) -> Result<(String, PathBuf, PathBuf, PathBuf), String> {
+        let ex_name = self.exchange.as_dir_name();
+
+        if !self.options.allow_segmented_restart && key.partition_minutes == 60 {
+            let stem = format!("{}_{}_{}", ex_name, key.yyyymmdd, key.hour);
+            let final_path = dir.join(format!("{}.tsv.zst", stem));
+            let partial_path = dir.join(format!("{}.tsv.zst.partial", stem));
+            let manifest_path = dir.join(format!("{}.manifest.json", stem));
+
+            if final_path.exists() {
+                return Err(format!(
+                    "Refusing to overwrite existing immutable sealed partition {}",
+                    final_path.display()
+                ));
+            }
+            if partial_path.exists() {
+                return Err(format!(
+                    "Refusing to overwrite existing unsealed partial file {} (preserve/quarantine before restarting in the same UTC hour)",
+                    partial_path.display()
+                ));
+            }
+            return Ok((stem, final_path, partial_path, manifest_path));
+        }
+
+        let mut boot_hasher = Sha256::new();
+        boot_hasher.update(self.boot_id.as_bytes());
+        let boot_hex = format!("{:x}", boot_hasher.finalize());
+        let boot_prefix = sanitize_tag(self.options.run_id.as_deref().unwrap_or(&self.boot_id), 16);
+        let boot_tag = format!("{}_{}", boot_prefix, &boot_hex[..8]);
+        let base_stem = if key.partition_minutes == 60 {
+            format!("{}_{}_{}_{}", ex_name, key.yyyymmdd, key.hour, boot_tag)
+        } else {
+            format!(
+                "{}_{}_{}{}_p{}m_{}",
+                ex_name, key.yyyymmdd, key.hour, key.minute, key.partition_minutes, boot_tag
+            )
+        };
+
+        for seg_idx in 1..=999u32 {
+            let stem = if seg_idx == 1 {
+                base_stem.clone()
+            } else {
+                format!("{}_s{}", base_stem, seg_idx)
+            };
+            let final_path = dir.join(format!("{}.tsv.zst", stem));
+            let partial_path = dir.join(format!("{}.tsv.zst.partial", stem));
+            let manifest_path = dir.join(format!("{}.manifest.json", stem));
+            if !final_path.exists() && !partial_path.exists() && !manifest_path.exists() {
+                return Ok((stem, final_path, partial_path, manifest_path));
+            }
+        }
+
+        Err(format!(
+            "Exhausted immutable segment slots for {} in {}",
+            base_stem,
+            dir.display()
+        ))
+    }
+
+    fn open_window(&mut self, key: PartitionWindowKey) -> Result<(), String> {
         let dir = self
             .data_root
             .join("raw")
@@ -424,29 +934,8 @@ impl HourlyTsvZstWriter {
         fs::create_dir_all(&dir)
             .map_err(|e| format!("create_dir_all {} failed: {}", dir.display(), e))?;
 
-        let stem = format!(
-            "{}_{}_{}",
-            self.exchange.as_dir_name(),
-            key.yyyymmdd,
-            key.hour
-        );
-        let final_path = dir.join(format!("{}.tsv.zst", stem));
-        let partial_path = dir.join(format!("{}.tsv.zst.partial", stem));
-        let manifest_path = dir.join(format!("{}.manifest.json", stem));
-
-        if final_path.exists() {
-            return Err(format!(
-                "Refusing to overwrite existing immutable sealed partition {}",
-                final_path.display()
-            ));
-        }
-
-        if partial_path.exists() {
-            return Err(format!(
-                "Refusing to overwrite existing unsealed partial file {} (preserve/quarantine before restarting in the same UTC hour)",
-                partial_path.display()
-            ));
-        }
+        let (segment_id, final_path, partial_path, manifest_path) =
+            self.resolve_segment_paths(&dir, &key)?;
 
         let file = fs::OpenOptions::new()
             .write(true)
@@ -456,14 +945,23 @@ impl HourlyTsvZstWriter {
         let encoder = zstd::stream::write::Encoder::new(BufWriter::new(file), self.zstd_level)
             .map_err(|e| format!("zstd encoder init failed: {}", e))?;
 
-        self.current = Some(OpenHour {
+        let is_first_window = self.opened_window_count == 0;
+        self.opened_window_count = self.opened_window_count.saturating_add(1);
+        let is_startup_stub = is_first_window
+            && self.options.process_start_wall_ns.is_some_and(|start_ns| {
+                start_ns > key.planned_start_wall_ns.saturating_add(STARTUP_STUB_GRACE_NS)
+            });
+
+        self.current = Some(OpenPartition {
             key,
+            segment_id,
             partial_path,
             final_path,
             manifest_path,
             encoder,
             start_wall_ns: None,
             end_wall_ns: None,
+            max_mono_ns: 0,
             first_rx_seq: None,
             last_rx_seq: None,
             data_lines: 0,
@@ -472,6 +970,10 @@ impl HourlyTsvZstWriter {
             local_loss_lines: 0,
             gap_start_lines: 0,
             switch_lines: 0,
+            is_startup_stub,
+            settled_by_timer: false,
+            late_frames_accepted: 0,
+            late_frames_rejected: 0,
         });
         Ok(())
     }
@@ -515,8 +1017,7 @@ pub fn verify_zstd_and_sha256(path: &Path) -> Result<(u64, String), String> {
 
 /// Read and decode all records from a sealed `.tsv.zst` file (for tests & verification).
 pub fn read_tsv_zst_records(path: &Path) -> Result<Vec<(CanonicalRecord, String)>, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("open {} failed: {}", path.display(), e))?;
+    let file = File::open(path).map_err(|e| format!("open {} failed: {}", path.display(), e))?;
     let decoder = zstd::stream::read::Decoder::new(BufReader::new(file))
         .map_err(|e| format!("zstd decoder failed: {}", e))?;
     let reader = BufReader::new(decoder);
@@ -538,12 +1039,22 @@ mod tests {
     #[tokio::test]
     async fn rollover_accepts_new_hour_while_previous_seal_is_waiting() {
         let root = tempfile::tempdir().unwrap();
-        let mut writer = HourlyTsvZstWriter::new(root.path().into(), ExchangeId::GateFutures, "test".into(), 3);
+        let mut writer = HourlyTsvZstWriter::new(
+            root.path().into(),
+            ExchangeId::GateFutures,
+            "test".into(),
+            3,
+        );
         let limit = Arc::new(Semaphore::new(0));
         writer.enable_background_sealing(Arc::clone(&limit));
         let mut record = CanonicalRecord {
-            recv_wall_ns: 0, recv_mono_ns: 0, conn_id: ConnId::A, epoch: 1, rx_seq: 0,
-            kind: RecordKind::Data, payload: "{}".into(),
+            recv_wall_ns: 0,
+            recv_mono_ns: 0,
+            conn_id: ConnId::A,
+            epoch: 1,
+            rx_seq: 0,
+            kind: RecordKind::Data,
+            payload: "{}".into(),
         };
         writer.write_record(&record).unwrap();
         record.recv_wall_ns = 3_600_000_000_000;
@@ -559,5 +1070,109 @@ mod tests {
         let current = writer.seal_current().unwrap().unwrap();
         assert_eq!(current.manifest.data_lines, 2);
         assert_eq!(current.manifest.local_loss_lines, 1);
+    }
+
+    #[test]
+    fn fifteen_minute_bounded_late_frame_quiet_settlement_midnight_and_same_window_restart() {
+        let root = tempfile::tempdir().unwrap();
+        // 2026-11-21T23:45:00Z
+        let w0_start = 1_795_304_700_000_000_000i64;
+        let w1_start = w0_start + 15 * NS_PER_MIN; // 2026-11-22T00:00:00Z (UTC midnight!)
+
+        let opts = WriterOptions {
+            partition_minutes: 15,
+            run_id: Some("trial_batch_1".to_string()),
+            allow_segmented_restart: true,
+            late_frame_grace_ns: 2 * NS_PER_SEC,
+            process_start_wall_ns: Some(w0_start + 60 * NS_PER_SEC), // started 1m into w0 -> startup stub!
+        };
+        let mut w = HourlyTsvZstWriter::with_options(
+            root.path().into(),
+            ExchangeId::BinanceFutures,
+            "trial_batch_1_bootA".into(),
+            3,
+            opts,
+        );
+
+        let mk = |wall_ns: i64, mono_ns: u64, payload: &str| CanonicalRecord {
+            recv_wall_ns: wall_ns,
+            recv_mono_ns: mono_ns,
+            conn_id: ConnId::A,
+            epoch: 1,
+            rx_seq: 0,
+            kind: RecordKind::Data,
+            payload: payload.into(),
+        };
+
+        // 1. Frame in 23:45Z window
+        w.write_record(&mk(w0_start + 60 * NS_PER_SEC, 10, r#"{"n":1}"#))
+            .unwrap();
+        // 2. First frame of 00:00Z (next UTC day!) dequeued BEFORE tail frame of 23:45Z
+        assert!(w
+            .write_record(&mk(w1_start + 200_000_000, 20, r#"{"n":2}"#))
+            .unwrap()
+            .is_none());
+        assert!(w.has_draining_partition());
+
+        // 3. Tail frame of 23:45Z arrives 300ms after rollover (within 2s grace!) -> accepted into draining!
+        assert!(w
+            .write_record(&mk(w1_start - 10_000_000, 19, r#"{"n":3}"#))
+            .unwrap()
+            .is_none());
+
+        // 4. Frame at w1_start + 2.5s triggers sealing of draining 23:45Z window
+        let sealed_w0 = w
+            .write_record(&mk(w1_start + 2_500_000_000, 30, r#"{"n":4}"#))
+            .unwrap()
+            .expect("draining window must seal once grace elapsed");
+        assert_eq!(sealed_w0.manifest.date_utc, "2026-11-21");
+        assert_eq!(sealed_w0.manifest.hour_utc, "23");
+        assert_eq!(sealed_w0.manifest.minute_utc, "45");
+        assert_eq!(sealed_w0.manifest.partition_minutes, 15);
+        assert_eq!(sealed_w0.manifest.window_id, "2026-11-21T23:45Z");
+        assert_eq!(sealed_w0.manifest.is_startup_stub, true);
+        assert_eq!(sealed_w0.manifest.late_frames_accepted, 1);
+        assert_eq!(sealed_w0.manifest.data_lines, 2);
+        assert_eq!(sealed_w0.manifest.run_id.as_deref(), Some("trial_batch_1"));
+
+        // 5. Very late frame for already-sealed 23:45Z -> rejected explicitly with audit META in w1
+        w.write_record(&mk(w1_start - 5_000_000, 31, r#"{"n":"too_late"}"#))
+            .unwrap();
+
+        // 6. Quiet exchange settlement: no further frames arrive past w1 end + 2s grace -> timer settles w1!
+        let timer_sealed = w
+            .settle_expired_windows(w1_start + 15 * NS_PER_MIN + 2 * NS_PER_SEC)
+            .unwrap();
+        assert_eq!(timer_sealed.len(), 1);
+        let m1 = &timer_sealed[0].manifest;
+        assert_eq!(m1.date_utc, "2026-11-22");
+        assert_eq!(m1.window_id, "2026-11-22T00:00Z");
+        assert_eq!(m1.is_startup_stub, false);
+        assert_eq!(m1.settled_by_timer, true);
+        assert_eq!(m1.coverage_incomplete, true);
+        assert_eq!(m1.late_frames_rejected, 1);
+
+        // 7. Same-window restart in 2026-11-22T00:00Z produces a SECOND non-overwriting immutable segment!
+        let mut w_restart = HourlyTsvZstWriter::with_options(
+            root.path().into(),
+            ExchangeId::BinanceFutures,
+            "trial_batch_1_bootB".into(),
+            3,
+            WriterOptions {
+                partition_minutes: 15,
+                run_id: Some("trial_batch_1".to_string()),
+                allow_segmented_restart: true,
+                late_frame_grace_ns: 2 * NS_PER_SEC,
+                process_start_wall_ns: Some(w1_start + 5 * NS_PER_MIN),
+            },
+        );
+        w_restart
+            .write_record(&mk(w1_start + 5 * NS_PER_MIN, 1, r#"{"n":"restart"}"#))
+            .unwrap();
+        let seg2 = w_restart.seal_current().unwrap().unwrap();
+        assert_ne!(seg2.data_path, timer_sealed[0].data_path);
+        assert!(timer_sealed[0].data_path.exists());
+        assert!(seg2.data_path.exists());
+        assert_eq!(seg2.manifest.window_id, "2026-11-22T00:00Z");
     }
 }

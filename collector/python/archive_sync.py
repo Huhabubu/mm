@@ -55,8 +55,9 @@ RCLONE_NOT_FOUND_EXIT_CODES = {3, 4}
 LEDGER_DB_FILENAME = "archive_ledger.sqlite"
 LEGACY_LEDGER_JSONL_FILENAME = "verified_archive_ledger.jsonl"
 PROJECTION_LEDGER_JSONL_FILENAME = "verified_archive_ledger.compat.jsonl"
+ARCHIVE_MANIFEST_INDEX_RELPATH = "meta/archive_manifest_index.json"
 ARCHIVE_LOCK_FILENAME = ".archive_sync.lock"
-LEDGER_SCHEMA_VERSION = "1"
+LEDGER_SCHEMA_VERSION = "2"
 
 STATE_SEALED = "SEALED"
 STATE_VERIFIED = "VERIFIED"
@@ -298,7 +299,9 @@ def _derive_partition_identity(
     manifest_path: Path,
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
-    """Extract canonical partition primary key and local/relative paths from a manifest."""
+    """Extract canonical partition primary key, planned window metadata, and relative paths."""
+    from data_coverage import normalize_manifest_window
+
     file_name = manifest.get("file_name")
     if isinstance(file_name, str) and file_name and Path(file_name).name == file_name and file_name.endswith(".tsv.zst"):
         data_path = manifest_path.with_name(file_name)
@@ -309,18 +312,31 @@ def _derive_partition_identity(
     stem = manifest_path.name
     if stem.endswith(".manifest.json"):
         stem = stem[: -len(".manifest.json")]
-    partition_id = str(manifest.get("partition_id") or stem)
-    exchange = str(manifest["exchange"])
-    date_utc = str(manifest["date_utc"])
-    hour_utc = str(manifest["hour_utc"]).zfill(2)
-    boot_id = str(manifest.get("boot_id") or "unknown_boot")
+    norm = normalize_manifest_window(manifest, fallback_file_name=data_path.name)
+    partition_id = str(manifest.get("partition_id") or norm["segment_id"] or stem)
+    data_lines = int(manifest.get("data_lines") or 0) + int(manifest.get("data_escaped_lines") or 0)
 
     return {
-        "exchange": exchange,
-        "date_utc": date_utc,
-        "hour_utc": hour_utc,
-        "boot_id": boot_id,
+        "exchange": norm["exchange"],
+        "date_utc": norm["date_utc"],
+        "hour_utc": norm["hour_utc"],
+        "minute_utc": norm["minute_utc"],
+        "partition_minutes": norm["partition_minutes"],
+        "window_id": norm["window_id"],
+        "planned_start_wall_ns": norm["planned_start_wall_ns"],
+        "planned_end_wall_ns": norm["planned_end_wall_ns"],
+        "collection_run_id": norm["run_id"],
+        "segment_id": norm["segment_id"],
+        "boot_id": norm["boot_id"],
         "partition_id": partition_id,
+        "is_startup_stub": norm["is_startup_stub"],
+        "settled_by_timer": norm["settled_by_timer"],
+        "coverage_incomplete": norm["coverage_incomplete"],
+        "first_rx_seq": manifest.get("first_rx_seq"),
+        "last_rx_seq": manifest.get("last_rx_seq"),
+        "start_wall_ns": manifest.get("start_wall_ns"),
+        "end_wall_ns": manifest.get("end_wall_ns"),
+        "data_lines": data_lines,
         "data_path": data_path,
         "manifest_path": manifest_path,
         "rel_data_path": data_path.relative_to(sealed_root).as_posix(),
@@ -337,8 +353,8 @@ def _infer_identity_from_rel_path(rel_data_path: str) -> dict[str, str]:
     m = _LEGACY_PATH_RE.match(rel_data_path)
     if m:
         stem = m.group("stem")
-        # Extract hour from ..._YYYYMMDD_HH or ..._YYYYMMDD_HH_<suffix>
-        hm = re.search(r"_(\d{8})_(\d{2})(?:$|_)", stem)
+        # Extract hour from ..._YYYYMMDD_HH or ..._YYYYMMDD_HHMM_p... or ..._YYYYMMDD_HH_<suffix>
+        hm = re.search(r"_(\d{8})_(\d{2})(?:$|_|\d{2}_p)", stem)
         hour_utc = hm.group(2) if hm else "00"
         return {
             "exchange": m.group("exchange"),
@@ -357,6 +373,25 @@ def _infer_identity_from_rel_path(rel_data_path: str) -> dict[str, str]:
     }
 
 
+_PARTITION_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("minute_utc", "TEXT NOT NULL DEFAULT '00'"),
+    ("partition_minutes", "INTEGER NOT NULL DEFAULT 60"),
+    ("window_id", "TEXT"),
+    ("planned_start_wall_ns", "INTEGER"),
+    ("planned_end_wall_ns", "INTEGER"),
+    ("collection_run_id", "TEXT"),
+    ("segment_id", "TEXT"),
+    ("is_startup_stub", "INTEGER NOT NULL DEFAULT 0"),
+    ("settled_by_timer", "INTEGER NOT NULL DEFAULT 0"),
+    ("coverage_incomplete", "INTEGER NOT NULL DEFAULT 0"),
+    ("first_rx_seq", "INTEGER"),
+    ("last_rx_seq", "INTEGER"),
+    ("start_wall_ns", "INTEGER"),
+    ("end_wall_ns", "INTEGER"),
+    ("data_lines", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 class ArchiveLedger:
     """Durable SQLite WAL incremental archive state store & event journal."""
 
@@ -373,6 +408,22 @@ class ArchiveLedger:
         self.conn.execute("PRAGMA synchronous=FULL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self.conn.execute("PRAGMA busy_timeout=5000;")
+
+    def _migrate_window_columns(self) -> None:
+        """Idempotently add Stage 2 window/segment columns to existing SQLite ledgers without data loss."""
+        existing = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(partitions)").fetchall()
+        }
+        for col_name, col_ddl in _PARTITION_EXTRA_COLUMNS:
+            if col_name not in existing:
+                self.conn.execute(f"ALTER TABLE partitions ADD COLUMN {col_name} {col_ddl}")
+        self.conn.execute(
+            "UPDATE partitions SET window_id = date_utc || 'T' || hour_utc || ':00Z' WHERE window_id IS NULL"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_partitions_window ON partitions(window_id, exchange)"
+        )
 
     def _init_schema(self) -> None:
         with self.conn:
@@ -454,8 +505,10 @@ class ArchiveLedger:
                 );
                 """
             )
+            self._migrate_window_columns()
             self.conn.execute(
-                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('schema_version', ?)",
+                "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (LEDGER_SCHEMA_VERSION,),
             )
 
@@ -595,6 +648,21 @@ class ArchiveLedger:
         source: str = "live_scan",
     ) -> dict[str, Any]:
         existing = self.get_partition_by_rel_data(ident["rel_data_path"])
+        minute_utc = str(ident.get("minute_utc") or "00").zfill(2)
+        partition_minutes = int(ident.get("partition_minutes") or 60)
+        window_id = ident.get("window_id") or f"{ident['date_utc']}T{ident['hour_utc']}:{minute_utc}Z"
+        planned_start = ident.get("planned_start_wall_ns")
+        planned_end = ident.get("planned_end_wall_ns")
+        collection_run_id = ident.get("collection_run_id")
+        segment_id = str(ident.get("segment_id") or ident["partition_id"])
+        is_startup_stub = 1 if ident.get("is_startup_stub") else 0
+        settled_by_timer = 1 if ident.get("settled_by_timer") else 0
+        coverage_incomplete = 1 if ident.get("coverage_incomplete") else 0
+        first_rx_seq = ident.get("first_rx_seq")
+        last_rx_seq = ident.get("last_rx_seq")
+        start_wall_ns = ident.get("start_wall_ns")
+        end_wall_ns = ident.get("end_wall_ns")
+        data_lines = int(ident.get("data_lines") or 0)
         with self.conn:
             if existing is None:
                 self.conn.execute(
@@ -604,8 +672,13 @@ class ArchiveLedger:
                         rel_data_path, rel_manifest_path, state,
                         local_bytes, local_sha256, local_md5,
                         manifest_bytes, manifest_sha256, manifest_md5,
-                        local_mtime_epoch_s, sealed_at_utc, source, updated_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'SEALED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        local_mtime_epoch_s, sealed_at_utc, source, updated_at_utc,
+                        minute_utc, partition_minutes, window_id,
+                        planned_start_wall_ns, planned_end_wall_ns,
+                        collection_run_id, segment_id,
+                        is_startup_stub, settled_by_timer, coverage_incomplete,
+                        first_rx_seq, last_rx_seq, start_wall_ns, end_wall_ns, data_lines
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'SEALED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ident["exchange"],
@@ -625,6 +698,21 @@ class ArchiveLedger:
                         now_iso,
                         source,
                         now_iso,
+                        minute_utc,
+                        partition_minutes,
+                        window_id,
+                        planned_start,
+                        planned_end,
+                        collection_run_id,
+                        segment_id,
+                        is_startup_stub,
+                        settled_by_timer,
+                        coverage_incomplete,
+                        first_rx_seq,
+                        last_rx_seq,
+                        start_wall_ns,
+                        end_wall_ns,
+                        data_lines,
                     ),
                 )
                 self.conn.execute(
@@ -643,7 +731,7 @@ class ArchiveLedger:
                         ident["boot_id"],
                         ident["partition_id"],
                         ident["rel_data_path"],
-                        json.dumps({"bytes": local_hashes["bytes"], "sha256": local_hashes["sha256"]}),
+                        json.dumps({"bytes": local_hashes["bytes"], "sha256": local_hashes["sha256"], "window_id": window_id}),
                     ),
                 )
             elif existing["state"] == STATE_SEALED:
@@ -653,6 +741,17 @@ class ArchiveLedger:
                     SET local_bytes = ?, local_sha256 = ?, local_md5 = ?,
                         manifest_bytes = ?, manifest_sha256 = ?, manifest_md5 = ?,
                         local_mtime_epoch_s = COALESCE(?, local_mtime_epoch_s),
+                        minute_utc = ?, partition_minutes = ?, window_id = ?,
+                        planned_start_wall_ns = COALESCE(?, planned_start_wall_ns),
+                        planned_end_wall_ns = COALESCE(?, planned_end_wall_ns),
+                        collection_run_id = COALESCE(?, collection_run_id),
+                        segment_id = COALESCE(?, segment_id),
+                        is_startup_stub = ?, settled_by_timer = ?, coverage_incomplete = ?,
+                        first_rx_seq = COALESCE(?, first_rx_seq),
+                        last_rx_seq = COALESCE(?, last_rx_seq),
+                        start_wall_ns = COALESCE(?, start_wall_ns),
+                        end_wall_ns = COALESCE(?, end_wall_ns),
+                        data_lines = ?,
                         updated_at_utc = ?
                     WHERE rel_data_path = ?
                     """,
@@ -664,6 +763,21 @@ class ArchiveLedger:
                         str(manifest_hashes["sha256"]),
                         str(manifest_hashes["md5"]),
                         local_mtime_epoch_s,
+                        minute_utc,
+                        partition_minutes,
+                        window_id,
+                        planned_start,
+                        planned_end,
+                        collection_run_id,
+                        segment_id,
+                        is_startup_stub,
+                        settled_by_timer,
+                        coverage_incomplete,
+                        first_rx_seq,
+                        last_rx_seq,
+                        start_wall_ns,
+                        end_wall_ns,
+                        data_lines,
                         now_iso,
                         ident["rel_data_path"],
                     ),
@@ -1249,6 +1363,9 @@ def migrate_legacy_jsonl_ledger(
 
 
 def _row_to_jsonl_entry(row: dict[str, Any]) -> dict[str, Any]:
+    minute_utc = str(row.get("minute_utc") or "00").zfill(2)
+    partition_minutes = int(row.get("partition_minutes") or 60)
+    window_id = row.get("window_id") or f"{row['date_utc']}T{row['hour_utc']}:{minute_utc}Z"
     return {
         "verified_utc": row["verified_at_utc"] or row["updated_at_utc"],
         "remote_path": row["rel_data_path"],
@@ -1258,6 +1375,8 @@ def _row_to_jsonl_entry(row: dict[str, Any]) -> dict[str, Any]:
         "bytes": int(row["local_bytes"]),
         "sha256": row["local_sha256"],
         "md5": row["local_md5"],
+        "manifest_bytes": int(row["manifest_bytes"]),
+        "manifest_sha256": row["manifest_sha256"],
         "verification_method": row["remote_data_verification_method"] or "remote_native_hash",
         "manifest_verification_method": row["remote_manifest_verification_method"],
         "remote_manifest_verified": bool(row["remote_manifest_verified"]),
@@ -1267,8 +1386,23 @@ def _row_to_jsonl_entry(row: dict[str, Any]) -> dict[str, Any]:
         "exchange": row["exchange"],
         "date_utc": row["date_utc"],
         "hour_utc": row["hour_utc"],
+        "minute_utc": minute_utc,
+        "partition_minutes": partition_minutes,
+        "window_id": window_id,
+        "planned_start_wall_ns": row.get("planned_start_wall_ns"),
+        "planned_end_wall_ns": row.get("planned_end_wall_ns"),
+        "collection_run_id": row.get("collection_run_id"),
+        "segment_id": row.get("segment_id") or row["partition_id"],
         "boot_id": row["boot_id"],
         "partition_id": row["partition_id"],
+        "is_startup_stub": bool(row.get("is_startup_stub")),
+        "settled_by_timer": bool(row.get("settled_by_timer")),
+        "coverage_incomplete": bool(row.get("coverage_incomplete")),
+        "first_rx_seq": row.get("first_rx_seq"),
+        "last_rx_seq": row.get("last_rx_seq"),
+        "start_wall_ns": row.get("start_wall_ns"),
+        "end_wall_ns": row.get("end_wall_ns"),
+        "data_lines": int(row.get("data_lines") or 0),
     }
 
 
@@ -1290,6 +1424,49 @@ def export_verified_jsonl_projection(sealed_root: Path, ledger: ArchiveLedger) -
     os.replace(tmp_path, out_path)
     ledger.set_meta("projection_jsonl_sha256", hashlib.sha256(payload.encode("utf-8")).hexdigest())
     ledger.set_meta("projection_jsonl_row_count", str(len(rows)))
+    return out_path
+
+
+def export_archive_manifest_index(sealed_root: Path, ledger: ArchiveLedger) -> Path | None:
+    """Atomically write content-deterministic cloud-readable index of remotely verified partitions.
+
+    Only contains dual-remote-verified (`VERIFIED` or `PRUNED`) records with zero volatile timestamps
+    so repeat runs with no state changes keep an identical SHA-256 and issue zero remote uploads.
+    """
+    rows = [
+        r
+        for r in ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
+        if r["remote_data_verified"] and r["remote_manifest_verified"] and not r["has_conflict"]
+    ]
+    if not rows:
+        return None
+    out_path = sealed_root / ARCHIVE_MANIFEST_INDEX_RELPATH
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    entries = sorted(
+        (_row_to_jsonl_entry(r) for r in rows),
+        key=lambda e: (e["date_utc"], e["window_id"], e["exchange"], e["remote_path"]),
+    )
+    payload = json.dumps(
+        {
+            "schema_version": 2,
+            "verified_count": len(entries),
+            "entries": entries,
+        },
+        indent=2,
+        sort_keys=False,
+    ) + "\n"
+    if out_path.is_file():
+        try:
+            if out_path.read_text(encoding="utf-8") == payload:
+                return out_path
+        except OSError:
+            pass
+    tmp_path = out_path.with_name(f"{out_path.name}.tmp.{os.getpid()}")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, out_path)
     return out_path
 
 
@@ -1575,6 +1752,52 @@ def restore_pruned_partition(
                 pass
 
 
+def _find_window_files(
+    raw_root: Path,
+    sealed_root: Path,
+    exchanges: set[str],
+    win_desc: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Locate leftover `.tsv.zst.partial` files and `.tsv.zst` files missing `.manifest.json`
+    matching the expected planned UTC window (both legacy hourly and sub-hour/segmented names).
+    """
+    from data_coverage import parse_partition_window_from_rel_path
+
+    expected_date = win_desc["date_utc"]
+    expected_window_id = win_desc["window_id"]
+    expected_pm = int(win_desc["partition_minutes"])
+    expected_hour = win_desc["hour_utc"]
+    unsealed_partials: list[str] = []
+    sealed_without_manifest: list[str] = []
+
+    for exchange in sorted(exchanges):
+        day_dir = raw_root / exchange / expected_date
+        if not day_dir.is_dir():
+            continue
+        for entry in sorted(day_dir.iterdir()):
+            name = entry.name
+            if not (name.endswith(".tsv.zst.partial") or name.endswith(".tsv.zst")):
+                continue
+            rel = entry.relative_to(sealed_root).as_posix()
+            parsed = parse_partition_window_from_rel_path(rel)
+            matches_window = False
+            if parsed is not None:
+                if parsed["window_id"] == expected_window_id and int(parsed["partition_minutes"]) == expected_pm:
+                    matches_window = True
+                elif expected_pm == 60 and parsed["date_utc"] == expected_date and parsed["hour_utc"] == expected_hour:
+                    matches_window = True
+            if not matches_window:
+                continue
+            if name.endswith(".tsv.zst.partial"):
+                unsealed_partials.append(rel)
+            elif name.endswith(".tsv.zst"):
+                mf_path = entry.with_name(name.removesuffix(".tsv.zst") + ".manifest.json")
+                if not mf_path.is_file():
+                    sealed_without_manifest.append(rel)
+
+    return unsealed_partials, sealed_without_manifest
+
+
 def sync_sealed_directory(
     sealed_root: Path,
     backend: ArchiveBackend,
@@ -1584,15 +1807,26 @@ def sync_sealed_directory(
     *,
     upload_ledger_snapshot: bool = True,
     expected_hourly_exchanges: set[str] | None = None,
+    partition_minutes: int = 60,
+    expected_run_id: str | None = None,
+    seal_wait_seconds: float = 0.0,
+    seal_poll_interval_seconds: float = 1.0,
+    sleeper: Callable[[float], None] = time.sleep,
     fault_hooks: dict[str, Callable[[str], None]] | None = None,
 ) -> dict[str, Any]:
     """Incrementally verify, upload, remote-verify, snapshot-backup, and safely prune partitions.
+
+    Supports configurable UTC windows (`partition_minutes` in `{5, 15, 30, 60}`), bounded wait for
+    asynchronous sealing, multi-segment per-exchange reconciliation, and catch-up of prior
+    unverified windows.
 
     `fault_hooks` (strictly for deterministic fault-injection testing) supports optional callbacks:
       - `before_verify_commit(rel_data_path)`
       - `after_verify_before_prune(rel_data_path)`
       - `after_prune_unlink_before_commit(rel_data_path)`
     """
+    from data_coverage import previous_complete_window
+
     now_s = time.time() if now_epoch_s is None else now_epoch_s
     now_iso = _iso_utc(now_s)
     run_id = f"arch_{int(now_s)}_{uuid.uuid4().hex[:8]}"
@@ -1625,14 +1859,41 @@ def sync_sealed_directory(
         if hasattr(backend, "resolve_proxy"):
             proxy_info = backend.resolve_proxy()
 
+        expected_win_desc = (
+            previous_complete_window(now_s, int(partition_minutes))
+            if expected_hourly_exchanges is not None
+            else None
+        )
+        seal_wait_attempts = 0
+        seal_waited_seconds = 0.0
+        if (
+            expected_hourly_exchanges is not None
+            and expected_win_desc is not None
+            and seal_wait_seconds > 0
+            and raw_root.exists()
+        ):
+            poll_step = max(0.05, float(seal_poll_interval_seconds))
+            while seal_waited_seconds < float(seal_wait_seconds):
+                pending_partials, pending_no_mf = _find_window_files(
+                    raw_root, sealed_root, expected_hourly_exchanges, expected_win_desc
+                )
+                if not pending_partials and not pending_no_mf:
+                    break
+                step = min(poll_step, float(seal_wait_seconds) - seal_waited_seconds)
+                sleeper(step)
+                seal_wait_attempts += 1
+                seal_waited_seconds += step
+
         manifests = sorted(raw_root.rglob("*.manifest.json")) if raw_root.exists() else []
         if not manifests:
             return {
                 "status": "blocked",
                 "phase": "archive",
                 "proxy": proxy_info,
+                "seal_wait_attempts": seal_wait_attempts,
+                "seal_waited_seconds": round(seal_waited_seconds, 3),
                 "failed_items": [f"No sealed *.manifest.json found under {raw_root}"],
-                "minimal_fixes": ["Seal at least one hourly partition before invoking archive"],
+                "minimal_fixes": ["Seal at least one partition before invoking archive"],
                 "ledger_db_path": str(ledger_db_path),
                 "ledger_path": str(ledger_jsonl_path),
                 "projection_ledger_path": str(ledger_jsonl_path),
@@ -2176,6 +2437,10 @@ def sync_sealed_directory(
                     )
                     errors.append(f"{rel_data}: {type(exc).__name__}: {exc}")
 
+            # Atomically export deterministic cloud-readable verified archive index BEFORE meta/ sync
+            # so GitHub Incremental QA discovers only remotely verified partitions.
+            archive_index_path = export_archive_manifest_index(sealed_root, ledger)
+
             # Upload changed meta/ files incrementally (excluding WAL/SHM/lock/partial files)
             meta_uploaded: list[str] = []
             meta_skipped = 0
@@ -2210,48 +2475,139 @@ def sync_sealed_directory(
             export_verified_jsonl_projection(sealed_root, ledger)
 
             all_verified_rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
+            pending_unverified_rows = ledger.list_partitions(states=(STATE_SEALED,))
             expected_hour_reconciliation: dict[str, Any] | None = None
-            if expected_hourly_exchanges is not None:
-                previous_hour = datetime.fromtimestamp(now_s, timezone.utc) - timedelta(hours=1)
-                expected_date = previous_hour.strftime("%Y-%m-%d")
-                expected_hour = previous_hour.strftime("%H")
+            if expected_hourly_exchanges is not None and expected_win_desc is not None:
+                expected_date = expected_win_desc["date_utc"]
+                expected_hour = expected_win_desc["hour_utc"]
+                expected_window_id = expected_win_desc["window_id"]
+                expected_pm = int(expected_win_desc["partition_minutes"])
                 if not verify_remote:
                     errors.append("verify_remote_required_when_config_enforced")
-                verified = {
-                    row["exchange"]
-                    for row in all_verified_rows
-                    if row["date_utc"] == expected_date and row["hour_utc"] == expected_hour
-                    and row["remote_data_verified"] and row["remote_manifest_verified"]
-                    and row["rel_manifest_path"] in manifests_with_data
-                    and not row["has_conflict"] and not row["last_error_code"]
+
+                per_exchange_segments: dict[str, list[dict[str, Any]]] = {
+                    ex: [] for ex in sorted(expected_hourly_exchanges)
                 }
+                for row in all_verified_rows:
+                    ex = str(row["exchange"])
+                    if ex not in per_exchange_segments:
+                        continue
+                    if not (row["remote_data_verified"] and row["remote_manifest_verified"]):
+                        continue
+                    if row["has_conflict"] or row["last_error_code"]:
+                        continue
+                    row_pm = int(row.get("partition_minutes") or 60)
+                    row_min = str(row.get("minute_utc") or "00").zfill(2)
+                    row_wid = row.get("window_id") or f"{row['date_utc']}T{row['hour_utc']}:{row_min}Z"
+                    matches_win = (row_wid == expected_window_id and row_pm == expected_pm) or (
+                        expected_pm == 60
+                        and row["date_utc"] == expected_date
+                        and row["hour_utc"] == expected_hour
+                        and row_pm == 60
+                    )
+                    if not matches_win:
+                        continue
+                    if expected_run_id is not None and row.get("collection_run_id") not in (None, expected_run_id):
+                        continue
+                    has_data = int(row.get("data_lines") or 0) > 0 or row["rel_manifest_path"] in manifests_with_data
+                    if not has_data:
+                        continue
+                    per_exchange_segments[ex].append(row)
+
+                verified: set[str] = set()
+                segment_summaries: dict[str, dict[str, Any]] = {}
+                overlaps: list[dict[str, Any]] = []
+                for ex in sorted(expected_hourly_exchanges):
+                    segs = sorted(
+                        per_exchange_segments[ex],
+                        key=lambda r: (
+                            r.get("start_wall_ns") if r.get("start_wall_ns") is not None else 0,
+                            r.get("first_rx_seq") if r.get("first_rx_seq") is not None else 0,
+                            r["rel_data_path"],
+                        ),
+                    )
+                    if segs:
+                        verified.add(ex)
+                    starts = [int(r["start_wall_ns"]) for r in segs if r.get("start_wall_ns") is not None]
+                    ends = [int(r["end_wall_ns"]) for r in segs if r.get("end_wall_ns") is not None]
+                    # Detect overlapping segments (same boot rx_seq overlap or wall_ns overlap)
+                    for prev_r, cur_r in zip(segs, segs[1:]):
+                        same_boot_seq_overlap = (
+                            prev_r["boot_id"] == cur_r["boot_id"]
+                            and prev_r.get("last_rx_seq") is not None
+                            and cur_r.get("first_rx_seq") is not None
+                            and int(cur_r["first_rx_seq"]) <= int(prev_r["last_rx_seq"])
+                        )
+                        wall_overlap = (
+                            prev_r.get("end_wall_ns") is not None
+                            and cur_r.get("start_wall_ns") is not None
+                            and int(cur_r["start_wall_ns"]) < int(prev_r["end_wall_ns"])
+                        )
+                        if same_boot_seq_overlap or wall_overlap:
+                            ov = {
+                                "exchange": ex,
+                                "window_id": expected_window_id,
+                                "first_segment": prev_r["rel_data_path"],
+                                "second_segment": cur_r["rel_data_path"],
+                                "same_boot_seq_overlap": same_boot_seq_overlap,
+                                "wall_overlap": wall_overlap,
+                            }
+                            overlaps.append(ov)
+                            if same_boot_seq_overlap:
+                                errors.append(
+                                    f"segment_seq_overlap_in_expected_window:{ex}:{expected_window_id}"
+                                )
+                    segment_summaries[ex] = {
+                        "segment_count": len(segs),
+                        "segments": [r["rel_data_path"] for r in segs],
+                        "boot_ids": sorted({str(r["boot_id"]) for r in segs}),
+                        "total_data_lines": sum(int(r.get("data_lines") or 0) for r in segs),
+                        "merged_start_wall_ns": min(starts) if starts else None,
+                        "merged_end_wall_ns": max(ends) if ends else None,
+                        "has_startup_stub": any(bool(r.get("is_startup_stub")) for r in segs),
+                        "settled_by_timer": any(bool(r.get("settled_by_timer")) for r in segs),
+                    }
+
                 missing_exchanges = sorted(expected_hourly_exchanges - verified)
+                window_label = f"{expected_date}T{expected_hour}Z" if expected_pm == 60 else expected_window_id
                 errors.extend(
-                    f"expected_hour_not_verified:{exchange}:{expected_date}T{expected_hour}Z"
+                    f"expected_hour_not_verified:{exchange}:{window_label}"
                     for exchange in missing_exchanges
                 )
-                unsealed_partials: list[str] = []
-                sealed_without_manifest: list[str] = []
-                for exchange in sorted(expected_hourly_exchanges):
-                    day_dir = raw_root / exchange / expected_date
-                    if not day_dir.is_dir():
-                        continue
-                    for path in sorted(day_dir.glob(f"{exchange}_{previous_hour:%Y%m%d}_{expected_hour}*.tsv.zst")):
-                        if not path.with_name(path.name.removesuffix(".tsv.zst") + ".manifest.json").is_file():
-                            rel_p = path.relative_to(sealed_root).as_posix()
-                            sealed_without_manifest.append(rel_p)
-                            errors.append(f"sealed_file_without_manifest:{rel_p}")
-                    for partial in sorted(day_dir.glob(f"{exchange}_{previous_hour:%Y%m%d}_{expected_hour}*.tsv.zst.partial")):
-                        rel_part = partial.relative_to(sealed_root).as_posix()
-                        unsealed_partials.append(rel_part)
-                        errors.append(f"unsealed_partial_in_expected_hour:{rel_part}")
+                unsealed_partials, sealed_without_manifest = _find_window_files(
+                    raw_root, sealed_root, expected_hourly_exchanges, expected_win_desc
+                )
+                for rel_p in sealed_without_manifest:
+                    errors.append(f"sealed_file_without_manifest:{rel_p}")
+                for rel_part in unsealed_partials:
+                    errors.append(f"unsealed_partial_in_expected_hour:{rel_part}")
+
+                # Track any prior windows still unverified in SQLite so they never drop silently
+                pending_prior_windows = sorted(
+                    {
+                        str(r.get("window_id") or f"{r['date_utc']}T{r['hour_utc']}:00Z")
+                        for r in pending_unverified_rows
+                    }
+                )
+                if verify_remote:
+                    for pwid in pending_prior_windows:
+                        if pwid != expected_window_id:
+                            errors.append(f"pending_prior_window_unverified:{pwid}")
                 expected_hour_reconciliation = {
-                    "expected_hour_utc": f"{expected_date}T{expected_hour}Z",
+                    "expected_hour_utc": window_label,
+                    "expected_window_id": expected_window_id,
+                    "partition_minutes": expected_pm,
+                    "expected_run_id": expected_run_id,
                     "expected_exchanges": sorted(expected_hourly_exchanges),
                     "verified_exchanges": sorted(verified),
                     "missing_exchanges": missing_exchanges,
+                    "per_exchange_segments": segment_summaries,
+                    "overlaps": overlaps,
                     "unsealed_partials": unsealed_partials,
                     "sealed_without_manifest": sealed_without_manifest,
+                    "pending_prior_windows": pending_prior_windows,
+                    "seal_wait_attempts": seal_wait_attempts,
+                    "seal_waited_seconds": round(seal_waited_seconds, 3),
                     "verify_remote_enforced": bool(verify_remote),
                 }
 
@@ -2313,7 +2669,7 @@ def sync_sealed_directory(
 
             all_entries = [_row_to_jsonl_entry(r) for r in all_verified_rows]
             state_counts = {
-                STATE_SEALED: len(ledger.list_partitions(states=(STATE_SEALED,))),
+                STATE_SEALED: len(pending_unverified_rows),
                 STATE_VERIFIED: len(ledger.list_partitions(states=(STATE_VERIFIED,))),
                 STATE_PRUNED: len(ledger.list_partitions(states=(STATE_PRUNED,))),
             }
@@ -2333,6 +2689,8 @@ def sync_sealed_directory(
                     "state_counts": state_counts,
                     "migration": migration_summary,
                     "expected_hour_reconciliation": expected_hour_reconciliation,
+                    "expected_window_reconciliation": expected_hour_reconciliation,
+                    "archive_manifest_index_path": str(archive_index_path) if archive_index_path else None,
                     "conflicts": conflicts,
                     "failed_items": errors + [f"remote_hash_conflict:{c['remote_path']}" for c in conflicts],
                     "minimal_fixes": [
@@ -2360,6 +2718,8 @@ def sync_sealed_directory(
                 "state_counts": state_counts,
                 "migration": migration_summary,
                 "expected_hour_reconciliation": expected_hour_reconciliation,
+                "expected_window_reconciliation": expected_hour_reconciliation,
+                "archive_manifest_index_path": str(archive_index_path) if archive_index_path else None,
                 "meta_uploaded_count": len(meta_uploaded),
                 "meta_skipped_count": meta_skipped,
                 "pruned_local_files": pruned,
@@ -2477,12 +2837,14 @@ def main() -> int:
         "--config",
         type=Path,
         default=None,
-        help="Require verified partitions for all configured exchanges in the previous UTC hour",
+        help="Require verified partitions for all configured exchanges in the previous UTC window",
     )
     p.add_argument("--remote", default="gdrive_main:tokyo_l2_data", help="rclone remote root")
     p.add_argument("--verify-remote", action="store_true", help="Verify remote ID, size, and hash after upload")
     p.add_argument("--prune-hours", type=float, default=None, help="Optional safe local retention hours after remote verify")
     p.add_argument("--no-snapshot", action="store_true", help="Skip uploading consistent SQLite ledger snapshot to meta/")
+    p.add_argument("--run-id", default=None, help="Optional collection batch run_id filter for window reconciliation")
+    p.add_argument("--seal-wait-seconds", type=float, default=None, help="Override bounded wait for async partition sealing")
     p.add_argument("--proxy-url", default=None, help="Optional SOCKS5 URL scoped to rclone only")
     p.add_argument(
         "--proxy-mode",
@@ -2497,10 +2859,20 @@ def main() -> int:
     else:
         backend = RcloneBackend(args.remote)
     expected = None
+    partition_minutes = 60
+    seal_wait_seconds = 0.0
+    seal_poll_interval = 1.0
     if args.config is not None:
-        from data_coverage import enabled_exchanges
+        from data_coverage import configured_partition_minutes, enabled_exchanges
 
-        expected = set(enabled_exchanges(json.loads(args.config.read_text(encoding="utf-8"))))
+        cfg_obj = json.loads(args.config.read_text(encoding="utf-8"))
+        expected = set(enabled_exchanges(cfg_obj))
+        partition_minutes = configured_partition_minutes(cfg_obj)
+        arch_cfg = cfg_obj.get("archive", {})
+        seal_wait_seconds = float(arch_cfg.get("seal_wait_seconds", 0.0))
+        seal_poll_interval = float(arch_cfg.get("seal_poll_interval_seconds", 1.0))
+    if args.seal_wait_seconds is not None:
+        seal_wait_seconds = float(args.seal_wait_seconds)
     result = sync_sealed_directory(
         args.dir,
         backend=backend,
@@ -2508,6 +2880,10 @@ def main() -> int:
         prune_older_than_hours=args.prune_hours,
         upload_ledger_snapshot=not args.no_snapshot,
         expected_hourly_exchanges=expected,
+        partition_minutes=partition_minutes,
+        expected_run_id=args.run_id,
+        seal_wait_seconds=seal_wait_seconds,
+        seal_poll_interval_seconds=seal_poll_interval,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2

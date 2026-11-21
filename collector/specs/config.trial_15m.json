@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "spec_version": "v1.4",
+  "mode": "trial_15m_24_market_panel",
+  "deployment": {
+    "aws_region": "ap-northeast-1",
+    "aws_physical_az_id": "apne1-az4",
+    "data_root": "/data/tokyo_l2",
+    "zstd_level": 3,
+    "bounded_queue_capacity": 65536,
+    "silence_watchdog_seconds": 3,
+    "partition_minutes": 15,
+    "late_frame_grace_ms": 2000,
+    "planned_rotation_utc": {
+      "A": "00:00:00",
+      "B": "12:00:00"
+    }
+  },
+  "archive": {
+    "rclone_remote": "gdrive_main:tokyo_l2_data",
+    "local_retention_hours": 24,
+    "disk_alert_pct": 70.0,
+    "verify_remote_hash": true,
+    "forbid_remote_overwrite_on_hash_mismatch": true,
+    "seal_wait_seconds": 20,
+    "seal_poll_interval_seconds": 2
+  },
+  "meta_daemon": {
+    "rtt_interval_seconds": 300,
+    "chrony_interval_seconds": 60,
+    "chrony_max_error_ms": 1.0,
+    "dual_outage_alert_seconds": 5,
+    "health_poll_seconds": 30,
+    "collector_hc_interval_seconds": 300,
+    "collector_stale_seconds": 300,
+    "continuous_quote_stale_seconds": 300,
+    "depth_stale_seconds": 300,
+    "event_trade_stale_seconds": 300,
+    "event_trade_quiet_max_seconds": 1800,
+    "require_stream_activity": true,
+    "archive_stale_minutes": 35,
+    "alert_cooldown_seconds": 1800,
+    "restart_recovery_seconds": 600,
+    "dual_outage_recovery_mode": "conservative",
+    "hourly_report_enabled": true,
+    "hourly_report_minute_utc": 10,
+    "collector_service_name": "tokyo-l2-collector.service",
+    "archive_service_name": "tokyo-l2-archive.service",
+    "telegram_bot_token_env": "TOKYO_L2_TELEGRAM_BOT_TOKEN",
+    "telegram_chat_id_env": "TOKYO_L2_TELEGRAM_CHAT_ID",
+    "healthchecks_collector_url_env": "TOKYO_L2_HEALTHCHECKS_COLLECTOR_URL",
+    "healthchecks_archive_url_env": "TOKYO_L2_HEALTHCHECKS_ARCHIVE_URL",
+    "alert_webhook_env": "TOKYO_L2_ALERT_WEBHOOK_URL"
+  },
+  "exchanges": {
+    "binance_futures": {
+      "enabled": true,
+      "public_ws_url": "wss://fstream.binance.com/public/stream",
+      "market_ws_url": "wss://fstream.binance.com/market/stream",
+      "rest_exchange_info_url": "https://fapi.binance.com/fapi/v1/exchangeInfo",
+      "rest_depth_url": "https://fapi.binance.com/fapi/v1/depth",
+      "depth_snapshot_limit": 1000,
+      "symbols": ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+      "public_channels": ["bookTicker", "depth@100ms"],
+      "market_channels": ["aggTrade"]
+    },
+    "bybit_linear": {
+      "enabled": true,
+      "ws_url": "wss://stream.bybit.com/v5/public/linear",
+      "rest_instruments_url": "https://api.bybit.com/v5/market/instruments-info?category=linear",
+      "ping_interval_seconds": 20,
+      "symbols": ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+      "channels": ["orderbook.50", "orderbook.1", "publicTrade"]
+    },
+    "bitget_v3": {
+      "enabled": true,
+      "ws_url": "wss://ws.bitget.com/v3/ws/public",
+      "rest_instruments_url": "https://api.bitget.com/api/v3/market/instruments?category=USDT-FUTURES",
+      "ping_interval_seconds": 25,
+      "symbols": ["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+      "channels": ["books50", "books1", "publicTrade"]
+    },
+    "gate_futures": {
+      "enabled": true,
+      "ws_url": "wss://fx-ws.gateio.ws/v4/ws/usdt",
+      "rest_contracts_url": "https://api.gateio.ws/api/v4/futures/usdt/contracts",
+      "required_headers": {
+        "X-Gate-Size-Decimal": "1"
+      },
+      "ping_interval_seconds": 15,
+      "symbols": ["BTC_USDT", "ETH_USDT", "XRP_USDT", "SOL_USDT", "DOGE_USDT", "SUI_USDT"],
+      "channels": ["futures.obu.50", "futures.book_ticker", "futures.trades"]
+    }
+  }
+}
