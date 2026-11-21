@@ -1110,31 +1110,108 @@ def assess_hourly_data_volume(
 
 
 def inspect_stream_activity(
-    data_root: Path, expected: set[tuple[str, str, str]], *, now_s: float, stale_seconds: float,
+    data_root: Path,
+    expected: set[tuple[str, str, str]],
+    *,
+    now_s: float,
+    stale_seconds: float,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Check timestamps of market frames written to disk, excluding META and control frames."""
+    """Check per-(exchange, symbol, channel) activity across four explicit states:
+    ws_connected, subscription_evidenced, received_valid_market_data, and written.
+
+    Uses shared channel taxonomy (`continuous_quote`, `depth`, `event_trade`) and
+    per-category silence thresholds from `data_coverage.py`. Sibling channel activity
+    on the same exchange NEVER proves a missing or silent channel healthy.
+    """
+    from data_coverage import (
+        channel_silence_thresholds,
+        evaluate_stream_activity_entry,
+        stream_owning_endpoint,
+    )
+
     path = data_root / "meta" / "stream_activity.json"
     now_ns = int(now_s * 1_000_000_000)
     try:
+        thresholds = channel_silence_thresholds(config, default_stale_seconds=stale_seconds)
         payload = json.loads(path.read_text(encoding="utf-8"))
         sampled = int(payload["sampled_wall_ns"])
         if not -2 <= (now_ns - sampled) / 1e9 <= min(60, stale_seconds):
             raise ValueError("stream activity sample is stale")
-        streams = {
-            (entry["exchange"], entry["symbol"], entry["channel"]):
-                int(entry["last_written_wall_ns"])
-            for entry in payload["streams"] if int(entry["written_frames"]) > 0
+        raw_streams = payload["streams"]
+        if not isinstance(raw_streams, list):
+            raise TypeError("streams must be a list")
+        endpoints_raw = payload.get("endpoints")
+        endpoints_map = endpoints_raw if isinstance(endpoints_raw, dict) else {}
+
+        entries_map: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for entry in raw_streams:
+            if not isinstance(entry, dict):
+                continue
+            key = (str(entry["exchange"]), str(entry["symbol"]), str(entry["channel"]))
+            entries_map[key] = entry
+
+        stream_states: list[dict[str, Any]] = []
+        confirmed_outage: list[str] = []
+        needs_review: list[str] = []
+        quiet_evidenced: list[str] = []
+
+        for exchange, symbol, channel in sorted(expected):
+            ep_name = stream_owning_endpoint(exchange, channel)
+            ep_info = endpoints_map.get(ep_name)
+            evaluated = evaluate_stream_activity_entry(
+                exchange=exchange,
+                symbol=symbol,
+                channel=channel,
+                now_ns=now_ns,
+                entry=entries_map.get((exchange, symbol, channel)),
+                endpoint_info=ep_info if isinstance(ep_info, dict) else None,
+                thresholds=thresholds,
+            )
+            stream_states.append(evaluated)
+            st = evaluated["status"]
+            if st == "confirmed_outage":
+                confirmed_outage.append(evaluated["stream_key"])
+            elif st == "needs_review":
+                needs_review.append(evaluated["stream_key"])
+            elif st == "quiet_evidenced":
+                quiet_evidenced.append(evaluated["stream_key"])
+
+        missing_or_stale = sorted(confirmed_outage + needs_review)
+        summary_counts = {
+            "expected_total": len(stream_states),
+            "ws_connected": sum(1 for r in stream_states if r["ws_connected"] is True),
+            "subscription_evidenced": sum(1 for r in stream_states if r["subscription_evidenced"] is True),
+            "received_valid_market_data": sum(1 for r in stream_states if r["received_valid_market_data"] is True),
+            "written": sum(1 for r in stream_states if r["written"] is True),
+            "ok": sum(1 for r in stream_states if r["status"] == "ok"),
+            "quiet_evidenced": len(quiet_evidenced),
+            "needs_review": len(needs_review),
+            "confirmed_outage": len(confirmed_outage),
         }
-        stale = [
-            "/".join(stream) for stream in sorted(expected)
-            if stream not in streams or not -2 <= (now_ns - streams[stream]) / 1e9 <= stale_seconds
-        ]
         return {
-            "healthy": not stale, "missing_or_stale": stale,
+            "healthy": not missing_or_stale,
+            "schema_version": int(payload.get("schema_version") or 1),
+            "missing_or_stale": missing_or_stale,
+            "confirmed_outage": sorted(confirmed_outage),
+            "needs_review": sorted(needs_review),
+            "quiet_evidenced": sorted(quiet_evidenced),
+            "stream_states": stream_states,
+            "summary_counts": summary_counts,
+            "thresholds": thresholds,
+            "endpoints": endpoints_map,
             "max_sampled_queue_depth": payload.get("max_sampled_queue_depth"),
         }
     except (OSError, ValueError, TypeError, KeyError) as exc:
-        return {"healthy": False, "error": type(exc).__name__ + ": " + str(exc), "missing_or_stale": []}
+        return {
+            "healthy": False,
+            "error": type(exc).__name__ + ": " + str(exc),
+            "missing_or_stale": [],
+            "confirmed_outage": [],
+            "needs_review": [],
+            "quiet_evidenced": [],
+            "stream_states": [],
+        }
 
 
 def inspect_shutdown_audits(data_root: Path, seen_files: set[str] | None = None) -> list[dict[str, Any]]:
@@ -1356,6 +1433,16 @@ def format_alert_message(
             lines.append("涉及交易所：" + "、".join(
                 _EXCHANGE_NAMES.get(str(ex), str(ex)) for ex in list(details)[:4]
             ))
+    elif alert_key == "collector_stream_stale":
+        if details.get("error"):
+            lines.append(f"诊断：{details['error']}")
+        confirmed = details.get("confirmed_outage") or []
+        review = details.get("needs_review") or []
+        if confirmed:
+            lines.append(f"确认断流（{len(confirmed)} 路）：" + ", ".join(str(x) for x in confirmed[:6]))
+        if review:
+            lines.append(f"待核查（{len(review)} 路，频道证据不足）：" + ", ".join(str(x) for x in review[:6]))
+        lines.append("说明：同所其他频道活跃不能单独证明缺失频道正常。")
     elif alert_key == "disk_usage_high":
         lines.append(f"磁盘占用：{details.get('disk_pct', '?')}%（阈值 {details.get('threshold', '?')}%）")
     elif alert_key == "archive_ledger_conflict":
@@ -1488,6 +1575,15 @@ def format_hourly_report(
             lines.append(f"另有 {len(previous_hour_loss) - 5} 个分区，完整清单见质检报告。")
     if historical_loss:
         lines.append(f"📌 历史丢数证据（累计）：{len(historical_loss)} 个分区留有丢数标记，相关数据待质检。")
+        prev_rels = {item["rel_path"] for item in previous_hour_loss}
+        older_loss = [item for item in historical_loss if item["rel_path"] not in prev_rels]
+        if older_loss:
+            lines.append("历史受损分区清单：")
+            for item in older_loss[:10]:
+                name = Path(item["rel_path"]).name
+                lines.append(f"• {item['hour_key']} UTC · {name} · LOSS {item['local_loss_lines']}")
+            if len(older_loss) > 10:
+                lines.append(f"另有 {len(older_loss) - 10} 个历史受损分区，完整清单见质检报告。")
     lines.append("说明：META 文件持续更新不代表行情 DATA 正常。")
     return "\n".join(lines)
 
@@ -2150,13 +2246,28 @@ class CollectorMonitor:
         stream_activity = None
         if self.require_stream_activity:
             stream_activity = inspect_stream_activity(
-                self.data_root, self.expected_market_streams, now_s=now_s,
+                self.data_root,
+                self.expected_market_streams,
+                now_s=now_s,
                 stale_seconds=float(self.collector_stale_seconds),
+                config=self.cfg,
             )
             if not stream_activity["healthy"]:
+                confirmed_cnt = len(stream_activity.get("confirmed_outage") or [])
+                review_cnt = len(stream_activity.get("needs_review") or [])
+                if stream_activity.get("error"):
+                    stream_summary = f"无法读取或核验逐频道写入状态 ({stream_activity['error']})"
+                elif confirmed_cnt and review_cnt:
+                    stream_summary = f"确认 {confirmed_cnt} 路必需频道断流，另有 {review_cnt} 路待核查"
+                elif confirmed_cnt:
+                    stream_summary = f"确认 {confirmed_cnt} 路必需频道未持续写入"
+                elif review_cnt:
+                    stream_summary = f"{review_cnt} 路频道缺少有效写入或订阅/连接证据（待核查）"
+                else:
+                    stream_summary = "无法确认全部行情频道持续写入"
                 observed["collector_stream_stale"] = {
                     "severity": "CRITICAL",
-                    "summary": "无法确认全部行情频道持续写入",
+                    "summary": stream_summary,
                     "details": stream_activity,
                 }
 

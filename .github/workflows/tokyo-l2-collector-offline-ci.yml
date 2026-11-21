@@ -116,6 +116,9 @@ jobs:
       - name: Run single-command offline preflight (Full 24-market panel)
         run: ./collector/bin/preflight --config collector/specs/config.example.json --offline
 
+      - name: Run single-command offline preflight (15m trial panel)
+        run: ./collector/bin/preflight --config collector/specs/config.trial_15m.json --offline
+
       - name: Verify live collect fails closed without explicit authorization
         run: |
           set +e

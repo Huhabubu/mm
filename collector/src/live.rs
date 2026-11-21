@@ -1,7 +1,14 @@
+use crate::binance_snapshot::{
+    classify_http_response, BinanceSnapshotScheduler, ResponseDisposition,
+    ScheduledSnapshotRequest, SnapshotAttemptOutcome, SnapshotSchedulerConfig,
+};
 use crate::causal_selector::{CausalSelector, SelectorAction};
 use crate::config::CollectorConfig;
-use crate::protocol::{binance::BinanceValidator, bitget::BitgetValidator, bybit::BybitValidator, gate::GateValidator};
-use crate::storage::HourlyTsvZstWriter;
+use crate::protocol::{
+    binance::BinanceValidator, bitget::BitgetValidator, bybit::BybitValidator,
+    gate::GateValidator,
+};
+use crate::storage::{HourlyTsvZstWriter, WriterOptions};
 use crate::types::{ConnId, EndpointKind, ExchangeId, RawFrame};
 use chrono::{Timelike, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -21,6 +28,10 @@ fn wall_clock_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+fn wall_clock_ms() -> i64 {
+    wall_clock_ns() / 1_000_000
 }
 
 fn flush_stderr() {
@@ -44,13 +55,18 @@ enum EngineEvent {
         epoch: u64,
         mono_ns: u64,
     },
-    RestSnapshot {
+    Subscribed {
+        endpoint: EndpointKind,
+        conn_id: ConnId,
+        epoch: u64,
+    },
+    RestSnapshotAttempt {
+        request_id: u64,
         endpoint: EndpointKind,
         conn_id: ConnId,
         epoch: u64,
         symbol: String,
-        last_update_id: u64,
-        raw_json: String,
+        outcome: SnapshotAttemptOutcome,
         wall_ns: i64,
         mono_ns: u64,
     },
@@ -102,12 +118,15 @@ fn active_selector_for_epoch(
     conn_id: ConnId,
     epoch: u64,
 ) -> Option<&mut CausalSelector> {
-    selectors.get_mut(&endpoint).filter(|selector| selector.connected_epoch(conn_id) == Some(epoch))
+    selectors
+        .get_mut(&endpoint)
+        .filter(|selector| selector.connected_epoch(conn_id) == Some(epoch))
 }
 
 const INITIAL_RETRY_MS: u64 = 500;
 const MAX_RETRY_MS: u64 = 15_000;
 const STABLE_SESSION: Duration = Duration::from_secs(30);
+const PING_TIMEOUT_NS: u64 = 30_000_000_000;
 
 fn next_retry_delay(backoff_ms: &mut u64, subscribed_uptime: Option<Duration>) -> Duration {
     if subscribed_uptime.is_some_and(|uptime| uptime >= STABLE_SESSION) {
@@ -130,40 +149,385 @@ async fn send_lifecycle_event(
     }
 }
 
+fn classify_stream_category(channel: &str) -> &'static str {
+    match channel {
+        "bookTicker" | "orderbook.1" | "books1" | "futures.book_ticker" => "continuous_quote",
+        "depth@100ms" | "orderbook.50" | "books50" | "futures.obu" | "futures.obu.50" => "depth",
+        "aggTrade" | "publicTrade" | "futures.trades" => "event_trade",
+        _ => "other",
+    }
+}
+
+fn owning_endpoint(exchange: &str, channel: &str) -> EndpointKind {
+    match (exchange, channel) {
+        ("binance_futures", "aggTrade") => EndpointKind::BinanceMarket,
+        ("binance_futures", _) => EndpointKind::BinancePublic,
+        ("bybit_linear", _) => EndpointKind::BybitPublic,
+        ("bitget_v3", _) => EndpointKind::BitgetPublic,
+        _ => EndpointKind::GatePublic,
+    }
+}
+
+#[derive(Default)]
+struct StreamTelemetryRow {
+    endpoint: Option<EndpointKind>,
+    last_received_wall_ns: Option<i64>,
+    received_frames: u64,
+    last_buffered_wall_ns: Option<i64>,
+    buffered_wait_anchor_frames: u64,
+    last_written_wall_ns: Option<i64>,
+    written_frames: u64,
+    last_rejected_late_wall_ns: Option<i64>,
+    rejected_late_frames: u64,
+    /// Per `(conn_id, epoch)` explicit subscription ACK wall_ns.
+    ack_epochs: HashMap<(ConnId, u64), i64>,
+    /// Per `(conn_id, epoch)` valid market/buffered frame observed wall_ns.
+    observed_epochs: HashMap<(ConnId, u64), i64>,
+}
+
 #[derive(Default)]
 struct StreamActivity {
-    streams: BTreeMap<(String, String, String), (i64, u64)>,
+    boot_id: String,
+    streams: BTreeMap<(String, String, String), StreamTelemetryRow>,
+    subscribe_requested_epochs: HashMap<(EndpointKind, ConnId), u64>,
     last_publish_mono_ns: u64,
     pending_publish: Option<tokio::task::JoinHandle<()>>,
     max_queue_depth: usize,
 }
 
 impl StreamActivity {
-    fn record(&mut self, ex: ExchangeId, symbol: String, channel: String, wall_ns: i64) {
-        let row = self.streams.entry((ex.as_dir_name().to_string(), symbol, channel)).or_default();
-        row.0 = row.0.max(wall_ns);
-        row.1 = row.1.saturating_add(1);
+    fn from_config(config: &CollectorConfig, boot_id: String) -> Self {
+        let mut s = Self {
+            boot_id,
+            ..Self::default()
+        };
+        let mut register = |exchange: &str, symbols: &[String], channels: &[String]| {
+            for sym in symbols {
+                let sym_u = sym.to_uppercase();
+                for ch in channels {
+                    let norm_ch = if ch == "futures.obu.50" {
+                        "futures.obu".to_string()
+                    } else {
+                        ch.clone()
+                    };
+                    let ep = owning_endpoint(exchange, &norm_ch);
+                    let row = s
+                        .streams
+                        .entry((exchange.to_string(), sym_u.clone(), norm_ch))
+                        .or_default();
+                    row.endpoint = Some(ep);
+                }
+            }
+        };
+        if config.exchanges.binance_futures.enabled {
+            register(
+                "binance_futures",
+                &config.exchanges.binance_futures.symbols,
+                &config.exchanges.binance_futures.public_channels,
+            );
+            register(
+                "binance_futures",
+                &config.exchanges.binance_futures.symbols,
+                &config.exchanges.binance_futures.market_channels,
+            );
+        }
+        if config.exchanges.bybit_linear.enabled {
+            register(
+                "bybit_linear",
+                &config.exchanges.bybit_linear.symbols,
+                &config.exchanges.bybit_linear.channels,
+            );
+        }
+        if config.exchanges.bitget_v3.enabled {
+            register(
+                "bitget_v3",
+                &config.exchanges.bitget_v3.symbols,
+                &config.exchanges.bitget_v3.channels,
+            );
+        }
+        if config.exchanges.gate_futures.enabled {
+            register(
+                "gate_futures",
+                &config.exchanges.gate_futures.symbols,
+                &config.exchanges.gate_futures.channels,
+            );
+        }
+        s
     }
 
-    fn publish(&mut self, data_root: &std::path::Path, wall_ns: i64, mono_ns: u64, queue_depth: usize) {
+    fn record_subscribe_requested(&mut self, endpoint: EndpointKind, conn_id: ConnId, epoch: u64) {
+        self.subscribe_requested_epochs
+            .insert((endpoint, conn_id), epoch);
+    }
+
+    fn clear_conn_epoch(&mut self, endpoint: EndpointKind, conn_id: ConnId, epoch: u64) {
+        if self.subscribe_requested_epochs.get(&(endpoint, conn_id)) == Some(&epoch) {
+            self.subscribe_requested_epochs.remove(&(endpoint, conn_id));
+        }
+        for row in self.streams.values_mut() {
+            if row.endpoint == Some(endpoint) {
+                row.ack_epochs.remove(&(conn_id, epoch));
+                row.observed_epochs.remove(&(conn_id, epoch));
+            }
+        }
+    }
+
+    fn record_subscription_ack(
+        &mut self,
+        ex: ExchangeId,
+        endpoint: EndpointKind,
+        conn_id: ConnId,
+        epoch: u64,
+        symbol: String,
+        channel: String,
+        wall_ns: i64,
+    ) {
+        let row = self
+            .streams
+            .entry((ex.as_dir_name().to_string(), symbol.to_uppercase(), channel))
+            .or_default();
+        row.endpoint = Some(endpoint);
+        row.ack_epochs.insert((conn_id, epoch), wall_ns);
+    }
+
+    fn record_received(
+        &mut self,
+        ex: ExchangeId,
+        endpoint: EndpointKind,
+        conn_id: ConnId,
+        epoch: u64,
+        symbol: String,
+        channel: String,
+        wall_ns: i64,
+    ) {
+        let row = self
+            .streams
+            .entry((ex.as_dir_name().to_string(), symbol.to_uppercase(), channel))
+            .or_default();
+        row.endpoint = Some(endpoint);
+        row.last_received_wall_ns = Some(
+            row.last_received_wall_ns
+                .map_or(wall_ns, |prev| prev.max(wall_ns)),
+        );
+        row.received_frames = row.received_frames.saturating_add(1);
+        row.observed_epochs.insert((conn_id, epoch), wall_ns);
+    }
+
+    fn record_buffered_wait_anchor(
+        &mut self,
+        ex: ExchangeId,
+        endpoint: EndpointKind,
+        conn_id: ConnId,
+        epoch: u64,
+        symbol: String,
+        channel: String,
+        wall_ns: i64,
+    ) {
+        let row = self
+            .streams
+            .entry((ex.as_dir_name().to_string(), symbol.to_uppercase(), channel))
+            .or_default();
+        row.endpoint = Some(endpoint);
+        row.last_buffered_wall_ns = Some(
+            row.last_buffered_wall_ns
+                .map_or(wall_ns, |prev| prev.max(wall_ns)),
+        );
+        row.buffered_wait_anchor_frames = row.buffered_wait_anchor_frames.saturating_add(1);
+        row.observed_epochs.insert((conn_id, epoch), wall_ns);
+    }
+
+    fn record_written(&mut self, ex: ExchangeId, symbol: String, channel: String, wall_ns: i64) {
+        let ex_str = ex.as_dir_name().to_string();
+        let ep = owning_endpoint(&ex_str, &channel);
+        let row = self
+            .streams
+            .entry((ex_str, symbol.to_uppercase(), channel))
+            .or_default();
+        row.endpoint.get_or_insert(ep);
+        row.last_written_wall_ns = Some(
+            row.last_written_wall_ns
+                .map_or(wall_ns, |prev| prev.max(wall_ns)),
+        );
+        row.written_frames = row.written_frames.saturating_add(1);
+    }
+
+    fn record_rejected_late(&mut self, ex: ExchangeId, symbol: String, channel: String, wall_ns: i64) {
+        let ex_str = ex.as_dir_name().to_string();
+        let ep = owning_endpoint(&ex_str, &channel);
+        let row = self
+            .streams
+            .entry((ex_str, symbol.to_uppercase(), channel))
+            .or_default();
+        row.endpoint.get_or_insert(ep);
+        row.last_rejected_late_wall_ns = Some(
+            row.last_rejected_late_wall_ns
+                .map_or(wall_ns, |prev| prev.max(wall_ns)),
+        );
+        row.rejected_late_frames = row.rejected_late_frames.saturating_add(1);
+    }
+
+    fn build_payload(
+        &mut self,
+        wall_ns: i64,
+        mono_ns: u64,
+        selectors: &HashMap<EndpointKind, CausalSelector>,
+    ) -> serde_json::Value {
+        let mut endpoints_json = serde_json::Map::new();
+        for (&ep, sel) in selectors {
+            endpoints_json.insert(
+                ep.as_str().to_string(),
+                serde_json::json!({
+                    "exchange": ep.exchange().as_dir_name(),
+                    "primary": sel.primary().as_str(),
+                    "in_gap": sel.in_gap(),
+                    "ws_connected": sel.any_connected(),
+                    "protocol_healthy": sel.protocol_healthy(mono_ns, PING_TIMEOUT_NS),
+                    "conn_a": {
+                        "connected": sel.is_connected(ConnId::A),
+                        "epoch": sel.conn_epoch(ConnId::A),
+                        "state": format!("{:?}", sel.conn_state(ConnId::A)),
+                        "last_msg_age_ms": if sel.last_msg_mono_ns(ConnId::A) > 0 {
+                            Some(mono_ns.saturating_sub(sel.last_msg_mono_ns(ConnId::A)) / 1_000_000)
+                        } else { None },
+                        "last_pong_age_ms": if sel.last_pong_mono_ns(ConnId::A) > 0 {
+                            Some(mono_ns.saturating_sub(sel.last_pong_mono_ns(ConnId::A)) / 1_000_000)
+                        } else { None },
+                    },
+                    "conn_b": {
+                        "connected": sel.is_connected(ConnId::B),
+                        "epoch": sel.conn_epoch(ConnId::B),
+                        "state": format!("{:?}", sel.conn_state(ConnId::B)),
+                        "last_msg_age_ms": if sel.last_msg_mono_ns(ConnId::B) > 0 {
+                            Some(mono_ns.saturating_sub(sel.last_msg_mono_ns(ConnId::B)) / 1_000_000)
+                        } else { None },
+                        "last_pong_age_ms": if sel.last_pong_mono_ns(ConnId::B) > 0 {
+                            Some(mono_ns.saturating_sub(sel.last_pong_mono_ns(ConnId::B)) / 1_000_000)
+                        } else { None },
+                    },
+                }),
+            );
+        }
+
+        let streams: Vec<_> = self
+            .streams
+            .iter()
+            .map(|((exchange, symbol, channel), row)| {
+                let ep = row
+                    .endpoint
+                    .unwrap_or_else(|| owning_endpoint(exchange, channel));
+                let sel = selectors.get(&ep);
+                let ws_connected = sel.is_some_and(|s| s.any_connected());
+                let protocol_healthy =
+                    sel.is_some_and(|s| s.protocol_healthy(mono_ns, PING_TIMEOUT_NS));
+                let active_conn_epochs: Vec<(ConnId, u64)> = sel
+                    .map(|s| {
+                        [ConnId::A, ConnId::B]
+                            .into_iter()
+                            .filter_map(|c| s.connected_epoch(c).map(|e| (c, e)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let has_explicit_ack = active_conn_epochs
+                    .iter()
+                    .any(|ce| row.ack_epochs.contains_key(ce));
+                let has_frame_observed = active_conn_epochs
+                    .iter()
+                    .any(|ce| row.observed_epochs.contains_key(ce));
+                let has_subscribe_sent = active_conn_epochs
+                    .iter()
+                    .any(|(c, e)| self.subscribe_requested_epochs.get(&(ep, *c)) == Some(e));
+
+                let (subscription_evidenced, subscription_evidence) = if has_explicit_ack {
+                    (true, "explicit_ack")
+                } else if has_frame_observed {
+                    (true, "frame_observed")
+                } else if ws_connected
+                    && matches!(ep, EndpointKind::BinancePublic | EndpointKind::BinanceMarket)
+                    && has_subscribe_sent
+                {
+                    (false, "combined_url_requested")
+                } else if ws_connected && has_subscribe_sent {
+                    (false, "subscribe_sent_unacked")
+                } else {
+                    (false, "none")
+                };
+
+                let depth_state = if channel == "depth@100ms" {
+                    sel.and_then(|s| s.symbol_depth_state(s.primary(), symbol))
+                        .map(|st| format!("{:?}", st))
+                } else {
+                    None
+                };
+
+                let total_received_frames = row
+                    .received_frames
+                    .saturating_add(row.buffered_wait_anchor_frames);
+                let last_received_wall_ns = match (row.last_received_wall_ns, row.last_buffered_wall_ns) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+
+                serde_json::json!({
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "channel": channel,
+                    "category": classify_stream_category(channel),
+                    "endpoint": ep.as_str(),
+                    "ws_connected": ws_connected,
+                    "protocol_healthy": protocol_healthy,
+                    "subscription_evidenced": subscription_evidenced,
+                    "subscription_evidence": subscription_evidence,
+                    "received_valid_market_data": total_received_frames > 0,
+                    "last_received_wall_ns": last_received_wall_ns,
+                    "received_frames": total_received_frames,
+                    "buffered_wait_anchor_frames": row.buffered_wait_anchor_frames,
+                    "last_buffered_wall_ns": row.last_buffered_wall_ns,
+                    "written": row.written_frames > 0,
+                    "last_written_wall_ns": row.last_written_wall_ns.unwrap_or(0),
+                    "written_frames": row.written_frames,
+                    "rejected_late_frames": row.rejected_late_frames,
+                    "last_rejected_late_wall_ns": row.last_rejected_late_wall_ns,
+                    "depth_state": depth_state,
+                })
+            })
+            .collect();
+
+        let payload = serde_json::json!({
+            "schema_version": 2,
+            "boot_id": self.boot_id,
+            "sampled_wall_ns": wall_ns,
+            "max_sampled_queue_depth": self.max_queue_depth,
+            "endpoints": endpoints_json,
+            "streams": streams,
+        });
+        self.max_queue_depth = 0;
+        payload
+    }
+
+    fn publish(
+        &mut self,
+        data_root: &std::path::Path,
+        wall_ns: i64,
+        mono_ns: u64,
+        queue_depth: usize,
+        selectors: &HashMap<EndpointKind, CausalSelector>,
+    ) {
         self.max_queue_depth = self.max_queue_depth.max(queue_depth);
-        if mono_ns.saturating_sub(self.last_publish_mono_ns) < 5_000_000_000
-            || self.pending_publish.as_ref().is_some_and(|task| !task.is_finished())
+        if self.last_publish_mono_ns > 0
+            && (mono_ns.saturating_sub(self.last_publish_mono_ns) < 5_000_000_000
+                || self
+                    .pending_publish
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished()))
         {
             return;
         }
         self.last_publish_mono_ns = mono_ns;
         let directory = data_root.join("meta");
-        let streams: Vec<_> = self.streams.iter().map(|((exchange, symbol, channel), (at, count))| {
-            serde_json::json!({
-                "exchange": exchange, "symbol": symbol, "channel": channel,
-                "last_written_wall_ns": at, "written_frames": count,
-            })
-        }).collect();
-        let payload = serde_json::json!({
-            "sampled_wall_ns": wall_ns, "max_sampled_queue_depth": self.max_queue_depth, "streams": streams,
-        });
-        self.max_queue_depth = 0;
+        let payload = self.build_payload(wall_ns, mono_ns, selectors);
         self.pending_publish = Some(tokio::task::spawn_blocking(move || {
             let path = directory.join("stream_activity.json");
             let temporary = directory.join("stream_activity.json.partial");
@@ -175,6 +539,157 @@ impl StreamActivity {
             }
         }));
     }
+
+    async fn flush_final(
+        &mut self,
+        data_root: &std::path::Path,
+        wall_ns: i64,
+        mono_ns: u64,
+        selectors: &HashMap<EndpointKind, CausalSelector>,
+    ) {
+        if let Some(prev) = self.pending_publish.take() {
+            let _ = prev.await;
+        }
+        let directory = data_root.join("meta");
+        let payload = self.build_payload(wall_ns, mono_ns, selectors);
+        let _ = tokio::task::spawn_blocking(move || {
+            let path = directory.join("stream_activity.json");
+            let temporary = directory.join("stream_activity.json.partial");
+            let result = std::fs::create_dir_all(&directory)
+                .and_then(|_| std::fs::write(&temporary, payload.to_string()))
+                .and_then(|_| std::fs::rename(temporary, path));
+            if let Err(error) = result {
+                warn!("Could not publish final stream activity: {error}");
+            }
+        })
+        .await;
+    }
+}
+
+async fn fetch_binance_snapshot_once(
+    http: reqwest::Client,
+    url: String,
+    attempt_timeout: Duration,
+    mut stop_rx: watch::Receiver<bool>,
+) -> Option<SnapshotAttemptOutcome> {
+    if *stop_rx.borrow() {
+        return None;
+    }
+    let fut = async move {
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_timeout() {
+                    return SnapshotAttemptOutcome::Timeout;
+                }
+                return SnapshotAttemptOutcome::TransportError {
+                    message: e.to_string(),
+                };
+            }
+        };
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let body = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                if e.is_timeout() {
+                    return SnapshotAttemptOutcome::Timeout;
+                }
+                return SnapshotAttemptOutcome::TransportError {
+                    message: format!("body read error: {}", e),
+                };
+            }
+        };
+        classify_http_response(status, &headers, body, wall_clock_ms())
+    };
+
+    tokio::select! {
+        biased;
+        _ = stop_rx.wait_for(|requested| *requested) => None,
+        timed = tokio::time::timeout(attempt_timeout, fut) => {
+            match timed {
+                Ok(outcome) => Some(outcome),
+                Err(_) => Some(SnapshotAttemptOutcome::Timeout),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_binance_snapshots(
+    scheduler: &mut BinanceSnapshotScheduler,
+    snapshot_tasks: &mut HashMap<u64, tokio::task::JoinHandle<()>>,
+    selectors: &HashMap<EndpointKind, CausalSelector>,
+    config: &CollectorConfig,
+    mono_origin: Instant,
+    tx: &mpsc::Sender<EngineEvent>,
+    http_client: &reqwest::Client,
+    stop_rx: &watch::Receiver<bool>,
+) {
+    if !config.exchanges.binance_futures.enabled {
+        return;
+    }
+    let now_mono = mono_origin.elapsed();
+    let preferred_primary = selectors
+        .get(&EndpointKind::BinancePublic)
+        .map(|s| s.primary());
+    let requests: Vec<ScheduledSnapshotRequest> =
+        scheduler.poll_dispatch(now_mono, preferred_primary);
+    let attempt_timeout = scheduler.config().attempt_timeout;
+
+    for req in requests {
+        let url = format!(
+            "{}?symbol={}&limit={}",
+            config.exchanges.binance_futures.rest_depth_url,
+            req.symbol,
+            config.exchanges.binance_futures.depth_snapshot_limit
+        );
+        let http_s = http_client.clone();
+        let tx_s = tx.clone();
+        let mut stop_s = stop_rx.clone();
+        let req_id = req.request_id;
+        let conn_id = req.conn_id;
+        let epoch = req.epoch;
+        let symbol = req.symbol.clone();
+
+        let handle = tokio::spawn(async move {
+            let Some(outcome) =
+                fetch_binance_snapshot_once(http_s, url, attempt_timeout, stop_s.clone()).await
+            else {
+                return;
+            };
+            let wall_ns = wall_clock_ns();
+            let mono_ns = mono_origin.elapsed().as_nanos() as u64;
+            let _ = send_lifecycle_event(
+                &tx_s,
+                &mut stop_s,
+                EngineEvent::RestSnapshotAttempt {
+                    request_id: req_id,
+                    endpoint: EndpointKind::BinancePublic,
+                    conn_id,
+                    epoch,
+                    symbol,
+                    outcome,
+                    wall_ns,
+                    mono_ns,
+                },
+            )
+            .await;
+        });
+        snapshot_tasks.insert(req_id, handle);
+    }
+    snapshot_tasks.retain(|_, h| !h.is_finished());
+}
+
+fn abort_snapshot_tasks(
+    snapshot_tasks: &mut HashMap<u64, tokio::task::JoinHandle<()>>,
+    ids: impl IntoIterator<Item = u64>,
+) {
+    for id in ids {
+        if let Some(handle) = snapshot_tasks.remove(&id) {
+            handle.abort();
+        }
+    }
 }
 
 pub async fn run_live_collector(
@@ -182,6 +697,7 @@ pub async fn run_live_collector(
     run_id: String,
     duration_secs: Option<u64>,
 ) -> Result<(), String> {
+    let run_id = config.resolve_effective_run_id(Some(&run_id), None)?;
     // Register OS shutdown signal listeners BEFORE spawning any network tasks and keep
     // them alive through the entire sealing phase so SIGINT/SIGTERM never revert to SIG_DFL.
     #[cfg(unix)]
@@ -195,7 +711,8 @@ pub async fn run_live_collector(
     };
 
     let mono_origin = Instant::now();
-    let boot_id = format!("{}_{}", run_id, wall_clock_ns());
+    let process_start_wall_ns = wall_clock_ns();
+    let boot_id = format!("{}_{}", run_id, process_start_wall_ns);
     let data_root = PathBuf::from(&config.deployment.data_root);
     let cap = config.deployment.bounded_queue_capacity;
     let (tx, mut rx) = mpsc::channel::<EngineEvent>(cap);
@@ -204,9 +721,13 @@ pub async fn run_live_collector(
     let mut selectors: HashMap<EndpointKind, CausalSelector> = HashMap::new();
     let mut writers: BTreeMap<ExchangeId, HourlyTsvZstWriter> = BTreeMap::new();
     let seal_limit = Arc::new(Semaphore::new(1));
-    let mut activity = StreamActivity::default();
+    let mut activity = StreamActivity::from_config(&config, boot_id.clone());
     let mut cmd_txs: HashMap<(EndpointKind, ConnId), mpsc::Sender<ConnCommand>> = HashMap::new();
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut binance_scheduler = BinanceSnapshotScheduler::new(SnapshotSchedulerConfig::for_limit(
+        config.exchanges.binance_futures.depth_snapshot_limit,
+    ));
+    let mut snapshot_tasks: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -238,15 +759,22 @@ pub async fn run_live_collector(
     }
 
     let cfg_arc = Arc::new(config.clone());
+    let writer_opts = WriterOptions::from_config(
+        &config,
+        Some(run_id.clone()),
+        true,
+        Some(process_start_wall_ns),
+    );
 
     for (ep, syms) in endpoints_to_spawn {
         let ex = ep.exchange();
         writers.entry(ex).or_insert_with(|| {
-            let mut writer = HourlyTsvZstWriter::new(
+            let mut writer = HourlyTsvZstWriter::with_options(
                 data_root.clone(),
                 ex,
                 boot_id.clone(),
                 config.deployment.zstd_level,
+                writer_opts.clone(),
             );
             writer.enable_background_sealing(Arc::clone(&seal_limit));
             writer
@@ -266,7 +794,6 @@ pub async fn run_live_collector(
             let tx_c = tx.clone();
             let cfg_c = Arc::clone(&cfg_arc);
             let syms_c = syms.clone();
-            let http_c = http_client.clone();
             let stop_rx = shutdown_rx.clone();
             bg_handles.push(tokio::spawn(async move {
                 ws_connection_loop(
@@ -274,7 +801,6 @@ pub async fn run_live_collector(
                     conn_id,
                     syms_c,
                     cfg_c,
-                    http_c,
                     mono_origin,
                     tx_c,
                     crx,
@@ -352,6 +878,10 @@ pub async fn run_live_collector(
 
     #[cfg(unix)]
     loop {
+        let now_mono = mono_origin.elapsed();
+        let next_snap_sleep = binance_scheduler
+            .next_wakeup_mono(now_mono)
+            .map(|target| target.saturating_sub(now_mono));
         tokio::select! {
             biased;
             _ = sigint.recv() => {
@@ -366,6 +896,24 @@ pub async fn run_live_collector(
                 shutdown_reason = "duration_elapsed";
                 break;
             }
+            _ = async {
+                if let Some(delay) = next_snap_sleep {
+                    tokio::time::sleep(delay).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                dispatch_binance_snapshots(
+                    &mut binance_scheduler,
+                    &mut snapshot_tasks,
+                    &selectors,
+                    &config,
+                    mono_origin,
+                    &tx,
+                    &http_client,
+                    &shutdown_rx,
+                );
+            }
             maybe_ev = rx.recv() => {
                 let Some(ev) = maybe_ev else {
                     shutdown_reason = "channel_closed";
@@ -377,12 +925,14 @@ pub async fn run_live_collector(
                     mono_origin,
                     &tx,
                     &http_client,
+                    &shutdown_rx,
                     &mut selectors,
                     &mut writers,
                     &mut activity,
                     &data_root,
                     &cmd_txs,
-                    &mut bg_handles,
+                    &mut binance_scheduler,
+                    &mut snapshot_tasks,
                     true,
                 );
             }
@@ -394,6 +944,10 @@ pub async fn run_live_collector(
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         loop {
+            let now_mono = mono_origin.elapsed();
+            let next_snap_sleep = binance_scheduler
+                .next_wakeup_mono(now_mono)
+                .map(|target| target.saturating_sub(now_mono));
             tokio::select! {
                 biased;
                 _ = &mut ctrl_c => {
@@ -403,6 +957,24 @@ pub async fn run_live_collector(
                 _ = &mut duration_sleep => {
                     shutdown_reason = "duration_elapsed";
                     break;
+                }
+                _ = async {
+                    if let Some(delay) = next_snap_sleep {
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    dispatch_binance_snapshots(
+                        &mut binance_scheduler,
+                        &mut snapshot_tasks,
+                        &selectors,
+                        &config,
+                        mono_origin,
+                        &tx,
+                        &http_client,
+                        &shutdown_rx,
+                    );
                 }
                 maybe_ev = rx.recv() => {
                     let Some(ev) = maybe_ev else {
@@ -415,12 +987,14 @@ pub async fn run_live_collector(
                         mono_origin,
                         &tx,
                         &http_client,
+                        &shutdown_rx,
                         &mut selectors,
                         &mut writers,
                         &mut activity,
                         &data_root,
                         &cmd_txs,
-                        &mut bg_handles,
+                        &mut binance_scheduler,
+                        &mut snapshot_tasks,
                         true,
                     );
                 }
@@ -430,9 +1004,10 @@ pub async fn run_live_collector(
 
     let seal_start = Instant::now();
     info!(
-        "Received shutdown trigger (reason={}), stopping {} background tasks and sealing {} exchange writers...",
+        "Received shutdown trigger (reason={}), stopping {} background tasks and {} snapshot tasks, sealing {} exchange writers...",
         shutdown_reason,
         bg_handles.len(),
+        snapshot_tasks.len(),
         writers.len()
     );
     flush_stderr();
@@ -441,6 +1016,9 @@ pub async fn run_live_collector(
     //    competing for CPU, sockets, or channel capacity during sealing.
     let _ = shutdown_tx.send(true);
     for h in &bg_handles {
+        h.abort();
+    }
+    for (_, h) in snapshot_tasks.drain() {
         h.abort();
     }
     tokio::task::yield_now().await;
@@ -458,17 +1036,27 @@ pub async fn run_live_collector(
             mono_origin,
             &dummy_tx,
             &http_client,
+            &shutdown_rx,
             &mut selectors,
             &mut writers,
             &mut activity,
             &data_root,
             &cmd_txs,
-            &mut bg_handles,
+            &mut binance_scheduler,
+            &mut snapshot_tasks,
             false,
         );
     }
     info!("Drained {} queued events prior to final seal", drained);
     flush_stderr();
+    activity
+        .flush_final(
+            &data_root,
+            wall_clock_ns(),
+            mono_origin.elapsed().as_nanos() as u64,
+            &selectors,
+        )
+        .await;
 
     // 3. Seal EVERY exchange deterministically in spawn_blocking (off Tokio worker threads),
     //    continuing across all exchanges even if one fails.
@@ -485,7 +1073,10 @@ pub async fn run_live_collector(
             }
         }
         if writer.pending_write_loss() > 0 {
-            rollover_failures.push(format!("{exchange}: {} unrecorded lost frames", writer.pending_write_loss()));
+            rollover_failures.push(format!(
+                "{exchange}: {} unrecorded lost frames",
+                writer.pending_write_loss()
+            ));
         }
     }
     let audit_root = data_root.clone();
@@ -505,34 +1096,39 @@ pub async fn run_live_collector(
             }
             info!("Sealing active partition for {}...", ex);
             flush_stderr();
-            match writer.seal_current() {
-                Ok(Some(s)) => {
+            match writer.seal_all() {
+                Ok(sealed_list) if !sealed_list.is_empty() => {
                     let elapsed_ms = ex_start.elapsed().as_millis() as u64;
-                    info!(
-                        "Sealed {} -> {} (bytes={}, data_lines={}, meta_lines={}, sha256={}, elapsed_ms={})",
-                        ex,
-                        s.data_path.display(),
-                        s.manifest.bytes,
-                        s.manifest.data_lines,
-                        s.manifest.meta_lines,
-                        s.manifest.sha256,
-                        elapsed_ms
-                    );
-                    flush_stderr();
-                    sealed_records.push(serde_json::json!({
-                        "exchange": ex.as_dir_name(),
-                        "data_path": s.data_path.to_string_lossy(),
-                        "manifest_path": s.manifest_path.to_string_lossy(),
-                        "bytes": s.manifest.bytes,
-                        "data_lines": s.manifest.data_lines,
-                        "data_escaped_lines": s.manifest.data_escaped_lines,
-                        "meta_lines": s.manifest.meta_lines,
-                        "local_loss_lines": s.manifest.local_loss_lines,
-                        "sha256": s.manifest.sha256,
-                        "elapsed_ms": elapsed_ms
-                    }));
+                    for s in sealed_list {
+                        info!(
+                            "Sealed {} -> {} (window={}, bytes={}, data_lines={}, meta_lines={}, sha256={}, elapsed_ms={})",
+                            ex,
+                            s.data_path.display(),
+                            s.manifest.window_id,
+                            s.manifest.bytes,
+                            s.manifest.data_lines,
+                            s.manifest.meta_lines,
+                            s.manifest.sha256,
+                            elapsed_ms
+                        );
+                        flush_stderr();
+                        sealed_records.push(serde_json::json!({
+                            "exchange": ex.as_dir_name(),
+                            "window_id": s.manifest.window_id,
+                            "partition_minutes": s.manifest.partition_minutes,
+                            "data_path": s.data_path.to_string_lossy(),
+                            "manifest_path": s.manifest_path.to_string_lossy(),
+                            "bytes": s.manifest.bytes,
+                            "data_lines": s.manifest.data_lines,
+                            "data_escaped_lines": s.manifest.data_escaped_lines,
+                            "meta_lines": s.manifest.meta_lines,
+                            "local_loss_lines": s.manifest.local_loss_lines,
+                            "sha256": s.manifest.sha256,
+                            "elapsed_ms": elapsed_ms
+                        }));
+                    }
                 }
-                Ok(None) => {
+                Ok(_) => {
                     empty_exchanges.push(ex.as_dir_name().to_string());
                 }
                 Err(e) => {
@@ -579,7 +1175,11 @@ pub async fn run_live_collector(
         if failed_records.is_empty() {
             Ok(())
         } else {
-            Err(format!("sealing failed for {} exchange(s): {}", failed_records.len(), failed_records.join("; ")))
+            Err(format!(
+                "sealing failed for {} exchange(s): {}",
+                failed_records.len(),
+                failed_records.join("; ")
+            ))
         }
     })
     .await
@@ -599,57 +1199,229 @@ fn process_engine_event(
     mono_origin: Instant,
     tx: &mpsc::Sender<EngineEvent>,
     http_client: &reqwest::Client,
+    stop_rx: &watch::Receiver<bool>,
     selectors: &mut HashMap<EndpointKind, CausalSelector>,
     writers: &mut BTreeMap<ExchangeId, HourlyTsvZstWriter>,
     activity: &mut StreamActivity,
     data_root: &std::path::Path,
     cmd_txs: &HashMap<(EndpointKind, ConnId), mpsc::Sender<ConnCommand>>,
-    bg_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    binance_scheduler: &mut BinanceSnapshotScheduler,
+    snapshot_tasks: &mut HashMap<u64, tokio::task::JoinHandle<()>>,
     allow_actions: bool,
 ) {
-    let mut outputs: Vec<(EndpointKind, crate::causal_selector::SelectorOutput)> = Vec::new();
+    let mut outputs: Vec<(EndpointKind, crate::causal_selector::SelectorOutput, Option<(ConnId, u64, i64)>)> = Vec::new();
     match ev {
         EngineEvent::Frame(f) => {
             let ep = f.endpoint;
+            let meta = (f.conn_id, f.epoch, f.recv_wall_ns);
             if let Some(sel) = selectors.get_mut(&ep) {
-                outputs.push((ep, sel.on_frame(f)));
+                outputs.push((ep, sel.on_frame(f), Some(meta)));
             }
         }
-        EngineEvent::Disconnect { endpoint, conn_id, epoch, wall_ns, mono_ns, reason } => {
+        EngineEvent::Disconnect {
+            endpoint,
+            conn_id,
+            epoch,
+            wall_ns,
+            mono_ns,
+            reason,
+        } => {
+            if endpoint == EndpointKind::BinancePublic {
+                let cancelled = binance_scheduler.cancel_connection(conn_id, Some(epoch));
+                abort_snapshot_tasks(snapshot_tasks, cancelled);
+            }
+            activity.clear_conn_epoch(endpoint, conn_id, epoch);
             if let Some(sel) = active_selector_for_epoch(selectors, endpoint, conn_id, epoch) {
-                outputs.push((endpoint, sel.on_disconnect(conn_id, wall_ns, mono_ns, &reason)));
+                outputs.push((
+                    endpoint,
+                    sel.on_disconnect(conn_id, wall_ns, mono_ns, &reason),
+                    None,
+                ));
             }
         }
-        EngineEvent::Reconnect { endpoint, conn_id, epoch, mono_ns } => {
+        EngineEvent::Reconnect {
+            endpoint,
+            conn_id,
+            epoch,
+            mono_ns,
+        } => {
             if let Some(sel) = selectors.get_mut(&endpoint) {
                 sel.on_reconnect(conn_id, epoch, mono_ns);
             }
-        }
-        EngineEvent::RestSnapshot { endpoint, conn_id, epoch, symbol, last_update_id, raw_json, wall_ns, mono_ns } => {
-            if let Some(sel) = active_selector_for_epoch(selectors, endpoint, conn_id, epoch) {
-                outputs.push((endpoint, sel.on_rest_snapshot(conn_id, &symbol, last_update_id, &raw_json, wall_ns, mono_ns)));
+            if endpoint == EndpointKind::BinancePublic && allow_actions {
+                let cancelled = binance_scheduler.register_connection_epoch(
+                    conn_id,
+                    epoch,
+                    &config.exchanges.binance_futures.symbols,
+                    mono_origin.elapsed(),
+                );
+                abort_snapshot_tasks(snapshot_tasks, cancelled);
             }
         }
-        EngineEvent::LocalLoss { endpoint, dropped, wall_ns, mono_ns, reason } => {
+        EngineEvent::Subscribed {
+            endpoint,
+            conn_id,
+            epoch,
+        } => {
+            activity.record_subscribe_requested(endpoint, conn_id, epoch);
+        }
+        EngineEvent::RestSnapshotAttempt {
+            request_id,
+            endpoint,
+            conn_id,
+            epoch,
+            symbol,
+            outcome,
+            wall_ns,
+            mono_ns,
+        } => {
+            snapshot_tasks.remove(&request_id);
+            let now_mono = mono_origin.elapsed();
+            let now_wall_ms = wall_ns / 1_000_000;
+            let disp = binance_scheduler.on_response(
+                request_id,
+                conn_id,
+                epoch,
+                &symbol,
+                outcome,
+                now_mono,
+                now_wall_ms,
+            );
+            match disp {
+                ResponseDisposition::IgnoredStale { reason } => {
+                    info!(
+                        "Ignoring stale Binance depth snapshot response conn={} epoch={} symbol={} req_id={}: {}",
+                        conn_id.as_str(),
+                        epoch,
+                        symbol,
+                        request_id,
+                        reason
+                    );
+                }
+                ResponseDisposition::ScheduledRetry {
+                    status_code,
+                    reason,
+                    retry_in,
+                    shared_cooldown_active,
+                    ..
+                } => {
+                    let used_w = binance_scheduler.effective_used_weight(now_mono);
+                    warn!(
+                        "Binance depth snapshot failed conn={} epoch={} symbol={} status={:?} reason=\"{}\" retry_in_ms={} shared_cooldown={} used_weight_1m={}",
+                        conn_id.as_str(),
+                        epoch,
+                        symbol,
+                        status_code,
+                        reason,
+                        retry_in.as_millis(),
+                        shared_cooldown_active,
+                        used_w
+                    );
+                    flush_stderr();
+                }
+                ResponseDisposition::ApplySnapshot {
+                    last_update_id,
+                    raw_json,
+                } => {
+                    if let Some(sel) = active_selector_for_epoch(selectors, endpoint, conn_id, epoch)
+                    {
+                        let sel_out = sel.on_rest_snapshot(
+                            conn_id,
+                            &symbol,
+                            last_update_id,
+                            &raw_json,
+                            wall_ns,
+                            mono_ns,
+                        );
+                        if let Some((c, ep_num, ref sym, bridged, sym_live)) =
+                            sel_out.snapshot_bridge_ok
+                        {
+                            info!(
+                                "Binance depth snapshot recovered conn={} epoch={} symbol={} channel=depth@100ms lastUpdateId={} bridged_deltas={} symbol_live={} conn_state={:?}",
+                                c.as_str(),
+                                ep_num,
+                                sym,
+                                last_update_id,
+                                bridged,
+                                sym_live,
+                                sel.conn_state(c)
+                            );
+                            flush_stderr();
+                        }
+                        if let Some((c, ep_num, ref sym, ref reason)) =
+                            sel_out.snapshot_bridge_failed
+                        {
+                            let next_mono = binance_scheduler.on_bridge_failure(
+                                c,
+                                ep_num,
+                                sym,
+                                now_mono,
+                                reason.clone(),
+                            );
+                            warn!(
+                                "Binance depth snapshot bridge failed conn={} epoch={} symbol={} reason=\"{}\" retry_in_ms={}",
+                                c.as_str(),
+                                ep_num,
+                                sym,
+                                reason,
+                                next_mono
+                                    .map(|m| m.saturating_sub(now_mono).as_millis())
+                                    .unwrap_or(0)
+                            );
+                            flush_stderr();
+                        }
+                        outputs.push((endpoint, sel_out, Some((conn_id, epoch, wall_ns))));
+                    }
+                }
+            }
+        }
+        EngineEvent::LocalLoss {
+            endpoint,
+            dropped,
+            wall_ns,
+            mono_ns,
+            reason,
+        } => {
             if let Some(sel) = selectors.get_mut(&endpoint) {
-                outputs.push((endpoint, sel.on_local_loss(dropped, wall_ns, mono_ns, &reason)));
+                outputs.push((
+                    endpoint,
+                    sel.on_local_loss(dropped, wall_ns, mono_ns, &reason),
+                    None,
+                ));
             }
         }
-        EngineEvent::PlannedRotation { target, wall_ns, mono_ns } => {
+        EngineEvent::PlannedRotation {
+            target,
+            wall_ns,
+            mono_ns,
+        } => {
             for (&ep, sel) in selectors.iter_mut() {
-                outputs.push((ep, sel.on_planned_rotation(target, wall_ns, mono_ns)));
+                outputs.push((ep, sel.on_planned_rotation(target, wall_ns, mono_ns), None));
             }
         }
         EngineEvent::WatchdogTick { wall_ns, mono_ns } => {
             if allow_actions {
-                activity.publish(data_root, wall_clock_ns(), mono_ns, tx.max_capacity() - tx.capacity());
+                activity.publish(
+                    data_root,
+                    wall_clock_ns(),
+                    mono_ns,
+                    tx.max_capacity() - tx.capacity(),
+                    selectors,
+                );
                 for (exchange, writer) in writers.iter_mut() {
+                    if let Err(error) = writer.settle_expired_windows(wall_ns) {
+                        error!("Failed settling expired window for {}: {}", exchange, error);
+                    }
                     for result in writer.poll_background_seals() {
                         match result {
                             Ok(sealed) => info!(
-                                "Rolled and sealed {} -> {} (bytes={}, data_lines={}, sha256={})",
-                                exchange, sealed.data_path.display(), sealed.manifest.bytes,
-                                sealed.manifest.data_lines, sealed.manifest.sha256
+                                "Rolled and sealed {} -> {} (window={}, bytes={}, data_lines={}, sha256={})",
+                                exchange,
+                                sealed.data_path.display(),
+                                sealed.manifest.window_id,
+                                sealed.manifest.bytes,
+                                sealed.manifest.data_lines,
+                                sealed.manifest.sha256
                             ),
                             Err(error) => error!("Failed sealing {}: {}", exchange, error),
                         }
@@ -657,31 +1429,56 @@ fn process_engine_event(
                 }
             }
             for (&ep, sel) in selectors.iter_mut() {
-                outputs.push((ep, sel.check_silence_watchdog(wall_ns, mono_ns, 30_000_000_000)));
+                outputs.push((
+                    ep,
+                    sel.check_silence_watchdog(wall_ns, mono_ns, PING_TIMEOUT_NS),
+                    None,
+                ));
             }
         }
     }
 
-    for (ep, out) in outputs {
+    for (ep, out, frame_meta) in outputs {
         let ex = ep.exchange();
+        if let Some((conn_id, epoch, wall_ns)) = frame_meta {
+            for (sym, chan) in out.subscription_acks {
+                activity.record_subscription_ack(ex, ep, conn_id, epoch, sym, chan, wall_ns);
+            }
+            for (sym, chan) in out.received_streams {
+                activity.record_received(ex, ep, conn_id, epoch, sym, chan, wall_ns);
+            }
+            if let Some((sym, chan)) = out.buffered_wait_anchor {
+                activity.record_buffered_wait_anchor(ex, ep, conn_id, epoch, sym, chan, wall_ns);
+            }
+        }
+
         let mut written_wall_ns = None;
+        let mut rejected_late_wall_ns = None;
         if let Some(writer) = writers.get_mut(&ex) {
             for rec in &out.records {
-                match writer.write_record(rec) {
-                    Ok(Some(s)) => {
-                        info!(
-                            "Rolled and sealed {} -> {} (bytes={}, data_lines={}, sha256={})",
-                            ex,
-                            s.data_path.display(),
-                            s.manifest.bytes,
-                            s.manifest.data_lines,
-                            s.manifest.sha256
-                        );
-                        flush_stderr();
-                    }
-                    Ok(None) => {
-                        if !matches!(rec.kind, crate::types::RecordKind::Meta) {
+                match writer.write_record_with_outcome(rec) {
+                    Ok(outcome) => {
+                        if let Some(s) = outcome.sealed {
+                            info!(
+                                "Rolled and sealed {} -> {} (bytes={}, data_lines={}, sha256={})",
+                                ex,
+                                s.data_path.display(),
+                                s.manifest.bytes,
+                                s.manifest.data_lines,
+                                s.manifest.sha256
+                            );
+                            flush_stderr();
+                        }
+                        if outcome.accepted_as_market_data {
                             written_wall_ns = Some(rec.recv_wall_ns);
+                        } else if let Some(target_wid) = outcome.rejected_late_target_window_id {
+                            if !matches!(rec.kind, crate::types::RecordKind::Meta) {
+                                rejected_late_wall_ns = Some(rec.recv_wall_ns);
+                                warn!(
+                                    "Rejected expired late market-data frame on {} for closed window {} (orig_recv_wall_ns={})",
+                                    ex, target_wid, rec.recv_wall_ns
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -694,8 +1491,22 @@ fn process_engine_event(
                 }
             }
         }
-        if let (Some((symbol, channel)), Some(wall_ns)) = (out.market_data, written_wall_ns) {
-            activity.record(ex, symbol, channel, wall_ns);
+        if let Some(wall_ns) = written_wall_ns {
+            if !out.written_streams.is_empty() {
+                for (symbol, channel) in &out.written_streams {
+                    activity.record_written(ex, symbol.clone(), channel.clone(), wall_ns);
+                }
+            } else if let Some((symbol, channel)) = &out.market_data {
+                activity.record_written(ex, symbol.clone(), channel.clone(), wall_ns);
+            }
+        } else if let Some(wall_ns) = rejected_late_wall_ns {
+            if !out.written_streams.is_empty() {
+                for (symbol, channel) in &out.written_streams {
+                    activity.record_rejected_late(ex, symbol.clone(), channel.clone(), wall_ns);
+                }
+            } else if let Some((symbol, channel)) = &out.market_data {
+                activity.record_rejected_late(ex, symbol.clone(), channel.clone(), wall_ns);
+            }
         }
         if !allow_actions {
             continue;
@@ -708,11 +1519,17 @@ fn process_engine_event(
                     {
                         if let Some(epoch) = selector.connected_epoch(conn_id) {
                             let command = ConnCommand {
-                                epoch, action: ConnCommandAction::Reconnect(reason),
+                                epoch,
+                                action: ConnCommandAction::Reconnect(reason),
                             };
                             if ctx.try_send(command).is_err() {
                                 selector.allow_reconnect_retry(conn_id);
-                                warn!("Reconnect command was not queued for {} conn={} epoch={}", ep.as_str(), conn_id.as_str(), epoch);
+                                warn!(
+                                    "Reconnect command was not queued for {} conn={} epoch={}",
+                                    ep.as_str(),
+                                    conn_id.as_str(),
+                                    epoch
+                                );
                             }
                         }
                     }
@@ -723,7 +1540,8 @@ fn process_engine_event(
                     {
                         if let Some(epoch) = selector.connected_epoch(conn_id) {
                             let command = ConnCommand {
-                                epoch, action: ConnCommandAction::Resubscribe(reason),
+                                epoch,
+                                action: ConnCommandAction::Resubscribe(reason),
                             };
                             if ctx.try_send(command).is_ok() && ep == EndpointKind::GatePublic {
                                 selector.prepare_depth_refresh(conn_id);
@@ -733,40 +1551,23 @@ fn process_engine_event(
                 }
                 SelectorAction::FetchRestSnapshot { conn_id, symbol } => {
                     if ep == EndpointKind::BinancePublic {
-                        let Some(epoch) = selectors.get(&ep).and_then(|selector| selector.connected_epoch(conn_id)) else {
+                        let Some(epoch) = selectors
+                            .get(&ep)
+                            .and_then(|selector| selector.connected_epoch(conn_id))
+                        else {
                             continue;
                         };
-                        let tx_s = tx.clone();
-                        let http_s = http_client.clone();
-                        let url = format!(
-                            "{}?symbol={}&limit={}",
-                            config.exchanges.binance_futures.rest_depth_url,
-                            symbol,
-                            config.exchanges.binance_futures.depth_snapshot_limit
-                        );
-                        bg_handles.retain(|h| !h.is_finished());
-                        bg_handles.push(tokio::spawn(async move {
-                            if let Ok(resp) = http_s.get(&url).send().await {
-                                if let Ok(text) = resp.text().await {
-                                    let wall_ns = wall_clock_ns();
-                                    let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        if let Some(id) = v.get("lastUpdateId").and_then(|x| x.as_u64()) {
-                                            let _ = tx_s.try_send(EngineEvent::RestSnapshot {
-                                                endpoint: ep,
-                                                conn_id,
-                                                epoch,
-                                                symbol,
-                                                last_update_id: id,
-                                                raw_json: text,
-                                                wall_ns,
-                                                mono_ns,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }));
+                        let supersede = out.snapshot_bridge_failed.is_none();
+                        if let Some(old_id) = binance_scheduler.trigger(
+                            conn_id,
+                            epoch,
+                            &symbol,
+                            mono_origin.elapsed(),
+                            "selector_resync",
+                            supersede,
+                        ) {
+                            abort_snapshot_tasks(snapshot_tasks, [old_id]);
+                        }
                     }
                 }
                 SelectorAction::Alert { severity, message } => {
@@ -776,6 +1577,19 @@ fn process_engine_event(
             }
         }
     }
+
+    if allow_actions {
+        dispatch_binance_snapshots(
+            binance_scheduler,
+            snapshot_tasks,
+            selectors,
+            config,
+            mono_origin,
+            tx,
+            http_client,
+            stop_rx,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -784,7 +1598,6 @@ async fn ws_connection_loop(
     conn_id: ConnId,
     symbols: Vec<String>,
     config: Arc<CollectorConfig>,
-    http_client: reqwest::Client,
     mono_origin: Instant,
     tx: mpsc::Sender<EngineEvent>,
     mut cmd_rx: mpsc::Receiver<ConnCommand>,
@@ -846,12 +1659,18 @@ async fn ws_connection_loop(
         match connect_res {
             Ok((ws_stream, _)) => {
                 let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                if !send_lifecycle_event(&tx, &mut stop_rx, EngineEvent::Reconnect {
-                    endpoint,
-                    conn_id,
-                    epoch,
-                    mono_ns,
-                }).await {
+                if !send_lifecycle_event(
+                    &tx,
+                    &mut stop_rx,
+                    EngineEvent::Reconnect {
+                        endpoint,
+                        conn_id,
+                        epoch,
+                        mono_ns,
+                    },
+                )
+                .await
+                {
                     return;
                 }
                 info!(
@@ -865,74 +1684,54 @@ async fn ws_connection_loop(
                 let (mut write, mut read) = ws_stream.split();
 
                 let disconnect_reason = 'session: {
-                    let subscribed_at = match subscribe_socket(endpoint, &symbols, &mut write, &mut stop_rx).await {
-                        Some(Ok(subscribed_at)) => subscribed_at,
-                        Some(Err(reason)) => {
-                            warn!("Subscribe write error on {} {:?}: {}", endpoint.as_str(), conn_id, reason);
-                            break 'session reason;
-                        }
-                        None => return,
-                    };
-
-                    // For Binance /public, spawn initial REST 1000-level snapshot fetch for each symbol
-                    // AFTER WS stream is open and buffering deltas.
-                    if endpoint == EndpointKind::BinancePublic {
-                        for sym in &symbols {
-                            let tx_s = tx.clone();
-                            let http_s = http_client.clone();
-                            let sym_c = sym.clone();
-                            let mut stop_s = stop_rx.clone();
-                            let rest_url = format!(
-                                "{}?symbol={}&limit={}",
-                                config.exchanges.binance_futures.rest_depth_url,
-                                sym,
-                                config.exchanges.binance_futures.depth_snapshot_limit
-                            );
-                            tokio::spawn(async move {
-                                tokio::select! {
-                                    biased;
-                                    _ = stop_s.changed() => return,
-                                    _ = tokio::time::sleep(Duration::from_millis(350)) => {}
-                                }
-                                if *stop_s.borrow() {
-                                    return;
-                                }
-                                if let Ok(resp) = http_s.get(&rest_url).send().await {
-                                    if let Ok(text) = resp.text().await {
-                                        let wall_ns = wall_clock_ns();
-                                        let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                            if let Some(id) = v.get("lastUpdateId").and_then(|x| x.as_u64()) {
-                                                let _ = tx_s.try_send(EngineEvent::RestSnapshot {
-                                                    endpoint,
-                                                    conn_id,
-                                                    epoch,
-                                                    symbol: sym_c,
-                                                    last_update_id: id,
-                                                    raw_json: text,
-                                                    wall_ns,
-                                                    mono_ns,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        }
+                    let subscribed_at =
+                        match subscribe_socket(endpoint, &symbols, &mut write, &mut stop_rx).await {
+                            Some(Ok(subscribed_at)) => subscribed_at,
+                            Some(Err(reason)) => {
+                                warn!(
+                                    "Subscribe write error on {} {:?}: {}",
+                                    endpoint.as_str(),
+                                    conn_id,
+                                    reason
+                                );
+                                break 'session reason;
+                            }
+                            None => return,
+                        };
+                    if !send_lifecycle_event(
+                        &tx,
+                        &mut stop_rx,
+                        EngineEvent::Subscribed {
+                            endpoint,
+                            conn_id,
+                            epoch,
+                        },
+                    )
+                    .await
+                    {
+                        return;
                     }
 
                     let ping_secs = match endpoint {
-                        EndpointKind::BybitPublic => config.exchanges.bybit_linear.ping_interval_seconds,
-                        EndpointKind::BitgetPublic => config.exchanges.bitget_v3.ping_interval_seconds,
-                        EndpointKind::GatePublic => config.exchanges.gate_futures.ping_interval_seconds,
+                        EndpointKind::BybitPublic => {
+                            config.exchanges.bybit_linear.ping_interval_seconds
+                        }
+                        EndpointKind::BitgetPublic => {
+                            config.exchanges.bitget_v3.ping_interval_seconds
+                        }
+                        EndpointKind::GatePublic => {
+                            config.exchanges.gate_futures.ping_interval_seconds
+                        }
                         _ => 30,
                     };
-                    let mut ping_timer = tokio::time::interval(Duration::from_secs(ping_secs.max(5)));
+                    let mut ping_timer =
+                        tokio::time::interval(Duration::from_secs(ping_secs.max(5)));
                     let disconnect_reason: String;
                     let mut gate_refresh: Option<GateDepthRefresh> = None;
 
                     loop {
-                        let refresh_deadline = gate_refresh.as_ref().map(|refresh| refresh.deadline);
+                        let refresh_deadline =
+                            gate_refresh.as_ref().map(|refresh| refresh.deadline);
                         tokio::select! {
                             biased;
                             _ = stop_rx.changed() => {
@@ -1066,14 +1865,20 @@ async fn ws_connection_loop(
                     disconnect_reason
                 };
 
-                if !send_lifecycle_event(&tx, &mut stop_rx, EngineEvent::Disconnect {
-                    endpoint,
-                    conn_id,
-                    epoch,
-                    wall_ns: wall_clock_ns(),
-                    mono_ns: mono_origin.elapsed().as_nanos() as u64,
-                    reason: disconnect_reason,
-                }).await {
+                if !send_lifecycle_event(
+                    &tx,
+                    &mut stop_rx,
+                    EngineEvent::Disconnect {
+                        endpoint,
+                        conn_id,
+                        epoch,
+                        wall_ns: wall_clock_ns(),
+                        mono_ns: mono_origin.elapsed().as_nanos() as u64,
+                        reason: disconnect_reason,
+                    },
+                )
+                .await
+                {
                     return;
                 }
             }
@@ -1110,12 +1915,22 @@ impl GateDepthRefresh {
     {
         let now = Utc::now();
         let mut awaiting_ack = HashSet::new();
-        let awaiting_snapshot = symbols.iter().map(|symbol| format!("ob.{}.50", symbol.to_uppercase())).collect();
-        for (index, mut frame) in GateValidator::build_depth_messages(symbols, now.timestamp(), "unsubscribe").into_iter().enumerate() {
+        let awaiting_snapshot = symbols
+            .iter()
+            .map(|symbol| format!("ob.{}.50", symbol.to_uppercase()))
+            .collect();
+        for (index, mut frame) in
+            GateValidator::build_depth_messages(symbols, now.timestamp(), "unsubscribe")
+                .into_iter()
+                .enumerate()
+        {
             let id = (now.timestamp_millis() as u64) * 100 + index as u64;
             frame["id"] = id.into();
             awaiting_ack.insert(id);
-            write.send(Message::Text(frame.to_string())).await.map_err(|e| e.to_string())?;
+            write
+                .send(Message::Text(frame.to_string()))
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(Self {
             deadline: tokio::time::Instant::now() + Duration::from_secs(10),
@@ -1124,7 +1939,12 @@ impl GateDepthRefresh {
         })
     }
 
-    async fn on_message<S>(&mut self, text: &str, symbols: &[String], write: &mut S) -> Result<bool, String>
+    async fn on_message<S>(
+        &mut self,
+        text: &str,
+        symbols: &[String],
+        write: &mut S,
+    ) -> Result<bool, String>
     where
         S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
@@ -1139,13 +1959,21 @@ impl GateDepthRefresh {
                 if let Some(id) = frame.get("id").and_then(|v| v.as_u64()) {
                     if self.awaiting_ack.remove(&id) {
                         if frame.get("error").is_some_and(|v| !v.is_null())
-                            || frame.pointer("/result/status").and_then(|v| v.as_str()) != Some("success")
+                            || frame.pointer("/result/status").and_then(|v| v.as_str())
+                                != Some("success")
                         {
                             return Err("Gate rejected depth unsubscribe".into());
                         }
                         if self.awaiting_ack.is_empty() {
-                            for message in GateValidator::build_depth_messages(symbols, Utc::now().timestamp(), "subscribe") {
-                                write.send(Message::Text(message.to_string())).await.map_err(|e| e.to_string())?;
+                            for message in GateValidator::build_depth_messages(
+                                symbols,
+                                Utc::now().timestamp(),
+                                "subscribe",
+                            ) {
+                                write
+                                    .send(Message::Text(message.to_string()))
+                                    .await
+                                    .map_err(|e| e.to_string())?;
                             }
                         }
                     }
@@ -1176,7 +2004,11 @@ where
         _ = stop.wait_for(|requested| *requested) => return None,
         result = send_subscriptions(endpoint, symbols, write) => result,
     };
-    Some(result.map(|()| Instant::now()).map_err(|error| format!("subscribe_write_error: {error}")))
+    Some(
+        result
+            .map(|()| Instant::now())
+            .map_err(|error| format!("subscribe_write_error: {error}")),
+    )
 }
 
 async fn send_subscriptions<S>(
@@ -1229,13 +2061,27 @@ mod tests {
     async fn command_queue_rejects_late_reconnect_and_resubscribe_for_previous_epoch() {
         let (tx, mut rx) = mpsc::channel(4);
         let next = tokio::spawn(async move { next_command_for_epoch(&mut rx, 2).await });
-        tx.send(ConnCommand { epoch: 1, action: ConnCommandAction::Reconnect("old".into()) })
-            .await.unwrap();
-        tx.send(ConnCommand { epoch: 1, action: ConnCommandAction::Resubscribe("old".into()) })
-            .await.unwrap();
-        tx.send(ConnCommand { epoch: 2, action: ConnCommandAction::Resubscribe("current".into()) })
-            .await.unwrap();
-        assert!(matches!(next.await.unwrap(), Some(ConnCommandAction::Resubscribe(reason)) if reason == "current"));
+        tx.send(ConnCommand {
+            epoch: 1,
+            action: ConnCommandAction::Reconnect("old".into()),
+        })
+        .await
+        .unwrap();
+        tx.send(ConnCommand {
+            epoch: 1,
+            action: ConnCommandAction::Resubscribe("old".into()),
+        })
+        .await
+        .unwrap();
+        tx.send(ConnCommand {
+            epoch: 2,
+            action: ConnCommandAction::Resubscribe("current".into()),
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(next.await.unwrap(), Some(ConnCommandAction::Resubscribe(reason)) if reason == "current")
+        );
     }
 
     #[test]
@@ -1250,7 +2096,10 @@ mod tests {
         selector.on_disconnect(ConnId::A, 10, 11, "old socket closed");
         assert!(active_selector_for_epoch(&mut selectors, endpoint, ConnId::A, 1).is_none());
 
-        selectors.get_mut(&endpoint).unwrap().on_reconnect(ConnId::A, 2, 20);
+        selectors
+            .get_mut(&endpoint)
+            .unwrap()
+            .on_reconnect(ConnId::A, 2, 20);
         assert!(active_selector_for_epoch(&mut selectors, endpoint, ConnId::A, 1).is_none());
         assert!(active_selector_for_epoch(&mut selectors, endpoint, ConnId::A, 2).is_some());
     }
@@ -1258,20 +2107,34 @@ mod tests {
     #[tokio::test]
     async fn subscription_sink_write_failure_is_a_disconnect_reason() {
         let sink = futures_util::sink::unfold((), |(), _: Message| {
-            std::future::ready(Err::<(), _>(tokio_tungstenite::tungstenite::Error::ConnectionClosed))
+            std::future::ready(Err::<(), _>(
+                tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+            ))
         });
         let mut sink = Box::pin(sink);
         let (_stop, mut stop_rx) = watch::channel(false);
-        let result = subscribe_socket(EndpointKind::GatePublic, &["BTC_USDT".into()], &mut sink, &mut stop_rx)
-            .await.unwrap();
+        let result = subscribe_socket(
+            EndpointKind::GatePublic,
+            &["BTC_USDT".into()],
+            &mut sink,
+            &mut stop_rx,
+        )
+        .await
+        .unwrap();
         assert!(result.unwrap_err().starts_with("subscribe_write_error:"));
     }
 
     #[test]
     fn failed_or_short_subscriptions_increase_retry_delay_until_a_stable_session() {
         let mut backoff_ms = INITIAL_RETRY_MS;
-        assert_eq!(next_retry_delay(&mut backoff_ms, None), Duration::from_millis(500));
-        assert_eq!(next_retry_delay(&mut backoff_ms, None), Duration::from_secs(1));
+        assert_eq!(
+            next_retry_delay(&mut backoff_ms, None),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_retry_delay(&mut backoff_ms, None),
+            Duration::from_secs(1)
+        );
         assert_eq!(
             next_retry_delay(&mut backoff_ms, Some(Duration::from_millis(20))),
             Duration::from_secs(2),
@@ -1279,8 +2142,14 @@ mod tests {
         for _ in 0..10 {
             let _ = next_retry_delay(&mut backoff_ms, None);
         }
-        assert_eq!(next_retry_delay(&mut backoff_ms, None), Duration::from_secs(15));
-        assert_eq!(next_retry_delay(&mut backoff_ms, Some(STABLE_SESSION)), Duration::from_millis(500));
+        assert_eq!(
+            next_retry_delay(&mut backoff_ms, None),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            next_retry_delay(&mut backoff_ms, Some(STABLE_SESSION)),
+            Duration::from_millis(500)
+        );
     }
 
     #[tokio::test]
@@ -1288,31 +2157,57 @@ mod tests {
         let frames = Arc::new(Mutex::new(Vec::<Value>::new()));
         let captured = Arc::clone(&frames);
         let sink = futures_util::sink::unfold((), move |(), msg: Message| {
-            let Message::Text(text) = msg else { panic!("expected a Gate text frame") };
-            captured.lock().unwrap().push(serde_json::from_str(&text).unwrap());
+            let Message::Text(text) = msg else {
+                panic!("expected a Gate text frame")
+            };
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(&text).unwrap());
             std::future::ready(Ok::<(), tokio_tungstenite::tungstenite::Error>(()))
         });
         let mut sink = Box::pin(sink);
         let symbols = vec!["BTC_USDT".to_string(), "ETH_USDT".to_string()];
         let mut refresh = GateDepthRefresh::start(&symbols, &mut sink).await.unwrap();
-        let ids: Vec<_> = frames.lock().unwrap().iter().map(|row| row["id"].clone()).collect();
+        let ids: Vec<_> = frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect();
         assert_eq!(ids.len(), 2);
-        assert!(frames.lock().unwrap().iter().all(|row| row["event"] == "unsubscribe"));
+        assert!(frames
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|row| row["event"] == "unsubscribe"));
 
         for (index, id) in ids.into_iter().enumerate() {
             let ack = json!({"id": id, "channel": "futures.obu", "event": "unsubscribe",
                 "result": {"status": "success"}});
-            assert!(!refresh.on_message(&ack.to_string(), &symbols, &mut sink).await.unwrap());
-            assert_eq!(frames.lock().unwrap().len(), if index == 0 { 2 } else { 4 });
+            assert!(!refresh
+                .on_message(&ack.to_string(), &symbols, &mut sink)
+                .await
+                .unwrap());
+            assert_eq!(
+                frames.lock().unwrap().len(),
+                if index == 0 { 2 } else { 4 }
+            );
         }
-        assert!(frames.lock().unwrap()[2..].iter().all(|row|
-            row["event"] == "subscribe" && row["channel"] == "futures.obu"
-        ));
+        assert!(frames.lock().unwrap()[2..]
+            .iter()
+            .all(|row| row["event"] == "subscribe" && row["channel"] == "futures.obu"));
         for (index, symbol) in symbols.iter().enumerate() {
             let raw = json!({"channel": "futures.obu", "result": {
                 "full": true, "s": format!("ob.{symbol}.50")
             }});
-            assert_eq!(refresh.on_message(&raw.to_string(), &symbols, &mut sink).await.unwrap(), index == 1);
+            assert_eq!(
+                refresh
+                    .on_message(&raw.to_string(), &symbols, &mut sink)
+                    .await
+                    .unwrap(),
+                index == 1
+            );
         }
     }
 }

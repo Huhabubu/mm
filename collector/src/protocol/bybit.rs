@@ -24,6 +24,7 @@ pub struct BybitValidator {
     book1_states: HashMap<String, BybitBookState>,
     seen_trade_ids: HashMap<String, VecDeque<String>>,
     seen_trade_set: HashMap<String, HashSet<String>>,
+    pending_sub_acks: Vec<(String, String)>,
     overall_invalid: bool,
 }
 
@@ -42,6 +43,7 @@ impl BybitValidator {
             book1_states,
             seen_trade_ids: HashMap::new(),
             seen_trade_set: HashMap::new(),
+            pending_sub_acks: Vec::new(),
             overall_invalid: false,
         }
     }
@@ -231,6 +233,22 @@ impl ProtocolValidator for BybitValidator {
             }
             if op == "subscribe" {
                 if v.get("success").and_then(Value::as_bool) == Some(true) {
+                    if let Some(args) = v.get("args").and_then(Value::as_array) {
+                        for item in args {
+                            if let Some(topic) = item.as_str() {
+                                if let Some((chan, sym)) = topic.rsplit_once('.') {
+                                    self.pending_sub_acks
+                                        .push((sym.to_uppercase(), chan.to_string()));
+                                }
+                            }
+                        }
+                    } else {
+                        for sym in &self.expected_symbols {
+                            for chan in ["orderbook.50", "orderbook.1", "publicTrade"] {
+                                self.pending_sub_acks.push((sym.clone(), chan.to_string()));
+                            }
+                        }
+                    }
                     return FrameVerdict::Control {
                         note: "bybit subscribe ack".to_string(),
                     };
@@ -307,8 +325,17 @@ impl ProtocolValidator for BybitValidator {
         }
     }
 
+    fn take_subscription_acks(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_sub_acks)
+    }
+
+    fn expected_symbols(&self) -> Vec<String> {
+        self.expected_symbols.clone()
+    }
+
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.pending_sub_acks.clear();
         for st in self.book50_states.values_mut() {
             *st = BybitBookState::new();
         }
