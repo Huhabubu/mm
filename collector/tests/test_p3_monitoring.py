@@ -61,6 +61,7 @@ def _write_test_config(tmp_path: Path, data_root: Path) -> Path:
     cfg = json.loads((SPECS_DIR / "config.example.json").read_text(encoding="utf-8"))
     cfg["deployment"]["data_root"] = str(data_root)
     cfg["meta_daemon"]["collector_stale_seconds"] = 300
+    cfg["meta_daemon"]["require_stream_activity"] = False  # legacy monitor fixtures
     cfg["meta_daemon"]["collector_hc_interval_seconds"] = 300
     cfg["meta_daemon"]["alert_cooldown_seconds"] = 1800
     cfg["meta_daemon"]["restart_recovery_seconds"] = 600
@@ -2099,3 +2100,41 @@ def test_stream_activity_does_not_count_an_active_sibling(tmp_path: Path) -> Non
     path.write_text(json.dumps(sample), encoding="utf-8")
     assert md_mod.inspect_stream_activity(data_root, expected, now_s=now_s, stale_seconds=300)["healthy"]
     assert not md_mod.inspect_stream_activity(data_root, expected, now_s=now_s + 61, stale_seconds=300)["healthy"]
+
+
+def test_stream_activity_drives_collector_healthcheck(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, data_root)
+    config = json.loads(cfg.read_text(encoding="utf-8"))
+    config["meta_daemon"]["require_stream_activity"] = True
+    for exchange, spec in config["exchanges"].items():
+        spec["enabled"] = exchange == "binance_futures"
+    config["exchanges"]["binance_futures"]["symbols"] = ["BTCUSDT"]
+    cfg.write_text(json.dumps(config), encoding="utf-8")
+
+    now_s = 1_800_000_000
+    _seed_exchange_files(data_root, "binance_futures", now_s=now_s)
+    monitor = CollectorMonitor(
+        cfg,
+        service_probe=lambda unit: {"available": True, "active_state": "active", "sub_state": "running"},
+        journal_reader=lambda unit, cursor: ([], cursor),
+        chrony_runner=lambda: GOOD_CHRONY_OUTPUT,
+        disk_checker=lambda path: 10.0,
+        allow_notify=False,
+    )
+    def sweep():
+        return monitor.run_sweep(
+            now_epoch_s=now_s, run_chrony=True, run_specs=False, run_rtt=False, force_collector_hc=True,
+        )
+
+    first = sweep()
+    assert "collector_stream_stale" in first["active_alerts"]
+    assert first["collector_healthcheck"]["healthy"] is False
+
+    sample = {"sampled_wall_ns": now_s * 10**9, "streams": [
+        {"exchange": "binance_futures", "symbol": "BTCUSDT", "channel": channel,
+         "written_frames": 1, "last_written_wall_ns": now_s * 10**9}
+        for channel in ("bookTicker", "depth@100ms", "aggTrade")
+    ]}
+    (data_root / "meta" / "stream_activity.json").write_text(json.dumps(sample), encoding="utf-8")
+    assert sweep()["collector_healthcheck"]["healthy"] is True

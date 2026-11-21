@@ -26,11 +26,17 @@ All commands emit structured JSON and fail closed (`"status": "blocked"`, non-ze
 ./collector/bin/collect --config /etc/tokyo-l2/config.json --run-id p2_trial_YYYYMMDD --allow-live-run
 
 # 3. Atomic archive verification & upload to single Google Drive Pro (rclone)
-./collector/bin/archive --dir /data/tokyo_l2 --remote gdrive_main:tokyo_l2_data --verify-remote --prune-hours 24
+./collector/bin/archive --dir /data/tokyo_l2 --config /etc/tokyo-l2/config.json --remote gdrive_main:tokyo_l2_data --verify-remote
 
 # 4. Offline QA gatekeeper & hftbacktest==2.4.4 conversion
-./collector/bin/qa-convert --manifest /data/tokyo_l2/verified_archive_ledger.jsonl --out /data/tokyo_l2/hbt_npz
+./collector/bin/qa-convert --manifest /data/tokyo_l2/archive_ledger.sqlite \
+  --coverage-config /etc/tokyo-l2/config.json --date-utc YYYY-MM-DD \
+  --remote gdrive_main:tokyo_l2_data --out /data/tokyo_l2/hbt_npz
 ```
+
+The archive service checks the previous complete UTC hour against the enabled exchanges before sending its success heartbeat. The scheduled service keeps local files. Supplying the QA coverage configuration and date requires all configured streams and hourly partitions, certified clock samples for every minute, and no recorded gaps or local loss. Conversion without the coverage arguments reports `coverage.status=not_assessed` and is suitable for partial samples.
+
+Set `meta_daemon.require_stream_activity` to `true` when upgrading the collector and monitor together. The monitor then checks the collector's recent per-market/channel write timestamps and blocks its success heartbeat if a stream or the activity report is stale.
 
 ### Exit Codes
 

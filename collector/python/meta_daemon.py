@@ -1781,7 +1781,17 @@ class CollectorMonitor:
         dt_now = datetime.fromtimestamp(now_s, tz=timezone.utc)
         hour_key = dt_now.strftime("%Y-%m-%dT%H")
 
-        # 1. Spec fetch on first startup, UTC midnight, or explicit request
+        # Sample the UTC slot before external network calls in this sweep.
+        last_c = self.state.get("last_chrony_epoch_s")
+        chrony_interval = max(1, self.chrony_interval_seconds)
+        do_chrony = run_chrony if run_chrony is not None else (
+            last_c is None or int(now_s // chrony_interval) != int(float(last_c) // chrony_interval)
+        )
+        if do_chrony:
+            self.last_chrony_row = sample_chrony_once(self.data_root, runner=self.chrony_runner)
+            self.state["last_chrony_epoch_s"] = now_s
+
+        # Spec fetch on first startup, UTC midnight, or explicit request
         observed: dict[str, dict[str, Any]] = {}
         spec_change_alerts: list[str] = []
         last_spec_day = self.state.get("last_spec_day")
@@ -1814,15 +1824,6 @@ class CollectorMonitor:
                         details={"flags": self.last_spec_res["spec_change_isolation_flags"]},
                     )
                 spec_change_alerts.append("spec_change_isolation")
-
-        # 2. Chrony check (strict <= 1.0 ms certification)
-        last_c = self.state.get("last_chrony_epoch_s")
-        do_chrony = run_chrony if run_chrony is not None else (
-            last_c is None or (now_s - float(last_c)) >= self.chrony_interval_seconds
-        )
-        if do_chrony:
-            self.last_chrony_row = sample_chrony_once(self.data_root, runner=self.chrony_runner)
-            self.state["last_chrony_epoch_s"] = now_s
 
         # 3. RTT probe
         last_r = self.state.get("last_rtt_epoch_s")
@@ -2412,7 +2413,7 @@ def run_daemon(
 
     poll_sec = max(5, int(monitor.health_poll_seconds))
     while True:
-        time.sleep(poll_sec)
+        time.sleep(poll_sec - time.time() % poll_sec)
         try:
             monitor.run_sweep()
         except Exception as exc:

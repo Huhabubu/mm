@@ -1406,3 +1406,44 @@ def test_complete_day_gate_rejects_single_verified_partition(tmp_path: Path) -> 
     assert len(result["coverage"]["missing_partitions"]) == 23
     assert "incomplete_utc_day_coverage" in result["failed_items"]
     assert not (tmp_path / "out").exists()
+
+
+def test_complete_day_coverage_checks_intrahour_gaps(tmp_path: Path) -> None:
+    from data_coverage import CompleteDayCoverage
+
+    config = {"exchanges": {"binance_futures": {
+        "enabled": True, "symbols": ["BTCUSDT"],
+        "public_channels": ["bookTicker"], "market_channels": [],
+    }}}
+    coverage = CompleteDayCoverage(config, "2026-12-03")
+    clock = tmp_path / "chrony"
+    clock.mkdir()
+    (clock / "chrony_20261203.csv").write_text(
+        "wall_ns,certified_le_1ms\n" + "".join(
+            f"{(coverage.start_s + minute * 60) * 10**9},True\n" for minute in range(1440)
+        ),
+        encoding="utf-8",
+    )
+    for hour in range(24):
+        coverage.observe_partition({
+            "date_utc": coverage.date, "hour_utc": hour, "exchange": "binance_futures",
+        })
+    raw = json.dumps({"e": "bookTicker", "s": "BTCUSDT"})
+    for minute in range(0, 1440, 60):
+        coverage.observe_record("binance_futures", {
+            "kind": "DATA", "recv_wall_ns": (coverage.start_s + minute * 60) * 10**9, "payload": raw,
+        })
+    result = coverage.report(tmp_path)
+    assert result["status"] == "incomplete"
+    assert result["missing_partitions"] == []
+    assert result["missing_stream_hours"] == []
+    assert result["clock_certified_minutes"] == 1440
+    assert len(result["stream_gaps"]) == 1
+
+    # In production the timestamps arrive in order. Rebuild coverage for the complete stream.
+    coverage.timing.clear()
+    for minute in range(0, 1440, 5):
+        coverage.observe_record("binance_futures", {
+            "kind": "DATA", "recv_wall_ns": (coverage.start_s + minute * 60) * 10**9, "payload": raw,
+        })
+    assert coverage.report(tmp_path)["status"] == "complete"

@@ -1658,11 +1658,16 @@ def sync_sealed_directory(
             recovered_pruned: list[str] = []
             skipped_pruned = 0
             skipped_verified = 0
+            manifests_with_data: set[str] = set()
 
             for mpath in manifests:
                 try:
                     manifest = json.loads(mpath.read_text(encoding="utf-8"))
                     ident = _derive_partition_identity(sealed_root, mpath, manifest)
+                    if expected_hourly_exchanges is not None and (
+                        int(manifest.get("data_lines") or 0) + int(manifest.get("data_escaped_lines") or 0) > 0
+                    ):
+                        manifests_with_data.add(ident["rel_manifest_path"])
                 except Exception as exc:
                     errors.append(f"{mpath}: manifest_parse_error: {type(exc).__name__}: {exc}")
                     continue
@@ -2214,6 +2219,7 @@ def sync_sealed_directory(
                     for row in all_verified_rows
                     if row["date_utc"] == expected_date and row["hour_utc"] == expected_hour
                     and row["remote_data_verified"] and row["remote_manifest_verified"]
+                    and row["rel_manifest_path"] in manifests_with_data
                     and not row["has_conflict"] and not row["last_error_code"]
                 }
                 errors.extend(
