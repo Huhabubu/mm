@@ -370,10 +370,15 @@ def audit_proxy_isolation(
 
     if proxy_env.is_file():
         checked_files.append(str(proxy_env))
-        p_keys = _extract_env_assignments(proxy_env.read_text(encoding="utf-8"))
+        pe_txt = proxy_env.read_text(encoding="utf-8")
+        p_keys = _extract_env_assignments(pe_txt)
         bad_p = sorted(k for k in p_keys if k in PROXY_ENV_KEYS)
         if bad_p:
             violations.append(f"{proxy_env.name} must not export global {bad_p}")
+        if "lightsail_ed25519" in pe_txt:
+            violations.append(f"{proxy_env.name} references wrong key name lightsail_ed25519; expected /etc/tokyo-l2/tokyo_l2_lightsail")
+        if "TOKYO_L2_LIGHTSAIL_KEY=" in pe_txt and "/etc/tokyo-l2/tokyo_l2_lightsail" not in pe_txt:
+            violations.append(f"{proxy_env.name} must configure TOKYO_L2_LIGHTSAIL_KEY=/etc/tokyo-l2/tokyo_l2_lightsail")
 
     if proxy_unit.is_file():
         checked_files.append(str(proxy_unit))
@@ -381,6 +386,17 @@ def audit_proxy_isolation(
         for req in ("ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", "BatchMode=yes", "Restart=always"):
             if req not in pu_txt:
                 violations.append(f"{proxy_unit.name} missing hardened option {req!r}")
+
+    guide_doc = deploy_dir / "LIGHTSAIL_PROXY.md"
+    if guide_doc.is_file():
+        checked_files.append(str(guide_doc))
+        gd_txt = guide_doc.read_text(encoding="utf-8")
+        if "tokyo_l2_lightsail" not in gd_txt or "lightsail_ed25519" in gd_txt:
+            violations.append(f"{guide_doc.name} must reference /etc/tokyo-l2/tokyo_l2_lightsail (not lightsail_ed25519)")
+        if "ssh-keygen -lf" not in gd_txt:
+            violations.append(f"{guide_doc.name} must verify host key SHA-256 fingerprint via ssh-keygen -lf before pinning")
+        if re.search(r"ssh-keyscan[^\n]*\|[^\n]*tee[^\n]*lightsail_known_hosts", gd_txt):
+            violations.append(f"{guide_doc.name} must not pipe ssh-keyscan blindly into lightsail_known_hosts")
 
     if collector_systemd_env_text is not None:
         live_keys = _extract_env_assignments(collector_systemd_env_text)
@@ -392,6 +408,156 @@ def audit_proxy_isolation(
         "isolated": len(violations) == 0,
         "violations": violations,
         "checked_files": checked_files,
+    }
+
+
+def _default_port_in_use(host: str, port: int) -> dict[str, Any]:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    bind_failed = False
+    bind_error: str | None = None
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, int(port)))
+    except OSError as exc:
+        bind_failed = True
+        bind_error = str(exc)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    connect_ok = False
+    connect_host = "127.0.0.1" if host in ("", "0.0.0.0") else host
+    try:
+        with socket.create_connection((connect_host, int(port)), timeout=0.5):
+            connect_ok = True
+    except OSError:
+        connect_ok = False
+
+    return {
+        "host": host,
+        "port": int(port),
+        "in_use": bool(bind_failed or connect_ok),
+        "bind_failed": bind_failed,
+        "bind_error": bind_error,
+        "connect_reachable": connect_ok,
+    }
+
+
+def _default_systemd_unit_state(unit: str) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["systemctl", "show", unit, "--property=ActiveState", "--property=SubState", "--property=MainPID"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "unit": unit,
+            "available": False,
+            "active_state": "unknown",
+            "sub_state": "unknown",
+            "main_pid": None,
+            "error": str(exc),
+        }
+    if proc.returncode != 0:
+        return {
+            "unit": unit,
+            "available": False,
+            "active_state": "unknown",
+            "sub_state": "unknown",
+            "main_pid": None,
+            "error": (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip(),
+        }
+    vals: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip()
+    raw_pid = vals.get("MainPID", "").strip()
+    main_pid: int | None = int(raw_pid) if raw_pid.isdigit() and int(raw_pid) > 0 else None
+    return {
+        "unit": unit,
+        "available": True,
+        "active_state": vals.get("ActiveState", "unknown") or "unknown",
+        "sub_state": vals.get("SubState", "unknown") or "unknown",
+        "main_pid": main_pid,
+    }
+
+
+def check_takeover_readiness(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 1080,
+    proxy_unit: str = SYSTEMD_PROXY_UNIT,
+    archive_unit: str = SYSTEMD_ARCHIVE_UNIT,
+    data_root: Path | None = None,
+    port_probe_fn: Callable[[str, int], dict[str, Any]] | None = None,
+    unit_state_fn: Callable[[str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    probe_fn = port_probe_fn or _default_port_in_use
+    state_fn = unit_state_fn or _default_systemd_unit_state
+
+    port_probe = dict(probe_fn(host, int(port)))
+    port_in_use = bool(port_probe.get("in_use", port_probe.get("reachable", False)))
+    proxy_state = dict(state_fn(proxy_unit))
+    archive_state = dict(state_fn(archive_unit))
+
+    archive_lock_held = False
+    archive_lock_path: str | None = None
+    if data_root is not None:
+        lock_file = Path(data_root) / ".archive_sync.lock"
+        if lock_file.exists():
+            archive_lock_path = str(lock_file)
+            try:
+                import fcntl
+
+                with lock_file.open("r", encoding="utf-8") as lf:
+                    try:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        archive_lock_held = True
+            except OSError:
+                pass
+
+    archive_busy = (archive_state.get("active_state") == "active") or archive_lock_held
+    proxy_systemd_active = proxy_state.get("active_state") == "active"
+    already_managed_by_systemd = bool(port_in_use and proxy_systemd_active)
+
+    blocking_reasons: list[str] = []
+    if archive_busy:
+        blocking_reasons.append("archive_active")
+    if port_in_use and not proxy_systemd_active:
+        blocking_reasons.append("port_occupied_by_non_systemd_process")
+
+    conflict: str | None = blocking_reasons[0] if blocking_reasons else None
+    ready_for_systemd_takeover = bool((not port_in_use) and (not archive_busy))
+    status = (
+        "ok"
+        if (conflict is None and (ready_for_systemd_takeover or already_managed_by_systemd))
+        else "blocked"
+    )
+
+    return {
+        "status": status,
+        "host": host,
+        "port": int(port),
+        "port_in_use": port_in_use,
+        "port_probe": port_probe,
+        "proxy_unit": proxy_unit,
+        "proxy_unit_state": proxy_state,
+        "archive_unit": archive_unit,
+        "archive_unit_state": archive_state,
+        "archive_lock_path": archive_lock_path,
+        "archive_lock_held": archive_lock_held,
+        "archive_busy": archive_busy,
+        "already_managed_by_systemd": already_managed_by_systemd,
+        "ready_for_systemd_takeover": ready_for_systemd_takeover,
+        "conflict": conflict,
+        "blocking_reasons": blocking_reasons,
     }
 
 
@@ -753,6 +919,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--out-md", type=Path, default=None)
     p_rep.add_argument("--out-json", type=Path, default=None)
 
+    p_takeover = sub.add_parser(
+        "check-takeover",
+        help="Check whether local SOCKS5 port and archive timer are clear for controlled systemd takeover",
+    )
+    p_takeover.add_argument("--host", default="127.0.0.1")
+    p_takeover.add_argument("--port", type=int, default=1080)
+    p_takeover.add_argument("--proxy-unit", default=SYSTEMD_PROXY_UNIT)
+    p_takeover.add_argument("--archive-unit", default=SYSTEMD_ARCHIVE_UNIT)
+    p_takeover.add_argument("--data-root", type=Path, default=None)
+
     return p
 
 
@@ -773,6 +949,17 @@ def main() -> int:
     sys_env_txt: str | None = None
     if getattr(args, "check_systemd", False):
         sys_env_txt = _read_live_collector_systemd_env()
+
+    if args.command == "check-takeover":
+        res = check_takeover_readiness(
+            host=args.host,
+            port=args.port,
+            proxy_unit=args.proxy_unit,
+            archive_unit=args.archive_unit,
+            data_root=args.data_root,
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res["status"] == "ok" else 2
 
     if args.command == "verify":
         res = run_proxy_verification(

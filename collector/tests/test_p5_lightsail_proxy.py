@@ -525,3 +525,138 @@ def test_p5_meta_daemon_tunnel_monitoring_opt_in_only(
     r_up = mon_off.run_sweep(now_epoch_s=t0 + 45.0, force_collector_hc=True)
     assert r_up["active_alerts"] == []
     assert r_up["alert_dispatch"]["sent_recoveries"] == ["lightsail_proxy_unavailable"]
+
+
+def test_p5_check_takeover_port_conflict_and_systemd_readiness(tmp_path: Path) -> None:
+    """Verify controlled :1080 takeover checks, archive lock blocking, CLI exit codes, and key/pinning audits."""
+    import fcntl
+    import shutil
+
+    # 1. Free port + idle archive -> ready_for_systemd_takeover=True, status='ok'
+    free_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+        unit_state_fn=lambda u: {"unit": u, "available": True, "active_state": "inactive", "sub_state": "dead", "main_pid": None},
+    )
+    assert free_res["status"] == "ok"
+    assert free_res["ready_for_systemd_takeover"] is True
+    assert free_res["conflict"] is None
+
+    # 2. Occupied port + systemd proxy inactive -> blocked (manual tunnel conflict)
+    occ_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": True},
+        unit_state_fn=lambda u: {"unit": u, "available": True, "active_state": "inactive", "sub_state": "dead", "main_pid": None},
+    )
+    assert occ_res["status"] == "blocked"
+    assert occ_res["ready_for_systemd_takeover"] is False
+    assert occ_res["conflict"] == "port_occupied_by_non_systemd_process"
+
+    # 3. Active archive unit OR held .archive_sync.lock -> blocked with archive_active
+    arch_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+        unit_state_fn=lambda u: {
+            "unit": u,
+            "available": True,
+            "active_state": "active" if u == lp_mod.SYSTEMD_ARCHIVE_UNIT else "inactive",
+            "sub_state": "running" if u == lp_mod.SYSTEMD_ARCHIVE_UNIT else "dead",
+            "main_pid": 1234 if u == lp_mod.SYSTEMD_ARCHIVE_UNIT else None,
+        },
+    )
+    assert arch_res["status"] == "blocked"
+    assert arch_res["conflict"] == "archive_active"
+    assert arch_res["ready_for_systemd_takeover"] is False
+
+    lock_dir = tmp_path / "data_root"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_dir / ".archive_sync.lock"
+    lock_file.write_text("1234\n", encoding="utf-8")
+    with lock_file.open("r+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            lock_res = lp_mod.check_takeover_readiness(
+                host="127.0.0.1",
+                port=1080,
+                data_root=lock_dir,
+                port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+                unit_state_fn=lambda u: {"unit": u, "available": False, "active_state": "unknown", "sub_state": "unknown", "main_pid": None},
+            )
+            assert lock_res["status"] == "blocked"
+            assert lock_res["archive_lock_held"] is True
+            assert lock_res["conflict"] == "archive_active"
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    # 4. Occupied port + systemd proxy active + archive idle -> already_managed_by_systemd=True, status='ok'
+    managed_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": True},
+        unit_state_fn=lambda u: {
+            "unit": u,
+            "available": True,
+            "active_state": "active" if u == lp_mod.SYSTEMD_PROXY_UNIT else "inactive",
+            "sub_state": "running" if u == lp_mod.SYSTEMD_PROXY_UNIT else "dead",
+            "main_pid": 4321 if u == lp_mod.SYSTEMD_PROXY_UNIT else None,
+        },
+    )
+    assert managed_res["status"] == "ok"
+    assert managed_res["already_managed_by_systemd"] is True
+    assert managed_res["conflict"] is None
+
+    # 5. Real CLI execution (`collector/bin/proxy-verify check-takeover`) against bound vs unused port
+    cli_bin = str(COLLECTOR_DIR / "bin" / "proxy-verify")
+    socks = _LoopbackSocks5Server()
+    free_port = _unused_local_port()
+    try:
+        proc_busy = subprocess.run(
+            [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(socks.port)],
+            capture_output=True,
+            text=True,
+        )
+        assert proc_busy.returncode == 2
+        busy_payload = json.loads(proc_busy.stdout)
+        assert busy_payload["status"] == "blocked"
+        assert busy_payload["port_in_use"] is True
+        assert busy_payload["conflict"] == "port_occupied_by_non_systemd_process"
+    finally:
+        socks.stop()
+
+    proc_free = subprocess.run(
+        [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(free_port)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc_free.returncode == 0
+    free_payload = json.loads(proc_free.stdout)
+    assert free_payload["status"] == "ok"
+    assert free_payload["ready_for_systemd_takeover"] is True
+
+    # 6. Audit real deploy templates & ensure wrong key path or blind ssh-keyscan pipe is rejected
+    real_iso = lp_mod.audit_proxy_isolation(DEPLOY_DIR)
+    assert real_iso["isolated"] is True, real_iso["violations"]
+    proxy_env_txt = (DEPLOY_DIR / "env" / "proxy.env.example").read_text(encoding="utf-8")
+    guide_txt = (DEPLOY_DIR / "LIGHTSAIL_PROXY.md").read_text(encoding="utf-8")
+    assert "/etc/tokyo-l2/tokyo_l2_lightsail" in proxy_env_txt
+    assert "/etc/tokyo-l2/tokyo_l2_lightsail" in guide_txt
+    assert "ssh-keygen -lf" in guide_txt
+
+    tmp_deploy = tmp_path / "deploy_copy"
+    shutil.copytree(DEPLOY_DIR, tmp_deploy)
+    (tmp_deploy / "LIGHTSAIL_PROXY.md").write_text(
+        "# Broken Guide\nssh-keyscan -H 13.192.29.63 | sudo tee /etc/tokyo-l2/lightsail_known_hosts\n",
+        encoding="utf-8",
+    )
+    (tmp_deploy / "env" / "proxy.env.example").write_text(
+        "TOKYO_L2_LIGHTSAIL_KEY=/etc/tokyo-l2/lightsail_ed25519\n",
+        encoding="utf-8",
+    )
+    bad_iso = lp_mod.audit_proxy_isolation(tmp_deploy)
+    assert bad_iso["isolated"] is False
+    assert any("lightsail_ed25519" in v for v in bad_iso["violations"])
+    assert any("ssh-keygen -lf" in v for v in bad_iso["violations"])
+    assert any("lightsail_known_hosts" in v for v in bad_iso["violations"])
