@@ -825,21 +825,27 @@ def test_p5_check_takeover_fail_closed_ownership_and_private_peering_templates(t
     assert "--data-root" in proc_no_root.stderr
 
     free_port = _unused_local_port()
-    proc_no_systemd = subprocess.run(
+    # Unmocked CLI on test host (either no-systemd container -> systemd_unavailable,
+    # or real systemd without archive unit installed -> archive_state_unclear) MUST fail closed!
+    proc_host_blocked = subprocess.run(
         [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(free_port), "--data-root", str(data_root)],
         capture_output=True,
         text=True,
     )
-    assert proc_no_systemd.returncode == 2
-    no_sys_payload = json.loads(proc_no_systemd.stdout)
-    assert no_sys_payload["status"] == "blocked"
-    assert "systemd_unavailable" in no_sys_payload["blocking_reasons"]
+    assert proc_host_blocked.returncode == 2
+    host_payload = json.loads(proc_host_blocked.stdout)
+    assert host_payload["status"] == "blocked"
+    assert any(r in host_payload["blocking_reasons"] for r in ("systemd_unavailable", "archive_state_unclear"))
 
     fake_bin = tmp_path / "fake_bin"
     fake_bin.mkdir()
     fake_systemctl = fake_bin / "systemctl"
     fake_systemctl.write_text(
         "#!/usr/bin/env bash\n"
+        "if [ \"${FAKE_SYSCTL_FAIL:-0}\" = \"1\" ]; then\n"
+        "  echo \"System has not been booted with systemd as init system\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
         "UNIT=\"$2\"\n"
         "if [ \"$UNIT\" = \"tokyo-l2-lightsail-proxy.service\" ]; then\n"
         "  echo \"LoadState=loaded\"\n"
@@ -859,6 +865,19 @@ def test_p5_check_takeover_fail_closed_ownership_and_private_peering_templates(t
     fake_systemctl.chmod(0o755)
     env_fake = dict(os.environ)
     env_fake["PATH"] = f"{fake_bin}:{os.environ.get('PATH', '')}"
+
+    # Deterministic CLI check for systemd unavailability on ANY host/CI runner
+    env_no_sys = dict(env_fake, FAKE_SYSCTL_FAIL="1")
+    proc_no_systemd = subprocess.run(
+        [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(free_port), "--data-root", str(data_root)],
+        env=env_no_sys,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_no_systemd.returncode == 2
+    no_sys_payload = json.loads(proc_no_systemd.stdout)
+    assert no_sys_payload["status"] == "blocked"
+    assert "systemd_unavailable" in no_sys_payload["blocking_reasons"]
 
     # 8a. Free port + fake systemctl idle -> rc=0, ready=True
     proc_ready = subprocess.run(
