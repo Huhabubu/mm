@@ -183,6 +183,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     file_reports = []
     quotes_before = None
     seen_anchors = set()
+    missing_anchor_sources = {}
     boundary_events = ProtocolReport()
     trade_ids = set()
     for candidate, mf, path in sorted(items, key=lambda item: (
@@ -241,13 +242,16 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                                 convert._emit_depth_batch(buffers[exchange], True, previous_exchange_ns, start_ns - 1,
                                                           list(book.bids.items()), list(book.asks.items()))
                 if event.mode == "snapshot":
-                    seen_anchors.add((exchange, event.symbol, "target" if in_target else "warmup"))
+                    seen_anchors.add((exchange, event.symbol, "target" if in_target else "warmup",
+                                      event.connection[1], event.connection[2]))
                 problem = chain.apply(exchange, event)
                 if not problem and exchange == GATE and not verify_gate_sizes(event):
                     problem = "gate_quantity_not_decimal_string"
                 if problem:
                     if in_target:
                         book_proofs.count(exchange, event.symbol, problem)
+                        if problem == "missing_same_connection_anchor":
+                            missing_anchor_sources.setdefault((exchange, event.symbol), event.connection[1:])
                     if sample_end > start_ns and exchange in books and event.symbol == BTC:
                         books[exchange] = Book()
                         last_depth_exchange_ns.pop(exchange, None)
@@ -307,7 +311,12 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         signal.insert(0, quotes_before)
     signal.sort(key=lambda row: row[0])
     summary["observed_snapshot_markets"] = [
-        {"exchange": ex, "symbol": sym, "phase": phase} for ex, sym, phase in sorted(seen_anchors)
+        {"exchange": ex, "symbol": sym, "phase": phase, "connection": conn, "epoch": epoch}
+        for ex, sym, phase, conn, epoch in sorted(seen_anchors)
+    ]
+    summary["missing_anchor_sources"] = [
+        {"exchange": ex, "symbol": sym, "connection": conn, "epoch": epoch}
+        for (ex, sym), (conn, epoch) in sorted(missing_anchor_sources.items())
     ]
     summary["boundary_events"] = boundary_events.json()["issues"]
     summary["archive_file_checks"] = file_reports
@@ -349,8 +358,9 @@ def probe_orders(depth, tick, lot, multiplier, order_qty):
     # A deterministic offline probe exercises the engine independently of
     # whether the research strategy decides to quote in this particular sample.
     from hftbacktest import (
-        BacktestAsset, CANCELED, FILLED, GTX, HashMapMarketDepthBacktest, IOC, LIMIT, NEW,
+        BacktestAsset, CANCELED, FILLED, GTX, HashMapMarketDepthBacktest, LIMIT, NEW,
     )
+    from hftbacktest.order import IOC
 
     asset = (BacktestAsset().data([str(depth)]).linear_asset(multiplier)
              .constant_order_latency(1_000_000, 1_000_000).power_prob_queue_model(2.0)

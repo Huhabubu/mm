@@ -1,5 +1,10 @@
+from pathlib import Path
+import tempfile
 import unittest
 
+import numpy as np
+
+from tokyo_l2_replay_qa import probe_orders
 from tokyo_l2_recurring_qa import plan_windows
 
 from tokyo_l2_protocol_qa import BITGET, BYBIT, GATE, Book, Chain, Depth, depth_event, verify_gate_sizes
@@ -13,6 +18,24 @@ class ProtocolTest(unittest.TestCase):
     def test_recurring_checks_latest_and_one_oldest_pending_partition(self):
         self.assertEqual([400, 200], plan_windows([100, 200, 300, 400], {100: {}}, 400))
         self.assertEqual([200], plan_windows([100, 200, 300, 400], {100: {}, 400: {}}, 400))
+
+    def test_pinned_hft_orders_and_ledger(self):
+        from hftbacktest import BUY_EVENT, DEPTH_EVENT, EXCH_EVENT, LOCAL_EVENT, SELL_EVENT, event_dtype
+
+        bid = DEPTH_EVENT | BUY_EVENT | EXCH_EVENT | LOCAL_EVENT
+        ask = DEPTH_EVENT | SELL_EVENT | EXCH_EVENT | LOCAL_EVENT
+        start = 1_700_000_000_000_000_000
+        rows = np.array([
+            (bid, start, start, 300.0, 5.0, 0, 0, 0.0),
+            (ask, start, start, 301.0, 5.0, 0, 0, 0.0),
+            (bid, start + 5_000_000_000, start + 5_000_000_000, 300.0, 5.0, 0, 0, 0.0),
+        ], dtype=event_dtype)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "orders.npz"
+            np.savez(path, data=rows)
+            result = probe_orders(path, tick=1.0, lot=1.0, multiplier=1.0, order_qty=1.0)
+        self.assertEqual("passed", result["status"], result)
+        self.assertTrue(result["ledger_ok"])
 
     def test_gate_detects_lost_update_despite_increasing_sequence(self):
         chain = Chain()
