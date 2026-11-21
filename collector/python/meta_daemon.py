@@ -1247,6 +1247,35 @@ def inspect_archive_ledger(
         conn.close()
 
 
+_ALERT_NAMES = {
+    "collector_stopped": "采集程序停止",
+    "collector_probe_failed": "采集状态无法检查",
+    "collector_abnormal_restart": "采集程序异常重启",
+    "collector_data_stale": "行情文件停止更新",
+    "collector_data_volume_abnormal": "有效行情量异常",
+    "dual_ab_outage_gt_5s": "行情双连接中断",
+    "local_loss_detected": "本地数据丢失记录",
+    "disk_usage_high": "磁盘使用率过高",
+    "disk_probe_failed": "磁盘状态无法检查",
+    "clock_unsynced": "时钟同步异常",
+    "archive_upload_or_verify_failed": "云端归档失败",
+    "archive_ledger_conflict": "云端文件校验冲突",
+}
+
+_EXCHANGE_NAMES = {
+    "binance_futures": "Binance",
+    "bybit_linear": "Bybit",
+    "bitget_v3": "Bitget",
+    "gate_futures": "Gate",
+}
+
+
+def _display_time(now_s: float) -> str:
+    dt_utc = datetime.fromtimestamp(now_s, tz=timezone.utc)
+    dt_cn = dt_utc.astimezone(timezone(timedelta(hours=8)))
+    return f"{dt_cn:%m-%d %H:%M} 北京时间 / {dt_utc:%H:%M} UTC"
+
+
 def format_alert_message(
     *,
     alert_key: str,
@@ -1257,17 +1286,54 @@ def format_alert_message(
     suppressed_count: int = 0,
     is_reminder: bool = False,
 ) -> str:
-    ts = datetime.fromtimestamp(now_s, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    prefix = "🔁 [持续告警" if is_reminder else "🚨 [告警"
-    header = f"{prefix} {severity}] {alert_key}"
-    lines = [header, f"时间: {ts}", f"摘要: {summary}"]
-    if suppressed_count > 0:
-        lines.append(f"期间已去重抑制: {suppressed_count} 次")
-    if details:
-        detail_str = json.dumps(details, ensure_ascii=False, sort_keys=True)
-        if len(detail_str) > 600:
-            detail_str = detail_str[:580] + "..."
-        lines.append(f"详情: {detail_str}")
+    """Human-readable operator message; raw diagnostics remain in monitor_state.json."""
+    title = _ALERT_NAMES.get(alert_key, alert_key.replace("_", " "))
+    prefix = "🔁 [持续告警]" if is_reminder else "🚨 [告警]"
+    lines = [
+        f"{prefix} 东京 L2｜{title}",
+        f"时间：{_display_time(now_s)}",
+        f"情况：{summary}",
+    ]
+    if alert_key == "collector_data_volume_abnormal":
+        hour_key = str(details.get("hour_key") or "上一完整小时")
+        lines.append(f"统计时段：{hour_key} UTC")
+        for ex, item in list((details.get("affected") or {}).items())[:4]:
+            name = _EXCHANGE_NAMES.get(ex, ex)
+            count = int(item.get("data_lines") or 0)
+            baseline = item.get("reference_data_lines")
+            ref_text = f"；参考约{int(baseline):,}行/小时" if baseline is not None else ""
+            lines.append(f"• {name}：{count:,} 行（{item.get('reason', '数量异常')}{ref_text}）")
+        lines.append("影响：该小时暂不纳入有效研究样本，待深度 QA 核验。")
+    elif alert_key == "dual_ab_outage_gt_5s":
+        endpoints = details.get("pending_endpoints") or []
+        if endpoints:
+            lines.append("受影响端点：" + ", ".join(str(ep) for ep in endpoints[:6]))
+        lines.append("恢复要求：确认真实 DATA 恢复后才能解除保守锁。")
+    elif alert_key == "local_loss_detected":
+        mf = details.get("manifest_local_loss") or []
+        journal = details.get("journal_local_loss") or []
+        write_errors = details.get("write_errors") or []
+        if mf:
+            lines.append("证据：" + "、".join(
+                f"{_EXCHANGE_NAMES.get(str(m.get('exchange')), str(m.get('exchange')))} {int(m.get('local_loss_lines') or 0):,}条标记"
+                for m in mf[:4]
+            ))
+        if journal or write_errors:
+            lines.append(f"另有采集日志 {len(journal)} 条，写盘异常 {len(write_errors)} 条。")
+        lines.append("注意：丢失标记行数不等于实际丢失的行情条数。")
+    elif alert_key == "collector_data_stale":
+        if details:
+            lines.append("涉及交易所：" + "、".join(
+                _EXCHANGE_NAMES.get(str(ex), str(ex)) for ex in list(details)[:4]
+            ))
+    elif alert_key == "disk_usage_high":
+        lines.append(f"磁盘占用：{details.get('disk_pct', '?')}%（阈值 {details.get('threshold', '?')}%）")
+    elif alert_key == "archive_ledger_conflict":
+        lines.append("影响：远端文件完整性待核验，本地原件必须保留。")
+    elif alert_key == "archive_upload_or_verify_failed":
+        lines.append("影响：本次归档尚未通过远端核验，本地原件必须保留。")
+    if suppressed_count:
+        lines.append(f"期间相同告警已去重抑制 {suppressed_count} 次。")
     return "\n".join(lines)
 
 
@@ -1279,17 +1345,25 @@ def format_recovery_message(
     now_s: float,
     suppressed_count: int = 0,
 ) -> str:
-    ts = datetime.fromtimestamp(now_s, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    title = _ALERT_NAMES.get(alert_key, alert_key.replace("_", " "))
     dur = max(0, int(now_s - started_at_s))
-    return "\n".join(
-        [
-            f"✅ [已恢复] {alert_key}",
-            f"恢复时间: {ts}",
-            f"持续时长: {dur}s (期间去重抑制 {suppressed_count} 次)",
-            f"状态: {summary}",
-        ]
-    )
-
+    if alert_key == "local_loss_detected":
+        return "\n".join([
+            f"🟡 [无新增] 东京 L2｜{title}",
+            f"时间：{_display_time(now_s)}",
+            f"最近 {dur} 秒的观察窗口结束，当前未检测到新的丢失标记。",
+            "历史缺口仍然存在，需独立完成数据质量核验。",
+        ])
+    lines = [
+        f"✅ [已恢复] 东京 L2｜{title}",
+        f"时间：{_display_time(now_s)}",
+        f"之前的异常条件已解除（持续约 {dur} 秒）。",
+    ]
+    if alert_key == "collector_data_volume_abnormal":
+        lines.append("说明：最近完整小时的 DATA 已回到初筛阈值，仍需按币种和频道完成深度 QA。")
+    if suppressed_count:
+        lines.append(f"期间去重抑制 {suppressed_count} 次。")
+    return "\n".join(lines)
 
 def format_hourly_report(
     *,
@@ -1304,84 +1378,70 @@ def format_hourly_report(
     chrony_row: dict[str, Any] | None,
     active_alerts: dict[str, dict[str, Any]],
 ) -> str:
-    dt = datetime.fromtimestamp(now_s, tz=timezone.utc)
-    hour_label = dt.strftime("%Y-%m-%d %H:%M UTC")
-    prev_hour_key = str(data_tree.get("prev_hour_key") or "")
-
-    if collector_status.get("available"):
-        c_state = (
-            f"{collector_status.get('active_state', '?')}/{collector_status.get('sub_state', '?')} "
-            f"(PID={collector_status.get('main_pid', 0)}, Restarts={collector_status.get('n_restarts', 0)})"
-        )
-    else:
-        c_state = f"PROBE_FAILED({collector_status.get('error') or 'unknown'})"
-
-    if chrony_row:
-        err_ms = chrony_row.get("estimated_error_ms")
-        err_disp = f"{float(err_ms):.3f}ms" if err_ms not in (None, "") else "N/A"
-        clk_disp = f"{'OK' if chrony_row.get('certified_le_1ms') else 'UNSYNC'} ({err_disp})"
-    else:
-        clk_disp = "N/A"
-
-    disk_disp = f"{disk_pct:.1f}%" if disk_pct is not None else "PROBE_FAILED"
-
+    """Compact Telegram summary, with market DATA distinct from META file activity."""
+    prev_key = str(data_tree.get("prev_hour_key") or "?")
+    volume = data_tree.get("hourly_volume_assessment") or {}
+    affected = volume.get("affected") or {}
     sc = ledger_info.get("state_counts") or {}
     if archive_status.get("available") and archive_status.get("active_state") == "failed":
-        eff_arch_status = "FAILED"
+        arch = "FAILED"
     else:
-        eff_arch_status = ledger_info.get("status", "PENDING")
-
+        arch = ledger_info.get("status", "PENDING")
+    running = (
+        collector_status.get("available")
+        and collector_status.get("active_state") == "active"
+        and collector_status.get("sub_state") == "running"
+    )
+    clock_good = chrony_row is not None and chrony_row.get("certified_le_1ms") is True
+    err = (chrony_row or {}).get("estimated_error_ms")
+    clock_str = f"{float(err):.3f} ms" if err is not None else "未知"
+    disk_str = f"{disk_pct:.1f}%" if disk_pct is not None else "未知"
+    current_alerts = list(active_alerts)
+    if affected or current_alerts:
+        overall = "🔴 采集或数据异常，当前小时样本待排除"
+    elif not volume.get("ready"):
+        overall = "🟡 未有完整小时数据可供初筛"
+    else:
+        overall = "🟡 行情量初筛正常，深度 QA 待完成"
     lines = [
-        f"📊 [东京 L2 小时战报] {hour_label}",
-        "━━━━━━━━━━━━━━━━━━",
-        f"⚙️ 采集进程: {c_state}",
-        f"💾 磁盘使用: {disk_disp} (阈值 {disk_thresh:.0f}%) | ⏱ 时钟: {clk_disp}",
-        f"📦 归档状态: {eff_arch_status} | 账本累计分区: SEALED={sc.get('SEALED', 0)} / VERIFIED={sc.get('VERIFIED', 0)} / PRUNED={sc.get('PRUNED', 0)}",
-        "🔬 深度数据质量: PENDING（待后续 GitHub 深度 QA 验证）",
+        "📊 东京 L2｜小时采集报告",
+        f"发送：{_display_time(now_s)}",
+        f"统计：{prev_key} UTC（上一完整小时）",
+        overall,
         "",
-        f"📡 四所采集情况 (上小时={prev_hour_key} 封口增量；另附历史累计):",
+        "📡 行情 DATA（有效行情消息行数）：",
     ]
-
-    ex_order = list(dict.fromkeys([*DEFAULT_EXCHANGE_ORDER, *enabled_exchanges]))
-    per_ex = data_tree.get("per_exchange", {})
-    per_ex_arch = ledger_info.get("per_exchange", {})
-    for ex in ex_order:
-        if ex not in enabled_exchanges:
-            continue
-        info = per_ex.get(ex, {})
-        age = info.get("last_activity_age_s")
-        age_str = f"{int(age)}s前" if age is not None else "无更新"
-        act_str = "异常停滞" if info.get("is_stale") else "活跃"
-        p_cnt = info.get("active_partial_count", 0)
-        p_mb = info.get("latest_partial_bytes", 0) / (1024 * 1024)
-
-        ph_cnt = info.get("prev_hour_manifest_count", 0)
-        ph_lines = info.get("prev_hour_data_lines", 0)
-        ph_mb = info.get("prev_hour_sealed_bytes", 0) / (1024 * 1024)
-        ph_sw = info.get("prev_hour_switch_lines", 0)
-        ph_gap = info.get("prev_hour_gap_start_lines", 0)
-        ph_loss = info.get("prev_hour_local_loss_lines", 0)
-
-        cum_cnt = info.get("cumulative_manifest_count", 0)
-        cum_lines = info.get("cumulative_data_lines", 0)
-        cum_loss = info.get("cumulative_local_loss_lines", 0)
-        arch_ex = per_ex_arch.get(ex, {})
-        lines.append(
-            f"• {ex}: {act_str}(.partial={p_cnt}, {age_str}, {p_mb:.2f}MB) | "
-            f"上小时({prev_hour_key}): 封口={ph_cnt} DATA={ph_lines:,} ({ph_mb:.2f}MB) "
-            f"SW={ph_sw} GAP={ph_gap} LOSS={ph_loss} | "
-            f"历史累计: 封口={cum_cnt}(V={arch_ex.get('VERIFIED', 0)}/P={arch_ex.get('PRUNED', 0)}) DATA={cum_lines:,} LOSS={cum_loss}"
-        )
-
-    lines.append("")
-    if active_alerts:
-        alert_items = [f"{k}: {v.get('summary', '')}" for k, v in sorted(active_alerts.items())]
-        lines.append(f"⚠️ 当前异常 ({len(alert_items)}): " + " ; ".join(alert_items))
+    per_ex = data_tree.get("per_exchange") or {}
+    for ex in enabled_exchanges:
+        info = per_ex.get(ex) or {}
+        n = int(info.get("prev_hour_data_lines") or 0)
+        gap = int(info.get("prev_hour_gap_start_lines") or 0)
+        loss = int(info.get("prev_hour_local_loss_lines") or 0)
+        if ex in affected:
+            mark = "🔴"
+        elif not volume.get("ready"):
+            mark = "⚪"
+        else:
+            mark = "▫️"
+        label = _EXCHANGE_NAMES.get(ex, ex)
+        lines.append(f"{mark} {label}: {n:,} 行 · GAP {gap} · LOSS {loss}")
+    lines.extend([
+        "",
+        f"⚙️ 采集程序：{'运行中' if running else '异常/未核实'}",
+        f"📦 云端归档：{arch}（只代表文件验证；V={sc.get('VERIFIED', 0)} / P={sc.get('PRUNED', 0)}）",
+        f"💾 磁盘：{disk_str}（警戒线 {disk_thresh:.0f}%）",
+        f"⏱ 时钟：{'正常' if clock_good else '异常/未核实'}（误差 {clock_str}）",
+        "🔬 深度数据质量：PENDING（待按币种、频道核验）",
+    ])
+    if current_alerts:
+        names = [_ALERT_NAMES.get(k, k.replace("_", " ")) for k in current_alerts[:5]]
+        lines.append("🚨 当前告警：" + "、".join(names))
+    elif affected:
+        lines.append("🚨 当前告警：有效行情量异常")
     else:
-        lines.append("✅ 当前异常: 无")
-
+        lines.append("✅ 当前没有监控告警；研究数据质量仍待验收")
+    lines.append("说明：META 文件持续更新不代表行情 DATA 正常。")
     return "\n".join(lines)
-
 
 def submit_outage_ack_request(
     data_root: Path,
