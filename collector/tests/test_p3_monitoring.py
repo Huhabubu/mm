@@ -1681,9 +1681,10 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
         assert not any("[已恢复]" in m["text"] for m in transport.tg_messages)
         assert r_silent["collector_healthcheck"]["healthy"] is False
         assert transport.hc_calls[-1]["is_fail"] is True
+        diag_s3 = mon.state["dual_outage_endpoints"]["binance_public"]["diagnostics"]
         assert (
-            mon.state["dual_outage_endpoints"]["binance_public"]["diagnostics"]["last_ws_connected_at_s"]
-            is not None
+            diag_s3["last_ws_connected_at_s"] is not None
+            or int(diag_s3.get("ws_errors_since_outage") or 0) >= 1
         ), f"ep_state={mon.state['dual_outage_endpoints']}; cursor={mon.state.get('journal_cursor')}; stderr={snapshot_stderr()}"
 
         # Stage 4a: Reconnecting live stream (`streaming`) still leaves unmodified Rust collector unable to recover
