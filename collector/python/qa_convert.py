@@ -1013,6 +1013,7 @@ def run_qa_convert(
         # Per-(exchange, date_utc) structural QA tracking
         day_gaps: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         day_local_loss: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        local_loss_partitions: list[dict[str, Any]] = []
         day_switches: dict[tuple[str, str], int] = defaultdict(int)
         day_active_gap_start: dict[tuple[str, str], int | None] = defaultdict(lambda: None)
         exchange_stats: dict[str, dict[str, Any]] = {}
@@ -1033,9 +1034,11 @@ def run_qa_convert(
             prev_mono_ns: int | None = None
             total_records = 0
 
-            for mf, dpath, _ in items:
+            for mf, dpath, mpath in items:
                 boot_id = str(mf.get("boot_id", ""))
                 records = parse_tsv_zst_records(dpath)
+                recorded_local_loss = 0
+                dropped_frames = 0
                 if boot_id != prev_boot:
                     prev_boot = boot_id
                     prev_rx_seq = None
@@ -1078,12 +1081,11 @@ def run_qa_convert(
                                 )
                             day_active_gap_start[(exchange, date_utc)] = None
                         elif ev == "LOCAL_LOSS":
+                            dropped = int(meta_obj.get("dropped_frames", meta_obj.get("dropped", 1)))
+                            recorded_local_loss += 1
+                            dropped_frames += dropped
                             day_local_loss[(exchange, date_utc)].append(
-                                {
-                                    "wall_ns": wall_ns,
-                                    "dropped": int(meta_obj.get("dropped_frames", meta_obj.get("dropped", 1))),
-                                    "reason": meta_obj.get("reason", ""),
-                                }
+                                {"wall_ns": wall_ns, "dropped": dropped, "reason": meta_obj.get("reason", "")}
                             )
                         elif ev == "SWITCH":
                             day_switches[(exchange, date_utc)] += 1
@@ -1097,6 +1099,21 @@ def run_qa_convert(
                     elif exchange == "bitget_v3":
                         _ingest_bitget_record(rec, date_utc, buffers)
 
+                manifest_local_loss = int(mf.get("local_loss_lines") or 0)
+                if recorded_local_loss or manifest_local_loss:
+                    local_loss_partitions.append({
+                        "exchange": exchange,
+                        "date_utc": mf["date_utc"],
+                        "hour_utc": mf["hour_utc"],
+                        "boot_id": boot_id,
+                        "manifest_file": mpath.name,
+                        "data_file": dpath.name,
+                        "data_sha256": mf["sha256"],
+                        "manifest_local_loss_lines": manifest_local_loss,
+                        "recorded_local_loss_lines": recorded_local_loss,
+                        "recorded_dropped_frames": dropped_frames,
+                    })
+
             exchange_stats[exchange] = {
                 "partitions_verified": len(items),
                 "records_parsed": total_records,
@@ -1108,7 +1125,7 @@ def run_qa_convert(
     coverage_report = coverage.report(effective_meta) if coverage is not None else {"status": "not_assessed"}
     if coverage is not None and coverage_report["status"] != "complete":
         failed_items.append("incomplete_utc_day_coverage")
-    if (strict_zero_loss or coverage is not None) and any(day_local_loss.values()):
+    if (strict_zero_loss or coverage is not None) and local_loss_partitions:
         failed_items.append("local_loss_detected_under_strict_zero_loss_gate")
     if coverage is not None and (any(day_gaps.values()) or chrony_uncertified.get(coverage.date)):
         failed_items.append("complete_day_gap_or_uncertified_clock")
@@ -1119,12 +1136,14 @@ def run_qa_convert(
             "phase": "qa_convert",
             "failed_items": failed_items,
             "coverage": coverage_report,
+            "local_loss_partitions": local_loss_partitions,
             "minimal_fixes": ["Review missing hours, uncertified clock, sequence errors, and local loss before converting"],
         }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     artifacts: list[dict[str, Any]] = []
     calendar_rows: list[dict[str, Any]] = []
+    loss_partition_days = {(row["exchange"], row["date_utc"]) for row in local_loss_partitions}
 
     for (exchange, sym, date_utc), buf in sorted(buffers.items()):
         ymd = yyyymmdd_from_date(date_utc)
@@ -1136,7 +1155,7 @@ def run_qa_convert(
 
         if gaps:
             reasons.append("uncovered_gap")
-        if losses:
+        if losses or (exchange, date_utc) in loss_partition_days:
             reasons.append("local_loss")
         if clock_issues:
             reasons.append("clock_uncertified_gt_1ms")
@@ -1350,6 +1369,7 @@ def run_qa_convert(
         "calendar_path": str(cal_json),
         "calendar_csv_path": str(cal_csv),
         "coverage": coverage_report,
+        "local_loss_partitions": local_loss_partitions,
         "eligible_asset_days": sum(1 for r in calendar_rows if r["eligibility_status"] == "eligible"),
         "execution_unverified_asset_days": sum(
             1 for r in calendar_rows if r["eligibility_status"] == "execution_unverified"

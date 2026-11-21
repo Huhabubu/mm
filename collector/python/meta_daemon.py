@@ -1432,8 +1432,12 @@ def format_hourly_report(
     clock_str = f"{float(err):.3f} ms" if err is not None else "未知"
     disk_str = f"{disk_pct:.1f}%" if disk_pct is not None else "未知"
     current_alerts = list(active_alerts)
-    if affected or current_alerts:
-        overall = "🔴 采集或数据异常，当前小时样本待排除"
+    historical_loss = data_tree.get("manifests_with_local_loss") or []
+    previous_hour_loss = [item for item in historical_loss if item["hour_key"] == prev_key]
+    if previous_hour_loss:
+        overall = "🔴 上一完整小时有本地丢数，受影响分区待质检"
+    elif affected or current_alerts:
+        overall = "🔴 采集或数据异常，相关时段需核查"
     elif not volume.get("ready"):
         overall = "🟡 未有完整小时数据可供初筛"
     else:
@@ -1452,7 +1456,7 @@ def format_hourly_report(
         n = int(info.get("prev_hour_data_lines") or 0)
         gap = int(info.get("prev_hour_gap_start_lines") or 0)
         loss = int(info.get("prev_hour_local_loss_lines") or 0)
-        if ex in affected:
+        if ex in affected or loss > 0:
             mark = "🔴"
         elif not volume.get("ready"):
             mark = "⚪"
@@ -1475,9 +1479,15 @@ def format_hourly_report(
         lines.append("🚨 当前告警：有效行情量异常")
     else:
         lines.append("✅ 当前没有监控告警；研究数据质量仍待验收")
-    historical_loss_partitions = len(data_tree.get("manifests_with_local_loss") or ())
-    if historical_loss_partitions:
-        lines.append(f"📌 历史丢数证据（累计）：{historical_loss_partitions} 个分区留有丢数标记，相关数据待质检。")
+    if previous_hour_loss:
+        lines.append("受影响分区（上一完整小时）：")
+        for item in previous_hour_loss[:5]:
+            name = Path(item["rel_path"]).name
+            lines.append(f"• {item['hour_key']} UTC · {name} · LOSS {item['local_loss_lines']}")
+        if len(previous_hour_loss) > 5:
+            lines.append(f"另有 {len(previous_hour_loss) - 5} 个分区，完整清单见质检报告。")
+    if historical_loss:
+        lines.append(f"📌 历史丢数证据（累计）：{len(historical_loss)} 个分区留有丢数标记，相关数据待质检。")
     lines.append("说明：META 文件持续更新不代表行情 DATA 正常。")
     return "\n".join(lines)
 

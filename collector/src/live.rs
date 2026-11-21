@@ -33,6 +33,7 @@ enum EngineEvent {
     Disconnect {
         endpoint: EndpointKind,
         conn_id: ConnId,
+        epoch: u64,
         wall_ns: i64,
         mono_ns: u64,
         reason: String,
@@ -46,6 +47,7 @@ enum EngineEvent {
     RestSnapshot {
         endpoint: EndpointKind,
         conn_id: ConnId,
+        epoch: u64,
         symbol: String,
         last_update_id: u64,
         raw_json: String,
@@ -70,10 +72,62 @@ enum EngineEvent {
     },
 }
 
-#[derive(Debug, Clone)]
-enum ConnCommand {
+#[derive(Debug)]
+struct ConnCommand {
+    epoch: u64,
+    action: ConnCommandAction,
+}
+
+#[derive(Debug)]
+enum ConnCommandAction {
     Reconnect(String),
     Resubscribe(String),
+}
+
+async fn next_command_for_epoch(
+    commands: &mut mpsc::Receiver<ConnCommand>,
+    epoch: u64,
+) -> Option<ConnCommandAction> {
+    while let Some(command) = commands.recv().await {
+        if command.epoch == epoch {
+            return Some(command.action);
+        }
+    }
+    None
+}
+
+fn active_selector_for_epoch(
+    selectors: &mut HashMap<EndpointKind, CausalSelector>,
+    endpoint: EndpointKind,
+    conn_id: ConnId,
+    epoch: u64,
+) -> Option<&mut CausalSelector> {
+    selectors.get_mut(&endpoint).filter(|selector| selector.connected_epoch(conn_id) == Some(epoch))
+}
+
+const INITIAL_RETRY_MS: u64 = 500;
+const MAX_RETRY_MS: u64 = 15_000;
+const STABLE_SESSION: Duration = Duration::from_secs(30);
+
+fn next_retry_delay(backoff_ms: &mut u64, subscribed_uptime: Option<Duration>) -> Duration {
+    if subscribed_uptime.is_some_and(|uptime| uptime >= STABLE_SESSION) {
+        *backoff_ms = INITIAL_RETRY_MS;
+    }
+    let delay = Duration::from_millis(*backoff_ms);
+    *backoff_ms = (*backoff_ms * 2).min(MAX_RETRY_MS);
+    delay
+}
+
+async fn send_lifecycle_event(
+    tx: &mpsc::Sender<EngineEvent>,
+    stop: &mut watch::Receiver<bool>,
+    event: EngineEvent,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|requested| *requested) => false,
+        result = tx.send(event) => result.is_ok(),
+    }
 }
 
 #[derive(Default)]
@@ -197,15 +251,14 @@ pub async fn run_live_collector(
             writer.enable_background_sealing(Arc::clone(&seal_limit));
             writer
         });
-        selectors.insert(
+        let mut selector = CausalSelector::new(
             ep,
-            CausalSelector::new(
-                ep,
-                syms.clone(),
-                config.deployment.silence_watchdog_seconds,
-                config.meta_daemon.dual_outage_alert_seconds,
-            ),
+            syms.clone(),
+            config.deployment.silence_watchdog_seconds,
+            config.meta_daemon.dual_outage_alert_seconds,
         );
+        selector.start_disconnected();
+        selectors.insert(ep, selector);
 
         for conn_id in [ConnId::A, ConnId::B] {
             let (ctx, crx) = mpsc::channel::<ConnCommand>(64);
@@ -562,13 +615,9 @@ fn process_engine_event(
                 outputs.push((ep, sel.on_frame(f)));
             }
         }
-        EngineEvent::Disconnect { endpoint, conn_id, wall_ns, mono_ns, reason } => {
-            if let Some(sel) = selectors.get_mut(&endpoint) {
-                let mut out = sel.on_disconnect(conn_id, wall_ns, mono_ns, &reason);
-                // The socket loop already reconnects. A second command can kill the fresh socket.
-                out.actions.retain(|action| !matches!(action,
-                    SelectorAction::Reconnect { conn_id: target, .. } if *target == conn_id));
-                outputs.push((endpoint, out));
+        EngineEvent::Disconnect { endpoint, conn_id, epoch, wall_ns, mono_ns, reason } => {
+            if let Some(sel) = active_selector_for_epoch(selectors, endpoint, conn_id, epoch) {
+                outputs.push((endpoint, sel.on_disconnect(conn_id, wall_ns, mono_ns, &reason)));
             }
         }
         EngineEvent::Reconnect { endpoint, conn_id, epoch, mono_ns } => {
@@ -576,8 +625,8 @@ fn process_engine_event(
                 sel.on_reconnect(conn_id, epoch, mono_ns);
             }
         }
-        EngineEvent::RestSnapshot { endpoint, conn_id, symbol, last_update_id, raw_json, wall_ns, mono_ns } => {
-            if let Some(sel) = selectors.get_mut(&endpoint) {
+        EngineEvent::RestSnapshot { endpoint, conn_id, epoch, symbol, last_update_id, raw_json, wall_ns, mono_ns } => {
+            if let Some(sel) = active_selector_for_epoch(selectors, endpoint, conn_id, epoch) {
                 outputs.push((endpoint, sel.on_rest_snapshot(conn_id, &symbol, last_update_id, &raw_json, wall_ns, mono_ns)));
             }
         }
@@ -654,16 +703,29 @@ fn process_engine_event(
         for act in out.actions {
             match act {
                 SelectorAction::Reconnect { conn_id, reason } => {
-                    if let Some(ctx) = cmd_txs.get(&(ep, conn_id)) {
-                        let _ = ctx.try_send(ConnCommand::Reconnect(reason));
+                    if let (Some(ctx), Some(selector)) =
+                        (cmd_txs.get(&(ep, conn_id)), selectors.get_mut(&ep))
+                    {
+                        if let Some(epoch) = selector.connected_epoch(conn_id) {
+                            let command = ConnCommand {
+                                epoch, action: ConnCommandAction::Reconnect(reason),
+                            };
+                            if ctx.try_send(command).is_err() {
+                                selector.allow_reconnect_retry(conn_id);
+                                warn!("Reconnect command was not queued for {} conn={} epoch={}", ep.as_str(), conn_id.as_str(), epoch);
+                            }
+                        }
                     }
                 }
                 SelectorAction::Resubscribe { conn_id, reason } => {
-                    if let Some(ctx) = cmd_txs.get(&(ep, conn_id)) {
-                        if ctx.try_send(ConnCommand::Resubscribe(reason)).is_ok()
-                            && ep == EndpointKind::GatePublic
-                        {
-                            if let Some(selector) = selectors.get_mut(&ep) {
+                    if let (Some(ctx), Some(selector)) =
+                        (cmd_txs.get(&(ep, conn_id)), selectors.get_mut(&ep))
+                    {
+                        if let Some(epoch) = selector.connected_epoch(conn_id) {
+                            let command = ConnCommand {
+                                epoch, action: ConnCommandAction::Resubscribe(reason),
+                            };
+                            if ctx.try_send(command).is_ok() && ep == EndpointKind::GatePublic {
                                 selector.prepare_depth_refresh(conn_id);
                             }
                         }
@@ -671,6 +733,9 @@ fn process_engine_event(
                 }
                 SelectorAction::FetchRestSnapshot { conn_id, symbol } => {
                     if ep == EndpointKind::BinancePublic {
+                        let Some(epoch) = selectors.get(&ep).and_then(|selector| selector.connected_epoch(conn_id)) else {
+                            continue;
+                        };
                         let tx_s = tx.clone();
                         let http_s = http_client.clone();
                         let url = format!(
@@ -690,6 +755,7 @@ fn process_engine_event(
                                             let _ = tx_s.try_send(EngineEvent::RestSnapshot {
                                                 endpoint: ep,
                                                 conn_id,
+                                                epoch,
                                                 symbol,
                                                 last_update_id: id,
                                                 raw_json: text,
@@ -725,7 +791,7 @@ async fn ws_connection_loop(
     mut stop_rx: watch::Receiver<bool>,
 ) {
     let mut epoch = 0u64;
-    let mut backoff_ms = 500u64;
+    let mut backoff_ms = INITIAL_RETRY_MS;
 
     loop {
         if *stop_rx.borrow() {
@@ -776,16 +842,18 @@ async fn ws_connection_loop(
             res = tokio_tungstenite::connect_async(req) => res,
         };
 
+        let mut subscribed_uptime = None;
         match connect_res {
             Ok((ws_stream, _)) => {
-                backoff_ms = 500;
                 let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                let _ = tx.try_send(EngineEvent::Reconnect {
+                if !send_lifecycle_event(&tx, &mut stop_rx, EngineEvent::Reconnect {
                     endpoint,
                     conn_id,
                     epoch,
                     mono_ns,
-                });
+                }).await {
+                    return;
+                }
                 info!(
                     "Connected {} conn={} epoch={}",
                     endpoint.as_str(),
@@ -796,214 +864,218 @@ async fn ws_connection_loop(
 
                 let (mut write, mut read) = ws_stream.split();
 
-                // Send subscriptions
-                if let Err(e) = send_subscriptions(endpoint, &symbols, &mut write).await {
-                    warn!("Subscribe write error on {} {:?}: {}", endpoint.as_str(), conn_id, e);
-                    continue;
-                }
+                let disconnect_reason = 'session: {
+                    let subscribed_at = match subscribe_socket(endpoint, &symbols, &mut write, &mut stop_rx).await {
+                        Some(Ok(subscribed_at)) => subscribed_at,
+                        Some(Err(reason)) => {
+                            warn!("Subscribe write error on {} {:?}: {}", endpoint.as_str(), conn_id, reason);
+                            break 'session reason;
+                        }
+                        None => return,
+                    };
 
-                // For Binance /public, spawn initial REST 1000-level snapshot fetch for each symbol
-                // AFTER WS stream is open and buffering deltas.
-                if endpoint == EndpointKind::BinancePublic {
-                    for sym in &symbols {
-                        let tx_s = tx.clone();
-                        let http_s = http_client.clone();
-                        let sym_c = sym.clone();
-                        let mut stop_s = stop_rx.clone();
-                        let rest_url = format!(
-                            "{}?symbol={}&limit={}",
-                            config.exchanges.binance_futures.rest_depth_url,
-                            sym,
-                            config.exchanges.binance_futures.depth_snapshot_limit
-                        );
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                biased;
-                                _ = stop_s.changed() => return,
-                                _ = tokio::time::sleep(Duration::from_millis(350)) => {}
+                    // For Binance /public, spawn initial REST 1000-level snapshot fetch for each symbol
+                    // AFTER WS stream is open and buffering deltas.
+                    if endpoint == EndpointKind::BinancePublic {
+                        for sym in &symbols {
+                            let tx_s = tx.clone();
+                            let http_s = http_client.clone();
+                            let sym_c = sym.clone();
+                            let mut stop_s = stop_rx.clone();
+                            let rest_url = format!(
+                                "{}?symbol={}&limit={}",
+                                config.exchanges.binance_futures.rest_depth_url,
+                                sym,
+                                config.exchanges.binance_futures.depth_snapshot_limit
+                            );
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    biased;
+                                    _ = stop_s.changed() => return,
+                                    _ = tokio::time::sleep(Duration::from_millis(350)) => {}
+                                }
+                                if *stop_s.borrow() {
+                                    return;
+                                }
+                                if let Ok(resp) = http_s.get(&rest_url).send().await {
+                                    if let Ok(text) = resp.text().await {
+                                        let wall_ns = wall_clock_ns();
+                                        let mono_ns = mono_origin.elapsed().as_nanos() as u64;
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            if let Some(id) = v.get("lastUpdateId").and_then(|x| x.as_u64()) {
+                                                let _ = tx_s.try_send(EngineEvent::RestSnapshot {
+                                                    endpoint,
+                                                    conn_id,
+                                                    epoch,
+                                                    symbol: sym_c,
+                                                    last_update_id: id,
+                                                    raw_json: text,
+                                                    wall_ns,
+                                                    mono_ns,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    let ping_secs = match endpoint {
+                        EndpointKind::BybitPublic => config.exchanges.bybit_linear.ping_interval_seconds,
+                        EndpointKind::BitgetPublic => config.exchanges.bitget_v3.ping_interval_seconds,
+                        EndpointKind::GatePublic => config.exchanges.gate_futures.ping_interval_seconds,
+                        _ => 30,
+                    };
+                    let mut ping_timer = tokio::time::interval(Duration::from_secs(ping_secs.max(5)));
+                    let disconnect_reason: String;
+                    let mut gate_refresh: Option<GateDepthRefresh> = None;
+
+                    loop {
+                        let refresh_deadline = gate_refresh.as_ref().map(|refresh| refresh.deadline);
+                        tokio::select! {
+                            biased;
+                            _ = stop_rx.changed() => {
+                                if *stop_rx.borrow() {
+                                    return;
+                                }
                             }
-                            if *stop_s.borrow() {
-                                return;
+                            _ = async {
+                                if let Some(deadline) = refresh_deadline {
+                                    tokio::time::sleep_until(deadline).await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            } => {
+                                disconnect_reason = "gate_depth_refresh_timeout".to_string();
+                                break;
                             }
-                            if let Ok(resp) = http_s.get(&rest_url).send().await {
-                                if let Ok(text) = resp.text().await {
-                                    let wall_ns = wall_clock_ns();
-                                    let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        if let Some(id) = v.get("lastUpdateId").and_then(|x| x.as_u64()) {
-                                            let _ = tx_s.try_send(EngineEvent::RestSnapshot {
-                                                endpoint,
-                                                conn_id,
-                                                symbol: sym_c,
-                                                last_update_id: id,
-                                                raw_json: text,
-                                                wall_ns,
-                                                mono_ns,
-                                            });
+                            _ = ping_timer.tick() => {
+                                let ping_res = match endpoint {
+                                    EndpointKind::BybitPublic => {
+                                        write.send(Message::Text(BybitValidator::build_ping_message().to_string())).await
+                                    }
+                                    EndpointKind::BitgetPublic => {
+                                        write.send(Message::Text(BitgetValidator::build_ping_text().to_string())).await
+                                    }
+                                    EndpointKind::GatePublic => {
+                                        let now_s = Utc::now().timestamp();
+                                        write.send(Message::Text(GateValidator::build_ping_message(now_s).to_string())).await
+                                    }
+                                    _ => write.send(Message::Ping(Vec::new())).await,
+                                };
+                                if let Err(e) = ping_res {
+                                    disconnect_reason = format!("ping_error: {}", e);
+                                    break;
+                                }
+                            }
+                            Some(cmd) = next_command_for_epoch(&mut cmd_rx, epoch) => {
+                                match cmd {
+                                    ConnCommandAction::Reconnect(r) => {
+                                        disconnect_reason = format!("cmd_reconnect: {}", r);
+                                        break;
+                                    }
+                                    ConnCommandAction::Resubscribe(r) => {
+                                        warn!(
+                                            "Resubscribing {} conn={} reason={}",
+                                            endpoint.as_str(),
+                                            conn_id.as_str(),
+                                            r
+                                        );
+                                        if endpoint == EndpointKind::GatePublic {
+                                            if gate_refresh.is_none() {
+                                                match GateDepthRefresh::start(&symbols, &mut write).await {
+                                                    Ok(refresh) => gate_refresh = Some(refresh),
+                                                    Err(error) => {
+                                                        disconnect_reason = format!("gate_unsubscribe_error: {error}");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else if let Err(e) = send_subscriptions(endpoint, &symbols, &mut write).await {
+                                            disconnect_reason = format!("resubscribe_error: {}", e);
+                                            break;
                                         }
                                     }
                                 }
                             }
-                        });
-                    }
-                }
-
-                let ping_secs = match endpoint {
-                    EndpointKind::BybitPublic => config.exchanges.bybit_linear.ping_interval_seconds,
-                    EndpointKind::BitgetPublic => config.exchanges.bitget_v3.ping_interval_seconds,
-                    EndpointKind::GatePublic => config.exchanges.gate_futures.ping_interval_seconds,
-                    _ => 30,
-                };
-                let mut ping_timer = tokio::time::interval(Duration::from_secs(ping_secs.max(5)));
-                let disconnect_reason: String;
-                let mut gate_refresh: Option<GateDepthRefresh> = None;
-
-                loop {
-                    let refresh_deadline = gate_refresh.as_ref().map(|refresh| refresh.deadline);
-                    tokio::select! {
-                        biased;
-                        _ = stop_rx.changed() => {
-                            if *stop_rx.borrow() {
-                                return;
-                            }
-                        }
-                        _ = async {
-                            if let Some(deadline) = refresh_deadline {
-                                tokio::time::sleep_until(deadline).await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        } => {
-                            disconnect_reason = "gate_depth_refresh_timeout".to_string();
-                            break;
-                        }
-                        _ = ping_timer.tick() => {
-                            let ping_res = match endpoint {
-                                EndpointKind::BybitPublic => {
-                                    write.send(Message::Text(BybitValidator::build_ping_message().to_string())).await
-                                }
-                                EndpointKind::BitgetPublic => {
-                                    write.send(Message::Text(BitgetValidator::build_ping_text().to_string())).await
-                                }
-                                EndpointKind::GatePublic => {
-                                    let now_s = Utc::now().timestamp();
-                                    write.send(Message::Text(GateValidator::build_ping_message(now_s).to_string())).await
-                                }
-                                _ => write.send(Message::Ping(Vec::new())).await,
-                            };
-                            if let Err(e) = ping_res {
-                                disconnect_reason = format!("ping_error: {}", e);
-                                break;
-                            }
-                        }
-                        Some(cmd) = cmd_rx.recv() => {
-                            match cmd {
-                                ConnCommand::Reconnect(r) => {
-                                    disconnect_reason = format!("cmd_reconnect: {}", r);
-                                    break;
-                                }
-                                ConnCommand::Resubscribe(r) => {
-                                    warn!(
-                                        "Resubscribing {} conn={} reason={}",
-                                        endpoint.as_str(),
-                                        conn_id.as_str(),
-                                        r
-                                    );
-                                    if endpoint == EndpointKind::GatePublic {
-                                        if gate_refresh.is_none() {
-                                            match GateDepthRefresh::start(&symbols, &mut write).await {
-                                                Ok(refresh) => gate_refresh = Some(refresh),
+                            maybe_msg = read.next() => {
+                                // HOT PATH: stamp recv_wall_ns and recv_mono_ns BEFORE any JSON parsing!
+                                let wall_ns = wall_clock_ns();
+                                let mono_ns = mono_origin.elapsed().as_nanos() as u64;
+                                match maybe_msg {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Some(refresh) = gate_refresh.as_mut() {
+                                            match refresh.on_message(&text, &symbols, &mut write).await {
+                                                Ok(true) => gate_refresh = None,
+                                                Ok(false) => {}
                                                 Err(error) => {
-                                                    disconnect_reason = format!("gate_unsubscribe_error: {error}");
+                                                    disconnect_reason = format!("gate_depth_refresh_error: {error}");
                                                     break;
                                                 }
                                             }
                                         }
-                                    } else if let Err(e) = send_subscriptions(endpoint, &symbols, &mut write).await {
-                                        disconnect_reason = format!("resubscribe_error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        maybe_msg = read.next() => {
-                            // HOT PATH: stamp recv_wall_ns and recv_mono_ns BEFORE any JSON parsing!
-                            let wall_ns = wall_clock_ns();
-                            let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                            match maybe_msg {
-                                Some(Ok(Message::Text(text))) => {
-                                    if let Some(refresh) = gate_refresh.as_mut() {
-                                        match refresh.on_message(&text, &symbols, &mut write).await {
-                                            Ok(true) => gate_refresh = None,
-                                            Ok(false) => {}
-                                            Err(error) => {
-                                                disconnect_reason = format!("gate_depth_refresh_error: {error}");
-                                                break;
+                                        let frame = RawFrame {
+                                            recv_wall_ns: wall_ns,
+                                            recv_mono_ns: mono_ns,
+                                            exchange: endpoint.exchange(),
+                                            endpoint,
+                                            conn_id,
+                                            epoch,
+                                            payload: text,
+                                        };
+                                        match tx.try_send(EngineEvent::Frame(frame)) {
+                                            Ok(()) => {}
+                                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                                // Never silently drop: force LOCAL_LOSS event notification.
+                                                let _ = tx.send(EngineEvent::LocalLoss {
+                                                    endpoint,
+                                                    dropped: 1,
+                                                    wall_ns,
+                                                    mono_ns,
+                                                    reason: "bounded_channel_full".to_string(),
+                                                }).await;
+                                            }
+                                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                return;
                                             }
                                         }
                                     }
-                                    let frame = RawFrame {
-                                        recv_wall_ns: wall_ns,
-                                        recv_mono_ns: mono_ns,
-                                        exchange: endpoint.exchange(),
-                                        endpoint,
-                                        conn_id,
-                                        epoch,
-                                        payload: text,
-                                    };
-                                    match tx.try_send(EngineEvent::Frame(frame)) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            // Never silently drop: force LOCAL_LOSS event notification.
-                                            let _ = tx.send(EngineEvent::LocalLoss {
-                                                endpoint,
-                                                dropped: 1,
-                                                wall_ns,
-                                                mono_ns,
-                                                reason: "bounded_channel_full".to_string(),
-                                            }).await;
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                                            return;
-                                        }
+                                    Some(Ok(Message::Ping(p))) => {
+                                        let _ = write.send(Message::Pong(p)).await;
                                     }
+                                    Some(Ok(Message::Pong(_))) => {}
+                                    Some(Ok(Message::Close(_))) => {
+                                        disconnect_reason = "ws_close_frame".to_string();
+                                        break;
+                                    }
+                                    Some(Err(e)) => {
+                                        disconnect_reason = format!("ws_read_error: {}", e);
+                                        break;
+                                    }
+                                    None => {
+                                        disconnect_reason = "ws_stream_ended".to_string();
+                                        break;
+                                    }
+                                    _ => {}
                                 }
-                                Some(Ok(Message::Ping(p))) => {
-                                    let _ = write.send(Message::Pong(p)).await;
-                                }
-                                Some(Ok(Message::Pong(_))) => {}
-                                Some(Ok(Message::Close(_))) => {
-                                    disconnect_reason = "ws_close_frame".to_string();
-                                    break;
-                                }
-                                Some(Err(e)) => {
-                                    disconnect_reason = format!("ws_read_error: {}", e);
-                                    break;
-                                }
-                                None => {
-                                    disconnect_reason = "ws_stream_ended".to_string();
-                                    break;
-                                }
-                                _ => {}
                             }
                         }
                     }
-                }
+                    subscribed_uptime = Some(subscribed_at.elapsed());
+                    disconnect_reason
+                };
 
-                if *stop_rx.borrow() {
+                if !send_lifecycle_event(&tx, &mut stop_rx, EngineEvent::Disconnect {
+                    endpoint,
+                    conn_id,
+                    epoch,
+                    wall_ns: wall_clock_ns(),
+                    mono_ns: mono_origin.elapsed().as_nanos() as u64,
+                    reason: disconnect_reason,
+                }).await {
                     return;
                 }
-                let wall_ns = wall_clock_ns();
-                let mono_ns = mono_origin.elapsed().as_nanos() as u64;
-                let _ = tx
-                    .send(EngineEvent::Disconnect {
-                        endpoint,
-                        conn_id,
-                        wall_ns,
-                        mono_ns,
-                        reason: disconnect_reason,
-                    })
-                    .await;
             }
             Err(e) => {
                 warn!(
@@ -1016,12 +1088,12 @@ async fn ws_connection_loop(
             }
         }
 
+        let delay = next_retry_delay(&mut backoff_ms, subscribed_uptime);
         tokio::select! {
             biased;
-            _ = stop_rx.changed() => return,
-            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            _ = stop_rx.wait_for(|requested| *requested) => return,
+            _ = tokio::time::sleep(delay) => {}
         }
-        backoff_ms = (backoff_ms * 2).min(15_000);
     }
 }
 
@@ -1090,6 +1162,23 @@ impl GateDepthRefresh {
     }
 }
 
+async fn subscribe_socket<S>(
+    endpoint: EndpointKind,
+    symbols: &[String],
+    write: &mut S,
+    stop: &mut watch::Receiver<bool>,
+) -> Option<Result<Instant, String>>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let result = tokio::select! {
+        biased;
+        _ = stop.wait_for(|requested| *requested) => return None,
+        result = send_subscriptions(endpoint, symbols, write) => result,
+    };
+    Some(result.map(|()| Instant::now()).map_err(|error| format!("subscribe_write_error: {error}")))
+}
+
 async fn send_subscriptions<S>(
     endpoint: EndpointKind,
     symbols: &[String],
@@ -1135,6 +1224,64 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn command_queue_rejects_late_reconnect_and_resubscribe_for_previous_epoch() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let next = tokio::spawn(async move { next_command_for_epoch(&mut rx, 2).await });
+        tx.send(ConnCommand { epoch: 1, action: ConnCommandAction::Reconnect("old".into()) })
+            .await.unwrap();
+        tx.send(ConnCommand { epoch: 1, action: ConnCommandAction::Resubscribe("old".into()) })
+            .await.unwrap();
+        tx.send(ConnCommand { epoch: 2, action: ConnCommandAction::Resubscribe("current".into()) })
+            .await.unwrap();
+        assert!(matches!(next.await.unwrap(), Some(ConnCommandAction::Resubscribe(reason)) if reason == "current"));
+    }
+
+    #[test]
+    fn late_rest_and_disconnect_events_do_not_target_the_new_epoch() {
+        let endpoint = EndpointKind::BinancePublic;
+        let mut selector = CausalSelector::new(endpoint, vec!["BTCUSDT".into()], 3, 5);
+        selector.start_disconnected();
+        let mut selectors = HashMap::from([(endpoint, selector)]);
+        assert!(active_selector_for_epoch(&mut selectors, endpoint, ConnId::A, 1).is_none());
+        let selector = selectors.get_mut(&endpoint).unwrap();
+        selector.on_reconnect(ConnId::A, 1, 10);
+        selector.on_disconnect(ConnId::A, 10, 11, "old socket closed");
+        assert!(active_selector_for_epoch(&mut selectors, endpoint, ConnId::A, 1).is_none());
+
+        selectors.get_mut(&endpoint).unwrap().on_reconnect(ConnId::A, 2, 20);
+        assert!(active_selector_for_epoch(&mut selectors, endpoint, ConnId::A, 1).is_none());
+        assert!(active_selector_for_epoch(&mut selectors, endpoint, ConnId::A, 2).is_some());
+    }
+
+    #[tokio::test]
+    async fn subscription_sink_write_failure_is_a_disconnect_reason() {
+        let sink = futures_util::sink::unfold((), |(), _: Message| {
+            std::future::ready(Err::<(), _>(tokio_tungstenite::tungstenite::Error::ConnectionClosed))
+        });
+        let mut sink = Box::pin(sink);
+        let (_stop, mut stop_rx) = watch::channel(false);
+        let result = subscribe_socket(EndpointKind::GatePublic, &["BTC_USDT".into()], &mut sink, &mut stop_rx)
+            .await.unwrap();
+        assert!(result.unwrap_err().starts_with("subscribe_write_error:"));
+    }
+
+    #[test]
+    fn failed_or_short_subscriptions_increase_retry_delay_until_a_stable_session() {
+        let mut backoff_ms = INITIAL_RETRY_MS;
+        assert_eq!(next_retry_delay(&mut backoff_ms, None), Duration::from_millis(500));
+        assert_eq!(next_retry_delay(&mut backoff_ms, None), Duration::from_secs(1));
+        assert_eq!(
+            next_retry_delay(&mut backoff_ms, Some(Duration::from_millis(20))),
+            Duration::from_secs(2),
+        );
+        for _ in 0..10 {
+            let _ = next_retry_delay(&mut backoff_ms, None);
+        }
+        assert_eq!(next_retry_delay(&mut backoff_ms, None), Duration::from_secs(15));
+        assert_eq!(next_retry_delay(&mut backoff_ms, Some(STABLE_SESSION)), Duration::from_millis(500));
+    }
 
     #[tokio::test]
     async fn gate_refresh_waits_for_unsubscribe_then_requests_only_depth() {

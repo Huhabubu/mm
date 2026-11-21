@@ -128,6 +128,20 @@ impl CausalSelector {
         self.runtime(id).state()
     }
 
+    pub(crate) fn start_disconnected(&mut self) {
+        self.conn_a.connected = false;
+        self.conn_b.connected = false;
+    }
+
+    pub(crate) fn connected_epoch(&self, id: ConnId) -> Option<u64> {
+        let connection = self.runtime(id);
+        connection.connected.then_some(connection.epoch)
+    }
+
+    pub(crate) fn allow_reconnect_retry(&mut self, id: ConnId) {
+        self.runtime_mut(id).resync_requested = false;
+    }
+
     fn runtime(&self, id: ConnId) -> &ConnRuntime {
         match id {
             ConnId::A => &self.conn_a,
@@ -204,10 +218,17 @@ impl CausalSelector {
         let wall_ns = frame.recv_wall_ns;
         let mono_ns = frame.recv_mono_ns;
 
+        let current_epoch = self.runtime(conn_id).epoch;
+        if frame.epoch < current_epoch || (frame.epoch == current_epoch && !self.runtime(conn_id).connected) {
+            return out;
+        }
+        if frame.epoch > current_epoch {
+            // Replay callers may start a new epoch with the first frame rather than a lifecycle event.
+            self.on_reconnect(conn_id, frame.epoch, mono_ns);
+        }
+
         let verdict = {
             let rt = self.runtime_mut(conn_id);
-            rt.connected = true;
-            rt.epoch = frame.epoch;
             rt.last_msg_mono_ns = mono_ns;
             rt.validator.on_text_frame(&frame.payload)
         };
@@ -449,10 +470,6 @@ impl CausalSelector {
                 }),
             ));
         }
-        out.actions.push(SelectorAction::Reconnect {
-            conn_id,
-            reason: reason.to_string(),
-        });
         out
     }
 
@@ -485,6 +502,9 @@ impl CausalSelector {
             market_data: None,
         };
 
+        if self.connected_epoch(target).is_none() {
+            return out;
+        }
         if target == self.primary {
             let standby = target.peer();
             if self.runtime(standby).state() == ConnState::Live {

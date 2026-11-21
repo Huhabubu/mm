@@ -2295,4 +2295,7 @@ def test_p3_loss_report_keeps_manifest_evidence_after_alert_expires(tmp_path: Pa
     assert "过去 300 秒" in quiet_message and "历史丢数记录继续保留" in quiet_message
     assert "[已恢复]" not in quiet_message
     assert len(after["data_tree"]["manifests_with_local_loss"]) == 1
-    assert "历史丢数证据（累计）：1 个分区" in after["hourly_report"]["text"]
+    report = after["hourly_report"]["text"]
+    assert "历史丢数证据（累计）：1 个分区" in report
+    assert "上一完整小时有本地丢数" in report
+    assert "2026-12-03T09 UTC · gate_futures_20261203_09.manifest.json · LOSS 2" in report
