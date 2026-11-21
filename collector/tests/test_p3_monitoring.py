@@ -493,31 +493,43 @@ def test_p3_dual_outage_local_loss_disk_and_clock_alerts_with_recovery(tmp_path:
         "clock_unsynced",
     }
 
-    # Verify disk & clock recover immediately when normalized; outage recovers after 60s, loss after 300s
+    # Without endpoint recovery evidence, binance_public dual outage MUST NOT recover solely from elapsed time
+    # or binance_futures .partial updates (e.g. from sibling binance_market)! Only disk/clock/loss recover here.
     disk_box[0] = 52.0
     chrony_box[0] = GOOD_CHRONY_OUTPUT
     for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
         p_path = next((data_root / "raw" / ex / "2026-12-03").glob("*.partial"))
         os.utime(p_path, (t0 + 400.0, t0 + 400.0))
-    r_rec = mon.run_sweep(now_epoch_s=t0 + 405.0, run_chrony=True)
-    assert r_rec["active_alerts"] == []
-    assert set(r_rec["alert_dispatch"]["sent_recoveries"]) == {
-        "dual_ab_outage_gt_5s",
+    r_mid = mon.run_sweep(now_epoch_s=t0 + 405.0, run_chrony=True)
+    assert r_mid["active_alerts"] == ["dual_ab_outage_gt_5s"]
+    assert set(r_mid["alert_dispatch"]["sent_recoveries"]) == {
         "local_loss_detected",
         "disk_usage_high",
         "clock_unsynced",
     }
+
+    # Once binance_public logs clean Connected + stabilizes >= 60s with fresh binance_futures writes, it recovers!
+    journal_queue.append("INFO tokyo_l2_collector::live: Connected binance_public conn=A epoch=2")
+    r_conn = mon.run_sweep(now_epoch_s=t0 + 410.0)
+    assert "dual_ab_outage_gt_5s" in r_conn["active_alerts"]  # Still within 60s stabilization window
+
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        p_path = next((data_root / "raw" / ex / "2026-12-03").glob("*.partial"))
+        os.utime(p_path, (t0 + 475.0, t0 + 475.0))
+    r_rec = mon.run_sweep(now_epoch_s=t0 + 480.0, run_chrony=True)
+    assert r_rec["active_alerts"] == []
+    assert r_rec["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
 
     # Also test LOCAL_LOSS detected from a newly sealed .manifest.json (without needing journal)
     transport.tg_messages.clear()
     _seed_exchange_files(
         data_root,
         "gate_futures",
-        now_s=t0 + 450.0,
+        now_s=t0 + 490.0,
         hour_utc="10",
         local_loss_lines=2,
     )
-    r_mf_loss = mon.run_sweep(now_epoch_s=t0 + 455.0)
+    r_mf_loss = mon.run_sweep(now_epoch_s=t0 + 495.0)
     assert "local_loss_detected" in r_mf_loss["active_alerts"]
     assert "local_loss_detected" in r_mf_loss["alert_dispatch"]["sent_alerts"]
 
@@ -797,4 +809,250 @@ def test_p3_legacy_minimal_config_defaults_and_oneshot_archive_idle(tmp_path: Pa
     arch_state[0] = "failed"
     r_fail = mon.run_sweep(now_epoch_s=t0 + 60.0)
     assert "archive_upload_or_verify_failed" in r_fail["active_alerts"]
+
+
+def test_p3_probe_failures_and_unverified_startup_block_healthy_heartbeat(tmp_path: Path) -> None:
+    """Review Issue 1: systemctl/chrony/disk probe failures & unverified freshness block HC success ping."""
+    data_root = tmp_path / "tokyo_l2"
+    cfg_path = _write_test_config(tmp_path, data_root)
+    t0 = 1_796_292_720.0
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        pp, dp, mp = _seed_exchange_files(data_root, ex, now_s=t0, partial_age_s=2.0)
+        _seed_ledger_row(data_root, dp, mp, exchange=ex, state="VERIFIED")
+
+    svc_mode = ["unavailable"]
+    chrony_ok = [True]
+    disk_fail = [False]
+
+    def probe(unit: str) -> dict[str, Any]:
+        if svc_mode[0] == "unavailable":
+            return {"available": False, "unit": unit, "error": "systemctl dbus timeout"}
+        if svc_mode[0] == "raise":
+            raise RuntimeError("systemctl subprocess crashed")
+        if svc_mode[0] == "startup_grace":
+            res = _healthy_service(unit)
+            if "collector" in unit:
+                res["uptime_seconds"] = 10.0
+            return res
+        return _healthy_service(unit)
+
+    def chrony() -> str:
+        if not chrony_ok[0]:
+            raise RuntimeError("chronyc socket missing")
+        return GOOD_CHRONY_OUTPUT
+
+    def disk_chk(_p: Path) -> float:
+        if disk_fail[0]:
+            raise OSError("statvfs EIO")
+        return 32.0
+
+    transport = FakeTransport()
+    mon = _build_monitor(
+        cfg_path,
+        transport,
+        service_probe=probe,
+        chrony_runner=chrony,
+        disk_checker=disk_chk,
+    )
+
+    # 1. systemctl unavailable -> NO false healthy ping! Sends /fail and triggers collector_probe_failed!
+    r1 = mon.run_sweep(now_epoch_s=t0, force_collector_hc=True)
+    assert "collector_probe_failed" in r1["active_alerts"]
+    assert r1["collector_healthcheck"]["healthy"] is False
+    assert transport.hc_calls[-1]["is_fail"] is True
+    assert "collector_probe_failed" in transport.hc_calls[-1]["body"]
+
+    # 2. service_probe raises exception -> ALSO fail-closed!
+    svc_mode[0] = "raise"
+    r2 = mon.run_sweep(now_epoch_s=t0 + 305.0, force_collector_hc=True)
+    assert "collector_probe_failed" in r2["active_alerts"]
+    assert r2["collector_healthcheck"]["healthy"] is False
+    assert transport.hc_calls[-1]["is_fail"] is True
+
+    # 3. systemctl recovers, BUT chronyc fails -> clock uncertified -> blocks healthy ping!
+    svc_mode[0] = "healthy"
+    chrony_ok[0] = False
+    r3 = mon.run_sweep(now_epoch_s=t0 + 610.0, run_chrony=True, force_collector_hc=True)
+    assert "collector_probe_failed" not in r3["active_alerts"]
+    assert "clock_unsynced" in r3["active_alerts"]
+    assert r3["collector_healthcheck"]["healthy"] is False
+    assert transport.hc_calls[-1]["is_fail"] is True
+
+    # 4. Chrony recovers, BUT disk probe raises -> disk_probe_failed -> blocks healthy ping!
+    chrony_ok[0] = True
+    disk_fail[0] = True
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        pp = next((data_root / "raw" / ex / "2026-12-03").glob("*.partial"))
+        os.utime(pp, (t0 + 670.0, t0 + 670.0))
+    r4 = mon.run_sweep(now_epoch_s=t0 + 675.0, run_chrony=True, force_collector_hc=True)
+    assert "disk_probe_failed" in r4["active_alerts"]
+    assert r4["collector_healthcheck"]["healthy"] is False
+    assert transport.hc_calls[-1]["is_fail"] is True
+
+    # 5. All probes & freshness genuinely healthy -> ONLY NOW sends success heartbeat!
+    disk_fail[0] = False
+    r5 = mon.run_sweep(now_epoch_s=t0 + 740.0, run_chrony=True, force_collector_hc=True)
+    assert r5["active_alerts"] == []
+    assert r5["collector_healthcheck"]["healthy"] is True
+    assert transport.hc_calls[-1]["is_fail"] is False
+
+    # 6. Fresh startup grace without any data files yet -> no stale alert, yet HC blocks ok=True!
+    data_empty = tmp_path / "empty_startup"
+    cfg2_obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg2_obj["deployment"]["data_root"] = str(data_empty)
+    cfg2_path = tmp_path / "p3_empty_startup.json"
+    cfg2_path.write_text(json.dumps(cfg2_obj), encoding="utf-8")
+    svc_mode[0] = "startup_grace"
+    transport2 = FakeTransport()
+    mon2 = _build_monitor(cfg2_path, transport2, service_probe=probe)
+    r_boot = mon2.run_sweep(now_epoch_s=t0, force_collector_hc=True)
+    assert "collector_data_stale" not in r_boot["active_alerts"]
+    assert r_boot["collector_healthcheck"]["healthy"] is False
+    assert transport2.hc_calls[-1]["is_fail"] is True
+    assert "data_freshness_unverified" in transport2.hc_calls[-1]["body"]
+
+
+def test_p3_dual_outage_no_premature_recovery_without_endpoint_evidence(tmp_path: Path) -> None:
+    """Review Issue 2: Sibling traffic & elapsed time MUST NOT clear dual A/B outage without endpoint proof."""
+    data_root = tmp_path / "tokyo_l2"
+    cfg_path = _write_test_config(tmp_path, data_root)
+    t0 = 1_796_292_720.0
+    partials: dict[str, Path] = {}
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        pp, dp, mp = _seed_exchange_files(data_root, ex, now_s=t0, partial_age_s=2.0)
+        partials[ex] = pp
+        _seed_ledger_row(data_root, dp, mp, exchange=ex, state="VERIFIED")
+
+    journal_queue: list[str] = []
+
+    def j_reader(_u: str, cur: str | None) -> tuple[list[str], str | None]:
+        out = list(journal_queue)
+        journal_queue.clear()
+        return out, f"cur_{len(out)}_{cur or '0'}"
+
+    transport = FakeTransport()
+    mon = _build_monitor(cfg_path, transport, journal_reader=j_reader)
+    assert mon.run_sweep(now_epoch_s=t0)["active_alerts"] == []
+    transport.tg_messages.clear()
+
+    # Two endpoints go into dual outage simultaneously: binance_public + gate_public
+    journal_queue.extend(
+        [
+            "ERROR live: [ALERT CRITICAL] binance_public dual A/B outage exceeded 5s",
+            "ERROR live: [ALERT CRITICAL] gate_public dual A/B outage exceeded 5s",
+        ]
+    )
+    r1 = mon.run_sweep(now_epoch_s=t0 + 10.0)
+    assert "dual_ab_outage_gt_5s" in r1["active_alerts"]
+
+    # Wait 30 minutes while binance_market & others continuously update ALL .partial files -> MUST NOT recover!
+    for step in (75.0, 600.0, 1200.0, 1800.0):
+        for pp in partials.values():
+            os.utime(pp, (t0 + step - 1.0, t0 + step - 1.0))
+        r_still = mon.run_sweep(now_epoch_s=t0 + step)
+        assert "dual_ab_outage_gt_5s" in r_still["active_alerts"]
+        assert r_still["alert_dispatch"]["sent_recoveries"] == []
+        assert r_still["collector_healthcheck"]["healthy"] in (None, False)
+
+    # Flapping: binance_public logs Connected, then Subscribe write error right after -> resets stabilization!
+    journal_queue.extend(
+        [
+            "INFO live: Connected binance_public conn=A epoch=2",
+            "WARN live: Subscribe write error on binance_public A: connection reset",
+        ]
+    )
+    for pp in partials.values():
+        os.utime(pp, (t0 + 1850.0, t0 + 1850.0))
+    r_flap = mon.run_sweep(now_epoch_s=t0 + 1855.0)
+    assert "dual_ab_outage_gt_5s" in r_flap["active_alerts"]
+
+    # After waiting > 60s since that failed Connected, still MUST NOT recover because error invalidated it!
+    for pp in partials.values():
+        os.utime(pp, (t0 + 1950.0, t0 + 1950.0))
+    r_still_flap = mon.run_sweep(now_epoch_s=t0 + 1955.0)
+    assert "dual_ab_outage_gt_5s" in r_still_flap["active_alerts"]
+
+    # gate_public recovers cleanly via explicit GAP_END, while binance_public stays broken -> stays FIRING!
+    journal_queue.append('INFO live: {"event":"GAP_END","endpoint":"gate_public","recovered_conn":"A"}')
+    for pp in partials.values():
+        os.utime(pp, (t0 + 1965.0, t0 + 1965.0))
+    r_partial_rec = mon.run_sweep(now_epoch_s=t0 + 1970.0)
+    assert "dual_ab_outage_gt_5s" in r_partial_rec["active_alerts"]
+    assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
+
+    # Finally binance_public explicitly emits GAP_END recovery + fresh binance_futures data -> RECOVERS!
+    journal_queue.append("INFO live: GAP_END endpoint=binance_public")
+    for pp in partials.values():
+        os.utime(pp, (t0 + 1985.0, t0 + 1985.0))
+    r_full_rec = mon.run_sweep(now_epoch_s=t0 + 1990.0, force_collector_hc=True)
+    assert r_full_rec["active_alerts"] == []
+    assert r_full_rec["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
+    assert r_full_rec["collector_healthcheck"]["healthy"] is True
+
+
+def test_p3_hourly_report_prev_hour_vs_cumulative_metrics(tmp_path: Path) -> None:
+    """Review Issue 3: Hourly battle report separates previous complete UTC hour vs cumulative history."""
+    data_root = tmp_path / "tokyo_l2"
+    cfg_path = _write_test_config(tmp_path, data_root)
+    # 2026-12-03T10:12:00 UTC -> previous complete UTC hour MUST be 2026-12-03T09!
+    t0 = 1_796_292_720.0
+
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        # Old hour 07 manifest with historical LOSS=7 & DATA=50000
+        _, dp_old, mp_old = _seed_exchange_files(
+            data_root,
+            ex,
+            now_s=t0,
+            hour_utc="07",
+            data_lines=50000,
+            local_loss_lines=7 if ex == "gate_futures" else 0,
+            gap_start_lines=3 if ex == "gate_futures" else 0,
+            switch_lines=2 if ex == "gate_futures" else 0,
+            boot_id="boot_0",
+        )
+        _seed_ledger_row(data_root, dp_old, mp_old, exchange=ex, hour_utc="07", state="PRUNED")
+
+        # Previous complete hour 09 manifest with clean LOSS=0 & DATA=12000
+        _, dp_prev, mp_prev = _seed_exchange_files(
+            data_root,
+            ex,
+            now_s=t0,
+            hour_utc="09",
+            data_lines=12000 if ex == "gate_futures" else 8000,
+            local_loss_lines=0,
+            gap_start_lines=1 if ex == "gate_futures" else 0,
+            switch_lines=1 if ex == "gate_futures" else 0,
+            boot_id="boot_1",
+        )
+        _seed_ledger_row(data_root, dp_prev, mp_prev, exchange=ex, hour_utc="09", state="VERIFIED")
+
+    transport = FakeTransport()
+    mon = _build_monitor(cfg_path, transport)
+    r = mon.run_sweep(now_epoch_s=t0, force_hourly_report=True)
+    report = r["hourly_report"]["text"]
+    assert report is not None
+
+    # Verify explicit separation: previous hour (2026-12-03T09) vs historical cumulative!
+    assert "上小时(2026-12-03T09): 封口=1 DATA=12,000" in report
+    assert "SW=1 GAP=1 LOSS=0" in report
+    assert "历史累计: 封口=2(V=1/P=1) DATA=62,000 LOSS=7" in report
+    assert "账本累计分区: SEALED=0 / VERIFIED=4 / PRUNED=4" in report
+
+    # Verify UTC midnight boundary: at 2026-12-04T00:12:00 UTC -> prev_hour_key = 2026-12-03T23
+    t_midnight = 1_796_343_120.0
+    _, dp_23, mp_23 = _seed_exchange_files(
+        data_root,
+        "binance_futures",
+        now_s=t_midnight,
+        date_utc="2026-12-03",
+        hour_utc="23",
+        data_lines=9999,
+        local_loss_lines=0,
+    )
+    _seed_ledger_row(data_root, dp_23, mp_23, exchange="binance_futures", hour_utc="23", state="VERIFIED")
+    r_mid = mon.run_sweep(now_epoch_s=t_midnight, force_hourly_report=True)
+    mid_report = r_mid["hourly_report"]["text"]
+    assert mid_report is not None
+    assert "上小时(2026-12-03T23): 封口=1 DATA=9,999" in mid_report
+
 

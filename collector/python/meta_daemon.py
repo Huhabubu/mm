@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -77,12 +77,30 @@ DEFAULT_EXCHANGE_ORDER = (
     "gate_futures",
 )
 
+ENDPOINT_TO_EXCHANGE = {
+    "binance_public": "binance_futures",
+    "binance_market": "binance_futures",
+    "bybit_public": "bybit_linear",
+    "bitget_public": "bitget_v3",
+    "gate_public": "gate_futures",
+}
+
 # Secret redaction patterns (Telegram bot tokens & Healthchecks ping UUIDs)
 _RE_TG_BOT_TOKEN = re.compile(r"(bot)\d{6,}:[A-Za-z0-9_-]{8,}")
 _RE_HC_PING_UUID = re.compile(
     r"(https?://[^/\s]+/)(?:ping/)?([0-9a-fA-F]{8}-[0-9a-fA-F-]{13,}|[A-Za-z0-9_-]{16,})(/(?:fail|start|\d+))?"
 )
 _RE_BOOT_STARTED = re.compile(r"tokyo-l2-collector live engine started boot_id=(\S+)")
+_RE_DUAL_OUTAGE_EP = re.compile(r"\b([a-z0-9_]+)\s+dual A/B outage exceeded", re.IGNORECASE)
+_RE_CONNECTED_EP = re.compile(r"\bConnected\s+([a-z0-9_]+)\s+conn=(A|B)\b")
+_RE_EP_ERROR = re.compile(
+    r"(?:WS connect failed|Subscribe write error on|Resubscribing)\s+([a-z0-9_]+)\b"
+)
+_RE_GAP_END_JSON_EP = re.compile(r'"event"\s*:\s*"GAP_END".*?"endpoint"\s*:\s*"([a-z0-9_]+)"')
+_RE_GAP_END_TEXT_EP = re.compile(
+    r"(?:GAP_END(?:\s+endpoint=|\s+on\s+|\s+)|dual A/B outage recovered(?:\s+on\s+|\s+))([a-z0-9_]+)\b",
+    re.IGNORECASE,
+)
 
 
 def redact_secrets(text: str, extra_secrets: list[str] | None = None) -> str:
@@ -737,8 +755,18 @@ def default_journal_reader(
     return messages, new_cursor
 
 
+def _extract_gap_end_endpoint(line: str) -> str | None:
+    m1 = _RE_GAP_END_JSON_EP.search(line)
+    if m1:
+        return m1.group(1)
+    m2 = _RE_GAP_END_TEXT_EP.search(line)
+    if m2:
+        return m2.group(1)
+    return None
+
+
 def inspect_collector_logs(lines: list[str]) -> dict[str, Any]:
-    """Parse Rust collector log lines for dual outages > 5s, LOCAL_LOSS, disk/seal errors, & unclean starts."""
+    """Parse Rust collector log lines for per-endpoint outages/recoveries, LOCAL_LOSS, errors & boots."""
     dual_outages: list[str] = []
     local_losses: list[str] = []
     write_or_seal_errors: list[str] = []
@@ -747,12 +775,59 @@ def inspect_collector_logs(lines: list[str]) -> dict[str, Any]:
     unclean_boot_transitions = 0
     saw_active_boot = False
 
+    # Chronological per-endpoint tracking within this log batch:
+    # A subsequent error or outage invalidates any earlier connect/recovery candidate in the same batch.
+    endpoint_timeline: dict[str, dict[str, Any]] = {}
+
+    def _ep_rec(ep: str) -> dict[str, Any]:
+        return endpoint_timeline.setdefault(
+            ep,
+            {
+                "saw_outage": False,
+                "outage_messages": [],
+                "connected_clean": False,
+                "explicit_recovered": False,
+                "saw_error_after_connect": False,
+            },
+        )
+
     for raw in lines:
         line = str(raw).strip()
         if not line:
             continue
-        if "dual A/B outage" in line or "outage exceeded" in line:
+        if "dual A/B outage exceeded" in line or (
+            "dual A/B outage" in line and "recovered" not in line.lower()
+        ):
             dual_outages.append(line)
+            m_ep = _RE_DUAL_OUTAGE_EP.search(line)
+            ep = m_ep.group(1) if m_ep else "unknown_endpoint"
+            rec = _ep_rec(ep)
+            rec["saw_outage"] = True
+            rec["connected_clean"] = False
+            rec["explicit_recovered"] = False
+            rec["outage_messages"].append(line)
+
+        gap_ep = _extract_gap_end_endpoint(line)
+        if gap_ep is not None:
+            rec = _ep_rec(gap_ep)
+            rec["explicit_recovered"] = True
+            rec["saw_error_after_connect"] = False
+
+        m_err = _RE_EP_ERROR.search(line)
+        if m_err:
+            ep = m_err.group(1)
+            rec = _ep_rec(ep)
+            rec["connected_clean"] = False
+            rec["explicit_recovered"] = False
+            rec["saw_error_after_connect"] = True
+
+        m_conn = _RE_CONNECTED_EP.search(line)
+        if m_conn:
+            ep = m_conn.group(1)
+            rec = _ep_rec(ep)
+            rec["connected_clean"] = True
+            rec["saw_error_after_connect"] = False
+
         if "LOCAL_LOSS" in line:
             local_losses.append(line)
         if "Disk write error on " in line or "Failed sealing " in line:
@@ -769,6 +844,7 @@ def inspect_collector_logs(lines: list[str]) -> dict[str, Any]:
 
     return {
         "dual_outages": dual_outages,
+        "endpoint_timeline": endpoint_timeline,
         "local_losses": local_losses,
         "write_or_seal_errors": write_or_seal_errors,
         "starts": starts,
@@ -816,7 +892,8 @@ def inspect_data_tree(
 ) -> dict[str, Any]:
     """Lightweight metadata scan of `.partial` stat & `.manifest.json` summaries ONLY.
 
-    Guarantees ZERO file opens or zstd decompressions of `.tsv.zst` or `.tsv.zst.partial`.
+    Computes both the **previous complete UTC hour** window (`prev_hour_*`) and **cumulative**
+    historical totals (`cumulative_*`), and strictly NEVER opens or decompresses `.tsv.zst` files.
     """
     cache = manifest_cache if manifest_cache is not None else {}
     raw_root = data_root / "raw"
@@ -826,6 +903,10 @@ def inspect_data_tree(
     in_startup_grace = (
         service_uptime_seconds is not None and service_uptime_seconds < min(float(stale_seconds), 90.0)
     )
+    prev_hour_dt = datetime.fromtimestamp(now_s, tz=timezone.utc).replace(
+        minute=0, second=0, microsecond=0
+    ) - timedelta(hours=1)
+    prev_hour_key = prev_hour_dt.strftime("%Y-%m-%dT%H")
 
     seen_manifest_keys: set[str] = set()
     for ex in enabled_exchanges:
@@ -864,6 +945,7 @@ def inspect_data_tree(
         manifests.sort(key=lambda m: (m["hour_key"], m["mtime_s"], m["rel_path"]))
         latest_partial = max(partials, key=lambda x: x[0]) if partials else None
         latest_manifest = manifests[-1] if manifests else None
+        prev_hour_mfs = [m for m in manifests if m["hour_key"] == prev_hour_key]
 
         activity_candidates: list[float] = []
         if latest_partial is not None:
@@ -889,24 +971,55 @@ def inspect_data_tree(
         loss_mfs = [m for m in manifests if m["local_loss_lines"] > 0]
         manifests_with_local_loss.extend(loss_mfs)
 
+        cum_data = sum(m["data_lines"] + m["data_escaped_lines"] for m in manifests)
+        cum_meta = sum(m["meta_lines"] for m in manifests)
+        cum_loss = sum(m["local_loss_lines"] for m in manifests)
+        cum_gap = sum(m["gap_start_lines"] for m in manifests)
+        cum_sw = sum(m["switch_lines"] for m in manifests)
+        cum_bytes = sum(m["bytes"] for m in manifests)
+
+        prev_data = sum(m["data_lines"] + m["data_escaped_lines"] for m in prev_hour_mfs)
+        prev_meta = sum(m["meta_lines"] for m in prev_hour_mfs)
+        prev_loss = sum(m["local_loss_lines"] for m in prev_hour_mfs)
+        prev_gap = sum(m["gap_start_lines"] for m in prev_hour_mfs)
+        prev_sw = sum(m["switch_lines"] for m in prev_hour_mfs)
+        prev_bytes = sum(m["bytes"] for m in prev_hour_mfs)
+
         per_exchange[ex] = {
             "active_partial_count": len(partials),
             "latest_partial_path": latest_partial[2] if latest_partial else None,
             "latest_partial_bytes": latest_partial[1] if latest_partial else 0,
             "latest_partial_age_s": round(now_s - latest_partial[0], 1) if latest_partial else None,
+            "last_activity_epoch_s": latest_activity_s,
             "last_activity_age_s": round(activity_age_s, 1) if activity_age_s is not None else None,
             "is_stale": is_stale,
             "stale_reason": stale_reason,
-            "manifest_count": len(manifests),
+            "prev_hour_key": prev_hour_key,
+            "prev_hour_manifest_count": len(prev_hour_mfs),
+            "prev_hour_data_lines": prev_data,
+            "prev_hour_meta_lines": prev_meta,
+            "prev_hour_local_loss_lines": prev_loss,
+            "prev_hour_gap_start_lines": prev_gap,
+            "prev_hour_switch_lines": prev_sw,
+            "prev_hour_sealed_bytes": prev_bytes,
             "latest_manifest_hour": latest_manifest["hour_key"] if latest_manifest else None,
             "latest_manifest_data_lines": latest_manifest["data_lines"] if latest_manifest else 0,
             "latest_manifest_bytes": latest_manifest["bytes"] if latest_manifest else 0,
-            "total_data_lines": sum(m["data_lines"] + m["data_escaped_lines"] for m in manifests),
-            "total_meta_lines": sum(m["meta_lines"] for m in manifests),
-            "total_local_loss_lines": sum(m["local_loss_lines"] for m in manifests),
-            "total_gap_start_lines": sum(m["gap_start_lines"] for m in manifests),
-            "total_switch_lines": sum(m["switch_lines"] for m in manifests),
-            "total_sealed_bytes": sum(m["bytes"] for m in manifests),
+            "cumulative_manifest_count": len(manifests),
+            "cumulative_data_lines": cum_data,
+            "cumulative_meta_lines": cum_meta,
+            "cumulative_local_loss_lines": cum_loss,
+            "cumulative_gap_start_lines": cum_gap,
+            "cumulative_switch_lines": cum_sw,
+            "cumulative_sealed_bytes": cum_bytes,
+            # Backwards-compatible aliases
+            "manifest_count": len(manifests),
+            "total_data_lines": cum_data,
+            "total_meta_lines": cum_meta,
+            "total_local_loss_lines": cum_loss,
+            "total_gap_start_lines": cum_gap,
+            "total_switch_lines": cum_sw,
+            "total_sealed_bytes": cum_bytes,
         }
 
     # Prune deleted manifests from cache if any
@@ -915,6 +1028,7 @@ def inspect_data_tree(
             cache.pop(k, None)
 
     return {
+        "prev_hour_key": prev_hour_key,
         "per_exchange": per_exchange,
         "stale_exchanges": stale_exchanges,
         "manifests_with_local_loss": manifests_with_local_loss,
@@ -1112,13 +1226,14 @@ def format_hourly_report(
     archive_status: dict[str, Any],
     data_tree: dict[str, Any],
     ledger_info: dict[str, Any],
-    disk_pct: float,
+    disk_pct: float | None,
     disk_thresh: float,
     chrony_row: dict[str, Any] | None,
     active_alerts: dict[str, dict[str, Any]],
 ) -> str:
     dt = datetime.fromtimestamp(now_s, tz=timezone.utc)
     hour_label = dt.strftime("%Y-%m-%d %H:%M UTC")
+    prev_hour_key = str(data_tree.get("prev_hour_key") or "")
 
     if collector_status.get("available"):
         c_state = (
@@ -1126,7 +1241,7 @@ def format_hourly_report(
             f"(PID={collector_status.get('main_pid', 0)}, Restarts={collector_status.get('n_restarts', 0)})"
         )
     else:
-        c_state = "UNKNOWN(无systemd探针)"
+        c_state = f"PROBE_FAILED({collector_status.get('error') or 'unknown'})"
 
     if chrony_row:
         err_ms = chrony_row.get("estimated_error_ms")
@@ -1134,6 +1249,8 @@ def format_hourly_report(
         clk_disp = f"{'OK' if chrony_row.get('certified_le_1ms') else 'UNSYNC'} ({err_disp})"
     else:
         clk_disp = "N/A"
+
+    disk_disp = f"{disk_pct:.1f}%" if disk_pct is not None else "PROBE_FAILED"
 
     sc = ledger_info.get("state_counts") or {}
     if archive_status.get("available") and archive_status.get("active_state") == "failed":
@@ -1145,11 +1262,11 @@ def format_hourly_report(
         f"📊 [东京 L2 小时战报] {hour_label}",
         "━━━━━━━━━━━━━━━━━━",
         f"⚙️ 采集进程: {c_state}",
-        f"💾 磁盘使用: {disk_pct:.1f}% (阈值 {disk_thresh:.0f}%) | ⏱ 时钟: {clk_disp}",
-        f"📦 归档状态: {eff_arch_status} | 分区统计: SEALED={sc.get('SEALED', 0)} / VERIFIED={sc.get('VERIFIED', 0)} / PRUNED={sc.get('PRUNED', 0)}",
+        f"💾 磁盘使用: {disk_disp} (阈值 {disk_thresh:.0f}%) | ⏱ 时钟: {clk_disp}",
+        f"📦 归档状态: {eff_arch_status} | 账本累计分区: SEALED={sc.get('SEALED', 0)} / VERIFIED={sc.get('VERIFIED', 0)} / PRUNED={sc.get('PRUNED', 0)}",
         "🔬 深度数据质量: PENDING（待后续 GitHub 深度 QA 验证）",
         "",
-        "📡 四所数据采集情况:",
+        f"📡 四所采集情况 (上小时={prev_hour_key} 封口增量；另附历史累计):",
     ]
 
     ex_order = list(dict.fromkeys([*DEFAULT_EXCHANGE_ORDER, *enabled_exchanges]))
@@ -1163,13 +1280,24 @@ def format_hourly_report(
         age_str = f"{int(age)}s前" if age is not None else "无更新"
         act_str = "异常停滞" if info.get("is_stale") else "活跃"
         p_cnt = info.get("active_partial_count", 0)
-        mf_cnt = info.get("manifest_count", 0)
-        tot_lines = info.get("total_data_lines", 0)
-        mb = (info.get("total_sealed_bytes", 0) + info.get("latest_partial_bytes", 0)) / (1024 * 1024)
+        p_mb = info.get("latest_partial_bytes", 0) / (1024 * 1024)
+
+        ph_cnt = info.get("prev_hour_manifest_count", 0)
+        ph_lines = info.get("prev_hour_data_lines", 0)
+        ph_mb = info.get("prev_hour_sealed_bytes", 0) / (1024 * 1024)
+        ph_sw = info.get("prev_hour_switch_lines", 0)
+        ph_gap = info.get("prev_hour_gap_start_lines", 0)
+        ph_loss = info.get("prev_hour_local_loss_lines", 0)
+
+        cum_cnt = info.get("cumulative_manifest_count", 0)
+        cum_lines = info.get("cumulative_data_lines", 0)
+        cum_loss = info.get("cumulative_local_loss_lines", 0)
         arch_ex = per_ex_arch.get(ex, {})
         lines.append(
-            f"• {ex}: {act_str}(.partial={p_cnt}, {age_str}) | 封口={mf_cnt}(V={arch_ex.get('VERIFIED', 0)}/P={arch_ex.get('PRUNED', 0)}) | "
-            f"DATA={tot_lines:,} (~{mb:.2f}MB) | SW={info.get('total_switch_lines', 0)} GAP={info.get('total_gap_start_lines', 0)} LOSS={info.get('total_local_loss_lines', 0)}"
+            f"• {ex}: {act_str}(.partial={p_cnt}, {age_str}, {p_mb:.2f}MB) | "
+            f"上小时({prev_hour_key}): 封口={ph_cnt} DATA={ph_lines:,} ({ph_mb:.2f}MB) "
+            f"SW={ph_sw} GAP={ph_gap} LOSS={ph_loss} | "
+            f"历史累计: 封口={cum_cnt}(V={arch_ex.get('VERIFIED', 0)}/P={arch_ex.get('PRUNED', 0)}) DATA={cum_lines:,} LOSS={cum_loss}"
         )
 
     lines.append("")
@@ -1275,6 +1403,7 @@ class CollectorMonitor:
             "last_collector_boot_id": None,
             "last_restart_event_epoch_s": None,
             "last_dual_outage_epoch_s": None,
+            "dual_outage_endpoints": {},
             "last_local_loss_epoch_s": None,
             "acknowledged_loss_manifests": [],
             "seen_shutdown_files": [],
@@ -1501,15 +1630,38 @@ class CollectorMonitor:
             )
             self.state["last_rtt_epoch_s"] = now_s
 
-        # 4. Disk check
-        disk_pct = float(self.disk_checker(self.data_root))
+        # 4. Disk check (fail-closed on probe failure)
+        disk_probe_error: str | None = None
+        try:
+            disk_pct: float | None = float(self.disk_checker(self.data_root))
+        except Exception as exc:
+            disk_pct = None
+            disk_probe_error = f"{type(exc).__name__}: {exc}"
 
-        # 5. Service & incremental journal probes
-        collector_status = self.service_probe(self.collector_service_name)
-        archive_status = self.service_probe(self.archive_service_name)
-        journal_lines, new_cursor = self.journal_reader(
-            self.collector_service_name, self.state.get("journal_cursor")
-        )
+        # 5. Service & incremental journal probes (fail-closed if service_probe fails/raises)
+        try:
+            collector_status = self.service_probe(self.collector_service_name)
+        except Exception as exc:
+            collector_status = {
+                "available": False,
+                "unit": self.collector_service_name,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        try:
+            archive_status = self.service_probe(self.archive_service_name)
+        except Exception as exc:
+            archive_status = {
+                "available": False,
+                "unit": self.archive_service_name,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        try:
+            journal_lines, new_cursor = self.journal_reader(
+                self.collector_service_name, self.state.get("journal_cursor")
+            )
+        except Exception:
+            journal_lines, new_cursor = [], self.state.get("journal_cursor")
         if new_cursor != self.state.get("journal_cursor"):
             self.state["journal_cursor"] = new_cursor
         log_events = inspect_collector_logs(journal_lines)
@@ -1567,8 +1719,21 @@ class CollectorMonitor:
         )
 
         # --- Evaluate alert conditions ---
-        # A. Collector stopped
-        if collector_status.get("available") and collector_status.get("active_state") != "active":
+        collector_available = bool(collector_status.get("available"))
+        collector_running_verified = bool(
+            collector_available
+            and collector_status.get("active_state") == "active"
+            and collector_status.get("sub_state") not in ("failed", "dead", "auto-restart", "stop-sigterm", "exited")
+        )
+
+        # A. Collector probe unavailable vs stopped (fail-closed: probe error MUST trigger alert & block HC ok!)
+        if not collector_available:
+            observed["collector_probe_failed"] = {
+                "severity": "CRITICAL",
+                "summary": f"无法探测采集服务状态 ({collector_status.get('error') or 'systemctl_unavailable'})",
+                "details": collector_status,
+            }
+        elif not collector_running_verified:
             observed["collector_stopped"] = {
                 "severity": "CRITICAL",
                 "summary": f"采集服务未运行 ({collector_status.get('active_state')}/{collector_status.get('sub_state')})",
@@ -1577,7 +1742,7 @@ class CollectorMonitor:
 
         # B. Collector abnormal restart
         restart_reasons: list[str] = []
-        if collector_status.get("available"):
+        if collector_available:
             cur_restarts = int(collector_status.get("n_restarts") or 0)
             prev_restarts = self.state.get("last_collector_n_restarts")
             if prev_restarts is not None and cur_restarts > int(prev_restarts):
@@ -1625,23 +1790,80 @@ class CollectorMonitor:
                 "details": stale_details,
             }
 
-        # D. Dual A/B outage > 5s
-        if log_events["dual_outages"]:
-            self.state["last_dual_outage_epoch_s"] = now_s
-        last_outage_s = self.state.get("last_dual_outage_epoch_s")
-        if log_events["dual_outages"] or (
-            last_outage_s is not None
-            and "dual_ab_outage_gt_5s" in self.state.get("active_alerts", {})
-            and (
-                (now_s - float(last_outage_s)) < self.outage_recovery_seconds
-                or bool(data_tree["stale_exchanges"])
-                or ("collector_stopped" in observed)
-            )
-        ):
+        # D. Dual A/B outage > 5s (endpoint-level tracking; NEVER recovers from time/sibling data alone!)
+        ep_outages: dict[str, dict[str, Any]] = self.state.setdefault("dual_outage_endpoints", {})
+        if not isinstance(ep_outages, dict):
+            ep_outages = {}
+            self.state["dual_outage_endpoints"] = ep_outages
+
+        timeline: dict[str, dict[str, Any]] = log_events.get("endpoint_timeline") or {}
+        for ep, ev in timeline.items():
+            if ev.get("saw_outage"):
+                self.state["last_dual_outage_epoch_s"] = now_s
+                ep_outages[ep] = {
+                    "outage_at_s": now_s,
+                    "connected_clean_at_s": None,
+                    "explicit_recovered_at_s": None,
+                    "sample_message": (ev.get("outage_messages") or [""])[-1],
+                }
+                continue
+            if ep not in ep_outages:
+                continue
+            ep_rec = ep_outages[ep]
+            if ev.get("explicit_recovered"):
+                ep_rec["explicit_recovered_at_s"] = now_s
+            elif ev.get("saw_error_after_connect"):
+                ep_rec["connected_clean_at_s"] = None
+                ep_rec["explicit_recovered_at_s"] = None
+            elif ev.get("connected_clean"):
+                if ep_rec.get("connected_clean_at_s") is None:
+                    ep_rec["connected_clean_at_s"] = now_s
+
+        # Evaluate endpoint-specific recovery ONLY on explicit GAP_END recovery OR clean endpoint
+        # reconnect stabilization + fresh parent-exchange write activity after reconnect.
+        for ep in list(ep_outages.keys()):
+            ep_rec = ep_outages[ep]
+            parent_ex = ENDPOINT_TO_EXCHANGE.get(ep)
+            if parent_ex and parent_ex in data_tree["per_exchange"]:
+                ex_info = data_tree["per_exchange"][parent_ex]
+                ex_fresh = bool(not ex_info.get("is_stale") and ex_info.get("last_activity_epoch_s") is not None)
+                last_ex_act_s = float(ex_info["last_activity_epoch_s"]) if ex_info.get("last_activity_epoch_s") is not None else None
+            else:
+                ex_fresh = False
+                last_ex_act_s = None
+
+            exp_rec_s = ep_rec.get("explicit_recovered_at_s")
+            conn_rec_s = ep_rec.get("connected_clean_at_s")
+
+            recovered = False
+            if exp_rec_s is not None and collector_running_verified:
+                if parent_ex is None:
+                    recovered = not data_tree["stale_exchanges"]
+                else:
+                    recovered = ex_fresh
+            elif (
+                conn_rec_s is not None
+                and collector_running_verified
+                and ex_fresh
+                and last_ex_act_s is not None
+                and last_ex_act_s >= float(conn_rec_s)
+                and (now_s - float(conn_rec_s)) >= self.outage_recovery_seconds
+            ):
+                recovered = True
+
+            if recovered:
+                ep_outages.pop(ep, None)
+
+        if ep_outages:
+            pending_eps = sorted(ep_outages.keys())
             observed["dual_ab_outage_gt_5s"] = {
                 "severity": "CRITICAL",
-                "summary": "检测到 A/B 双线中断超过 5 秒",
-                "details": {"events": log_events["dual_outages"][-5:] or ["awaiting_clean_recovery_window"]},
+                "summary": f"检测到 A/B 双线中断超过 5 秒 (待恢复端点: {', '.join(pending_eps)})",
+                "details": {
+                    "pending_endpoints": pending_eps,
+                    "endpoint_states": ep_outages,
+                    "recent_events": log_events["dual_outages"][-5:],
+                },
             }
 
         # E. LOCAL_LOSS & disk write errors
@@ -1680,23 +1902,28 @@ class CollectorMonitor:
                 },
             }
 
-        # F. Disk >= 70%
-        if disk_pct >= self.disk_thresh:
+        # F. Disk >= 70% or disk probe failed
+        if disk_pct is None:
+            observed["disk_probe_failed"] = {
+                "severity": "CRITICAL",
+                "summary": f"无法获取磁盘使用率 ({disk_probe_error})",
+                "details": {"error": disk_probe_error},
+            }
+        elif disk_pct >= self.disk_thresh:
             observed["disk_usage_high"] = {
                 "severity": "CRITICAL",
                 "summary": f"磁盘使用率 {disk_pct:.1f}% 超过阈值 {self.disk_thresh:.0f}%",
                 "details": {"disk_pct": round(disk_pct, 2), "threshold": self.disk_thresh},
             }
 
-        # G. Clock out of sync
-        if self.last_chrony_row is not None and not self.last_chrony_row.get("certified_le_1ms"):
+        # G. Clock out of sync or unavailable
+        if self.last_chrony_row is None or not self.last_chrony_row.get("certified_le_1ms"):
+            err_ms_val = self.last_chrony_row.get("estimated_error_ms") if self.last_chrony_row else None
+            synced_val = self.last_chrony_row.get("synced") if self.last_chrony_row else False
             observed["clock_unsynced"] = {
                 "severity": "WARNING",
-                "summary": (
-                    f"Chrony 时钟未通过 <=1ms 认证 "
-                    f"(synced={self.last_chrony_row.get('synced')}, err_ms={self.last_chrony_row.get('estimated_error_ms')})"
-                ),
-                "details": self.last_chrony_row,
+                "summary": f"Chrony 时钟未通过 <=1ms 认证 (synced={synced_val}, err_ms={err_ms_val})",
+                "details": self.last_chrony_row or {"error": "chrony_row_missing"},
             }
 
         # H. Archive upload / verification failure / stale SEALED / archive service failure
@@ -1733,6 +1960,9 @@ class CollectorMonitor:
         dispatch_res = self._update_alerts(observed=observed, now_s=now_s)
 
         # --- Collector Healthchecks low-frequency periodic ping (default 5 min) ---
+        # STRICT POSITIVE PROOF REQUIRED: only report healthy if collector is verified running,
+        # all enabled exchanges are verified fresh, clock is <=1ms certified, disk is under threshold,
+        # and no blocking collector/probe alerts are active.
         last_hc_s = self.state.get("last_collector_hc_epoch_s")
         due_hc = force_collector_hc or (
             last_hc_s is None or (now_s - float(last_hc_s)) >= self.collector_hc_interval_seconds
@@ -1743,23 +1973,53 @@ class CollectorMonitor:
                 k
                 for k in (
                     "collector_stopped",
+                    "collector_probe_failed",
                     "collector_abnormal_restart",
                     "collector_data_stale",
                     "dual_ab_outage_gt_5s",
                     "local_loss_detected",
                     "disk_usage_high",
+                    "disk_probe_failed",
                     "clock_unsynced",
                 )
                 if k in self.state["active_alerts"]
             ]
-            healthy = len(collector_unhealthy_keys) == 0
+            data_fresh_verified = bool(
+                self.enabled_exchanges
+                and not data_tree["stale_exchanges"]
+                and all(
+                    info.get("last_activity_age_s") is not None and not info.get("is_stale")
+                    for info in data_tree["per_exchange"].values()
+                )
+            )
+            clock_verified = bool(
+                self.last_chrony_row is not None and self.last_chrony_row.get("certified_le_1ms") is True
+            )
+            disk_verified = bool(disk_pct is not None and disk_pct < self.disk_thresh)
+
+            healthy = bool(
+                collector_running_verified
+                and data_fresh_verified
+                and clock_verified
+                and disk_verified
+                and len(collector_unhealthy_keys) == 0
+            )
             if healthy:
                 reason = f"ok active_exchanges={len(self.enabled_exchanges)} disk={disk_pct:.1f}%"
             else:
-                reason = "; ".join(
-                    f"{k}:{self.state['active_alerts'][k].get('summary', '')}"
-                    for k in collector_unhealthy_keys
-                )
+                fail_parts: list[str] = []
+                for k in collector_unhealthy_keys:
+                    fail_parts.append(f"{k}:{self.state['active_alerts'][k].get('summary', '')}")
+                if not collector_running_verified and "collector_stopped" not in collector_unhealthy_keys and "collector_probe_failed" not in collector_unhealthy_keys:
+                    fail_parts.append("collector_running_unverified")
+                if not data_fresh_verified and "collector_data_stale" not in collector_unhealthy_keys:
+                    fail_parts.append("data_freshness_unverified")
+                if not clock_verified and "clock_unsynced" not in collector_unhealthy_keys:
+                    fail_parts.append("clock_certification_unverified")
+                if not disk_verified and "disk_usage_high" not in collector_unhealthy_keys and "disk_probe_failed" not in collector_unhealthy_keys:
+                    fail_parts.append("disk_usage_unverified")
+                reason = "; ".join(fail_parts) or "collector_health_unverified"
+
             hc_result["healthy"] = healthy
             hc_result["reason"] = redact_secrets(reason, extra_secrets=self._all_secrets())
             if self.allow_notify and self.hc_collector_url:
@@ -1809,7 +2069,7 @@ class CollectorMonitor:
         return {
             "status": "ok",
             "utc": dt_now.isoformat(),
-            "disk_pct": round(disk_pct, 2),
+            "disk_pct": round(disk_pct, 2) if disk_pct is not None else None,
             "collector_service": collector_status,
             "archive_service": archive_status,
             "chrony": self.last_chrony_row,
