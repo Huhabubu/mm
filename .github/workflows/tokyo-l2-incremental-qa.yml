@@ -1,0 +1,129 @@
+name: Tokyo L2 incremental hourly QA (3h)
+
+on:
+  schedule:
+    # Every three hours, after EC2's :05 UTC archive run.
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      since_date:
+        description: "Earliest UTC date to inspect (YYYY-MM-DD)"
+        required: false
+        default: "2026-11-21"
+      limit:
+        description: "Max new exchange-hour partitions per run"
+        required: false
+        default: "16"
+      force:
+        description: "Recheck already recorded partitions"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tokyo-l2-incremental-qa
+  cancel-in-progress: false
+
+jobs:
+  hourly-qa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    steps:
+      - name: Checkout collector QA code
+        uses: actions/checkout@v4
+        with:
+          ref: feat/tokyo-l2-reliability-fixes
+          path: source
+          persist-credentials: false
+
+      - name: Checkout persistent QA reports
+        uses: actions/checkout@v4
+        with:
+          ref: tokyo-l2-qa-state
+          path: state
+          sparse-checkout: |
+            qa_reports
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install bounded QA dependencies
+        run: |
+          python -m pip install zstandard==0.23.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Configure read-only Google Drive access
+        env:
+          QA_SERVICE_ACCOUNT: ${{ secrets.TOKYO_L2_QA_GDRIVE_SA_JSON }}
+          QA_FOLDER_ID: ${{ secrets.TOKYO_L2_QA_GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$QA_SERVICE_ACCOUNT" || -z "$QA_FOLDER_ID" ]]; then
+            echo "::error::Missing read-only Drive account or folder ID GitHub secrets"
+            exit 2
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/tokyo-qa-auth"
+          printf '%s' "$QA_SERVICE_ACCOUNT" > "$RUNNER_TEMP/tokyo-qa-auth/service-account.json"
+          printf '[qa]\ntype = drive\nscope = drive.readonly\nservice_account_file = %s\nroot_folder_id = %s\n' \
+            "$RUNNER_TEMP/tokyo-qa-auth/service-account.json" "$QA_FOLDER_ID" \
+            > "$RUNNER_TEMP/tokyo-qa-auth/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" >> "$GITHUB_ENV"
+          RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsf qa:raw --max-depth 1 > /dev/null
+
+      - name: Inspect only previously unchecked sealed partitions
+        id: inspect
+        env:
+          QA_SINCE_DATE: ${{ inputs.since_date || '2026-11-21' }}
+          QA_LIMIT: ${{ inputs.limit || '16' }}
+          QA_FORCE: ${{ inputs.force || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ "$QA_FORCE" == "true" ]]; then extra+=(--force); fi
+          python source/collector/python/hourly_incremental_qa.py \
+            --remote "qa:" \
+            --config source/collector/specs/config.example.json \
+            --state-dir state \
+            --since-date "$QA_SINCE_DATE" \
+            --limit "$QA_LIMIT" \
+            "${extra[@]}"
+
+      - name: Persist QA progress even when a partition failed QA
+        if: always()
+        working-directory: state
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add qa_reports
+          if ! git diff --cached --quiet; then
+            git commit -m "qa: record incremental Tokyo L2 partition reports"
+            git push origin HEAD:tokyo-l2-qa-state
+          fi
+
+      - name: Notify QA Healthchecks
+        if: always()
+        env:
+          QA_HEALTHCHECKS_URL: ${{ secrets.TOKYO_L2_QA_HEALTHCHECKS_URL }}
+          JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$QA_HEALTHCHECKS_URL" ]]; then
+            echo "No optional QA Healthchecks endpoint configured."
+            exit 0
+          fi
+          url="${QA_HEALTHCHECKS_URL%/}"
+          if [[ "$JOB_STATUS" != "success" ]]; then url="${url}/fail"; fi
+          curl --fail --silent --show-error --retry 3 --max-time 15 \
+            --request POST --data-urlencode "status=$JOB_STATUS" "$url"
