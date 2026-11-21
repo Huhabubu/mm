@@ -323,10 +323,13 @@ def test_p3_healthy_run_hourly_battle_report_and_zero_zstd_decompression(
     assert len(transport.hc_calls) == 2
     assert len(transport.tg_messages) == 1
 
-    # Next UTC hour (+3600s, minute=12): sends next hourly battle report!
+    # Next UTC hour (+3600s, minute=12): a fresh complete-hour manifest
+    # exists, so DATA volume stays healthy and only one report is sent.
     for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
-        p_path = next((data_root / "raw" / ex / "2026-12-03").glob("*.partial"))
-        os.utime(p_path, (t0 + 3600.0, t0 + 3600.0))
+        _seed_exchange_files(
+            data_root, ex, now_s=t0 + 3600.0,
+            hour_utc="10", data_lines=12000,
+        )
     r4 = mon.run_sweep(now_epoch_s=t0 + 3605.0)
     assert r4["hourly_report"]["sent"] is True
     assert len(transport.tg_messages) == 2
