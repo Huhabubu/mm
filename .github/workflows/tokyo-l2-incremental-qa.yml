@@ -12,23 +12,19 @@ on:
   workflow_dispatch:
     inputs:
       config_path:
-        description: "Collector config path in source repo (15m trial or 60m full)"
-        required: false
-        default: "collector/specs/config.trial_15m.json"
-      since_date:
-        description: "Earliest UTC date to inspect (YYYY-MM-DD)"
-        required: false
-        default: "2026-11-21"
-      since_window:
-        description: "Inclusive planned UTC window start (YYYY-MM-DDTHH:MMZ, overrides since_hour when set)"
+        description: "Effective collector config path in source repo (defaults to vars.TOKYO_L2_QA_CONFIG_PATH)"
         required: false
         default: ""
-      since_hour:
-        description: "Backward-compatible inclusive UTC hour (YYYY-MM-DDTHH)"
+      since_date:
+        description: "Earliest UTC date to inspect (YYYY-MM-DD; auto-derived from since_window when empty)"
         required: false
-        default: "2026-11-21T08"
+        default: ""
+      since_window:
+        description: "Actual cutover UTC window start (YYYY-MM-DDTHH:MMZ; defaults to vars.TOKYO_L2_QA_SINCE_WINDOW)"
+        required: false
+        default: ""
       run_id:
-        description: "Optional collection batch run_id filter"
+        description: "Active collection batch run_id (defaults to vars.TOKYO_L2_QA_RUN_ID)"
         required: false
         default: ""
       limit:
@@ -115,31 +111,44 @@ jobs:
             "$RUNNER_TEMP/tokyo-qa-auth/service-account.json" "$QA_FOLDER_ID" \
             > "$RUNNER_TEMP/tokyo-qa-auth/rclone.conf"
           echo "RCLONE_CONFIG=$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" >> "$GITHUB_ENV"
-          RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsf qa:raw --max-depth 1 > /dev/null
+          RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsf qa:meta --max-depth 1 > /dev/null
 
       - name: Inspect verified archived partitions (file, window, UTC day)
         id: inspect
         env:
-          QA_CONFIG_PATH: ${{ inputs.config_path || 'collector/specs/config.trial_15m.json' }}
-          QA_SINCE_DATE: ${{ inputs.since_date || '2026-11-21' }}
-          QA_SINCE_WINDOW: ${{ inputs.since_window || '' }}
-          QA_SINCE_HOUR: ${{ inputs.since_hour || '2026-11-21T08' }}
-          QA_RUN_ID: ${{ inputs.run_id || '' }}
+          QA_CONFIG_PATH: ${{ inputs.config_path || vars.TOKYO_L2_QA_CONFIG_PATH }}
+          QA_SINCE_DATE: ${{ inputs.since_date || vars.TOKYO_L2_QA_SINCE_DATE }}
+          QA_SINCE_WINDOW: ${{ inputs.since_window || vars.TOKYO_L2_QA_SINCE_WINDOW }}
+          QA_RUN_ID: ${{ inputs.run_id || vars.TOKYO_L2_QA_RUN_ID }}
           QA_LIMIT: ${{ github.event_name == 'push' && '4' || inputs.limit || '16' }}
           QA_SLA_GRACE_MINUTES: ${{ inputs.sla_grace_minutes || '10' }}
           QA_FORCE: ${{ inputs.force || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
-          extra=()
-          if [[ -n "$QA_SINCE_WINDOW" ]]; then
-            extra+=(--since-window "$QA_SINCE_WINDOW")
-          elif [[ -n "$QA_SINCE_HOUR" ]]; then
-            extra+=(--since-hour "$QA_SINCE_HOUR")
+          missing_bindings=()
+          if [[ -z "$QA_CONFIG_PATH" ]]; then missing_bindings+=("TOKYO_L2_QA_CONFIG_PATH (or input config_path)"); fi
+          if [[ -z "$QA_SINCE_WINDOW" ]]; then missing_bindings+=("TOKYO_L2_QA_SINCE_WINDOW (or input since_window)"); fi
+          if [[ -z "$QA_RUN_ID" ]]; then missing_bindings+=("TOKYO_L2_QA_RUN_ID (or input run_id)"); fi
+          if (( ${#missing_bindings[@]} > 0 )); then
+            echo "::error::Scheduled/incremental QA must be explicitly bound to the active cutover time, batch run_id, and effective config. Missing: ${missing_bindings[*]}. Configure these under Settings -> Secrets and variables -> Actions -> Variables before enabling scheduled QA."
+            exit 2
           fi
-          if [[ -n "$QA_RUN_ID" ]]; then
-            extra+=(--run-id "$QA_RUN_ID")
+          if [[ ! -f "source/${QA_CONFIG_PATH}" ]]; then
+            echo "::error::Bound collector config 'source/${QA_CONFIG_PATH}' does not exist."
+            exit 2
           fi
+          if [[ -z "$QA_SINCE_DATE" ]]; then
+            QA_SINCE_DATE="${QA_SINCE_WINDOW:0:10}"
+          fi
+          echo "QA_BOUND_RUN_ID=${QA_RUN_ID}" >> "$GITHUB_ENV"
+          echo "QA_BOUND_SINCE_WINDOW=${QA_SINCE_WINDOW}" >> "$GITHUB_ENV"
+          echo "QA_BOUND_CONFIG_PATH=${QA_CONFIG_PATH}" >> "$GITHUB_ENV"
+
+          extra=(
+            --since-window "$QA_SINCE_WINDOW"
+            --run-id "$QA_RUN_ID"
+          )
           if [[ "$QA_FORCE" == "true" ]]; then
             extra+=(--force)
           fi
@@ -157,26 +166,48 @@ jobs:
           QA_RC=${PIPESTATUS[0]}
           set -e
 
-          python - "$RUNNER_TEMP/qa_summary.json" "$GITHUB_STEP_SUMMARY" <<'PY'
+          python - "$RUNNER_TEMP/qa_summary.json" "$GITHUB_STEP_SUMMARY" "$GITHUB_ENV" <<'PY'
           import json, sys
-          summary_path, md_path = sys.argv[1], sys.argv[2]
+          summary_path, md_path, env_path = sys.argv[1], sys.argv[2], sys.argv[3]
           try:
               data = json.loads(open(summary_path, encoding="utf-8").read())
           except Exception as exc:
               with open(md_path, "a", encoding="utf-8") as out:
                   out.write(f"## Tokyo L2 Incremental QA\n\nFailed to parse QA summary JSON: `{exc}`\n")
+              with open(env_path, "a", encoding="utf-8") as env_out:
+                  env_out.write("QA_JOB_EXECUTION_STATUS=failed\n")
+                  env_out.write("QA_CURRENT_WINDOW_COMPLETED=false\n")
+                  env_out.write("QA_CURRENT_WINDOW_VERIFICATION_STATUS=parse_error\n")
               sys.exit(0)
+
+          job_status = str(data.get("job_execution_status") or "failed")
+          cur_wid = str(data.get("current_window_id") or "")
+          cur_done = "true" if data.get("current_window_completed") is True else "false"
+          cur_vstatus = str(data.get("current_window_verification_status") or "unknown")
+          hist_status = str(data.get("historical_data_quality_status") or "unknown")
+          hist_wins = data.get("historical_damaged_windows") or []
+          hist_parts = data.get("historical_damaged_partitions") or []
+
+          with open(env_path, "a", encoding="utf-8") as env_out:
+              env_out.write(f"QA_JOB_EXECUTION_STATUS={job_status}\n")
+              env_out.write(f"QA_CURRENT_WINDOW_ID={cur_wid}\n")
+              env_out.write(f"QA_CURRENT_WINDOW_COMPLETED={cur_done}\n")
+              env_out.write(f"QA_CURRENT_WINDOW_VERIFICATION_STATUS={cur_vstatus}\n")
+              env_out.write(f"QA_HISTORICAL_DATA_QUALITY_STATUS={hist_status}\n")
+              env_out.write(f"QA_HISTORICAL_DAMAGED_WINDOWS_COUNT={len(hist_wins)}\n")
+
           lines = [
               "## Tokyo L2 Incremental QA Summary",
-              f"- **QA Status**: `{data.get('qa_status')}` (`status={data.get('status')}`)",
+              f"- **1. Job Execution Status**: `{job_status}` (discovery=`{data.get('discovery_mode')}`, retry_needed=`{data.get('retry_needed')}`)",
+              f"- **2. Current Due Window**: `{cur_wid}` | completed=`{cur_done}` | verification_status=`{cur_vstatus}`",
+              f"- **3. Historical Data Quality**: `{hist_status}` | damaged_windows=`{hist_wins}` | damaged_partitions_count=`{len(hist_parts)}`",
+              f"- **Overall Gate**: `qa_status={data.get('qa_status')}` (`status={data.get('status')}`)",
+              f"- **Binding**: config=`{data.get('partition_minutes')}m` | run_id=`{data.get('run_id_filter')}` | since_window=`{data.get('since_window')}`",
               f"- **Checker Commit**: `{data.get('checker_commit_sha')}` (`qa_version={data.get('qa_version')}`)",
-              f"- **Partition Cadence**: `{data.get('partition_minutes')}m` | **Discovery**: `{data.get('discovery_mode')}`",
               f"- **Partitions**: eligible=`{data.get('eligible_manifest_count')}`, attempted=`{data.get('attempted')}`, ok=`{data.get('ok')}`, blocked=`{data.get('blocked')}`, needs_review=`{data.get('needs_review')}`, already_checked=`{data.get('already_checked')}`, backlog=`{data.get('remaining_backlog')}`",
               f"- **Reports Written**: windows=`{data.get('window_reports_written')}`, days=`{data.get('day_reports_written')}`",
               f"- **Overdue Windows**: `{data.get('overdue_windows')}`",
               f"- **Pending Archive Windows**: `{data.get('pending_archive_windows')}`",
-              f"- **Failed Windows**: `{data.get('failed_windows')}`",
-              f"- **Review Windows**: `{data.get('review_windows')}`",
           ]
           with open(md_path, "a", encoding="utf-8") as out:
               out.write("\n".join(lines) + "\n")
@@ -233,13 +264,32 @@ jobs:
             exit 0
           fi
           url="${QA_HEALTHCHECKS_URL%/}"
+          job_status="${QA_JOB_EXECUTION_STATUS:-failed}"
+          cur_wid="${QA_CURRENT_WINDOW_ID:-none}"
+          cur_done="${QA_CURRENT_WINDOW_COMPLETED:-false}"
+          cur_vstatus="${QA_CURRENT_WINDOW_VERIFICATION_STATUS:-unknown}"
+          hist_status="${QA_HISTORICAL_DATA_QUALITY_STATUS:-unknown}"
+          hist_count="${QA_HISTORICAL_DAMAGED_WINDOWS_COUNT:-0}"
+
+          # Heartbeat reflects job execution + current due window completion & verification,
+          # while historical damaged windows are reported separately in the payload without
+          # permanently failing future heartbeats once current due windows verify cleanly.
+          # When the current window is still pending_archive (cur_done != true), NEVER send a false success ping.
           status="success"
-          if [[ "$INSPECT_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" ]]; then
+          if [[ "$INSPECT_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
             status="failure"
             url="${url}/fail"
           fi
           curl --fail --silent --show-error --retry 3 --max-time 15 \
             --request POST \
             --data-urlencode "status=${status}" \
+            --data-urlencode "job_execution_status=${job_status}" \
+            --data-urlencode "current_window_id=${cur_wid}" \
+            --data-urlencode "current_window_completed=${cur_done}" \
+            --data-urlencode "current_window_verification_status=${cur_vstatus}" \
+            --data-urlencode "historical_data_quality_status=${hist_status}" \
+            --data-urlencode "historical_damaged_windows_count=${hist_count}" \
+            --data-urlencode "run_id=${QA_BOUND_RUN_ID:-unbound}" \
+            --data-urlencode "since_window=${QA_BOUND_SINCE_WINDOW:-unbound}" \
             --data-urlencode "checker_commit=${TOKYO_L2_QA_CHECKER_COMMIT:-unknown}" \
             "$url"
