@@ -1,0 +1,37 @@
+[Unit]
+Description=AWS Tokyo Lightsail Dedicated SSH SOCKS5 Tunnel for Archive Egress
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/mm
+EnvironmentFile=/etc/tokyo-l2/proxy.env
+ExecStart=/usr/bin/ssh \
+  -N \
+  -T \
+  -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=${TOKYO_L2_LIGHTSAIL_KNOWN_HOSTS} \
+  -o IdentitiesOnly=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -o ConnectTimeout=10 \
+  -p ${TOKYO_L2_LIGHTSAIL_PORT} \
+  -i ${TOKYO_L2_LIGHTSAIL_KEY} \
+  -D ${TOKYO_L2_PROXY_BIND_ADDR}:${TOKYO_L2_PROXY_BIND_PORT} \
+  ${TOKYO_L2_LIGHTSAIL_USER}@${TOKYO_L2_LIGHTSAIL_HOST}
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

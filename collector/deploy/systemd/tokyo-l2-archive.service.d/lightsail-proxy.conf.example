@@ -1,0 +1,22 @@
+# Optional P5 systemd drop-in for `tokyo-l2-archive.service` ONLY.
+# Install ONLY after:
+#   1. `tokyo-l2-lightsail-proxy.service` is running cleanly on 127.0.0.1:1080
+#   2. `/opt/mm/collector/bin/proxy-verify verify` and `compare-report` pass
+#   3. AWS Cost Explorer verifies actual EC2 -> Lightsail transfer billing item
+#
+# Install path on EC2:
+#   sudo mkdir -p /etc/systemd/system/tokyo-l2-archive.service.d
+#   sudo install -m 0644 collector/deploy/systemd/tokyo-l2-archive.service.d/lightsail-proxy.conf.example \
+#     /etc/systemd/system/tokyo-l2-archive.service.d/lightsail-proxy.conf
+#   sudo systemctl daemon-reload
+#
+# IMPORTANT: Do NOT set global HTTP_PROXY / HTTPS_PROXY here!
+# Only `TOKYO_L2_ARCHIVE_PROXY_*` is set so `RcloneBackend` injects proxy variables strictly into
+# spawned `rclone` subprocesses while Healthchecks/Telegram notifications stay direct.
+
+[Unit]
+After=network-online.target tokyo-l2-lightsail-proxy.service
+Wants=tokyo-l2-lightsail-proxy.service
+
+[Service]
+EnvironmentFile=/etc/tokyo-l2/proxy.env

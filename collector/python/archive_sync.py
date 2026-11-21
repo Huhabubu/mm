@@ -86,8 +86,41 @@ class ArchiveBackend(Protocol):
 class RcloneBackend:
     """Real rclone backend targeting single Google Drive Pro (`gdrive_main:tokyo_l2_data`)."""
 
-    def __init__(self, remote_root: str):
+    def __init__(
+        self,
+        remote_root: str,
+        *,
+        proxy_url: str | None = None,
+        proxy_mode: str | None = None,
+    ):
         self.remote_root = remote_root.rstrip("/")
+        self.proxy_url = proxy_url
+        self.proxy_mode = proxy_mode
+        self._proxy_resolution: dict[str, Any] | None = None
+        self._child_env: dict[str, str] | None = None
+
+    def resolve_proxy(self, *, force: bool = False) -> dict[str, Any]:
+        """Resolve runtime proxy config and enforce `required` vs `fallback_direct` fail-closed semantics."""
+        if self._proxy_resolution is not None and not force:
+            return self._proxy_resolution
+        from lightsail_proxy import build_rclone_subprocess_env, resolve_rclone_proxy_runtime
+
+        res = resolve_rclone_proxy_runtime(
+            proxy_url=self.proxy_url,
+            proxy_mode=self.proxy_mode,
+        )
+        self._proxy_resolution = res.to_dict()
+        self._child_env = build_rclone_subprocess_env(
+            res.active_proxy_url,
+            clear_proxy=res.fallback_used,
+        )
+        return self._proxy_resolution
+
+    def _subprocess_kwargs(self) -> dict[str, Any]:
+        self.resolve_proxy()
+        if self._child_env is None:
+            return {}
+        return {"env": self._child_env}
 
     def _full(self, rel: str) -> str:
         return f"{self.remote_root}/{rel.lstrip('/')}"
@@ -99,6 +132,7 @@ class RcloneBackend:
             capture_output=True,
             text=True,
             timeout=60,
+            **self._subprocess_kwargs(),
         )
         if proc.returncode != 0:
             if proc.returncode in RCLONE_NOT_FOUND_EXIT_CODES:
@@ -136,6 +170,7 @@ class RcloneBackend:
             capture_output=True,
             text=True,
             timeout=600,
+            **self._subprocess_kwargs(),
         )
 
     def download_file(self, remote_rel_path: str, local_dest: Path) -> None:
@@ -149,6 +184,7 @@ class RcloneBackend:
                 capture_output=True,
                 text=True,
                 timeout=600,
+                **self._subprocess_kwargs(),
             )
             os.replace(tmp_dest, local_dest)
         finally:
@@ -1584,11 +1620,16 @@ def sync_sealed_directory(
         }
 
     try:
+        proxy_info: dict[str, Any] | None = None
+        if hasattr(backend, "resolve_proxy"):
+            proxy_info = backend.resolve_proxy()
+
         manifests = sorted(raw_root.rglob("*.manifest.json")) if raw_root.exists() else []
         if not manifests:
             return {
                 "status": "blocked",
                 "phase": "archive",
+                "proxy": proxy_info,
                 "failed_items": [f"No sealed *.manifest.json found under {raw_root}"],
                 "minimal_fixes": ["Seal at least one hourly partition before invoking archive"],
                 "ledger_db_path": str(ledger_db_path),
@@ -1601,6 +1642,13 @@ def sync_sealed_directory(
             migration_summary = migrate_legacy_jsonl_ledger(
                 sealed_root, ledger, now_s=now_s, run_id=run_id
             )
+            if proxy_info and proxy_info.get("fallback_used"):
+                ledger.record_event(
+                    ts_utc=now_iso,
+                    run_id=run_id,
+                    event_type="PROXY_FALLBACK_DIRECT",
+                    detail=proxy_info,
+                )
 
             newly_verified_entries: list[dict[str, Any]] = []
             conflicts: list[dict[str, Any]] = []
@@ -2220,6 +2268,7 @@ def sync_sealed_directory(
                     "status": "blocked",
                     "phase": "archive",
                     "run_id": run_id,
+                    "proxy": proxy_info,
                     "verified_count": len(newly_verified_entries),
                     "total_verified_or_pruned_count": len(all_verified_rows),
                     "skipped_verified_count": skipped_verified,
@@ -2245,6 +2294,7 @@ def sync_sealed_directory(
                 "status": "ok",
                 "phase": "archive",
                 "run_id": run_id,
+                "proxy": proxy_info,
                 "verified_count": len(all_verified_rows),
                 "newly_verified_count": len(newly_verified_entries),
                 "skipped_verified_count": skipped_verified,
@@ -2274,9 +2324,19 @@ def main() -> int:
     p.add_argument("--verify-remote", action="store_true", help="Verify remote ID, size, and hash after upload")
     p.add_argument("--prune-hours", type=float, default=None, help="Optional safe local retention hours after remote verify")
     p.add_argument("--no-snapshot", action="store_true", help="Skip uploading consistent SQLite ledger snapshot to meta/")
+    p.add_argument("--proxy-url", default=None, help="Optional SOCKS5 URL scoped to rclone only")
+    p.add_argument(
+        "--proxy-mode",
+        choices=("off", "required", "fallback_direct"),
+        default=None,
+        help="Optional archive proxy mode overriding TOKYO_L2_ARCHIVE_PROXY_MODE",
+    )
     args = p.parse_args()
 
-    backend = RcloneBackend(args.remote)
+    if args.proxy_url is not None or args.proxy_mode is not None:
+        backend = RcloneBackend(args.remote, proxy_url=args.proxy_url, proxy_mode=args.proxy_mode)
+    else:
+        backend = RcloneBackend(args.remote)
     result = sync_sealed_directory(
         args.dir,
         backend=backend,

@@ -1383,6 +1383,7 @@ class CollectorMonitor:
         rtt_prober: Callable[[str, int], float | None] | None = None,
         chrony_runner: Callable[[], str] | None = None,
         disk_checker: Callable[[Path], float] | None = None,
+        proxy_probe: Callable[[str, int], dict[str, Any]] | None = None,
         hc_sender: HttpSenderFn | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         allow_notify: bool = True,
@@ -1414,6 +1415,7 @@ class CollectorMonitor:
         self.hourly_report_minute_utc = int(meta_cfg.get("hourly_report_minute_utc", 10))
         self.collector_service_name = str(meta_cfg.get("collector_service_name", "tokyo-l2-collector.service"))
         self.archive_service_name = str(meta_cfg.get("archive_service_name", "tokyo-l2-archive.service"))
+        self.proxy_service_name = str(meta_cfg.get("proxy_service_name", "tokyo-l2-lightsail-proxy.service"))
 
         self.allow_notify = allow_notify
         if notifier is not None:
@@ -1446,6 +1448,7 @@ class CollectorMonitor:
         self.rtt_prober = rtt_prober
         self.chrony_runner = chrony_runner
         self.disk_checker = disk_checker or check_disk_usage_pct
+        self.proxy_probe = proxy_probe
         self.hc_sender = hc_sender
         self.sleeper = sleeper
 
@@ -2098,6 +2101,28 @@ class CollectorMonitor:
                 "details": {"conflicts": ledger_info["conflicted_partitions"][:5]},
             }
 
+        # J. Optional P5 Lightsail archive SOCKS5 tunnel check (strictly inactive while proxy mode == off)
+        try:
+            from lightsail_proxy import parse_proxy_url, probe_socks5_proxy, resolve_rclone_proxy_config
+
+            p_mode, p_url = resolve_rclone_proxy_config()
+            if p_mode in ("required", "fallback_direct") and p_url:
+                _, p_host, p_port = parse_proxy_url(p_url)
+                p_res = (self.proxy_probe or probe_socks5_proxy)(p_host, p_port)
+                if not p_res.get("reachable"):
+                    observed["lightsail_proxy_unavailable"] = {
+                        "severity": "CRITICAL" if p_mode == "required" else "WARNING",
+                        "summary": f"Lightsail 归档 SOCKS5 隧道不可达 ({p_url}; mode={p_mode})",
+                        "details": {"proxy_url": p_url, "mode": p_mode, "probe": p_res},
+                    }
+        except Exception as exc:
+            if os.environ.get("TOKYO_L2_ARCHIVE_PROXY_MODE", "off").strip().lower() not in ("", "off"):
+                observed["lightsail_proxy_unavailable"] = {
+                    "severity": "CRITICAL",
+                    "summary": f"Lightsail 归档代理配置或探测失败 ({type(exc).__name__})",
+                    "details": {"error": f"{type(exc).__name__}: {exc}"},
+                }
+
         # --- Apply alert dedup & recovery notifications ---
         dispatch_res = self._update_alerts(observed=observed, now_s=now_s)
 
@@ -2255,11 +2280,16 @@ def notify_archive_healthcheck(
             sleeper=sleeper,
         )
 
+    proxy_meta = result.get("proxy") if isinstance(result.get("proxy"), dict) else None
+    proxy_suffix = ""
+    if proxy_meta and proxy_meta.get("used_route") in ("lightsail_proxy", "direct_fallback"):
+        proxy_suffix = f" proxy={proxy_meta['used_route']}"
+
     if result.get("status") == "ok":
         reason = (
             f"ok verified={result.get('verified_count', 0)} "
             f"pruned={len(result.get('pruned_local_files', []))} "
-            f"snap={bool(result.get('snapshot_remote_path'))}"
+            f"snap={bool(result.get('snapshot_remote_path'))}{proxy_suffix}"
         )
         return ping_healthcheck(
             url,
@@ -2272,7 +2302,7 @@ def notify_archive_healthcheck(
     conflicts = result.get("conflicts") or []
     failed = result.get("failed_items") or []
     head_items = "; ".join(str(x) for x in failed[:2])
-    reason = f"archive_blocked conflicts={len(conflicts)} failed={len(failed)}: {head_items}"
+    reason = f"archive_blocked conflicts={len(conflicts)} failed={len(failed)}{proxy_suffix}: {head_items}"
     return ping_healthcheck(
         url,
         ok=False,
