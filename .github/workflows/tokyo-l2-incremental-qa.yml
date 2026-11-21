@@ -1,6 +1,10 @@
 name: Tokyo L2 incremental hourly QA (3h)
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/tokyo-l2-incremental-qa.yml"
   schedule:
     # Every three hours, after EC2's :05 UTC archive run.
     - cron: "17 */3 * * *"
@@ -82,7 +86,7 @@ jobs:
         id: inspect
         env:
           QA_SINCE_DATE: ${{ inputs.since_date || '2026-11-21' }}
-          QA_LIMIT: ${{ inputs.limit || '16' }}
+          QA_LIMIT: ${{ github.event_name == 'push' && '1' || inputs.limit || '16' }}
           QA_FORCE: ${{ inputs.force || 'false' }}
         shell: bash
         run: |
