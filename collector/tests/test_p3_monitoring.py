@@ -2071,5 +2071,115 @@ def test_p3_ack_outage_idempotent_on_crash_after_state_save_before_unlink(
     assert transport2.hc_calls[-1]["is_fail"] is True
 
 
+def test_p3_no_late_hourly_backfill_after_restart_and_next_window(tmp_path: Path) -> None:
+    """13:50 startup does not send a stale report; the next UTC :10 window sends once."""
+    from datetime import datetime, timezone
+
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t_late = datetime(2026, 12, 3, 10, 50, tzinfo=timezone.utc).timestamp()
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t_late, data_lines=5000)
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    first = mon.run_sweep(now_epoch_s=t_late)
+    assert first["hourly_report"]["due"] is False
+    assert not any("小时采集报告" in m["text"] for m in t.tg_messages)
+
+    # State-backed restart still cannot backfill after the fixed delivery window.
+    restarted = _build_monitor(cfg, t)
+    next_try = restarted.run_sweep(now_epoch_s=t_late + 30.0)
+    assert next_try["hourly_report"]["due"] is False
+
+    # At UTC 11:10 the last complete hour is 10.
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t_late + 1200, hour_utc="10", data_lines=6000)
+    in_window = restarted.run_sweep(now_epoch_s=t_late + 1200.0)
+    assert in_window["hourly_report"]["sent"] is True
+    assert sum("小时采集报告" in m["text"] for m in t.tg_messages) == 1
+    again = restarted.run_sweep(now_epoch_s=t_late + 1230.0)
+    assert again["hourly_report"]["due"] is False
 
 
+def test_p3_meta_still_writing_but_zero_data_blocks_healthy_hc(tmp_path: Path) -> None:
+    """Recent .partial activity cannot establish health when Bybit's sealed DATA is zero."""
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t0 = 1_796_292_720.0  # UTC 10:12, previous complete hour 09
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(
+            root, ex, now_s=t0,
+            data_lines=0 if ex == "bybit_linear" else 10000,
+        )
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    result = mon.run_sweep(now_epoch_s=t0)
+    assert result["collector_healthcheck"]["healthy"] is False
+    assert t.hc_calls[-1]["is_fail"] is True
+    assert "collector_data_volume_abnormal" in result["active_alerts"]
+    assert result["data_tree"]["per_exchange"]["bybit_linear"]["last_activity_age_s"] < 300
+    msg = next(m["text"] for m in t.tg_messages if "有效行情量异常" in m["text"])
+    assert "Bybit" in msg and "0 行" in msg
+    assert "{" not in msg and "current_sha256" not in msg
+    report = result["hourly_report"]["text"]
+    assert "🔴 Bybit: 0 行" in report
+
+    # Later valid complete hour removes the operational alarm; deep QA stays pending.
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t0 + 3600, hour_utc="10", data_lines=11000)
+    recovered = mon.run_sweep(now_epoch_s=t0 + 3600.0, force_collector_hc=True)
+    assert "collector_data_volume_abnormal" not in recovered["active_alerts"]
+    assert "collector_data_volume_abnormal" in recovered["alert_dispatch"]["sent_recoveries"]
+
+
+def test_p3_very_low_data_ratio_vs_prior_hours_blocks_healthy(tmp_path: Path) -> None:
+    """223 rows against three earlier healthy 10,000-row hours must fail initial screening."""
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t0 = 1_796_292_720.0
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        for hour in ("06", "07", "08"):
+            _seed_exchange_files(root, ex, now_s=t0, hour_utc=hour, data_lines=10000)
+        _seed_exchange_files(
+            root, ex, now_s=t0, hour_utc="09",
+            data_lines=223 if ex == "binance_futures" else 10000,
+        )
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    result = mon.run_sweep(now_epoch_s=t0)
+    issue = result["data_tree"]["hourly_volume_assessment"]["affected"]
+    assert issue["binance_futures"]["data_lines"] == 223
+    assert issue["binance_futures"]["reference_data_lines"] == 10000
+    assert "bybit_linear" not in issue
+    assert result["collector_healthcheck"]["healthy"] is False
+
+
+def test_p3_raw_spec_body_changes_are_audited_without_unverified_tg_alarm(tmp_path: Path) -> None:
+    """Raw REST body change does not prove tick size / multiplier changed."""
+    root = tmp_path / "data"
+    cfg = _write_test_config(tmp_path, root)
+    t0 = 1_796_292_720.0
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        _seed_exchange_files(root, ex, now_s=t0, data_lines=10000)
+    t = FakeTransport()
+    mon = _build_monitor(cfg, t)
+    version = [1]
+    mon.spec_fetcher = lambda _url, _headers: json.dumps({"dynamic": version[0]}).encode()
+    mon.run_sweep(now_epoch_s=t0, run_specs=True)
+    version[0] = 2
+    result = mon.run_sweep(now_epoch_s=t0 + 30, run_specs=True)
+    assert "raw_spec_response_changed_unverified" in result["spec_change_alerts"]
+    assert not any("合约规格变更" in m["text"] for m in t.tg_messages)
+    assert (root / "meta" / "specs" / "spec_changes.jsonl").is_file()
+
+
+def test_p3_local_loss_expiry_message_preserves_historical_gap() -> None:
+    msg = md_mod.format_recovery_message(
+        alert_key="local_loss_detected",
+        summary="旧告警已清除",
+        started_at_s=1000.0,
+        now_s=1300.0,
+    )
+    assert "[无新增]" in msg
+    assert "历史缺口仍然存在" in msg
+    assert "[已恢复]" not in msg
