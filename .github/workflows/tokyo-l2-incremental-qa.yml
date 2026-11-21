@@ -20,6 +20,11 @@ on:
         required: false
         type: string
         default: '660'
+      preview_recurring:
+        description: 'Exercise the normal QA jobs with temporary report state and no notifications'
+        required: false
+        type: boolean
+        default: false
       config_path:
         description: "Effective collector config path in source repo (defaults to vars.TOKYO_L2_QA_CONFIG_PATH)"
         required: false
@@ -54,7 +59,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: tokyo-l2-incremental-qa
+  group: ${{ (inputs.replay_window || inputs.preview_recurring) && format('tokyo-l2-qa-preview-{0}', github.ref_name) || 'tokyo-l2-incremental-qa' }}
   cancel-in-progress: false
 
 jobs:
@@ -64,6 +69,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
+      - name: Check out GitHub protocol and replay validation
+        uses: actions/checkout@v4
+        with:
+          path: workflow_code
+          sparse-checkout: |
+            scripts/tokyo_l2_protocol_qa.py
+            scripts/tokyo_l2_replay_qa.py
+            scripts/tokyo_l2_recurring_qa.py
+            scripts/test_tokyo_l2_protocol_qa.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Checkout collector QA code
         uses: actions/checkout@v4
         with:
@@ -96,7 +113,8 @@ jobs:
 
       - name: Install bounded QA dependencies
         run: |
-          python -m pip install zstandard==0.23.0
+          python -m pip install hftbacktest==2.4.4 numpy numba zstandard==0.23.0
+          PYTHONPATH=source/collector/python python workflow_code/scripts/test_tokyo_l2_protocol_qa.py
           sudo apt-get update -qq
           sudo apt-get install -y -qq rclone
 
@@ -232,9 +250,23 @@ jobs:
 
           exit "$QA_RC"
 
+      - name: Validate current archive protocols and hourly representative replay
+        id: protocols
+        if: ${{ !cancelled() && steps.inspect.outcome == 'success' }}
+        env:
+          PYTHONPATH: source/collector/python
+        shell: bash
+        run: |
+          set -euo pipefail
+          rules_sha="$(sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum | cut -d ' ' -f1)"
+          python workflow_code/scripts/tokyo_l2_recurring_qa.py \
+            --remote qa: --state-dir state --config "source/$QA_BOUND_CONFIG_PATH" \
+            --run-id "$QA_BOUND_RUN_ID" --cutover "$QA_BOUND_SINCE_WINDOW" \
+            --current "$QA_CURRENT_WINDOW_ID" --checker "$TOKYO_L2_QA_CHECKER_COMMIT/$rules_sha"
+
       - name: Persist QA summary reports to tokyo-l2-qa-state
         id: persist
-        if: always()
+        if: ${{ !cancelled() && !inputs.preview_recurring }}
         working-directory: state
         shell: bash
         run: |
@@ -268,10 +300,11 @@ jobs:
           fi
 
       - name: Notify independent QA Healthchecks
-        if: always()
+        if: ${{ !cancelled() && !inputs.preview_recurring }}
         env:
           QA_HEALTHCHECKS_URL: ${{ secrets.TOKYO_L2_QA_HEALTHCHECKS_URL }}
           INSPECT_OUTCOME: ${{ steps.inspect.outcome }}
+          PROTOCOL_OUTCOME: ${{ steps.protocols.outcome }}
           PERSIST_OUTCOME: ${{ steps.persist.outcome }}
         shell: bash
         run: |
@@ -296,7 +329,7 @@ jobs:
           # preserved and reported separately in the payload without failing latest-window heartbeats.
           # When the current window is still pending_archive (cur_done != true), NEVER send a false success ping.
           status="success"
-          if [[ "$INSPECT_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
+          if [[ "$INSPECT_OUTCOME" != "success" || "$PROTOCOL_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
             status="failure"
             url="${url}/fail"
           fi
@@ -314,6 +347,8 @@ jobs:
             --data-urlencode "historical_loss_manifests_count=${hist_loss_mfs_count}" \
             --data-urlencode "run_id=${QA_BOUND_RUN_ID:-unbound}" \
             --data-urlencode "since_window=${QA_BOUND_SINCE_WINDOW:-unbound}" \
+            --data-urlencode "protocol_status=${QA_PROTOCOL_STATUS:-pending}" \
+            --data-urlencode "hourly_btc_replay=${QA_HOURLY_BTC_REPLAY:-pending}" \
             --data-urlencode "checker_commit=${TOKYO_L2_QA_CHECKER_COMMIT:-unknown}" \
             "$url"
 
@@ -332,6 +367,7 @@ jobs:
           sparse-checkout: |
             scripts/tokyo_l2_protocol_qa.py
             scripts/tokyo_l2_replay_qa.py
+            scripts/tokyo_l2_recurring_qa.py
             scripts/test_tokyo_l2_protocol_qa.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
@@ -354,7 +390,7 @@ jobs:
           python -m pip install hftbacktest==2.4.4 numpy numba zstandard==0.23.0
           sudo apt-get update -qq
           sudo apt-get install -y -qq rclone
-          python workflow_code/scripts/test_tokyo_l2_protocol_qa.py
+          PYTHONPATH=source/collector/python python workflow_code/scripts/test_tokyo_l2_protocol_qa.py
 
       - name: Configure read-only Google Drive access
         env:

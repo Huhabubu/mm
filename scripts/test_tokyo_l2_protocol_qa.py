@@ -1,5 +1,7 @@
 import unittest
 
+from tokyo_l2_recurring_qa import plan_windows
+
 from tokyo_l2_protocol_qa import BITGET, BYBIT, GATE, Book, Chain, Depth, depth_event, verify_gate_sizes
 
 
@@ -8,6 +10,10 @@ def depth(mode, seq, parent=None, epoch=1):
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_recurring_checks_latest_and_one_oldest_pending_partition(self):
+        self.assertEqual([400, 200], plan_windows([100, 200, 300, 400], {100: {}}, 400))
+        self.assertEqual([200], plan_windows([100, 200, 300, 400], {100: {}, 400: {}}, 400))
+
     def test_gate_detects_lost_update_despite_increasing_sequence(self):
         chain = Chain()
         self.assertIsNone(chain.apply(GATE, depth("snapshot", 100)))
