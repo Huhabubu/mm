@@ -1644,6 +1644,7 @@ class CollectorMonitor:
             "last_chrony_epoch_s": None,
             "last_collector_hc_epoch_s": None,
             "last_hourly_report_hour": None,
+            "last_hourly_volume_assessment": None,
         }
 
     def _load_state(self) -> dict[str, Any]:
@@ -1889,21 +1890,10 @@ class CollectorMonitor:
             self.state["spec_previous_hashes"] = prev_hashes
             self.state["last_spec_day"] = today
             if self.last_spec_res.get("spec_change_isolation_flags"):
-                spec_msg = format_alert_message(
-                    alert_key="spec_change_isolation",
-                    severity="WARNING",
-                    summary="检测到合约规格变更，已记录隔离窗口",
-                    details={"flags": self.last_spec_res["spec_change_isolation_flags"]},
-                    now_s=now_s,
-                )
-                if self.allow_notify:
-                    self.notifier.send_text(
-                        spec_msg,
-                        severity="WARNING",
-                        title="spec_change_isolation",
-                        details={"flags": self.last_spec_res["spec_change_isolation_flags"]},
-                    )
-                spec_change_alerts.append("spec_change_isolation")
+                # A hash of the *entire* REST body changes with benign/dynamic fields.
+                # Preserve raw before/after snapshots and isolation flags for audit, but
+                # do not announce a verified contract change without field-level proof.
+                spec_change_alerts.append("raw_spec_response_changed_unverified")
 
         # 2. Chrony check (strict <= 1.0 ms certification)
         last_c = self.state.get("last_chrony_epoch_s")
@@ -1976,21 +1966,8 @@ class CollectorMonitor:
                 )
                 self.state["spec_previous_hashes"] = prev_hashes
                 if self.last_spec_res.get("spec_change_isolation_flags"):
-                    spec_msg = format_alert_message(
-                        alert_key="spec_change_isolation",
-                        severity="WARNING",
-                        summary="重连期间检测到合约规格变更，已记录隔离窗口",
-                        details={"flags": self.last_spec_res["spec_change_isolation_flags"]},
-                        now_s=now_s,
-                    )
-                    if self.allow_notify:
-                        self.notifier.send_text(
-                            spec_msg,
-                            severity="WARNING",
-                            title="spec_change_isolation",
-                            details={"flags": self.last_spec_res["spec_change_isolation_flags"]},
-                        )
-                    spec_change_alerts.append("spec_change_isolation")
+                    # Record raw hash changes without mislabeling them verified spec changes.
+                    spec_change_alerts.append("raw_spec_response_changed_unverified")
             self.state["last_collector_boot_id"] = latest_boot
 
         # 6. Filesystem metadata inspect (.partial stat + .manifest.json + shutdown_*.json; ZERO .tsv.zst decompression!)
@@ -2002,6 +1979,18 @@ class CollectorMonitor:
             manifest_cache=self.manifest_cache,
             service_uptime_seconds=collector_status.get("uptime_seconds"),
         )
+        volume_now = assess_hourly_data_volume(
+            data_tree, now_s=now_s, report_minute=self.hourly_report_minute_utc
+        )
+        if volume_now["ready"]:
+            self.state["last_hourly_volume_assessment"] = volume_now
+            data_tree["hourly_volume_assessment"] = volume_now
+        else:
+            # Keep the last evaluated complete-hour condition until the next
+            # :10 window; do not briefly report healthy at every UTC hour boundary.
+            data_tree["hourly_volume_assessment"] = (
+                self.state.get("last_hourly_volume_assessment") or volume_now
+            )
         seen_shutdowns = set(self.state.get("seen_shutdown_files") or ())
         new_shutdowns = inspect_shutdown_audits(self.data_root, seen_shutdowns)
         self.state["seen_shutdown_files"] = sorted(seen_shutdowns)[-200:]
@@ -2083,6 +2072,19 @@ class CollectorMonitor:
                 "severity": "CRITICAL",
                 "summary": f"采集数据长期未更新: {', '.join(data_tree['stale_exchanges'])}",
                 "details": stale_details,
+            }
+
+        # C2. META or .partial bytes must never masquerade as healthy market DATA.
+        volume_info = data_tree.get("hourly_volume_assessment") or {}
+        volume_bad = volume_info.get("affected") or {}
+        if volume_bad:
+            observed["collector_data_volume_abnormal"] = {
+                "severity": "CRITICAL",
+                "summary": f"上一完整小时 {len(volume_bad)} 家交易所 DATA 为零或显著低于参考量",
+                "details": {
+                    "hour_key": volume_info.get("hour_key"),
+                    "affected": volume_bad,
+                },
             }
 
         # D. Dual A/B outage > 5s (strict conservative endpoint tracking; NEVER clears from
@@ -2271,6 +2273,7 @@ class CollectorMonitor:
                     "collector_probe_failed",
                     "collector_abnormal_restart",
                     "collector_data_stale",
+                    "collector_data_volume_abnormal",
                     "dual_ab_outage_gt_5s",
                     "local_loss_detected",
                     "disk_usage_high",
@@ -2333,7 +2336,9 @@ class CollectorMonitor:
         due_hourly = force_hourly_report or (
             self.hourly_report_enabled
             and last_hr_sent != hour_key
-            and dt_now.minute >= self.hourly_report_minute_utc
+            and self.hourly_report_minute_utc <= dt_now.minute < min(
+                60, self.hourly_report_minute_utc + 5
+            )
         )
         hourly_res: dict[str, Any] = {"due": due_hourly, "sent": False, "hour_key": hour_key, "text": None}
         if due_hourly:
