@@ -49,6 +49,10 @@ def selected_archives(remote, config, run_id, begin, end, tmp, warmup_windows, r
         raise ValueError("target window does not have verified files for every enabled exchange")
     if sum(int(c["data_bytes"] or 0) for c in candidates) > 3 * 1024**3:
         raise ValueError("archive sample exceeds the compressed input budget")
+    report["warmup_inputs"] = [
+        {"exchange": c["exchange"], "window_id": coverage.window_descriptor(c["planned_start_s"], step // 60)["window_id"]}
+        for c in candidates if c["planned_start_s"] < begin
+    ]
     report["target_inputs"] = [
         {"exchange": c["exchange"], "manifest_sha256": c["manifest_sha256"], "data_sha256": c["data_sha256"]}
         for c in target
@@ -160,7 +164,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary):
     signal = []
     file_reports = []
     quotes_before = None
-    gaps = {}
+    seen_anchors = set()
     trade_ids = set()
     for candidate, mf, path in sorted(items, key=lambda item: (
         item[0]["exchange"], item[0]["planned_start_s"], item[1].get("start_wall_ns") or 0,
@@ -175,7 +179,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary):
             if not wall < end_ns:
                 continue
             in_target = wall >= start_ns
-            if exchange == BINANCE and kind != "META" and wall < sample_end:
+            if sample_end > start_ns and exchange == BINANCE and kind != "META" and wall < sample_end:
                 data = obj.get("data", obj)
                 if data.get("e") == "bookTicker" and data.get("s") == BTC:
                     bid, ask = float(data["b"]), float(data["a"])
@@ -193,23 +197,25 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary):
                 chain = chains.setdefault((exchange, event.symbol), Chain())
                 if in_target:
                     book_proofs.frames[(exchange, event.symbol)] += 1
-                if exchange in FOLLOWERS and event.symbol == BTC and in_target and exchange not in seeded:
+                if sample_end > start_ns and exchange in FOLLOWERS and event.symbol == BTC and in_target and exchange not in seeded:
                     seeded.add(exchange)
                     if chain.seq is not None and chain.connection == event.connection and event.mode != "snapshot":
                         book = books[exchange]
                         if book.bids and book.asks and not book.crossed():
                             convert._emit_depth_batch(buffers[exchange], True, start_ns - 2, start_ns - 1,
                                                       list(book.bids.items()), list(book.asks.items()))
+                if event.mode == "snapshot":
+                    seen_anchors.add((exchange, event.symbol, "target" if in_target else "warmup"))
                 problem = chain.apply(exchange, event)
                 if not problem and exchange == GATE and not verify_gate_sizes(event):
                     problem = "gate_quantity_not_decimal_string"
                 if problem:
                     if in_target:
                         book_proofs.count(exchange, event.symbol, problem)
-                    if exchange in books and event.symbol == BTC:
+                    if sample_end > start_ns and exchange in books and event.symbol == BTC:
                         books[exchange] = Book()
                     continue
-                if exchange in books and event.symbol == BTC:
+                if sample_end > start_ns and exchange in books and event.symbol == BTC:
                     book = books[exchange]
                     book.apply(event)
                     if book.crossed() and in_target:
@@ -255,6 +261,9 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary):
     if quotes_before:
         signal.insert(0, quotes_before)
     signal.sort(key=lambda row: row[0])
+    summary["observed_snapshot_markets"] = [
+        {"exchange": ex, "symbol": sym, "phase": phase} for ex, sym, phase in sorted(seen_anchors)
+    ]
     summary["archive_file_checks"] = file_reports
     summary["protocol"] = book_proofs.json()
     summary["protocol_status"] = "failed" if book_proofs.issues else "passed"
@@ -275,10 +284,23 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary):
         if len(signal) < 2 or not buffers[exchange].seen_snapshot or not buffers[exchange].hbt_rows:
             summary["replay"][exchange] = {"status": "blocked", "reason": "missing_signal_or_initial_book"}
             continue
-        summary["replay"][exchange] = run_replay(exchange, buffers[exchange], signal, specs[exchange], sample_end)
+        try:
+            summary["replay"][exchange] = run_replay(exchange, buffers[exchange], signal, specs[exchange], sample_end)
+        except Exception as exc:
+            summary["replay"][exchange] = {
+                "status": "failed", "reason": "converter_or_engine_error", "error_type": type(exc).__name__,
+            }
 
 
 def run_replay(exchange, buffer, signal, spec, sample_end):
+    import sys
+
+    sys.path.insert(0, str(Path(convert.__file__).resolve().parents[2] / "scripts"))
+    from g0_glft_baseline import STEP_NS, TRAIN
+
+    if sample_end - int(buffer.hbt_rows[0][2]) <= TRAIN * STEP_NS:
+        return {"status": "blocked", "reason": "sample_too_short_for_strategy_warmup",
+                "strategy_warmup_seconds": TRAIN * STEP_NS // NS}
     tick, lot, multiplier = (float(spec[k]) for k in ("tick", "lot", "multiplier"))
     if not all(math.isfinite(x) and x > 0 for x in (tick, lot, multiplier)):
         return {"status": "blocked", "reason": "invalid_contract_spec"}
@@ -320,7 +342,7 @@ def main():
     parser.add_argument("--window", required=True)
     parser.add_argument("--summary", type=Path, required=True)
     parser.add_argument("--warmup-windows", type=int, default=1, choices=range(0, 9))
-    parser.add_argument("--replay-seconds", type=int, default=60, choices=range(0, 301))
+    parser.add_argument("--replay-seconds", type=int, default=660, choices=range(0, 3601))
     args = parser.parse_args()
     out = {"status": "failed", "run_id": args.run_id, "window_id": args.window,
            "warmup_windows": args.warmup_windows, "replay_sample_seconds": args.replay_seconds}

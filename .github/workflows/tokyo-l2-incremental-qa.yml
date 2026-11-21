@@ -16,10 +16,10 @@ on:
         required: false
         type: string
       replay_seconds:
-        description: 'Seconds of real BTC replay per follower (0 for protocol-only)'
+        description: 'BTC input duration including 600s strategy warmup (0 for protocol-only)'
         required: false
         type: string
-        default: '60'
+        default: '660'
       config_path:
         description: "Effective collector config path in source repo (defaults to vars.TOKYO_L2_QA_CONFIG_PATH)"
         required: false
@@ -384,7 +384,7 @@ jobs:
           QA_CONFIG_PATH: ${{ inputs.config_path || vars.TOKYO_L2_QA_CONFIG_PATH }}
           QA_RUN_ID: ${{ inputs.run_id || vars.TOKYO_L2_QA_RUN_ID }}
           QA_REPLAY_WINDOW: ${{ inputs.replay_window }}
-          QA_REPLAY_SECONDS: ${{ inputs.replay_seconds || '60' }}
+          QA_REPLAY_SECONDS: ${{ inputs.replay_seconds || '660' }}
           PYTHONPATH: source/collector/python
         shell: bash
         run: |
