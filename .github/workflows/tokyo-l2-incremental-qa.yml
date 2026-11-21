@@ -14,6 +14,10 @@ on:
         description: "Earliest UTC date to inspect (YYYY-MM-DD)"
         required: false
         default: "2026-11-21"
+      since_hour:
+        description: "First UTC hour for new collector run (YYYY-MM-DDTHH)"
+        required: false
+        default: "2026-11-21T08"
       limit:
         description: "Max new exchange-hour partitions per run"
         required: false
@@ -86,6 +90,7 @@ jobs:
         id: inspect
         env:
           QA_SINCE_DATE: ${{ inputs.since_date || '2026-11-21' }}
+          QA_SINCE_HOUR: ${{ inputs.since_hour || '2026-11-21T08' }}
           QA_LIMIT: ${{ github.event_name == 'push' && '1' || inputs.limit || '16' }}
           QA_FORCE: ${{ inputs.force || 'false' }}
         shell: bash
@@ -98,6 +103,7 @@ jobs:
             --config source/collector/specs/config.example.json \
             --state-dir state \
             --since-date "$QA_SINCE_DATE" \
+            --since-hour "$QA_SINCE_HOUR" \
             --limit "$QA_LIMIT" \
             "${extra[@]}"
 
