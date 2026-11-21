@@ -166,7 +166,9 @@ def check_partition(data_path: Path, manifest: dict, config: dict) -> dict:
 
 
 def run(remote: str, config_path: Path, state_dir: Path, limit: int, since_date: str,
-        force: bool = False) -> dict:
+        force: bool = False, since_hour: str | None = None) -> dict:
+    if since_hour is not None:
+        datetime.strptime(since_hour, "%Y-%m-%dT%H")
     config = json.loads(config_path.read_text(encoding="utf-8"))
     relative = _run("rclone", "lsf", f"{remote.rstrip('/')}/raw", "-R", "--files-only",
                     "--include", "*.manifest.json")
@@ -177,7 +179,9 @@ def run(remote: str, config_path: Path, state_dir: Path, limit: int, since_date:
             continue
         ex, day, filename = parts
         if day >= since_date and ex in config["exchanges"] and config["exchanges"][ex].get("enabled"):
-            candidates.append(f"raw/{path}")
+            hour = filename.removesuffix(".manifest.json").rsplit("_", 1)[-1]
+            if since_hour is None or (len(hour) == 2 and hour.isdigit() and f"{day}T{hour}" >= since_hour):
+                candidates.append(f"raw/{path}")
     candidates.sort(key=lambda p: (p.split("/")[2], p.split("/")[3], p.split("/")[1]))
     attempted = ok = blocked = skipped = transient = 0
     summary = []
@@ -256,12 +260,13 @@ def main() -> int:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--since-date", default="2026-11-21")
+    parser.add_argument("--since-hour", default=None, help="Inclusive first UTC hour, YYYY-MM-DDTHH")
     parser.add_argument("--limit", type=int, default=16)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if args.limit < 1:
         parser.error("--limit must be positive")
-    result = run(args.remote, args.config, args.state_dir, args.limit, args.since_date, args.force)
+    result = run(args.remote, args.config, args.state_dir, args.limit, args.since_date, args.force, args.since_hour)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["status"] == "ok" else 2
 
