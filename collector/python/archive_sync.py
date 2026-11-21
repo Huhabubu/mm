@@ -41,7 +41,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -1583,6 +1583,7 @@ def sync_sealed_directory(
     now_epoch_s: float | None = None,
     *,
     upload_ledger_snapshot: bool = True,
+    expected_hourly_exchanges: set[str] | None = None,
     fault_hooks: dict[str, Callable[[str], None]] | None = None,
 ) -> dict[str, Any]:
     """Incrementally verify, upload, remote-verify, snapshot-backup, and safely prune partitions.
@@ -2201,23 +2202,48 @@ def sync_sealed_directory(
             # (never overwriting any pre-existing legacy verified_archive_ledger.jsonl).
             export_verified_jsonl_projection(sealed_root, ledger)
 
-            # Create consistent SQLite snapshot (sqlite3.Connection.backup) and upload to remote meta/
-            # whenever ANY committed local ledger state changed (even if other unrelated partitions
-            # failed or conflicted in this run!) so cloud backup never lags behind committed VERIFIED/
-            # PRUNED state. When zero state changed and an error/conflict blocked all work (e.g. API
-            # outage), skip snapshot upload; on clean unchanged repeat runs with an existing snapshot,
-            # also skip redundant uploads.
+            all_verified_rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
+            if expected_hourly_exchanges is not None:
+                previous_hour = datetime.fromtimestamp(now_s, timezone.utc) - timedelta(hours=1)
+                expected_date = previous_hour.strftime("%Y-%m-%d")
+                expected_hour = previous_hour.strftime("%H")
+                verified = {
+                    row["exchange"]
+                    for row in all_verified_rows
+                    if row["date_utc"] == expected_date and row["hour_utc"] == expected_hour
+                    and row["remote_data_verified"] and row["remote_manifest_verified"]
+                    and not row["has_conflict"] and not row["last_error_code"]
+                }
+                errors.extend(
+                    f"expected_hour_not_verified:{exchange}:{expected_date}T{expected_hour}Z"
+                    for exchange in sorted(expected_hourly_exchanges - verified)
+                )
+                for exchange in sorted(expected_hourly_exchanges):
+                    for path in (raw_root / exchange / expected_date).glob(
+                        f"{exchange}_{previous_hour:%Y%m%d}_{expected_hour}*.tsv.zst"
+                    ):
+                        if not path.with_name(path.name.removesuffix(".tsv.zst") + ".manifest.json").is_file():
+                            errors.append(f"sealed_file_without_manifest:{path.relative_to(sealed_root).as_posix()}")
+
+            # Compare committed recovery state to the last successfully copied snapshot, even
+            # after a crash or a retry with zero new uploads. Exclude the snapshot's own metadata.
             snapshot_remote_path: str | None = None
             snapshot_sha256: str | None = None
-            committed_state_changed = bool(
-                newly_verified_entries
-                or pruned
-                or recovered_pruned
-                or migration_summary.get("migrated")
-                or meta_uploaded
+            recovery_state = sorted(
+                (row["rel_data_path"], row["state"], row["verified_at_utc"], row["pruned_at_utc"],
+                 row["local_sha256"], row["manifest_sha256"])
+                for row in all_verified_rows
             )
-            snapshot_needed = committed_state_changed or (
-                ledger.get_meta("last_snapshot_remote_path") is None and not errors and not conflicts
+            meta_state = [
+                tuple(row) for row in ledger.conn.execute(
+                    "SELECT rel_path, sha256 FROM meta_sync_state ORDER BY rel_path"
+                )
+            ]
+            generation = hashlib.sha256(
+                json.dumps([recovery_state, meta_state], separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            snapshot_needed = bool(recovery_state or meta_state) and (
+                generation != ledger.get_meta("last_snapshot_generation")
             )
             if upload_ledger_snapshot and snapshot_needed:
                 ts_tag = datetime.fromtimestamp(now_s, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -2240,6 +2266,7 @@ def sync_sealed_directory(
                         ledger.set_meta("last_snapshot_remote_path", snap_rel)
                         ledger.set_meta("last_snapshot_sha256", snap_info["sha256"])
                         ledger.set_meta("last_snapshot_utc", now_iso)
+                        ledger.set_meta("last_snapshot_generation", generation)
                         ledger.record_event(
                             ts_utc=now_iso,
                             run_id=run_id,
@@ -2254,7 +2281,6 @@ def sync_sealed_directory(
                 except Exception as exc:
                     errors.append(f"{snap_rel}: {type(exc).__name__}: {exc}")
 
-            all_verified_rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
             all_entries = [_row_to_jsonl_entry(r) for r in all_verified_rows]
             state_counts = {
                 STATE_SEALED: len(ledger.list_partitions(states=(STATE_SEALED,))),

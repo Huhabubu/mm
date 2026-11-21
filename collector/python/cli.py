@@ -570,6 +570,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
 
 def cmd_archive(args: argparse.Namespace) -> int:
+    from data_coverage import enabled_exchanges
     from meta_daemon import notify_archive_healthcheck
 
     proxy_url = getattr(args, "proxy_url", None)
@@ -580,12 +581,18 @@ def cmd_archive(args: argparse.Namespace) -> int:
         backend = RcloneBackend(args.remote)
     result: dict[str, Any] | None = None
     try:
+        archive_config = getattr(args, "config", None)
+        expected = (
+            set(enabled_exchanges(json.loads(archive_config.read_text(encoding="utf-8"))))
+            if archive_config else None
+        )
         result = sync_sealed_directory(
             args.dir,
             backend=backend,
             verify_remote=args.verify_remote,
             prune_older_than_hours=args.prune_hours,
             upload_ledger_snapshot=not args.no_snapshot,
+            expected_hourly_exchanges=expected,
         )
     except Exception as exc:
         if not getattr(args, "no_healthchecks", False):
@@ -606,6 +613,14 @@ def cmd_archive(args: argparse.Namespace) -> int:
 
 def cmd_qa_convert(args: argparse.Namespace) -> int:
     remote_backend = RcloneBackend(args.remote) if args.remote else None
+    try:
+        coverage_config = (
+            json.loads(args.coverage_config.read_text(encoding="utf-8"))
+            if args.coverage_config else None
+        )
+    except (OSError, ValueError) as exc:
+        print(json.dumps(_blocked("qa_convert", [str(exc)], ["Supply a readable collector configuration"])))
+        return 2
     result = run_qa_convert(
         args.manifest,
         args.out,
@@ -614,6 +629,8 @@ def cmd_qa_convert(args: argparse.Namespace) -> int:
         strict_zero_loss=args.strict_zero_loss,
         remote_backend=remote_backend,
         restore_cache_dir=args.restore_cache_dir,
+        coverage_config=coverage_config,
+        coverage_date_utc=args.date_utc,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2
@@ -640,6 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_arc = sub.add_parser("archive", help="Verify sealed partitions and upload to single Google Drive Pro")
     p_arc.add_argument("--dir", type=Path, required=True)
+    p_arc.add_argument("--config", type=Path, help="Require verified partitions for all configured exchanges in the previous UTC hour")
     p_arc.add_argument("--verify-remote", action="store_true")
     p_arc.add_argument("--remote", default="gdrive_main:tokyo_l2_data")
     p_arc.add_argument("--prune-hours", type=float, default=None)
@@ -658,6 +676,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_qa.add_argument("--manifest", type=Path, required=True)
     p_qa.add_argument("--out", type=Path, required=True)
     p_qa.add_argument("--meta-dir", type=Path, default=None)
+    p_qa.add_argument("--coverage-config", type=Path, help="Collector configuration for complete-day coverage")
+    p_qa.add_argument("--date-utc", help="UTC day (YYYY-MM-DD) to certify with --coverage-config")
     p_qa.add_argument("--allow-unverified-local", action="store_true")
     p_qa.add_argument("--strict-zero-loss", action="store_true")
     p_qa.add_argument("--remote", default=None, help="Optional rclone remote root to restore PRUNED partitions")

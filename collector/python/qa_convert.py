@@ -80,7 +80,7 @@ def canonical_asset(exchange: str, raw_symbol: str) -> str:
 
 
 def date_utc_from_wall_ns(wall_ns: int) -> str:
-    dt = datetime.fromtimestamp(wall_ns / 1e9, tz=timezone.utc)
+    dt = datetime.fromtimestamp(wall_ns // 1_000_000_000, tz=timezone.utc)
     return dt.strftime("%Y-%m-%d")
 
 
@@ -408,9 +408,13 @@ def _ingest_binance_record(
     obj = json.loads(rec["payload"])
 
     if kind == "META":
-        if obj.get("event") == "REST_SNAPSHOT" and isinstance(obj.get("raw"), dict):
+        snapshot = {
+            "REST_SNAPSHOT": obj.get("raw"),
+            "REST_SNAPSHOT_ANCHOR": obj.get("snapshot"),
+        }.get(obj.get("event"))
+        if isinstance(snapshot, dict):
             sym = canonical_asset("binance_futures", str(obj.get("symbol", "")))
-            raw = obj["raw"]
+            raw = snapshot
             exch_ts = int(raw.get("E") or raw.get("T") or (local_ts // 1_000_000)) * 1_000_000
             bids = _parse_price_qty_pairs(raw.get("bids") or [])
             asks = _parse_price_qty_pairs(raw.get("asks") or [])
@@ -712,10 +716,12 @@ def _ingest_bitget_record(
                 buf.exch_ahead_of_local_count += 1
             side_str = str(tr.get("S") or tr.get("side") or "").lower()
             side_flag = BUY_EVENT if side_str == "buy" else SELL_EVENT
-            px = float(tr.get("P") if "P" in tr else tr["px"])
+            price = tr["p"] if "p" in tr else tr["P"] if "P" in tr else tr["px"]
+            px = float(price)
             qty = float(tr.get("v") if "v" in tr else tr["sz"])
             ival = 0
-            if bool(tr.get("isRPI", False)):
+            is_rpi = tr.get("isRPI")
+            if is_rpi is True or str(is_rpi).strip().lower() in {"yes", "true", "1"}:
                 ival |= TRADE_FLAG_RPI
                 buf.special_flag_counts["RPI"] += 1
             buf.hbt_rows.append(
@@ -795,6 +801,7 @@ def evaluate_50_level_coverage(
 def _resolve_manifest_inputs(
     manifest_arg: Path,
     allow_unverified_local: bool,
+    date_utc: str | None = None,
 ) -> tuple[list[tuple[Path, Path, dict[str, Any] | None]], Path | None, list[str]]:
     """Resolve input manifest/SQLite ledger/JSONL ledger/directory into [(data_path, manifest_path, ledger_entry), ...]."""
     errors: list[str] = []
@@ -822,6 +829,8 @@ def _resolve_manifest_inputs(
             states = ("SEALED", "VERIFIED", "PRUNED") if allow_unverified_local else ("VERIFIED", "PRUNED")
             rows = ledger.list_partitions(states=states)
             for row in rows:
+                if date_utc is not None and row["date_utc"] != date_utc:
+                    continue
                 is_verified = bool(row["remote_data_verified"] and row["remote_manifest_verified"])
                 if not is_verified and not allow_unverified_local:
                     errors.append(
@@ -852,6 +861,8 @@ def _resolve_manifest_inputs(
             if not line:
                 continue
             entry = json.loads(line)
+            if date_utc is not None and entry.get("date_utc") not in (None, date_utc):
+                continue
             if not entry.get("verified") and not allow_unverified_local:
                 errors.append(f"{manifest_arg.name}:{line_no}: ledger entry not remote-verified ({entry.get('remote_path')})")
                 continue
@@ -899,9 +910,25 @@ def run_qa_convert(
     strict_zero_loss: bool = False,
     remote_backend: ArchiveBackend | None = None,
     restore_cache_dir: Path | None = None,
+    coverage_config: dict[str, Any] | None = None,
+    coverage_date_utc: str | None = None,
 ) -> dict[str, Any]:
     """Run full QA gatekeeper + strict-separation HBT 2.4.4 conversion (with PRUNED restore support)."""
-    items_resolved, inferred_meta, resolve_errors = _resolve_manifest_inputs(manifest_arg, allow_unverified_local)
+    from data_coverage import CompleteDayCoverage
+
+    if (coverage_config is None) != (coverage_date_utc is None):
+        return {"status": "blocked", "phase": "qa_convert", "failed_items": ["coverage_config_and_date_required_together"]}
+    try:
+        coverage = (
+            CompleteDayCoverage(coverage_config, coverage_date_utc)
+            if coverage_config is not None and coverage_date_utc is not None
+            else None
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        return {"status": "blocked", "phase": "qa_convert", "failed_items": [f"invalid_coverage_config:{exc}"]}
+    items_resolved, inferred_meta, resolve_errors = _resolve_manifest_inputs(
+        manifest_arg, allow_unverified_local, coverage.date if coverage is not None else None
+    )
     if resolve_errors:
         return {
             "status": "blocked",
@@ -933,6 +960,10 @@ def run_qa_convert(
     try:
         for dpath, mpath, ledger_entry in items_resolved:
             try:
+                if coverage is not None and mpath.is_file():
+                    input_manifest = json.loads(mpath.read_text(encoding="utf-8"))
+                    if input_manifest["date_utc"] != coverage.date:
+                        continue
                 effective_dpath = dpath
                 effective_mpath = mpath
 
@@ -963,7 +994,10 @@ def run_qa_convert(
 
                 checked = verify_local_partition(effective_dpath, effective_mpath)
                 mf = checked["manifest"]
-                by_exchange[mf["exchange"]].append((mf, effective_dpath, effective_mpath))
+                if coverage is None or mf["date_utc"] == coverage.date:
+                    by_exchange[mf["exchange"]].append((mf, effective_dpath, effective_mpath))
+                    if coverage is not None:
+                        coverage.observe_partition(mf)
             except Exception as exc:
                 failed_items.append(f"integrity_failed:{dpath.name}:{type(exc).__name__}:{exc}")
 
@@ -1008,6 +1042,8 @@ def run_qa_convert(
                     prev_mono_ns = None
 
                 for rec in records:
+                    if coverage is not None:
+                        coverage.observe_record(exchange, rec)
                     total_records += 1
                     rx_seq = rec["rx_seq"]
                     mono_ns = rec["recv_mono_ns"]
@@ -1045,7 +1081,7 @@ def run_qa_convert(
                             day_local_loss[(exchange, date_utc)].append(
                                 {
                                     "wall_ns": wall_ns,
-                                    "dropped": int(meta_obj.get("dropped", 1)),
+                                    "dropped": int(meta_obj.get("dropped_frames", meta_obj.get("dropped", 1))),
                                     "reason": meta_obj.get("reason", ""),
                                 }
                             )
@@ -1069,15 +1105,21 @@ def run_qa_convert(
         if temp_restore_ctx is not None:
             temp_restore_ctx.cleanup()
 
-    if strict_zero_loss and any(day_local_loss.values()):
+    coverage_report = coverage.report(effective_meta) if coverage is not None else {"status": "not_assessed"}
+    if coverage is not None and coverage_report["status"] != "complete":
+        failed_items.append("incomplete_utc_day_coverage")
+    if (strict_zero_loss or coverage is not None) and any(day_local_loss.values()):
         failed_items.append("local_loss_detected_under_strict_zero_loss_gate")
+    if coverage is not None and (any(day_gaps.values()) or chrony_uncertified.get(coverage.date)):
+        failed_items.append("complete_day_gap_or_uncertified_clock")
 
     if failed_items:
         return {
             "status": "blocked",
             "phase": "qa_convert",
             "failed_items": failed_items,
-            "minimal_fixes": ["Fix monotonic sequence/clock errors or local loss before converting"],
+            "coverage": coverage_report,
+            "minimal_fixes": ["Review missing hours, uncertified clock, sequence errors, and local loss before converting"],
         }
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1307,6 +1349,7 @@ def run_qa_convert(
         "exchanges": exchange_stats,
         "calendar_path": str(cal_json),
         "calendar_csv_path": str(cal_csv),
+        "coverage": coverage_report,
         "eligible_asset_days": sum(1 for r in calendar_rows if r["eligibility_status"] == "eligible"),
         "execution_unverified_asset_days": sum(
             1 for r in calendar_rows if r["eligibility_status"] == "execution_unverified"
@@ -1501,6 +1544,8 @@ def main() -> int:
     p.add_argument("--manifest", type=Path, required=True, help="Archive ledger (.sqlite/.jsonl), .manifest.json, or sealed root dir")
     p.add_argument("--out", type=Path, required=True, help="Output directory for HBT .npz files and eligibility calendar")
     p.add_argument("--meta-dir", type=Path, default=None, help="Optional meta/ directory with chrony/ and specs/")
+    p.add_argument("--coverage-config", type=Path, help="Collector configuration for complete-day coverage")
+    p.add_argument("--date-utc", help="UTC day (YYYY-MM-DD) to certify with --coverage-config")
     p.add_argument("--allow-unverified-local", action="store_true", help="Allow reading unverified local sealed partitions (offline tests only)")
     p.add_argument("--strict-zero-loss", action="store_true", help="Fail closed with status=blocked if any LOCAL_LOSS occurred")
     p.add_argument("--remote", default=None, help="Optional rclone remote root to restore PRUNED partitions (e.g. gdrive_main:tokyo_l2_data)")
@@ -1516,6 +1561,8 @@ def main() -> int:
         strict_zero_loss=args.strict_zero_loss,
         remote_backend=remote_backend,
         restore_cache_dir=args.restore_cache_dir,
+        coverage_config=json.loads(args.coverage_config.read_text(encoding="utf-8")) if args.coverage_config else None,
+        coverage_date_utc=args.date_utc,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2

@@ -852,8 +852,8 @@ def test_four_exchange_protocol_edge_cases_and_channel_separation(tmp_path: Path
                     "action": "update",
                     "arg": {"instType": "usdt-futures", "topic": "publicTrade", "symbol": "BTCUSDT"},
                     "data": [
-                        {"T": str(base_ms + 12), "P": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": True},
-                        {"T": str(base_ms + 12), "P": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": True},
+                        {"T": str(base_ms + 12), "p": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": "yes"},
+                        {"T": str(base_ms + 12), "p": "95000.1", "v": "0.4", "S": "buy", "i": "bg-1", "isRPI": "yes"},
                     ],
                     "ts": base_ms + 12,
                 }
