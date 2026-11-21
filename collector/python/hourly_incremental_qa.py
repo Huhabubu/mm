@@ -17,7 +17,13 @@ import tempfile
 
 import zstandard as zstd
 
-from data_coverage import _data_streams, expected_streams
+from data_coverage import (
+    CHANNEL_CATEGORY_EVENT_TRADE,
+    _data_streams,
+    channel_silence_thresholds,
+    classify_channel,
+    expected_streams,
+)
 
 QA_VERSION = 1
 MAX_PARTITION_BYTES = 8 * 1024**3
@@ -67,9 +73,8 @@ def check_partition(data_path: Path, manifest: dict, config: dict) -> dict:
     start_ns = int(datetime.fromisoformat(date).replace(tzinfo=timezone.utc).timestamp() * 1e9)
     start_ns += hour * 3600 * 1_000_000_000
     end_ns = start_ns + 3600 * 1_000_000_000
-    stale_ns = int(config.get("meta_daemon", {}).get("collector_stale_seconds", 300)) * 1_000_000_000
-    if stale_ns <= 0:
-        raise ValueError("stale threshold must be positive")
+    thresholds = channel_silence_thresholds(config)
+    stale_ns = int(thresholds["other"] * 1_000_000_000)
 
     counts = defaultdict(int)
     streams = {}
@@ -142,15 +147,23 @@ def check_partition(data_path: Path, manifest: dict, config: dict) -> dict:
     stream_rows = []
     for key in sorted(streams):
         item = streams[key]
+        category = classify_channel(key[0], key[2])
+        cat_limit_s = (
+            thresholds["event_trade_quiet_max"]
+            if category == CHANNEL_CATEGORY_EVENT_TRADE
+            else thresholds.get(category, stale_ns / 1e9)
+        )
+        cat_limit_ns = int(cat_limit_s * 1_000_000_000)
         gap_ns = max(item["first_ns"] - start_ns, end_ns - item["last_ns"], item["max_internal_gap_ns"])
         stream_rows.append({
             "exchange": key[0], "symbol": key[1], "channel": key[2],
+            "category": category,
             "count": item["count"], "first_wall_ns": item["first_ns"],
             "last_wall_ns": item["last_ns"],
             "max_gap_seconds": round(gap_ns / 1e9, 6),
         })
-        if gap_ns > stale_ns:
-            problems.append(f"stream gap > {stale_ns / 1e9:g}s: {'/'.join(key)} ({gap_ns / 1e9:.1f}s)")
+        if gap_ns > cat_limit_ns:
+            problems.append(f"stream gap > {cat_limit_s:g}s ({category}): {'/'.join(key)} ({gap_ns / 1e9:.1f}s)")
 
     return {
         "status": "ok" if not problems else "blocked",

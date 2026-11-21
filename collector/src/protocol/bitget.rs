@@ -28,6 +28,7 @@ pub struct BitgetValidator {
     books1_states: HashMap<String, BitgetBookState>,
     seen_trade_ids: HashMap<String, VecDeque<String>>,
     seen_trade_set: HashMap<String, HashSet<String>>,
+    pending_sub_acks: Vec<(String, String)>,
     overall_invalid: bool,
 }
 
@@ -46,6 +47,7 @@ impl BitgetValidator {
             books1_states,
             seen_trade_ids: HashMap::new(),
             seen_trade_set: HashMap::new(),
+            pending_sub_acks: Vec::new(),
             overall_invalid: false,
         }
     }
@@ -291,6 +293,22 @@ impl ProtocolValidator for BitgetValidator {
 
         if let Some(ev) = v.get("event").and_then(Value::as_str) {
             if ev == "subscribe" {
+                if let Some(arg) = v.get("arg") {
+                    let topic = arg
+                        .get("topic")
+                        .or_else(|| arg.get("channel"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let sym = arg
+                        .get("symbol")
+                        .or_else(|| arg.get("instId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_uppercase();
+                    if !topic.is_empty() && !sym.is_empty() {
+                        self.pending_sub_acks.push((sym, topic.to_string()));
+                    }
+                }
                 return FrameVerdict::Control {
                     note: "bitget subscribe ack".to_string(),
                 };
@@ -384,8 +402,17 @@ impl ProtocolValidator for BitgetValidator {
         }
     }
 
+    fn take_subscription_acks(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_sub_acks)
+    }
+
+    fn expected_symbols(&self) -> Vec<String> {
+        self.expected_symbols.clone()
+    }
+
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.pending_sub_acks.clear();
         for st in self.books50_states.values_mut() {
             *st = BitgetBookState::new();
         }

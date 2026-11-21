@@ -25,6 +25,8 @@ pub struct GateValidator {
     obu_states: HashMap<String, GateObuState>,
     seen_trade_ids: HashMap<String, VecDeque<u64>>,
     seen_trade_set: HashMap<String, HashSet<u64>>,
+    pending_sub_acks: Vec<(String, String)>,
+    extra_accepted_streams: Vec<(String, String)>,
     overall_invalid: bool,
 }
 
@@ -40,6 +42,8 @@ impl GateValidator {
             obu_states,
             seen_trade_ids: HashMap::new(),
             seen_trade_set: HashMap::new(),
+            pending_sub_acks: Vec::new(),
+            extra_accepted_streams: Vec::new(),
             overall_invalid: false,
         }
     }
@@ -314,6 +318,32 @@ impl ProtocolValidator for GateValidator {
             };
         }
         if event == "subscribe" || event == "unsubscribe" {
+            if event == "subscribe"
+                && v.pointer("/result/status").and_then(Value::as_str) == Some("success")
+                && matches!(channel, "futures.obu" | "futures.book_ticker" | "futures.trades")
+            {
+                let mut matched_any = false;
+                if let Some(arr) = v.get("payload").and_then(Value::as_array) {
+                    for item in arr {
+                        if let Some(tok) = item.as_str() {
+                            let sym = if channel == "futures.obu" {
+                                Self::parse_obu_symbol(tok)
+                            } else {
+                                Some(tok.to_uppercase())
+                            };
+                            if let Some(s) = sym {
+                                self.pending_sub_acks.push((s, channel.to_string()));
+                                matched_any = true;
+                            }
+                        }
+                    }
+                }
+                if !matched_any {
+                    for sym in &self.expected_symbols {
+                        self.pending_sub_acks.push((sym.clone(), channel.to_string()));
+                    }
+                }
+            }
             return FrameVerdict::Control {
                 note: format!("gate {} ack for {}", event, channel),
             };
@@ -385,6 +415,7 @@ impl ProtocolValidator for GateValidator {
                     }
                 };
                 let mut first_sym = String::new();
+                let mut seen_syms = HashSet::new();
                 let mut dups = 0usize;
                 for item in arr {
                     let sym = match item.get("contract").and_then(Value::as_str) {
@@ -400,6 +431,10 @@ impl ProtocolValidator for GateValidator {
                     };
                     if first_sym.is_empty() {
                         first_sym = sym.clone();
+                        seen_syms.insert(sym.clone());
+                    } else if seen_syms.insert(sym.clone()) {
+                        self.extra_accepted_streams
+                            .push((sym.clone(), "futures.trades".to_string()));
                     }
                     let sz = match item.get("size") {
                         Some(s) => s,
@@ -456,6 +491,18 @@ impl ProtocolValidator for GateValidator {
         }
     }
 
+    fn take_subscription_acks(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_sub_acks)
+    }
+
+    fn take_extra_accepted_streams(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.extra_accepted_streams)
+    }
+
+    fn expected_symbols(&self) -> Vec<String> {
+        self.expected_symbols.clone()
+    }
+
     fn prepare_depth_refresh(&mut self) {
         self.reset();
         for state in self.obu_states.values_mut() {
@@ -465,6 +512,8 @@ impl ProtocolValidator for GateValidator {
 
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.pending_sub_acks.clear();
+        self.extra_accepted_streams.clear();
         for st in self.obu_states.values_mut() {
             *st = GateObuState::new();
         }

@@ -2210,10 +2210,13 @@ def sync_sealed_directory(
             export_verified_jsonl_projection(sealed_root, ledger)
 
             all_verified_rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
+            expected_hour_reconciliation: dict[str, Any] | None = None
             if expected_hourly_exchanges is not None:
                 previous_hour = datetime.fromtimestamp(now_s, timezone.utc) - timedelta(hours=1)
                 expected_date = previous_hour.strftime("%Y-%m-%d")
                 expected_hour = previous_hour.strftime("%H")
+                if not verify_remote:
+                    errors.append("verify_remote_required_when_config_enforced")
                 verified = {
                     row["exchange"]
                     for row in all_verified_rows
@@ -2222,16 +2225,35 @@ def sync_sealed_directory(
                     and row["rel_manifest_path"] in manifests_with_data
                     and not row["has_conflict"] and not row["last_error_code"]
                 }
+                missing_exchanges = sorted(expected_hourly_exchanges - verified)
                 errors.extend(
                     f"expected_hour_not_verified:{exchange}:{expected_date}T{expected_hour}Z"
-                    for exchange in sorted(expected_hourly_exchanges - verified)
+                    for exchange in missing_exchanges
                 )
+                unsealed_partials: list[str] = []
+                sealed_without_manifest: list[str] = []
                 for exchange in sorted(expected_hourly_exchanges):
-                    for path in (raw_root / exchange / expected_date).glob(
-                        f"{exchange}_{previous_hour:%Y%m%d}_{expected_hour}*.tsv.zst"
-                    ):
+                    day_dir = raw_root / exchange / expected_date
+                    if not day_dir.is_dir():
+                        continue
+                    for path in sorted(day_dir.glob(f"{exchange}_{previous_hour:%Y%m%d}_{expected_hour}*.tsv.zst")):
                         if not path.with_name(path.name.removesuffix(".tsv.zst") + ".manifest.json").is_file():
-                            errors.append(f"sealed_file_without_manifest:{path.relative_to(sealed_root).as_posix()}")
+                            rel_p = path.relative_to(sealed_root).as_posix()
+                            sealed_without_manifest.append(rel_p)
+                            errors.append(f"sealed_file_without_manifest:{rel_p}")
+                    for partial in sorted(day_dir.glob(f"{exchange}_{previous_hour:%Y%m%d}_{expected_hour}*.tsv.zst.partial")):
+                        rel_part = partial.relative_to(sealed_root).as_posix()
+                        unsealed_partials.append(rel_part)
+                        errors.append(f"unsealed_partial_in_expected_hour:{rel_part}")
+                expected_hour_reconciliation = {
+                    "expected_hour_utc": f"{expected_date}T{expected_hour}Z",
+                    "expected_exchanges": sorted(expected_hourly_exchanges),
+                    "verified_exchanges": sorted(verified),
+                    "missing_exchanges": missing_exchanges,
+                    "unsealed_partials": unsealed_partials,
+                    "sealed_without_manifest": sealed_without_manifest,
+                    "verify_remote_enforced": bool(verify_remote),
+                }
 
             # Compare committed recovery state to the last successfully copied snapshot, even
             # after a crash or a retry with zero new uploads. Exclude the snapshot's own metadata.
@@ -2310,6 +2332,7 @@ def sync_sealed_directory(
                     "recovered_pruned_files": recovered_pruned,
                     "state_counts": state_counts,
                     "migration": migration_summary,
+                    "expected_hour_reconciliation": expected_hour_reconciliation,
                     "conflicts": conflicts,
                     "failed_items": errors + [f"remote_hash_conflict:{c['remote_path']}" for c in conflicts],
                     "minimal_fixes": [
@@ -2336,6 +2359,7 @@ def sync_sealed_directory(
                 "recovered_pruned_files": recovered_pruned,
                 "state_counts": state_counts,
                 "migration": migration_summary,
+                "expected_hour_reconciliation": expected_hour_reconciliation,
                 "meta_uploaded_count": len(meta_uploaded),
                 "meta_skipped_count": meta_skipped,
                 "pruned_local_files": pruned,
@@ -2351,9 +2375,110 @@ def sync_sealed_directory(
         lock.release()
 
 
+def audit_effective_archive_service(
+    systemd_cat_output: str,
+    *,
+    expected_config_path: str = "/etc/tokyo-l2/config.json",
+    forbid_auto_prune: bool = True,
+) -> dict[str, Any]:
+    """Audit `systemctl cat tokyo-l2-archive.service` output for effective ExecStart & drop-in overrides.
+
+    Follows systemd ExecStart override semantics (an empty `ExecStart=` in a drop-in clears
+    earlier `ExecStart=` entries from the base unit file).
+    """
+    import shlex
+
+    current_source = "<base>"
+    in_service_section = False
+    base_exec_starts: list[str] = []
+    effective_exec_starts: list[str] = []
+    drop_in_files: list[str] = []
+    drop_in_replaced_exec_start = False
+
+    for raw_line in systemd_cat_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("# /"):
+            current_source = line[2:].strip()
+            in_service_section = False
+            if ".service.d/" in current_source and current_source not in drop_in_files:
+                drop_in_files.append(current_source)
+            continue
+        if line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_service_section = line == "[Service]"
+            continue
+        if not in_service_section:
+            continue
+        if line.startswith("ExecStart="):
+            val = line.split("=", 1)[1].strip()
+            is_drop_in = ".service.d/" in current_source
+            if val == "":
+                effective_exec_starts.clear()
+                if is_drop_in:
+                    drop_in_replaced_exec_start = True
+            else:
+                if not is_drop_in:
+                    base_exec_starts.append(val)
+                else:
+                    drop_in_replaced_exec_start = True
+                effective_exec_starts.append(val)
+
+    issues: list[str] = []
+    has_expected_config = False
+    has_verify_remote = False
+    has_prune_hours = False
+    parsed_tokens: list[list[str]] = []
+
+    if not effective_exec_starts:
+        issues.append("missing_effective_exec_start")
+    for cmd in effective_exec_starts:
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            tokens = cmd.split()
+        parsed_tokens.append(tokens)
+        if "--verify-remote" in tokens:
+            has_verify_remote = True
+        for idx, tok in enumerate(tokens):
+            if tok == "--config" and idx + 1 < len(tokens) and tokens[idx + 1] == expected_config_path:
+                has_expected_config = True
+            elif tok == f"--config={expected_config_path}":
+                has_expected_config = True
+            if tok == "--prune-hours" or tok.startswith("--prune-hours="):
+                has_prune_hours = True
+
+    if effective_exec_starts and not has_expected_config:
+        issues.append(f"missing_expected_config:{expected_config_path}")
+    if effective_exec_starts and not has_verify_remote:
+        issues.append("missing_verify_remote_flag")
+    if forbid_auto_prune and has_prune_hours:
+        issues.append("auto_prune_must_remain_off")
+
+    return {
+        "ok": len(issues) == 0,
+        "base_exec_start": base_exec_starts,
+        "effective_exec_start": effective_exec_starts,
+        "drop_in_files": drop_in_files,
+        "drop_in_replaced_exec_start": drop_in_replaced_exec_start,
+        "has_expected_config": has_expected_config,
+        "has_verify_remote": has_verify_remote,
+        "auto_prune_disabled": not has_prune_hours,
+        "issues": issues,
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Incremental SQLite archive ledger and Google Drive verifier")
     p.add_argument("--dir", type=Path, required=True, help="Root directory containing raw/ and meta/")
+    p.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Require verified partitions for all configured exchanges in the previous UTC hour",
+    )
     p.add_argument("--remote", default="gdrive_main:tokyo_l2_data", help="rclone remote root")
     p.add_argument("--verify-remote", action="store_true", help="Verify remote ID, size, and hash after upload")
     p.add_argument("--prune-hours", type=float, default=None, help="Optional safe local retention hours after remote verify")
@@ -2371,12 +2496,18 @@ def main() -> int:
         backend = RcloneBackend(args.remote, proxy_url=args.proxy_url, proxy_mode=args.proxy_mode)
     else:
         backend = RcloneBackend(args.remote)
+    expected = None
+    if args.config is not None:
+        from data_coverage import enabled_exchanges
+
+        expected = set(enabled_exchanges(json.loads(args.config.read_text(encoding="utf-8"))))
     result = sync_sealed_directory(
         args.dir,
         backend=backend,
         verify_remote=args.verify_remote,
         prune_older_than_hours=args.prune_hours,
         upload_ledger_snapshot=not args.no_snapshot,
+        expected_hourly_exchanges=expected,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["status"] == "ok" else 2
