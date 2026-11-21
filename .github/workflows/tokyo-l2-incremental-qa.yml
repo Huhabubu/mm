@@ -11,6 +11,15 @@ on:
     - cron: "3,18,33,48 * * * *"
   workflow_dispatch:
     inputs:
+      replay_window:
+        description: 'Run isolated real-data QA for this complete UTC window'
+        required: false
+        type: string
+      replay_seconds:
+        description: 'Seconds of real BTC replay per follower (0 for protocol-only)'
+        required: false
+        type: string
+        default: '60'
       config_path:
         description: "Effective collector config path in source repo (defaults to vars.TOKYO_L2_QA_CONFIG_PATH)"
         required: false
@@ -50,6 +59,7 @@ concurrency:
 
 jobs:
   hourly-qa:
+    if: ${{ inputs.replay_window == '' || inputs.replay_window == null }}
     name: Incremental partitioned QA (file / window / UTC day)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -306,3 +316,88 @@ jobs:
             --data-urlencode "since_window=${QA_BOUND_SINCE_WINDOW:-unbound}" \
             --data-urlencode "checker_commit=${TOKYO_L2_QA_CHECKER_COMMIT:-unknown}" \
             "$url"
+
+  real-data-qa:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.replay_window != '' }}
+    name: Real Tokyo window protocol QA and BTC short replay
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out replay audit
+        uses: actions/checkout@v4
+        with:
+          path: workflow_code
+          sparse-checkout: |
+            scripts/tokyo_l2_protocol_qa.py
+            scripts/tokyo_l2_replay_qa.py
+            scripts/test_tokyo_l2_protocol_qa.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check out collector converter
+        uses: actions/checkout@v4
+        with:
+          ref: feat/tokyo-l2-reliability-fixes
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install replay dependencies and test wire validators
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install hftbacktest==2.4.4 numpy numba zstandard==0.23.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          python workflow_code/scripts/test_tokyo_l2_protocol_qa.py
+
+      - name: Configure read-only Google Drive access
+        env:
+          QA_SERVICE_ACCOUNT: ${{ secrets.TOKYO_L2_QA_GDRIVE_SA_JSON }}
+          QA_FOLDER_ID: ${{ secrets.TOKYO_L2_QA_GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          if [[ -z "$QA_SERVICE_ACCOUNT" ]]; then missing+=("TOKYO_L2_QA_GDRIVE_SA_JSON"); fi
+          if [[ -z "$QA_FOLDER_ID" ]]; then missing+=("TOKYO_L2_QA_GDRIVE_FOLDER_ID"); fi
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required GitHub Actions secret(s): ${missing[*]}. Configure read-only Google Drive Viewer credentials under Settings -> Secrets and variables -> Actions."
+            exit 2
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/tokyo-qa-auth"
+          printf '%s' "$QA_SERVICE_ACCOUNT" > "$RUNNER_TEMP/tokyo-qa-auth/service-account.json"
+          printf '[qa]\ntype = drive\nscope = drive.readonly\nservice_account_file = %s\nroot_folder_id = %s\n' \
+            "$RUNNER_TEMP/tokyo-qa-auth/service-account.json" "$QA_FOLDER_ID" \
+            > "$RUNNER_TEMP/tokyo-qa-auth/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" >> "$GITHUB_ENV"
+          RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsf qa:meta --max-depth 1 > /dev/null
+
+      - name: Verify archived frames and replay a real BTC sample
+        env:
+          QA_CONFIG_PATH: ${{ inputs.config_path || vars.TOKYO_L2_QA_CONFIG_PATH }}
+          QA_RUN_ID: ${{ inputs.run_id || vars.TOKYO_L2_QA_RUN_ID }}
+          QA_REPLAY_WINDOW: ${{ inputs.replay_window }}
+          QA_REPLAY_SECONDS: ${{ inputs.replay_seconds || '60' }}
+          PYTHONPATH: source/collector/python
+        shell: bash
+        run: |
+          set -euo pipefail
+          python workflow_code/scripts/tokyo_l2_replay_qa.py \
+            --remote qa: --config "source/$QA_CONFIG_PATH" --run-id "$QA_RUN_ID" \
+            --window "$QA_REPLAY_WINDOW" --replay-seconds "$QA_REPLAY_SECONDS" \
+            --summary "$RUNNER_TEMP/tokyo-replay-summary.json"
+
+      - name: Upload summary only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokyo-l2-real-replay-summary
+          path: ${{ runner.temp }}/tokyo-replay-summary.json
+          if-no-files-found: warn
