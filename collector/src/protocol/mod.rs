@@ -43,6 +43,8 @@ pub trait ProtocolValidator: Send {
     fn on_rest_snapshot(&mut self, _symbol: &str, _last_update_id: u64) -> Result<usize, String> {
         Ok(0)
     }
+    /// Invalidate depth anchors before a controlled refresh on the same connection.
+    fn prepare_depth_refresh(&mut self) {}
     /// Reset validator state on reconnect / fresh epoch.
     fn reset(&mut self);
     /// Return symbols currently in LIVE state.

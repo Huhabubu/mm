@@ -2179,7 +2179,9 @@ def sync_sealed_directory(
                 for fpath in sorted(meta_root.rglob("*")):
                     if not fpath.is_file():
                         continue
-                    if any(fpath.name.endswith(suf) for suf in _META_SYNC_EXCLUDED_SUFFIXES):
+                    if fpath.name == "stream_activity.json" or any(
+                        fpath.name.endswith(suf) for suf in _META_SYNC_EXCLUDED_SUFFIXES
+                    ):
                         continue
                     rel = fpath.relative_to(sealed_root).as_posix()
                     try:

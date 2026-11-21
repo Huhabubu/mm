@@ -1356,7 +1356,7 @@ def test_hourly_archive_detects_missing_exchange_and_orphan(tmp_path: Path) -> N
         expected_hourly_exchanges={"gate_futures", "bybit_linear"},
     )
     assert result["status"] == "blocked"
-    assert result["newly_verified_count"] == 1
+    assert result["verified_count"] == 1
     assert "expected_hour_not_verified:bybit_linear:2026-12-03T23Z" in result["failed_items"]
     assert f"sealed_file_without_manifest:{orphan.relative_to(tmp_path).as_posix()}" in result["failed_items"]
 
@@ -1379,7 +1379,7 @@ def test_failed_new_snapshot_retries_without_new_partitions(
     monkeypatch.setattr(backend, "copy_file", fail_snapshot)
     failed = sync_sealed_directory(tmp_path, backend)
     assert failed["status"] == "blocked"
-    assert failed["newly_verified_count"] == 1
+    assert failed["verified_count"] == 1
 
     monkeypatch.setattr(backend, "copy_file", original_copy)
     recovered = sync_sealed_directory(tmp_path, backend)

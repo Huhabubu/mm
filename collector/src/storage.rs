@@ -5,8 +5,11 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HourPartitionKey {
     pub date: String,     // YYYY-MM-DD
     pub yyyymmdd: String, // YYYYMMDD
@@ -143,6 +146,11 @@ struct OpenHour {
     switch_lines: u64,
 }
 
+struct BackgroundSeal {
+    records: u64,
+    task: JoinHandle<Result<SealedPartition, String>>,
+}
+
 /// Seamless UTC-hourly TSV-Raw Zstd writer with atomic .partial -> verify -> rename + manifest.
 pub struct HourlyTsvZstWriter {
     data_root: PathBuf,
@@ -152,6 +160,9 @@ pub struct HourlyTsvZstWriter {
     next_rx_seq: u64,
     current: Option<OpenHour>,
     sealed: Vec<SealedPartition>,
+    seal_limit: Option<Arc<Semaphore>>,
+    background_seals: Vec<BackgroundSeal>,
+    pending_write_loss: u64,
 }
 
 impl HourlyTsvZstWriter {
@@ -164,6 +175,9 @@ impl HourlyTsvZstWriter {
             next_rx_seq: 0,
             current: None,
             sealed: Vec::new(),
+            seal_limit: None,
+            background_seals: Vec::new(),
+            pending_write_loss: 0,
         }
     }
 
@@ -175,6 +189,43 @@ impl HourlyTsvZstWriter {
         self.current.is_some()
     }
 
+    pub fn enable_background_sealing(&mut self, limit: Arc<Semaphore>) {
+        self.seal_limit = Some(limit);
+    }
+
+    pub fn poll_background_seals(&mut self) -> Vec<Result<SealedPartition, String>> {
+        use futures_util::FutureExt;
+
+        let mut pending = Vec::new();
+        let mut completed = Vec::new();
+        for mut seal in self.background_seals.drain(..) {
+            match (&mut seal.task).now_or_never() {
+                Some(result) => {
+                    let result = result.map_err(|e| format!("seal task failed: {e}")).and_then(|r| r);
+                    if result.is_err() {
+                        self.pending_write_loss = self.pending_write_loss.saturating_add(seal.records);
+                    }
+                    completed.push(result);
+                }
+                None => pending.push(seal),
+            }
+        }
+        self.background_seals = pending;
+        completed
+    }
+
+    pub fn take_background_seals(&mut self) -> Vec<JoinHandle<Result<SealedPartition, String>>> {
+        self.background_seals.drain(..).map(|seal| seal.task).collect()
+    }
+
+    pub fn note_write_loss(&mut self) {
+        self.pending_write_loss = self.pending_write_loss.saturating_add(1);
+    }
+
+    pub fn pending_write_loss(&self) -> u64 {
+        self.pending_write_loss
+    }
+
     pub fn write_record(&mut self, rec: &CanonicalRecord) -> Result<Option<SealedPartition>, String> {
         let key = HourPartitionKey::from_wall_ns(rec.recv_wall_ns);
         let mut just_sealed = None;
@@ -184,12 +235,49 @@ impl HourlyTsvZstWriter {
             None => false,
         };
         if need_rotate {
-            just_sealed = self.seal_current()?;
+            if self.seal_limit.is_some() && self.current.as_ref().is_some_and(|open| key < open.key) {
+                return Err("late frame for an earlier UTC hour".into());
+            }
+            if let Some(limit) = self.seal_limit.clone() {
+                if self.background_seals.len() >= 4 {
+                    return Err("hourly seal backlog exceeded four partitions".into());
+                }
+                let open = self.current.take().expect("rotation requires an open partition");
+                let records = open.data_lines + open.data_escaped_lines + open.meta_lines;
+                let exchange = self.exchange;
+                let boot_id = self.boot_id.clone();
+                let task = tokio::spawn(async move {
+                    let _permit = limit.acquire_owned().await.map_err(|e| e.to_string())?;
+                    tokio::task::spawn_blocking(move || Self::seal_partition(open, exchange, &boot_id))
+                        .await.map_err(|e| format!("blocking seal failed: {e}"))?
+                });
+                self.background_seals.push(BackgroundSeal { records, task });
+            } else {
+                just_sealed = self.seal_current()?;
+            }
         }
         if self.current.is_none() {
             self.open_hour(key)?;
         }
 
+        if self.pending_write_loss > 0 {
+            let marker = CanonicalRecord {
+                kind: RecordKind::Meta,
+                payload: serde_json::json!({
+                    "event": "LOCAL_LOSS",
+                    "dropped_frames": self.pending_write_loss,
+                    "reason": "disk_write_or_seal_failed"
+                }).to_string(),
+                ..rec.clone()
+            };
+            self.append_record(&marker)?;
+            self.pending_write_loss = 0;
+        }
+        self.append_record(rec)?;
+        Ok(just_sealed)
+    }
+
+    fn append_record(&mut self, rec: &CanonicalRecord) -> Result<(), String> {
         self.next_rx_seq += 1;
         let mut disk_rec = rec.clone();
         disk_rec.rx_seq = self.next_rx_seq;
@@ -226,7 +314,7 @@ impl HourlyTsvZstWriter {
             }
         }
 
-        Ok(just_sealed)
+        Ok(())
     }
 
     /// Flush, fsync, verify zstd integrity, hash SHA-256, atomically rename, and emit manifest.
@@ -236,6 +324,12 @@ impl HourlyTsvZstWriter {
             return Ok(None);
         };
 
+        let sealed = Self::seal_partition(open, self.exchange, &self.boot_id)?;
+        self.sealed.push(sealed.clone());
+        Ok(Some(sealed))
+    }
+
+    fn seal_partition(open: OpenHour, exchange: ExchangeId, boot_id: &str) -> Result<SealedPartition, String> {
         let mut buf_writer = open
             .encoder
             .finish()
@@ -278,10 +372,10 @@ impl HourlyTsvZstWriter {
             .to_string();
         let manifest = PartitionManifest {
             schema_version: 1,
-            exchange: self.exchange.as_dir_name().to_string(),
+            exchange: exchange.as_dir_name().to_string(),
             date_utc: open.key.date.clone(),
             hour_utc: open.key.hour.clone(),
-            boot_id: self.boot_id.clone(),
+            boot_id: boot_id.to_string(),
             file_name,
             bytes,
             sha256,
@@ -314,13 +408,11 @@ impl HourlyTsvZstWriter {
         fs::rename(&manifest_tmp, &open.manifest_path)
             .map_err(|e| format!("atomic rename manifest failed: {}", e))?;
 
-        let sealed = SealedPartition {
+        Ok(SealedPartition {
             data_path: open.final_path,
             manifest_path: open.manifest_path,
             manifest,
-        };
-        self.sealed.push(sealed.clone());
-        Ok(Some(sealed))
+        })
     }
 
     fn open_hour(&mut self, key: HourPartitionKey) -> Result<(), String> {
@@ -437,4 +529,35 @@ pub fn read_tsv_zst_records(path: &Path) -> Result<Vec<(CanonicalRecord, String)
         records.push(decode_tsv_line(&line).map_err(|e| format!("line {}: {}", idx + 1, e))?);
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rollover_accepts_new_hour_while_previous_seal_is_waiting() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = HourlyTsvZstWriter::new(root.path().into(), ExchangeId::GateFutures, "test".into(), 3);
+        let limit = Arc::new(Semaphore::new(0));
+        writer.enable_background_sealing(Arc::clone(&limit));
+        let mut record = CanonicalRecord {
+            recv_wall_ns: 0, recv_mono_ns: 0, conn_id: ConnId::A, epoch: 1, rx_seq: 0,
+            kind: RecordKind::Data, payload: "{}".into(),
+        };
+        writer.write_record(&record).unwrap();
+        record.recv_wall_ns = 3_600_000_000_000;
+        assert!(writer.write_record(&record).unwrap().is_none());
+        assert_eq!(writer.background_seals.len(), 1);
+        assert!(writer.poll_background_seals().is_empty());
+        writer.note_write_loss();
+        writer.write_record(&record).unwrap();
+        limit.add_permits(1);
+        let task = writer.take_background_seals().pop().unwrap();
+        let previous = task.await.unwrap().unwrap();
+        assert_eq!(previous.manifest.data_lines, 1);
+        let current = writer.seal_current().unwrap().unwrap();
+        assert_eq!(current.manifest.data_lines, 2);
+        assert_eq!(current.manifest.local_loss_lines, 1);
+    }
 }

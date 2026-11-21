@@ -22,6 +22,7 @@ pub enum SelectorAction {
 pub struct SelectorOutput {
     pub records: Vec<CanonicalRecord>,
     pub actions: Vec<SelectorAction>,
+    pub market_data: Option<(String, String)>,
 }
 
 struct ConnRuntime {
@@ -196,6 +197,7 @@ impl CausalSelector {
         let mut out = SelectorOutput {
             records: Vec::new(),
             actions: Vec::new(),
+            market_data: None,
         };
 
         let conn_id = frame.conn_id;
@@ -221,13 +223,13 @@ impl CausalSelector {
             }
             FrameVerdict::AcceptData {
                 symbol,
-                channel: _,
+                channel,
                 is_anchor_reset: _,
                 diagnostic: _,
             } => {
                 self.runtime_mut(conn_id)
                     .last_symbol_mono_ns
-                    .insert(symbol, mono_ns);
+                    .insert(symbol.clone(), mono_ns);
 
                 let conn_is_live = self.runtime(conn_id).state() == ConnState::Live;
 
@@ -250,6 +252,7 @@ impl CausalSelector {
                         }),
                     ));
                     out.records.push(self.emit_data(&frame));
+                    out.market_data = Some((symbol, channel));
                     return out;
                 }
 
@@ -276,12 +279,14 @@ impl CausalSelector {
                         }),
                     ));
                     out.records.push(self.emit_data(&frame));
+                    out.market_data = Some((symbol, channel));
                     return out;
                 }
 
                 // Normal single-stream emission: ONLY write active primary to disk.
                 if conn_id == self.primary && !self.in_gap {
                     out.records.push(self.emit_data(&frame));
+                    out.market_data = Some((symbol, channel));
                 }
             }
             FrameVerdict::Violation {
@@ -336,6 +341,7 @@ impl CausalSelector {
         let mut out = SelectorOutput {
             records: Vec::new(),
             actions: Vec::new(),
+            market_data: None,
         };
 
         let res = self
@@ -421,6 +427,7 @@ impl CausalSelector {
         let mut out = SelectorOutput {
             records: Vec::new(),
             actions: Vec::new(),
+            market_data: None,
         };
         {
             let rt = self.runtime_mut(conn_id);
@@ -449,6 +456,10 @@ impl CausalSelector {
         out
     }
 
+    pub fn prepare_depth_refresh(&mut self, conn_id: ConnId) {
+        self.runtime_mut(conn_id).validator.prepare_depth_refresh();
+    }
+
     /// Notify selector that a connection reconnected cleanly with a new epoch.
     pub fn on_reconnect(&mut self, conn_id: ConnId, new_epoch: u64, mono_ns: u64) {
         let rt = self.runtime_mut(conn_id);
@@ -471,6 +482,7 @@ impl CausalSelector {
         let mut out = SelectorOutput {
             records: Vec::new(),
             actions: Vec::new(),
+            market_data: None,
         };
 
         if target == self.primary {
@@ -539,6 +551,7 @@ impl CausalSelector {
         let mut out = SelectorOutput {
             records: Vec::new(),
             actions: Vec::new(),
+            market_data: None,
         };
 
         // Check dual outage > 5s alert condition
@@ -642,6 +655,7 @@ impl CausalSelector {
         );
         SelectorOutput {
             records: vec![rec],
+            market_data: None,
             actions: vec![SelectorAction::Alert {
                 severity: "CRITICAL".to_string(),
                 message: format!(

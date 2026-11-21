@@ -2070,3 +2070,32 @@ def test_p3_ack_outage_idempotent_on_crash_after_state_save_before_unlink(
 
 
 
+
+
+def test_stream_activity_does_not_count_an_active_sibling(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    meta = data_root / "meta"
+    meta.mkdir(parents=True)
+    now_s = 1_800_000_000
+    expected = {
+        ("binance_futures", "BTCUSDT", "bookTicker"),
+        ("binance_futures", "BTCUSDT", "aggTrade"),
+    }
+    sample = {
+        "sampled_wall_ns": now_s * 10**9,
+        "max_sampled_queue_depth": 11,
+        "streams": [{
+            "exchange": "binance_futures", "symbol": "BTCUSDT", "channel": "bookTicker",
+            "last_written_wall_ns": now_s * 10**9, "written_frames": 9,
+        }],
+    }
+    path = meta / "stream_activity.json"
+    path.write_text(json.dumps(sample), encoding="utf-8")
+    stats = md_mod.inspect_stream_activity(data_root, expected, now_s=now_s, stale_seconds=300)
+    assert stats["missing_or_stale"] == ["binance_futures/BTCUSDT/aggTrade"]
+    assert not stats["healthy"]
+    assert stats["max_sampled_queue_depth"] == 11
+    sample["streams"].append({**sample["streams"][0], "channel": "aggTrade"})
+    path.write_text(json.dumps(sample), encoding="utf-8")
+    assert md_mod.inspect_stream_activity(data_root, expected, now_s=now_s, stale_seconds=300)["healthy"]
+    assert not md_mod.inspect_stream_activity(data_root, expected, now_s=now_s + 61, stale_seconds=300)["healthy"]

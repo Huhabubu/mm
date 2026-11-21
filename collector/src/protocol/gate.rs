@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 struct GateObuState {
     state: ConnState,
     prev_u: Option<u64>,
+    refreshing: bool,
 }
 
 impl GateObuState {
@@ -14,6 +15,7 @@ impl GateObuState {
         Self {
             state: ConnState::WaitAnchor,
             prev_u: None,
+            refreshing: false,
         }
     }
 }
@@ -42,18 +44,18 @@ impl GateValidator {
         }
     }
 
+    pub fn build_depth_messages(symbols: &[String], now_sec: i64, event: &str) -> Vec<Value> {
+        symbols.iter().map(|symbol| json!({
+            "time": now_sec,
+            "channel": "futures.obu",
+            "event": event,
+            "payload": [format!("ob.{}.50", symbol.to_uppercase())]
+        })).collect()
+    }
+
     /// Build subscribe frames for Gate Futures v4 (obu.50, book_ticker, trades).
     pub fn build_subscribe_messages(symbols: &[String], now_sec: i64) -> Vec<Value> {
-        let mut msgs = Vec::new();
-        for s in symbols {
-            let sym = s.to_uppercase();
-            msgs.push(json!({
-                "time": now_sec,
-                "channel": "futures.obu",
-                "event": "subscribe",
-                "payload": [format!("ob.{}.50", sym)]
-            }));
-        }
+        let mut msgs = Self::build_depth_messages(symbols, now_sec, "subscribe");
         let upper: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
         if !upper.is_empty() {
             msgs.push(json!({
@@ -191,6 +193,7 @@ impl GateValidator {
             // Accept full=true initial or re-pushed snapshot even if it arrives before subscribe ACK.
             st.prev_u = Some(u);
             st.state = ConnState::Live;
+            st.refreshing = false;
             return FrameVerdict::AcceptData {
                 symbol: sym,
                 channel: "futures.obu".to_string(),
@@ -199,6 +202,9 @@ impl GateValidator {
             };
         }
 
+        if st.refreshing {
+            return FrameVerdict::BufferedWaitAnchor { symbol: sym };
+        }
         if st.state != ConnState::Live {
             return FrameVerdict::Violation {
                 symbol: Some(sym),
@@ -447,6 +453,13 @@ impl ProtocolValidator for GateValidator {
             _ => FrameVerdict::Control {
                 note: format!("gate unrecognized channel {}", channel),
             },
+        }
+    }
+
+    fn prepare_depth_refresh(&mut self) {
+        self.reset();
+        for state in self.obu_states.values_mut() {
+            state.refreshing = true;
         }
     }
 

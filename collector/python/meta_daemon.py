@@ -1042,6 +1042,34 @@ def inspect_data_tree(
     }
 
 
+def inspect_stream_activity(
+    data_root: Path, expected: set[tuple[str, str, str]], *, now_s: float, stale_seconds: float,
+) -> dict[str, Any]:
+    """Check timestamps of market frames written to disk, excluding META and control frames."""
+    path = data_root / "meta" / "stream_activity.json"
+    now_ns = int(now_s * 1_000_000_000)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        sampled = int(payload["sampled_wall_ns"])
+        if not -2 <= (now_ns - sampled) / 1e9 <= min(60, stale_seconds):
+            raise ValueError("stream activity sample is stale")
+        streams = {
+            (entry["exchange"], entry["symbol"], entry["channel"]):
+                int(entry["last_written_wall_ns"])
+            for entry in payload["streams"] if int(entry["written_frames"]) > 0
+        }
+        stale = [
+            "/".join(stream) for stream in sorted(expected)
+            if stream not in streams or not -2 <= (now_ns - streams[stream]) / 1e9 <= stale_seconds
+        ]
+        return {
+            "healthy": not stale, "missing_or_stale": stale,
+            "max_sampled_queue_depth": payload.get("max_sampled_queue_depth"),
+        }
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return {"healthy": False, "error": type(exc).__name__ + ": " + str(exc), "missing_or_stale": []}
+
+
 def inspect_shutdown_audits(data_root: Path, seen_files: set[str] | None = None) -> list[dict[str, Any]]:
     """Read new `meta/shutdown_*.json` files emitted by `tokyo-l2-collector`."""
     meta_dir = data_root / "meta"
@@ -1404,6 +1432,12 @@ class CollectorMonitor:
         self.health_poll_seconds = int(meta_cfg.get("health_poll_seconds", 30))
         self.collector_hc_interval_seconds = int(meta_cfg.get("collector_hc_interval_seconds", 300))
         self.collector_stale_seconds = int(meta_cfg.get("collector_stale_seconds", 300))
+        self.require_stream_activity = bool(meta_cfg.get("require_stream_activity", False))
+        self.expected_market_streams: set[tuple[str, str, str]] = set()
+        if self.require_stream_activity:
+            from data_coverage import expected_streams
+
+            self.expected_market_streams = expected_streams(self.cfg)
         self.archive_stale_minutes = float(meta_cfg.get("archive_stale_minutes", 90.0))
         self.alert_cooldown_seconds = int(meta_cfg.get("alert_cooldown_seconds", 1800))
         self.restart_recovery_seconds = int(meta_cfg.get("restart_recovery_seconds", 600))
@@ -1961,6 +1995,19 @@ class CollectorMonitor:
                 "details": stale_details,
             }
 
+        stream_activity = None
+        if self.require_stream_activity:
+            stream_activity = inspect_stream_activity(
+                self.data_root, self.expected_market_streams, now_s=now_s,
+                stale_seconds=float(self.collector_stale_seconds),
+            )
+            if not stream_activity["healthy"]:
+                observed["collector_stream_stale"] = {
+                    "severity": "CRITICAL",
+                    "summary": "无法确认全部行情频道持续写入",
+                    "details": stream_activity,
+                }
+
         # D. Dual A/B outage > 5s (strict conservative endpoint tracking; NEVER clears from
         #    `Connected` handshake or sibling-shared `.partial` disk activity!)
         #    Single-writer ack order: drain queued `--ack-outage` request files FIRST, then process
@@ -2169,6 +2216,7 @@ class CollectorMonitor:
                     "collector_probe_failed",
                     "collector_abnormal_restart",
                     "collector_data_stale",
+                    "collector_stream_stale",
                     "dual_ab_outage_gt_5s",
                     "local_loss_detected",
                     "disk_usage_high",
@@ -2273,6 +2321,7 @@ class CollectorMonitor:
             "chrony": self.last_chrony_row,
             "data_tree": data_tree,
             "archive_ledger": ledger_info,
+            "stream_activity": stream_activity,
             "active_alerts": list(sorted(self.state["active_alerts"].keys())),
             "outage_acks_applied": applied_outage_acks,
             "alert_dispatch": dispatch_res,
