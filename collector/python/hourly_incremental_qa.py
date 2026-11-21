@@ -186,7 +186,9 @@ def run(remote: str, config_path: Path, state_dir: Path, limit: int, since_date:
         if not force and result_path.is_file():
             try:
                 previous = json.loads(result_path.read_text(encoding="utf-8"))
-                if previous.get("qa_version") == QA_VERSION and previous.get("source_manifest") == rel:
+                if (previous.get("qa_version") == QA_VERSION
+                        and previous.get("source_manifest") == rel
+                        and previous.get("status") in {"ok", "blocked"}):
                     skipped += 1
                     continue
             except (ValueError, OSError):
@@ -199,21 +201,26 @@ def run(remote: str, config_path: Path, state_dir: Path, limit: int, since_date:
             manifest_path = directory / "manifest.json"
             try:
                 _download(remote, rel, manifest_path)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+                transient += 1
+                summary.append(f"RETRY {rel}: manifest download {type(e).__name__}")
+                continue
+            try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 expected_name = Path(rel).name.removesuffix(".manifest.json") + ".tsv.zst"
                 if manifest.get("file_name") != expected_name:
                     raise ValueError("manifest file_name mismatches archive path")
-                if int(manifest.get("bytes") or 0) > MAX_PARTITION_BYTES:
-                    raise RuntimeError("partition exceeds 8 GiB runner disk safety cap")
+                if not 0 < int(manifest.get("bytes") or 0) <= MAX_PARTITION_BYTES:
+                    raise ValueError("invalid file size or partition exceeds 8 GiB runner disk cap")
                 data_path = directory / expected_name
-                _download(remote, str(Path(rel).parent / expected_name), data_path)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-                transient += 1
-                summary.append(f"RETRY {rel}: {type(e).__name__}")
-                continue
-            try:
+                try:
+                    _download(remote, str(Path(rel).parent / expected_name), data_path)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+                    transient += 1
+                    summary.append(f"RETRY {rel}: data download {type(e).__name__}")
+                    continue
                 result = check_partition(data_path, manifest, config)
-            except (ValueError, TypeError, KeyError, UnicodeError, zstd.ZstdError) as e:
+            except (ValueError, TypeError, KeyError, UnicodeError, zstd.ZstdError, RuntimeError) as e:
                 result = {"status": "blocked", "problems": [f"{type(e).__name__}: {e}"]}
             result.update({
                 "qa_version": QA_VERSION, "source_manifest": rel,
@@ -226,10 +233,21 @@ def run(remote: str, config_path: Path, state_dir: Path, limit: int, since_date:
             else:
                 blocked += 1
             summary.append(f"{result['status'].upper()} {rel}: {len(result.get('problems', []))} issues")
-    return {"status": "ok" if not (blocked or transient) else "blocked",
+    # Previously blocked immutable partitions remain unresolved until manually rechecked.
+    unresolved = 0
+    for rel in candidates:
+        report = state_dir / "qa_reports" / (rel + ".qa.json")
+        if report.is_file():
+            try:
+                obj = json.loads(report.read_text(encoding="utf-8"))
+                if obj.get("qa_version") == QA_VERSION and obj.get("status") == "blocked":
+                    unresolved += 1
+            except (ValueError, OSError):
+                pass
+    return {"status": "ok" if not (blocked or transient or unresolved) else "blocked",
             "attempted": attempted, "ok": ok, "blocked": blocked, "retry_needed": transient,
-            "already_checked": skipped, "eligible_manifest_count": len(candidates),
-            "details": summary}
+            "unresolved_blocked": unresolved, "already_checked": skipped,
+            "eligible_manifest_count": len(candidates), "details": summary}
 
 
 def main() -> int:
