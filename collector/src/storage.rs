@@ -160,6 +160,13 @@ pub struct SealedPartition {
     pub manifest: PartitionManifest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRecordOutcome {
+    pub sealed: Option<SealedPartition>,
+    pub accepted_as_market_data: bool,
+    pub rejected_late_target_window_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
     pub partition_minutes: u32,
@@ -500,9 +507,17 @@ impl HourlyTsvZstWriter {
     }
 
     pub fn write_record(&mut self, rec: &CanonicalRecord) -> Result<Option<SealedPartition>, String> {
+        self.write_record_with_outcome(rec).map(|o| o.sealed)
+    }
+
+    pub fn write_record_with_outcome(
+        &mut self,
+        rec: &CanonicalRecord,
+    ) -> Result<WriteRecordOutcome, String> {
         let key = PartitionWindowKey::from_wall_ns(rec.recv_wall_ns, self.options.partition_minutes);
         let grace = self.options.late_frame_grace_ns;
         let mut just_sealed: Option<SealedPartition> = None;
+        let is_market_data = !matches!(rec.kind, RecordKind::Meta);
 
         // First flush any draining previous window whose bounded grace period has elapsed.
         if self
@@ -522,12 +537,20 @@ impl HourlyTsvZstWriter {
                 self.open_window(key)?;
                 self.flush_pending_loss_into_current(rec)?;
                 self.append_to_current(rec)?;
-                return Ok(just_sealed);
+                return Ok(WriteRecordOutcome {
+                    sealed: just_sealed,
+                    accepted_as_market_data: is_market_data,
+                    rejected_late_target_window_id: None,
+                });
             }
             Some(std::cmp::Ordering::Equal) => {
                 self.flush_pending_loss_into_current(rec)?;
                 self.append_to_current(rec)?;
-                return Ok(just_sealed);
+                return Ok(WriteRecordOutcome {
+                    sealed: just_sealed,
+                    accepted_as_market_data: is_market_data,
+                    rejected_late_target_window_id: None,
+                });
             }
             Some(std::cmp::Ordering::Greater) => {
                 // Rollover into newer UTC window: keep previous window open in `draining` while
@@ -548,20 +571,29 @@ impl HourlyTsvZstWriter {
                 self.open_window(key)?;
                 self.flush_pending_loss_into_current(rec)?;
                 self.append_to_current(rec)?;
-                return Ok(just_sealed);
+                return Ok(WriteRecordOutcome {
+                    sealed: just_sealed,
+                    accepted_as_market_data: is_market_data,
+                    rejected_late_target_window_id: None,
+                });
             }
             Some(std::cmp::Ordering::Less) => {
                 // Late frame belonging to an earlier UTC window.
                 let fits_draining = self.draining.as_ref().is_some_and(|d| d.key == key);
                 if fits_draining {
                     self.append_to_draining(rec)?;
-                    return Ok(just_sealed);
+                    return Ok(WriteRecordOutcome {
+                        sealed: just_sealed,
+                        accepted_as_market_data: is_market_data,
+                        rejected_late_target_window_id: None,
+                    });
                 }
                 if grace == 0 && self.seal_limit.is_some() {
                     return Err("late frame for an earlier UTC window".into());
                 }
                 // Bounded late-frame rejection: record explicit auditable META inside `current`
-                // without violating `current`'s `[planned_start, planned_end)` timestamp invariant.
+                // without violating `current`'s `[planned_start, planned_end)` timestamp invariant,
+                // and NEVER mark this rejected frame as a successful market-data write.
                 let (cur_window_id, meta_wall_ns, meta_mono_ns) = {
                     let cur = self.current.as_mut().expect("current must exist");
                     cur.late_frames_rejected = cur.late_frames_rejected.saturating_add(1);
@@ -571,6 +603,7 @@ impl HourlyTsvZstWriter {
                         .clamp(cur.key.planned_start_wall_ns, cur.key.planned_end_wall_ns - 1);
                     (cur.key.window_id.clone(), w_ns, cur.max_mono_ns.max(rec.recv_mono_ns))
                 };
+                let target_wid = key.window_id.clone();
                 let rejected_meta = CanonicalRecord {
                     recv_wall_ns: meta_wall_ns,
                     recv_mono_ns: meta_mono_ns,
@@ -580,16 +613,26 @@ impl HourlyTsvZstWriter {
                     kind: RecordKind::Meta,
                     payload: serde_json::json!({
                         "event": "LATE_FRAME_REJECTED",
+                        "dropped_frames": 1,
                         "orig_recv_wall_ns": rec.recv_wall_ns,
                         "orig_recv_mono_ns": rec.recv_mono_ns,
-                        "target_window_id": key.window_id,
+                        "orig_kind": rec.kind.as_str(),
+                        "target_window_id": target_wid,
+                        "loss_attributed_window_id": key.window_id,
+                        "target_planned_start_wall_ns": key.planned_start_wall_ns,
+                        "target_planned_end_wall_ns": key.planned_end_wall_ns,
+                        "target_partition_minutes": key.partition_minutes,
                         "current_window_id": cur_window_id,
                         "grace_ms": grace / 1_000_000,
                     })
                     .to_string(),
                 };
                 self.append_to_current(&rejected_meta)?;
-                return Ok(just_sealed);
+                return Ok(WriteRecordOutcome {
+                    sealed: just_sealed,
+                    accepted_as_market_data: false,
+                    rejected_late_target_window_id: Some(key.window_id),
+                });
             }
         }
     }

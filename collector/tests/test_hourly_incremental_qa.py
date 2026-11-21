@@ -85,18 +85,49 @@ def test_partition_sha_mismatch_fails():
 def test_incremental_skips_completed_partition_even_when_blocked():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        data, manifest_path, cfg_path, rel, _, _ = _fixture(root)
+        data, manifest_path, cfg_path, rel, _, mf_obj = _fixture(root)
         state = root / "state"
         remote = "qa:"
+        rel_data = rel.removesuffix(".manifest.json") + ".tsv.zst"
+        index_payload = {
+            "schema_version": 2,
+            "entries": [
+                {
+                    "exchange": "binance_futures",
+                    "date_utc": "2026-11-21",
+                    "hour_utc": "15",
+                    "minute_utc": "00",
+                    "partition_minutes": 60,
+                    "window_id": "2026-11-21T15:00Z",
+                    "rel_data_path": rel_data,
+                    "rel_manifest_path": rel,
+                    "bytes": data.stat().st_size,
+                    "sha256": mf_obj["sha256"],
+                    "manifest_bytes": manifest_path.stat().st_size,
+                    "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                    "verified": True,
+                    "remote_manifest_verified": True,
+                }
+            ],
+        }
+        index_path = root / "archive_manifest_index.json"
+        index_path.write_text(json.dumps(index_payload), encoding="utf-8")
+
         def fake_download(_remote, path, dst):
-            shutil.copyfile(manifest_path if path == rel else data, dst)
-        with patch.object(qa, "_run", return_value=rel.removeprefix("raw/") + "\n"), \
-             patch.object(qa, "_download", side_effect=fake_download) as download:
+            if path == qa.ARCHIVE_INDEX_RELPATH:
+                shutil.copyfile(index_path, dst)
+            elif path == rel:
+                shutil.copyfile(manifest_path, dst)
+            else:
+                shutil.copyfile(data, dst)
+
+        with patch.object(qa, "_download", side_effect=fake_download) as download:
             first = qa.run(remote, cfg_path, state, 16, "2026-11-21")
             second = qa.run(remote, cfg_path, state, 16, "2026-11-21")
         assert first["ok"] == 1 and first["attempted"] == 1
         assert second["already_checked"] == 1 and second["attempted"] == 0
-        assert download.call_count == 2
+        # 1 index download + 2 file downloads on run 1, plus 1 index download on run 2 = 4 calls
+        assert download.call_count == 4
 
 
 def test_loss_marker_blocks_qualification():

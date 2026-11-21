@@ -187,7 +187,16 @@ fn test_cross_partition_bounded_late_frame_accept_and_reject() {
         1,
         r#"{"seq":5,"too_late":true}"#,
     );
-    assert!(writer.write_record(&r5_too_late).unwrap().is_none());
+    let outcome_r5 = writer.write_record_with_outcome(&r5_too_late).unwrap();
+    assert!(outcome_r5.sealed.is_none());
+    assert!(
+        !outcome_r5.accepted_as_market_data,
+        "expired late frame must NOT be counted as accepted market data"
+    );
+    assert_eq!(
+        outcome_r5.rejected_late_target_window_id.as_deref(),
+        Some("2026-11-21T00:00Z")
+    );
 
     let remaining = writer.seal_all().unwrap();
     assert_eq!(remaining.len(), 1);
@@ -206,9 +215,14 @@ fn test_cross_partition_bounded_late_frame_accept_and_reject() {
     assert!(rej.recv_mono_ns >= 1500);
     let rej_json: Value = serde_json::from_str(&rej.payload).unwrap();
     assert_eq!(rej_json["event"], "LATE_FRAME_REJECTED");
+    assert_eq!(rej_json["dropped_frames"], 1);
     assert_eq!(rej_json["orig_recv_wall_ns"], w1_start - 10_000_000);
     assert_eq!(rej_json["orig_recv_mono_ns"], 900);
     assert_eq!(rej_json["target_window_id"], "2026-11-21T00:00Z");
+    assert_eq!(rej_json["loss_attributed_window_id"], "2026-11-21T00:00Z");
+    assert_eq!(rej_json["target_planned_start_wall_ns"], w0_start);
+    assert_eq!(rej_json["target_planned_end_wall_ns"], w1_start);
+    assert_eq!(rej_json["target_partition_minutes"], 15);
 }
 
 #[tokio::test]

@@ -1457,6 +1457,19 @@ def run_qa_convert(
                             day_local_loss[(exchange, date_utc)].append(
                                 {"wall_ns": wall_ns, "dropped": dropped, "reason": meta_obj.get("reason", "")}
                             )
+                        elif ev == "LATE_FRAME_REJECTED":
+                            dropped = int(meta_obj.get("dropped_frames", 1))
+                            target_wid = str(meta_obj.get("target_window_id") or meta_obj.get("loss_attributed_window_id") or "")
+                            target_date = target_wid[:10] if len(target_wid) >= 10 else date_utc
+                            recorded_local_loss += 1
+                            dropped_frames += dropped
+                            day_local_loss[(exchange, target_date)].append(
+                                {
+                                    "wall_ns": int(meta_obj.get("orig_recv_wall_ns") or wall_ns),
+                                    "dropped": dropped,
+                                    "reason": f"late_frame_rejected_for_{target_wid or 'prior_window'}",
+                                }
+                            )
                         elif ev == "SWITCH":
                             day_switches[(exchange, date_utc)] += 1
 
@@ -1477,12 +1490,13 @@ def run_qa_convert(
                     )
                 prev_file_had_late_frames = norm_mf["late_frames_accepted"] > 0
 
-                manifest_local_loss = int(mf.get("local_loss_lines") or 0)
+                manifest_local_loss = int(mf.get("local_loss_lines") or 0) + int(mf.get("late_frames_rejected") or 0)
                 if recorded_local_loss or manifest_local_loss:
                     local_loss_partitions.append({
                         "exchange": exchange,
                         "date_utc": mf["date_utc"],
                         "hour_utc": mf["hour_utc"],
+                        "window_id": norm_mf["window_id"],
                         "boot_id": boot_id,
                         "manifest_file": mpath.name,
                         "data_file": dpath.name,

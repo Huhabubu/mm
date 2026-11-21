@@ -855,7 +855,10 @@ def test_qa_index_discovery_memoization_invalidation_three_levels_and_five_state
         assert r4["attempted"] == 4 and r4["already_checked"] == 0
 
         # 5. Content hash change in archive index forces re-check of ONLY the changed partition!
-        idx_mut = json.loads(backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH].decode("utf-8"))
+        #    And because the index hash ("f"*64) differs from the actual remote manifest file,
+        #    3-way verification (Index <-> Manifest <-> Data) must fail closed (`blocked == 1`)!
+        orig_index_bytes = backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH]
+        idx_mut = json.loads(orig_index_bytes.decode("utf-8"))
         for ent in idx_mut["entries"]:
             if ent.get("collection_run_id") == "batch_A" and ent["exchange"] == "gate_futures":
                 ent["manifest_sha256"] = "f" * 64
@@ -874,6 +877,26 @@ def test_qa_index_discovery_memoization_invalidation_three_levels_and_five_state
                 sla_grace_minutes=10.0,
             )
         assert r5["attempted"] == 1 and r5["already_checked"] == 3
+        assert r5["blocked"] == 1
+        assert r5["qa_status"] == qa.QA_STATUS_FAILED
+
+        # Restore genuine index -> re-check of that 1 partition passes 3-way verification again!
+        backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH] = orig_index_bytes
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_download):
+            r5_restored = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_A",
+                now_epoch_s=w0 + 20 * 60,
+                sla_grace_minutes=10.0,
+            )
+        assert r5_restored["attempted"] == 1 and r5_restored["already_checked"] == 3
+        assert r5_restored["ok"] == 1 and r5_restored["qa_status"] == qa.QA_STATUS_PASSED
 
         # 6. Zero-file / missing-window SLA tests:
         #    At w1 + 17m (00:32Z, 2m after W1 ended, sla_grace=10m) -> W1 is PENDING_ARCHIVE (not overdue!)
@@ -903,6 +926,9 @@ def test_qa_index_discovery_memoization_invalidation_three_levels_and_five_state
                 sla_grace_minutes=10.0,
             )
         assert r_pending["qa_status"] == qa.QA_STATUS_PENDING_ARCHIVE
+        assert r_pending["status"] == "blocked"  # pending_archive must NOT report whole-job status="ok"!
+        assert r_pending["current_window_completed"] is False
+        assert r_pending["current_window_verification_status"] == qa.QA_STATUS_PENDING_ARCHIVE
         assert "2026-11-21T00:15Z" in r_pending["pending_archive_windows"]
         assert r_overdue["qa_status"] == qa.QA_STATUS_OVERDUE
         assert r_overdue["status"] == "blocked"
@@ -917,9 +943,14 @@ def test_qa_zero_files_overdue_fails_closed_never_false_green():
         cfg_path.write_text(json.dumps(_make_config(partition_minutes=15)), encoding="utf-8")
         w0 = int(datetime(2026, 11, 21, 8, 0, tzinfo=timezone.utc).timestamp())
 
-        # Empty Drive (reproduces run 44887217848 zero-file bug!)
-        with patch.object(qa, "_run", return_value=""), \
-             patch.object(qa, "_download"):
+        # Empty verified index on Drive (reproduces run 44887217848 zero-file bug!)
+        backend = _MemoryArchiveBackend()
+        backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH] = json.dumps(
+            {"schema_version": 2, "entries": []}
+        ).encode("utf-8")
+        fake_run, fake_download = _wire_mock_drive(root, backend)
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_download):
             res = qa.run(
                 "qa:",
                 cfg_path,
@@ -1060,4 +1091,490 @@ def test_qa_needs_review_on_quiet_event_trade_and_mixed_format_coverage():
         )
         assert p_legacy is not None and p_legacy["partition_minutes"] == 60 and p_legacy["window_id"] == "2026-11-21T05:00Z"
         assert p_15m is not None and p_15m["partition_minutes"] == 15 and p_15m["window_id"] == "2026-11-21T05:15Z"
+
+
+# ---------------------------------------------------------------------------
+# 5. User Review Reproductions (4 P1 + 1 P2)
+# ---------------------------------------------------------------------------
+
+
+def test_review_p1_1_window_qa_and_archive_isolate_batch_and_duration():
+    """Reproduces P1 #1:
+    (a) 60-minute archive starting at 2026-11-21T00:00Z must NOT satisfy a 15-minute window [00:00Z, 00:15Z).
+    (b) Two partial batches (`batch_1` with 2 exchanges, `batch_2` with the other 2 exchanges) must NOT
+        combine to pass a 15-minute window in either archive reconciliation or incremental QA.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        cfg_15m = _make_config(
+            partition_minutes=15,
+            exchanges=EXCHANGES_4,
+            symbols=["BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT"],
+            stale_seconds=900,
+        )
+        cfg_path = root / "config_15m.json"
+        cfg_path.write_text(json.dumps(cfg_15m), encoding="utf-8")
+
+        # Sample A: 60-minute archive starting at 00:00Z evaluated under 15-minute config
+        dir_60m = root / "case_60m_in_15m"
+        for ex in EXCHANGES_4:
+            d60, _, mf60 = _write_sealed_partition(
+                dir_60m,
+                exchange=ex,
+                window_start_s=w0,
+                partition_minutes=60,
+                legacy_v1=True,
+                boot_id="legacy_60m",
+            )
+            # Single-file check_partition under 15m config must fail duration mismatch
+            single_res = qa.check_partition(d60, mf60, cfg_15m)
+            assert single_res["qa_status"] == qa.QA_STATUS_FAILED
+            assert single_res["status"] == "blocked"
+            assert any("partition duration mismatch" in p for p in single_res["problems"])
+
+        backend_60m = _MemoryArchiveBackend()
+        # Archive under 15m config must NOT allow 60m partitions to satisfy the 15m [00:00Z, 00:15Z) window
+        arch_60m = arch.sync_sealed_directory(
+            dir_60m,
+            backend_60m,
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges=set(EXCHANGES_4),
+            partition_minutes=15,
+        )
+        assert arch_60m["status"] == "blocked"
+        assert sorted(arch_60m["expected_window_reconciliation"]["missing_exchanges"]) == sorted(EXCHANGES_4)
+
+        fake_run_60, fake_dl_60 = _wire_mock_drive(dir_60m, backend_60m)
+        with patch.object(qa, "_run", side_effect=fake_run_60), \
+             patch.object(qa, "_download", side_effect=fake_dl_60):
+            qa_60m = qa.run(
+                "qa:",
+                cfg_path,
+                root / "state_60m",
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                now_epoch_s=w0 + 30 * 60,
+                sla_grace_minutes=10.0,
+            )
+        assert qa_60m["eligible_manifest_count"] == 0
+        assert qa_60m["qa_status"] != qa.QA_STATUS_PASSED
+        assert qa_60m["status"] == "blocked"
+
+        # Sample B: Two partial batches (`batch_1` has binance+bybit; `batch_2` has bitget+gate)
+        dir_mixed = root / "case_mixed_batches"
+        for ex in ("binance_futures", "bybit_linear"):
+            _write_sealed_partition(
+                dir_mixed, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b1", run_id="batch_1"
+            )
+        for ex in ("bitget_v3", "gate_futures"):
+            _write_sealed_partition(
+                dir_mixed, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b2", run_id="batch_2"
+            )
+
+        backend_mixed = _MemoryArchiveBackend()
+        arch_mixed = arch.sync_sealed_directory(
+            dir_mixed,
+            backend_mixed,
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges=set(EXCHANGES_4),
+            partition_minutes=15,
+        )
+        assert arch_mixed["status"] == "blocked"
+        assert any("mixed_batches_in_expected_window:" in f for f in arch_mixed["failed_items"])
+
+        fake_run_mix, fake_dl_mix = _wire_mock_drive(dir_mixed, backend_mixed)
+        with patch.object(qa, "_run", side_effect=fake_run_mix), \
+             patch.object(qa, "_download", side_effect=fake_dl_mix):
+            # Even if run without --run-id, mixed batches in the same window MUST fail and never union to 4 exchanges!
+            qa_mixed_unfiltered = qa.run(
+                "qa:",
+                cfg_path,
+                root / "state_mixed_unfiltered",
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                now_epoch_s=w0 + 16 * 60,
+                sla_grace_minutes=10.0,
+            )
+            # And when bound to --run-id batch_1, it reports missing bitget_v3 and gate_futures!
+            qa_mixed_bound = qa.run(
+                "qa:",
+                cfg_path,
+                root / "state_mixed_bound",
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_1",
+                now_epoch_s=w0 + 16 * 60,
+                sla_grace_minutes=10.0,
+            )
+        assert qa_mixed_unfiltered["qa_status"] == qa.QA_STATUS_FAILED
+        assert qa_mixed_unfiltered["status"] == "blocked"
+        assert qa_mixed_bound["qa_status"] == qa.QA_STATUS_FAILED
+        assert qa_mixed_bound["status"] == "blocked"
+        bound_win = json.loads(
+            (root / "state_mixed_bound" / "qa_reports" / "windows" / "2026-11-21" / "2026-11-21T0000Z.window.qa.json").read_text()
+        )
+        assert bound_win["missing_exchanges"] == ["bitget_v3", "gate_futures"]
+
+
+def test_review_p1_2_late_frame_rejected_counts_as_loss_and_blocks_target_window():
+    """Reproduces P1 #2:
+    A compressed sample containing 1 LATE_FRAME_REJECTED record must NOT return passed
+    with local_loss_events=0; it must count as data loss, block the partition, and attribute
+    the loss back to the target window `target_window_id` where the late frame originally belonged.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive_root = root / "data"
+        state_dir = root / "state"
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        w1 = w0 + 15 * 60
+        cfg = _make_config(partition_minutes=15, exchanges=("binance_futures",), stale_seconds=900)
+        cfg_path = root / "config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        # Window W0 (00:00Z): initially clean on its own
+        _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="b_late",
+            run_id="batch_late",
+            first_rx_seq=1,
+        )
+        # Window W1 (00:15Z): contains 1 LATE_FRAME_REJECTED whose original timestamp belonged to W0 (00:00Z)!
+        d_w1, mf_w1_path, mf_w1 = _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w1,
+            partition_minutes=15,
+            boot_id="b_late",
+            run_id="batch_late",
+            first_rx_seq=7,
+            extra_meta=[
+                {
+                    "event": "LATE_FRAME_REJECTED",
+                    "dropped_frames": 1,
+                    "orig_recv_wall_ns": w1 * 1_000_000_000 - 10_000_000,
+                    "orig_recv_mono_ns": 550,
+                    "orig_rx_seq": 6,
+                    "orig_kind": "DATA",
+                    "target_window_id": "2026-11-21T00:00Z",
+                    "loss_attributed_window_id": "2026-11-21T00:00Z",
+                    "target_planned_start_wall_ns": w0 * 1_000_000_000,
+                    "target_planned_end_wall_ns": w1 * 1_000_000_000,
+                    "target_partition_minutes": 15,
+                }
+            ],
+        )
+        mf_w1["late_frames_rejected"] = 1
+        mf_w1_path.write_text(json.dumps(mf_w1, indent=2) + "\n", encoding="utf-8")
+
+        # 1. Single-file check_partition on W1 MUST fail with local_loss_events=1, dropped_frames=1, late_frames_rejected=1
+        single_w1 = qa.check_partition(d_w1, mf_w1, cfg)
+        assert single_w1["qa_status"] == qa.QA_STATUS_FAILED
+        assert single_w1["status"] == "blocked"
+        assert single_w1["late_frames_rejected"] == 1
+        assert single_w1["local_loss_events"] == 1
+        assert single_w1["dropped_frames"] == 1
+        assert single_w1["late_loss_by_target_window"] == {"2026-11-21T00:00Z": 1}
+
+        # 2. Full QA run across W0 and W1 attributes the rejected late frame back to W0 (00:00Z),
+        #    blocking BOTH W0 (where the data was lost) and W1 (where the rejection occurred)!
+        backend = _MemoryArchiveBackend()
+        arch.sync_sealed_directory(archive_root, backend, verify_remote=True, now_epoch_s=w1 + 16 * 60, upload_ledger_snapshot=False)
+        fake_run, fake_dl = _wire_mock_drive(archive_root, backend)
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            res = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_late",
+                now_epoch_s=w1 + 16 * 60,
+            )
+        assert res["qa_status"] == qa.QA_STATUS_FAILED
+        assert res["status"] == "blocked"
+        assert "2026-11-21T00:00Z" in res["failed_windows"]
+        assert "2026-11-21T00:15Z" in res["failed_windows"]
+
+        w0_win_rep = json.loads(
+            (state_dir / "qa_reports" / "windows" / "2026-11-21" / "2026-11-21T0000Z.window.qa.json").read_text()
+        )
+        assert w0_win_rep["qa_status"] == qa.QA_STATUS_FAILED
+        assert w0_win_rep["attributed_late_frames_rejected"] == 1
+        assert w0_win_rep["local_loss_events"] == 1
+        assert w0_win_rep["dropped_frames"] == 1
+
+
+def test_review_p1_3_archive_separates_file_verification_from_window_coverage_and_tracks_zero_file_backlog():
+    """Reproduces P1 #3:
+    (a) Having 1 verified file with >0 lines per exchange must NOT pass archive window reconciliation
+        when the exchange has a head, tail, or internal middle gap.
+    (b) An expected window with 0 files on disk on Run 1 must still be persisted in SQLite `expected_windows`
+        and tracked in `pending_prior_windows` on Run 2 even after the next window succeeds.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        w1 = w0 + 15 * 60
+        backend = _MemoryArchiveBackend()
+
+        # Run 1 at 00:16Z (expected W0 = 00:00Z): ZERO files on disk for W0!
+        r_empty = arch.sync_sealed_directory(
+            root,
+            backend,
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges=set(EXCHANGES_4),
+            partition_minutes=15,
+        )
+        assert r_empty["status"] == "blocked"
+        assert r_empty["expected_window_reconciliation"]["window_coverage_status"] == "missing"
+
+        # Run 2 at 00:31Z (expected W1 = 00:15Z): W1 has all 4 exchanges with full coverage,
+        # while W0 STILL has 0 files on disk -> W0 MUST remain in pending_prior_windows and block status="ok"!
+        for ex in EXCHANGES_4:
+            _write_sealed_partition(root, exchange=ex, window_start_s=w1, partition_minutes=15, boot_id="b1")
+
+        r_w1 = arch.sync_sealed_directory(
+            root,
+            backend,
+            verify_remote=True,
+            now_epoch_s=w1 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges=set(EXCHANGES_4),
+            partition_minutes=15,
+        )
+        assert r_w1["status"] == "blocked"
+        rec_w1 = r_w1["expected_window_reconciliation"]
+        assert rec_w1["expected_window_id"] == "2026-11-21T00:15Z"
+        assert rec_w1["file_verification_status"] == "verified"
+        assert rec_w1["window_coverage_status"] == "complete"
+        assert "2026-11-21T00:00Z" in rec_w1["pending_prior_windows"]
+        assert any("pending_prior_window_unverified:2026-11-21T00:00Z" in f for f in r_w1["failed_items"])
+
+        # Run 3: Backfill W0 for all 4 exchanges, BUT gate_futures only covers seconds [1..60] of the 900s window
+        # (leaving an 840s tail gap > max_coverage_gap_seconds)!
+        for ex in ("binance_futures", "bybit_linear", "bitget_v3"):
+            _write_sealed_partition(root, exchange=ex, window_start_s=w0, partition_minutes=15, boot_id="b0")
+        _write_sealed_partition(
+            root,
+            exchange="gate_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="b0",
+            offset_start_s=1,
+            offset_end_s=60,  # 840s tail gap!
+        )
+
+        r_gap = arch.sync_sealed_directory(
+            root,
+            backend,
+            verify_remote=True,
+            now_epoch_s=w0 + 16 * 60,
+            upload_ledger_snapshot=False,
+            expected_hourly_exchanges=set(EXCHANGES_4),
+            partition_minutes=15,
+        )
+        assert r_gap["status"] == "blocked"
+        rec_gap = r_gap["expected_window_reconciliation"]
+        # Files themselves ARE verified, but whole-window coverage is INCOMPLETE!
+        assert rec_gap["file_verification_status"] == "verified"
+        assert rec_gap["window_coverage_status"] == "incomplete"
+        assert rec_gap["incomplete_coverage_exchanges"] == ["gate_futures"]
+        assert any(
+            "expected_window_coverage_incomplete:gate_futures:2026-11-21T00:00Z:tail_gap_" in f
+            for f in r_gap["failed_items"]
+        )
+
+
+def test_review_p1_4_qa_never_bypasses_verified_index_and_enforces_three_way_verification():
+    """Reproduces P1 #4:
+    (a) When `meta/archive_manifest_index.json` is unavailable/corrupted, formal QA must NOT
+        fall back to scanning unverified `raw/`; it must report `verified_index_unavailable` and block.
+    (b) After download, QA must verify 3-way hash consistency across Index <-> Manifest <-> Data File.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive_root = root / "data"
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        cfg = _make_config(partition_minutes=15, exchanges=("binance_futures",), stale_seconds=900)
+        cfg_path = root / "config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        _write_sealed_partition(
+            archive_root, exchange="binance_futures", window_start_s=w0, partition_minutes=15, boot_id="b_idx", run_id="batch_idx"
+        )
+        backend = _MemoryArchiveBackend()
+        arch.sync_sealed_directory(archive_root, backend, verify_remote=True, now_epoch_s=w0 + 16 * 60, upload_ledger_snapshot=False)
+
+        # Case A: Remove verified index while keeping unverified files under raw/
+        saved_index = backend.objects.pop(arch.ARCHIVE_MANIFEST_INDEX_RELPATH)
+        backend.objects.pop("meta/verified_archive_ledger.compat.jsonl", None)
+        fake_run, fake_dl = _wire_mock_drive(archive_root, backend)
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            res_no_idx = qa.run(
+                "qa:",
+                cfg_path,
+                root / "state_no_idx",
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_idx",
+                now_epoch_s=w0 + 16 * 60,
+            )
+        assert res_no_idx["discovery_mode"] == "verified_index_unavailable"
+        assert res_no_idx["attempted"] == 0
+        assert res_no_idx["job_execution_status"] == "failed"
+        assert res_no_idx["status"] == "blocked"
+
+        # Case B: Restore index, but tamper with index `sha256` (data_sha256) so Manifest == Data != Index
+        idx_tampered = json.loads(saved_index.decode("utf-8"))
+        idx_tampered["entries"][0]["sha256"] = "e" * 64
+        backend.objects[arch.ARCHIVE_MANIFEST_INDEX_RELPATH] = json.dumps(idx_tampered).encode("utf-8")
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            res_3way = qa.run(
+                "qa:",
+                cfg_path,
+                root / "state_3way",
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_idx",
+                now_epoch_s=w0 + 16 * 60,
+            )
+        assert res_3way["attempted"] == 1
+        assert res_3way["blocked"] == 1
+        assert res_3way["qa_status"] == qa.QA_STATUS_FAILED
+        assert res_3way["status"] == "blocked"
+
+
+def test_review_p2_5_qa_heartbeat_separates_job_current_window_and_historical_damage():
+    """Reproduces P2 #5:
+    (a) Window W0 (00:00Z) fails with LOCAL_LOSS on Run 1 -> status="blocked", historical damage recorded.
+    (b) Window W1 (00:15Z) is in `pending_archive` on Run 2 (0 new files checked) ->
+        `current_window_completed` is False, `current_window_verification_status == "pending_archive"`,
+        and `status == "blocked"` (never false-positive success when current window is unverified!).
+    (c) Window W1 (00:15Z) finishes archiving all healthy exchanges on Run 3 ->
+        `job_execution_status == "ok"`, `current_window_completed is True`,
+        `current_window_verification_status == "passed"`, and `status == "ok"` (so the current-window
+        heartbeat recovers), while `historical_data_quality_status == "has_historical_damage"` and
+        `historical_damaged_windows == ["2026-11-21T00:00Z"]` preserves W0's damage record!
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        archive_root = root / "data"
+        state_dir = root / "state"
+        w0 = int(datetime(2026, 11, 21, 0, 0, tzinfo=timezone.utc).timestamp())
+        w1 = w0 + 15 * 60
+        cfg = _make_config(partition_minutes=15, exchanges=("binance_futures",), stale_seconds=900)
+        cfg_path = root / "config.json"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        # W0 has a LOCAL_LOSS marker
+        _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w0,
+            partition_minutes=15,
+            boot_id="b_p2",
+            run_id="batch_p2",
+            first_rx_seq=1,
+            extra_meta=[{"event": "LOCAL_LOSS", "dropped_frames": 3}],
+        )
+        backend = _MemoryArchiveBackend()
+        arch.sync_sealed_directory(archive_root, backend, verify_remote=True, now_epoch_s=w0 + 16 * 60, upload_ledger_snapshot=False)
+        fake_run, fake_dl = _wire_mock_drive(archive_root, backend)
+
+        # Run 1 at 00:16Z (current expected window = W0 00:00Z): W0 fails!
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            r1 = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_p2",
+                now_epoch_s=w0 + 16 * 60,
+                sla_grace_minutes=10.0,
+            )
+        assert r1["job_execution_status"] == "ok"
+        assert r1["current_window_id"] == "2026-11-21T00:00Z"
+        assert r1["current_window_completed"] is True
+        assert r1["current_window_verification_status"] == qa.QA_STATUS_FAILED
+        assert r1["status"] == "blocked"
+
+        # Run 2 at 00:32Z (current expected window = W1 00:15Z, still within 10m archive grace):
+        # 0 files for W1 yet -> pending_archive -> MUST NOT report status="ok"!
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            r2 = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_p2",
+                now_epoch_s=w1 + 17 * 60,
+                sla_grace_minutes=10.0,
+            )
+        assert r2["job_execution_status"] == "ok"
+        assert r2["current_window_id"] == "2026-11-21T00:15Z"
+        assert r2["current_window_completed"] is False
+        assert r2["current_window_verification_status"] == qa.QA_STATUS_PENDING_ARCHIVE
+        assert r2["historical_data_quality_status"] == "has_historical_damage"
+        assert r2["historical_damaged_windows"] == ["2026-11-21T00:00Z"]
+        assert r2["status"] == "blocked"
+
+        # Run 3 at 00:34Z: W1 (00:15Z) is archived and passes QA!
+        _write_sealed_partition(
+            archive_root,
+            exchange="binance_futures",
+            window_start_s=w1,
+            partition_minutes=15,
+            boot_id="b_p2",
+            run_id="batch_p2",
+            first_rx_seq=8,
+        )
+        arch.sync_sealed_directory(archive_root, backend, verify_remote=True, now_epoch_s=w1 + 19 * 60, upload_ledger_snapshot=False)
+        with patch.object(qa, "_run", side_effect=fake_run), \
+             patch.object(qa, "_download", side_effect=fake_dl):
+            r3 = qa.run(
+                "qa:",
+                cfg_path,
+                state_dir,
+                limit=16,
+                since_date="2026-11-21",
+                since_window="2026-11-21T00:00Z",
+                run_id="batch_p2",
+                now_epoch_s=w1 + 19 * 60,
+                sla_grace_minutes=10.0,
+            )
+        assert r3["job_execution_status"] == "ok"
+        assert r3["current_window_id"] == "2026-11-21T00:15Z"
+        assert r3["current_window_completed"] is True
+        assert r3["current_window_verification_status"] == qa.QA_STATUS_PASSED
+        assert r3["status"] == "ok"
+        assert r3["historical_data_quality_status"] == "has_historical_damage"
+        assert r3["historical_damaged_windows"] == ["2026-11-21T00:00Z"]
+        assert len(r3["historical_damaged_partitions"]) == 1
+
 

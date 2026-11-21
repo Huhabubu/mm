@@ -503,6 +503,33 @@ class ArchiveLedger:
                     sha256 TEXT NOT NULL,
                     synced_at_utc TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS expected_windows (
+                    window_key TEXT PRIMARY KEY,
+                    window_id TEXT NOT NULL,
+                    window_span_id TEXT NOT NULL,
+                    date_utc TEXT NOT NULL,
+                    hour_utc TEXT NOT NULL,
+                    minute_utc TEXT NOT NULL,
+                    partition_minutes INTEGER NOT NULL,
+                    planned_start_wall_ns INTEGER NOT NULL,
+                    planned_end_wall_ns INTEGER NOT NULL,
+                    collection_run_id TEXT,
+                    expected_exchanges_json TEXT NOT NULL,
+                    file_verified_exchanges_json TEXT NOT NULL,
+                    covered_exchanges_json TEXT NOT NULL,
+                    missing_exchanges_json TEXT NOT NULL,
+                    incomplete_coverage_exchanges_json TEXT NOT NULL,
+                    file_verification_status TEXT NOT NULL,
+                    window_coverage_status TEXT NOT NULL,
+                    window_status TEXT NOT NULL,
+                    detail_json TEXT,
+                    first_checked_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_expected_windows_status
+                    ON expected_windows(window_status, partition_minutes);
                 """
             )
             self._migrate_window_columns()
@@ -511,6 +538,95 @@ class ArchiveLedger:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (LEDGER_SCHEMA_VERSION,),
             )
+
+    def upsert_expected_window(
+        self,
+        *,
+        window_key: str,
+        win_desc: dict[str, Any],
+        collection_run_id: str | None,
+        expected_exchanges: list[str],
+        file_verified_exchanges: list[str],
+        covered_exchanges: list[str],
+        missing_exchanges: list[str],
+        incomplete_coverage_exchanges: list[str],
+        file_verification_status: str,
+        window_coverage_status: str,
+        window_status: str,
+        detail: dict[str, Any],
+        now_iso: str,
+    ) -> None:
+        span_id = str(
+            win_desc.get("window_span_id")
+            or f"{win_desc['window_id']}__{win_desc['partition_minutes']}m"
+        )
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO expected_windows (
+                    window_key, window_id, window_span_id, date_utc, hour_utc, minute_utc,
+                    partition_minutes, planned_start_wall_ns, planned_end_wall_ns,
+                    collection_run_id, expected_exchanges_json, file_verified_exchanges_json,
+                    covered_exchanges_json, missing_exchanges_json, incomplete_coverage_exchanges_json,
+                    file_verification_status, window_coverage_status, window_status,
+                    detail_json, first_checked_utc, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(window_key) DO UPDATE SET
+                    file_verified_exchanges_json = excluded.file_verified_exchanges_json,
+                    covered_exchanges_json = excluded.covered_exchanges_json,
+                    missing_exchanges_json = excluded.missing_exchanges_json,
+                    incomplete_coverage_exchanges_json = excluded.incomplete_coverage_exchanges_json,
+                    file_verification_status = excluded.file_verification_status,
+                    window_coverage_status = excluded.window_coverage_status,
+                    window_status = excluded.window_status,
+                    detail_json = excluded.detail_json,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (
+                    window_key,
+                    str(win_desc["window_id"]),
+                    span_id,
+                    str(win_desc["date_utc"]),
+                    str(win_desc["hour_utc"]),
+                    str(win_desc["minute_utc"]),
+                    int(win_desc["partition_minutes"]),
+                    int(win_desc["planned_start_wall_ns"]),
+                    int(win_desc["planned_end_wall_ns"]),
+                    collection_run_id,
+                    json.dumps(expected_exchanges),
+                    json.dumps(file_verified_exchanges),
+                    json.dumps(covered_exchanges),
+                    json.dumps(missing_exchanges),
+                    json.dumps(incomplete_coverage_exchanges),
+                    file_verification_status,
+                    window_coverage_status,
+                    window_status,
+                    json.dumps(detail, sort_keys=True),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+
+    def list_expected_windows(
+        self,
+        *,
+        partition_minutes: int | None = None,
+        collection_run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if partition_minutes is not None:
+            clauses.append("partition_minutes = ?")
+            params.append(int(partition_minutes))
+        if collection_run_id is not None:
+            clauses.append("collection_run_id = ?")
+            params.append(str(collection_run_id))
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM expected_windows {where_sql} ORDER BY planned_start_wall_ns ASC, window_key ASC",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self) -> None:
         if self.conn is not None:
@@ -1430,15 +1546,17 @@ def export_verified_jsonl_projection(sealed_root: Path, ledger: ArchiveLedger) -
 def export_archive_manifest_index(sealed_root: Path, ledger: ArchiveLedger) -> Path | None:
     """Atomically write content-deterministic cloud-readable index of remotely verified partitions.
 
-    Only contains dual-remote-verified (`VERIFIED` or `PRUNED`) records with zero volatile timestamps
-    so repeat runs with no state changes keep an identical SHA-256 and issue zero remote uploads.
+    Only contains dual-remote-verified (`VERIFIED` or `PRUNED`) records and deterministic expected-window
+    reconciliation records with zero volatile timestamps so repeat runs with no state changes keep an
+    identical SHA-256 and issue zero remote uploads.
     """
     rows = [
         r
         for r in ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
         if r["remote_data_verified"] and r["remote_manifest_verified"] and not r["has_conflict"]
     ]
-    if not rows:
+    win_rows = ledger.list_expected_windows()
+    if not rows and not win_rows:
         return None
     out_path = sealed_root / ARCHIVE_MANIFEST_INDEX_RELPATH
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1446,15 +1564,37 @@ def export_archive_manifest_index(sealed_root: Path, ledger: ArchiveLedger) -> P
         (_row_to_jsonl_entry(r) for r in rows),
         key=lambda e: (e["date_utc"], e["window_id"], e["exchange"], e["remote_path"]),
     )
-    payload = json.dumps(
+    window_ledger = [
         {
-            "schema_version": 2,
-            "verified_count": len(entries),
-            "entries": entries,
-        },
-        indent=2,
-        sort_keys=False,
-    ) + "\n"
+            "window_key": wr["window_key"],
+            "window_id": wr["window_id"],
+            "window_span_id": wr["window_span_id"],
+            "date_utc": wr["date_utc"],
+            "hour_utc": wr["hour_utc"],
+            "minute_utc": wr["minute_utc"],
+            "partition_minutes": int(wr["partition_minutes"]),
+            "planned_start_wall_ns": int(wr["planned_start_wall_ns"]),
+            "planned_end_wall_ns": int(wr["planned_end_wall_ns"]),
+            "collection_run_id": wr["collection_run_id"],
+            "expected_exchanges": json.loads(wr["expected_exchanges_json"]),
+            "file_verified_exchanges": json.loads(wr["file_verified_exchanges_json"]),
+            "covered_exchanges": json.loads(wr["covered_exchanges_json"]),
+            "missing_exchanges": json.loads(wr["missing_exchanges_json"]),
+            "incomplete_coverage_exchanges": json.loads(wr["incomplete_coverage_exchanges_json"]),
+            "file_verification_status": wr["file_verification_status"],
+            "window_coverage_status": wr["window_coverage_status"],
+            "window_status": wr["window_status"],
+        }
+        for wr in win_rows
+    ]
+    doc: dict[str, Any] = {
+        "schema_version": 2,
+        "verified_count": len(entries),
+        "entries": entries,
+    }
+    if window_ledger:
+        doc["window_ledger"] = window_ledger
+    payload = json.dumps(doc, indent=2, sort_keys=False) + "\n"
     if out_path.is_file():
         try:
             if out_path.read_text(encoding="utf-8") == payload:
@@ -1798,6 +1938,309 @@ def _find_window_files(
     return unsealed_partials, sealed_without_manifest
 
 
+def _row_planned_start_s(row: dict[str, Any]) -> int:
+    raw_start = row.get("planned_start_wall_ns")
+    if raw_start is not None:
+        return int(raw_start) // 1_000_000_000
+    day_s = int(datetime.fromisoformat(str(row["date_utc"])).replace(tzinfo=timezone.utc).timestamp())
+    hh = int(row.get("hour_utc") or 0)
+    mm = int(row.get("minute_utc") or 0)
+    return day_s + hh * 3600 + mm * 60
+
+
+def _row_matches_window_and_batch(
+    row: dict[str, Any],
+    win_desc: dict[str, Any],
+    expected_run_id: str | None,
+) -> tuple[bool, str | None]:
+    """Check whether a ledger partition row belongs to the exact planned UTC window, duration, and batch."""
+    expected_pm = int(win_desc["partition_minutes"])
+    row_pm = int(row.get("partition_minutes") or 60)
+    if row_pm != expected_pm:
+        return False, None
+
+    p_start_ns = int(win_desc["planned_start_wall_ns"])
+    p_end_ns = int(win_desc["planned_end_wall_ns"])
+    if row.get("planned_start_wall_ns") is not None and row.get("planned_end_wall_ns") is not None:
+        if int(row["planned_start_wall_ns"]) != p_start_ns or int(row["planned_end_wall_ns"]) != p_end_ns:
+            return False, None
+    else:
+        row_min = str(row.get("minute_utc") or "00").zfill(2)
+        row_wid = row.get("window_id") or f"{row['date_utc']}T{row['hour_utc']}:{row_min}Z"
+        matches_legacy = (row_wid == win_desc["window_id"]) or (
+            expected_pm == 60
+            and row["date_utc"] == win_desc["date_utc"]
+            and str(row["hour_utc"]).zfill(2) == win_desc["hour_utc"]
+        )
+        if not matches_legacy:
+            return False, None
+
+    raw_run_id = row.get("collection_run_id")
+    eff_run_id = str(raw_run_id) if raw_run_id not in (None, "") else None
+    if expected_run_id is not None:
+        boot_str = str(row.get("boot_id") or "")
+        if eff_run_id != expected_run_id and not (
+            eff_run_id is None and (boot_str == expected_run_id or boot_str.startswith(f"{expected_run_id}_"))
+        ):
+            return False, eff_run_id
+    return True, eff_run_id
+
+
+def _reconcile_single_window(
+    *,
+    win_desc: dict[str, Any],
+    expected_exchanges: set[str],
+    expected_run_id: str | None,
+    all_verified_rows: list[dict[str, Any]],
+    pending_unverified_rows: list[dict[str, Any]],
+    manifests_with_data: set[str],
+    raw_root: Path,
+    sealed_root: Path,
+    max_coverage_gap_seconds: float,
+    seal_wait_attempts: int = 0,
+    seal_waited_seconds: float = 0.0,
+    verify_remote: bool = True,
+) -> dict[str, Any]:
+    """Evaluate BOTH file verification and whole-window data coverage for one expected UTC window."""
+    expected_date = win_desc["date_utc"]
+    expected_hour = win_desc["hour_utc"]
+    expected_window_id = win_desc["window_id"]
+    expected_pm = int(win_desc["partition_minutes"])
+    p_start_ns = int(win_desc["planned_start_wall_ns"])
+    p_end_ns = int(win_desc["planned_end_wall_ns"])
+    window_label = f"{expected_date}T{expected_hour}Z" if expected_pm == 60 else expected_window_id
+    max_gap_ns = int(max_coverage_gap_seconds * 1_000_000_000)
+
+    win_errors: list[str] = []
+    if not verify_remote:
+        win_errors.append("verify_remote_required_when_config_enforced")
+
+    matching_verified: list[tuple[dict[str, Any], str]] = []
+    for row in all_verified_rows:
+        ex = str(row["exchange"])
+        if ex not in expected_exchanges:
+            continue
+        if not (row["remote_data_verified"] and row["remote_manifest_verified"]):
+            continue
+        if row["has_conflict"] or row["last_error_code"]:
+            continue
+        matches_win, eff_batch = _row_matches_window_and_batch(row, win_desc, expected_run_id)
+        if not matches_win:
+            continue
+        has_data = int(row.get("data_lines") or 0) > 0 or row["rel_manifest_path"] in manifests_with_data
+        if not has_data:
+            continue
+        matching_verified.append((row, eff_batch or "__default__"))
+
+    # Enforce strict batch isolation: never merge segments across different collection_run_id batches
+    distinct_batches = sorted({b for _, b in matching_verified})
+    mixed_batches: list[str] = []
+    selected_batch: str | None = None
+    if len(distinct_batches) > 1:
+        mixed_batches = [b for b in distinct_batches]
+        win_errors.append(
+            f"mixed_batches_in_expected_window:{window_label}:{','.join(mixed_batches)}"
+        )
+        # Pick the single batch with the most distinct exchanges (never union across batches!)
+        by_batch_ex: dict[str, set[str]] = {b: set() for b in distinct_batches}
+        for row, b in matching_verified:
+            by_batch_ex[b].add(str(row["exchange"]))
+        selected_batch = max(distinct_batches, key=lambda b: (len(by_batch_ex[b]), b))
+    elif len(distinct_batches) == 1:
+        selected_batch = distinct_batches[0]
+
+    per_exchange_segments: dict[str, list[dict[str, Any]]] = {
+        ex: [] for ex in sorted(expected_exchanges)
+    }
+    for row, b in matching_verified:
+        if selected_batch is None or b == selected_batch:
+            per_exchange_segments[str(row["exchange"])].append(row)
+
+    unsealed_partials, sealed_without_manifest = _find_window_files(
+        raw_root, sealed_root, expected_exchanges, win_desc
+    )
+    for rel_p in sealed_without_manifest:
+        win_errors.append(f"sealed_file_without_manifest:{rel_p}")
+    for rel_part in unsealed_partials:
+        win_errors.append(f"unsealed_partial_in_expected_hour:{rel_part}")
+
+    exchanges_with_unverified_local: set[str] = set()
+    for rel_p in unsealed_partials + sealed_without_manifest:
+        parts = rel_p.split("/")
+        if len(parts) >= 2:
+            exchanges_with_unverified_local.add(parts[1])
+    for prow in pending_unverified_rows:
+        m_ok, _ = _row_matches_window_and_batch(prow, win_desc, expected_run_id)
+        if m_ok:
+            exchanges_with_unverified_local.add(str(prow["exchange"]))
+
+    file_verified: set[str] = set()
+    covered_exchanges: set[str] = set()
+    incomplete_coverage_exchanges: list[str] = []
+    coverage_gaps: dict[str, dict[str, Any]] = {}
+    segment_summaries: dict[str, dict[str, Any]] = {}
+    overlaps: list[dict[str, Any]] = []
+
+    for ex in sorted(expected_exchanges):
+        segs = sorted(
+            per_exchange_segments[ex],
+            key=lambda r: (
+                r.get("start_wall_ns") if r.get("start_wall_ns") is not None else 0,
+                r.get("first_rx_seq") if r.get("first_rx_seq") is not None else 0,
+                r["rel_data_path"],
+            ),
+        )
+        ex_has_seq_overlap = False
+        for prev_r, cur_r in zip(segs, segs[1:]):
+            same_boot_seq_overlap = (
+                prev_r["boot_id"] == cur_r["boot_id"]
+                and prev_r.get("last_rx_seq") is not None
+                and cur_r.get("first_rx_seq") is not None
+                and int(cur_r["first_rx_seq"]) <= int(prev_r["last_rx_seq"])
+            )
+            wall_overlap = (
+                prev_r.get("end_wall_ns") is not None
+                and cur_r.get("start_wall_ns") is not None
+                and int(cur_r["start_wall_ns"]) < int(prev_r["end_wall_ns"])
+            )
+            if same_boot_seq_overlap or wall_overlap:
+                ov = {
+                    "exchange": ex,
+                    "window_id": expected_window_id,
+                    "first_segment": prev_r["rel_data_path"],
+                    "second_segment": cur_r["rel_data_path"],
+                    "same_boot_seq_overlap": same_boot_seq_overlap,
+                    "wall_overlap": wall_overlap,
+                }
+                overlaps.append(ov)
+                if same_boot_seq_overlap:
+                    ex_has_seq_overlap = True
+                    win_errors.append(
+                        f"segment_seq_overlap_in_expected_window:{ex}:{expected_window_id}"
+                    )
+
+        if segs and ex not in exchanges_with_unverified_local and not ex_has_seq_overlap:
+            file_verified.add(ex)
+
+        starts = [int(r["start_wall_ns"]) for r in segs if r.get("start_wall_ns") is not None]
+        ends = [int(r["end_wall_ns"]) for r in segs if r.get("end_wall_ns") is not None]
+        head_gap_ns = max(0, min(starts) - p_start_ns) if starts else (p_end_ns - p_start_ns)
+        tail_gap_ns = max(0, p_end_ns - max(ends)) if ends else (p_end_ns - p_start_ns)
+        internal_gaps_ns = [
+            max(0, int(cur["start_wall_ns"]) - int(prev["end_wall_ns"]))
+            for prev, cur in zip(segs, segs[1:])
+            if prev.get("end_wall_ns") is not None and cur.get("start_wall_ns") is not None
+        ]
+        max_internal_gap_ns = max(internal_gaps_ns, default=0)
+
+        gap_reasons: list[str] = []
+        if segs:
+            if not starts or not ends:
+                gap_reasons.append("missing_segment_timestamps")
+            else:
+                if head_gap_ns > max_gap_ns or bool(segs[0].get("is_startup_stub")):
+                    gap_reasons.append(f"head_gap_{head_gap_ns / 1e9:.1f}s")
+                if tail_gap_ns > max_gap_ns or bool(segs[-1].get("settled_by_timer")):
+                    gap_reasons.append(f"tail_gap_{tail_gap_ns / 1e9:.1f}s")
+                if max_internal_gap_ns > max_gap_ns:
+                    gap_reasons.append(f"internal_gap_{max_internal_gap_ns / 1e9:.1f}s")
+                if len(segs) == 1 and bool(segs[0].get("coverage_incomplete")) and not gap_reasons:
+                    gap_reasons.append("manifest_marked_coverage_incomplete")
+
+        if ex in file_verified and not gap_reasons and not mixed_batches:
+            covered_exchanges.add(ex)
+        elif segs:
+            incomplete_coverage_exchanges.append(ex)
+            coverage_gaps[ex] = {
+                "head_gap_seconds": round(head_gap_ns / 1e9, 3),
+                "tail_gap_seconds": round(tail_gap_ns / 1e9, 3),
+                "max_internal_gap_seconds": round(max_internal_gap_ns / 1e9, 3),
+                "reasons": gap_reasons or ["unverified_or_mixed_batch"],
+            }
+            if gap_reasons:
+                win_errors.append(
+                    f"expected_window_coverage_incomplete:{ex}:{window_label}:{','.join(gap_reasons)}"
+                )
+
+        segment_summaries[ex] = {
+            "segment_count": len(segs),
+            "segments": [r["rel_data_path"] for r in segs],
+            "boot_ids": sorted({str(r["boot_id"]) for r in segs}),
+            "collection_run_ids": sorted({str(r.get("collection_run_id") or "") for r in segs if r.get("collection_run_id")}),
+            "total_data_lines": sum(int(r.get("data_lines") or 0) for r in segs),
+            "merged_start_wall_ns": min(starts) if starts else None,
+            "merged_end_wall_ns": max(ends) if ends else None,
+            "head_gap_seconds": round(head_gap_ns / 1e9, 3) if starts else None,
+            "tail_gap_seconds": round(tail_gap_ns / 1e9, 3) if ends else None,
+            "max_internal_gap_seconds": round(max_internal_gap_ns / 1e9, 3) if len(segs) > 1 else 0.0,
+            "has_startup_stub": any(bool(r.get("is_startup_stub")) for r in segs),
+            "settled_by_timer": any(bool(r.get("settled_by_timer")) for r in segs),
+            "file_verified": ex in file_verified,
+            "coverage_complete": ex in covered_exchanges,
+        }
+
+    missing_exchanges = sorted(expected_exchanges - file_verified)
+    win_errors.extend(
+        f"expected_hour_not_verified:{exchange}:{window_label}"
+        for exchange in missing_exchanges
+    )
+
+    file_verification_status = (
+        "verified"
+        if (
+            not missing_exchanges
+            and not unsealed_partials
+            and not sealed_without_manifest
+            and not overlaps
+            and not mixed_batches
+            and verify_remote
+        )
+        else "pending"
+    )
+    if file_verification_status == "verified" and len(covered_exchanges) == len(expected_exchanges) and not incomplete_coverage_exchanges:
+        window_coverage_status = "complete"
+    elif len(file_verified) == 0:
+        window_coverage_status = "missing"
+    else:
+        window_coverage_status = "incomplete"
+
+    window_status = (
+        "COMPLETE"
+        if (file_verification_status == "verified" and window_coverage_status == "complete")
+        else "PENDING"
+    )
+
+    return {
+        "expected_hour_utc": window_label,
+        "expected_window_id": expected_window_id,
+        "window_span_id": win_desc.get("window_span_id"),
+        "planned_start_wall_ns": p_start_ns,
+        "planned_end_wall_ns": p_end_ns,
+        "partition_minutes": expected_pm,
+        "expected_run_id": expected_run_id,
+        "observed_batches": distinct_batches,
+        "mixed_batches": mixed_batches,
+        "expected_exchanges": sorted(expected_exchanges),
+        "verified_exchanges": sorted(file_verified),
+        "file_verified_exchanges": sorted(file_verified),
+        "covered_exchanges": sorted(covered_exchanges),
+        "missing_exchanges": missing_exchanges,
+        "incomplete_coverage_exchanges": sorted(incomplete_coverage_exchanges),
+        "coverage_gaps": coverage_gaps,
+        "file_verification_status": file_verification_status,
+        "window_coverage_status": window_coverage_status,
+        "window_status": window_status,
+        "per_exchange_segments": segment_summaries,
+        "overlaps": overlaps,
+        "unsealed_partials": unsealed_partials,
+        "sealed_without_manifest": sealed_without_manifest,
+        "seal_wait_attempts": seal_wait_attempts,
+        "seal_waited_seconds": round(seal_waited_seconds, 3),
+        "verify_remote_enforced": bool(verify_remote),
+        "errors": win_errors,
+    }
+
+
 def sync_sealed_directory(
     sealed_root: Path,
     backend: ArchiveBackend,
@@ -1809,6 +2252,7 @@ def sync_sealed_directory(
     expected_hourly_exchanges: set[str] | None = None,
     partition_minutes: int = 60,
     expected_run_id: str | None = None,
+    max_coverage_gap_seconds: float | None = None,
     seal_wait_seconds: float = 0.0,
     seal_poll_interval_seconds: float = 1.0,
     sleeper: Callable[[float], None] = time.sleep,
@@ -1817,8 +2261,8 @@ def sync_sealed_directory(
     """Incrementally verify, upload, remote-verify, snapshot-backup, and safely prune partitions.
 
     Supports configurable UTC windows (`partition_minutes` in `{5, 15, 30, 60}`), bounded wait for
-    asynchronous sealing, multi-segment per-exchange reconciliation, and catch-up of prior
-    unverified windows.
+    asynchronous sealing, multi-segment per-exchange reconciliation, separate file-verification vs
+    whole-window coverage checks, and persistent catch-up of prior unfinished/missing windows.
 
     `fault_hooks` (strictly for deterministic fault-injection testing) supports optional callbacks:
       - `before_verify_commit(rel_data_path)`
@@ -1885,7 +2329,7 @@ def sync_sealed_directory(
                 seal_waited_seconds += step
 
         manifests = sorted(raw_root.rglob("*.manifest.json")) if raw_root.exists() else []
-        if not manifests:
+        if not manifests and expected_hourly_exchanges is None:
             return {
                 "status": "blocked",
                 "phase": "archive",
@@ -2437,8 +2881,136 @@ def sync_sealed_directory(
                     )
                     errors.append(f"{rel_data}: {type(exc).__name__}: {exc}")
 
+            # Atomically export compatibility projection to verified_archive_ledger.compat.jsonl
+            # (never overwriting any pre-existing legacy verified_archive_ledger.jsonl).
+            export_verified_jsonl_projection(sealed_root, ledger)
+
+            all_verified_rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
+            pending_unverified_rows = ledger.list_partitions(states=(STATE_SEALED,))
+            if not manifests and not all_verified_rows and not pending_unverified_rows:
+                errors.append(f"No sealed *.manifest.json found under {raw_root}")
+
+            expected_hour_reconciliation: dict[str, Any] | None = None
+            if expected_hourly_exchanges is not None and expected_win_desc is not None:
+                from data_coverage import window_descriptor
+
+                expected_pm = int(expected_win_desc["partition_minutes"])
+                step_s = expected_pm * 60
+                eff_max_gap_s = (
+                    float(max_coverage_gap_seconds)
+                    if max_coverage_gap_seconds is not None
+                    else min(300.0, float(step_s) / 3.0)
+                )
+
+                # Discover earliest window start to track contiguously (from existing expected_windows,
+                # matching partitions in ledger, or the current expected window).
+                candidate_starts: list[int] = [int(expected_win_desc["planned_start_s"])]
+                for ew in ledger.list_expected_windows(
+                    partition_minutes=expected_pm, collection_run_id=expected_run_id
+                ):
+                    ew_s = int(ew["planned_start_wall_ns"]) // 1_000_000_000
+                    if ew_s <= int(expected_win_desc["planned_start_s"]):
+                        candidate_starts.append(ew_s)
+                for row in all_verified_rows + pending_unverified_rows:
+                    if int(row.get("partition_minutes") or 60) != expected_pm:
+                        continue
+                    if expected_run_id is not None:
+                        r_run = row.get("collection_run_id")
+                        b_str = str(row.get("boot_id") or "")
+                        if r_run != expected_run_id and not (
+                            r_run in (None, "") and (b_str == expected_run_id or b_str.startswith(f"{expected_run_id}_"))
+                        ):
+                            continue
+                    r_start_s = (_row_planned_start_s(row) // step_s) * step_s
+                    if r_start_s <= int(expected_win_desc["planned_start_s"]):
+                        candidate_starts.append(r_start_s)
+
+                earliest_start_s = min(candidate_starts)
+                cur_s = earliest_start_s
+                pending_prior_windows: list[str] = []
+                pending_prior_window_details: list[dict[str, Any]] = []
+                current_rec: dict[str, Any] | None = None
+
+                while cur_s <= int(expected_win_desc["planned_start_s"]):
+                    w_desc = window_descriptor(cur_s, expected_pm)
+                    is_current_target = cur_s == int(expected_win_desc["planned_start_s"])
+                    rec = _reconcile_single_window(
+                        win_desc=w_desc,
+                        expected_exchanges=expected_hourly_exchanges,
+                        expected_run_id=expected_run_id,
+                        all_verified_rows=all_verified_rows,
+                        pending_unverified_rows=pending_unverified_rows,
+                        manifests_with_data=manifests_with_data,
+                        raw_root=raw_root,
+                        sealed_root=sealed_root,
+                        max_coverage_gap_seconds=eff_max_gap_s,
+                        seal_wait_attempts=seal_wait_attempts if is_current_target else 0,
+                        seal_waited_seconds=seal_waited_seconds if is_current_target else 0.0,
+                        verify_remote=verify_remote,
+                    )
+                    w_key = (
+                        f"{expected_run_id or ''}|{w_desc['planned_start_wall_ns']}|"
+                        f"{w_desc['planned_end_wall_ns']}|{expected_pm}"
+                    )
+                    ledger.upsert_expected_window(
+                        window_key=w_key,
+                        win_desc=w_desc,
+                        collection_run_id=expected_run_id,
+                        expected_exchanges=rec["expected_exchanges"],
+                        file_verified_exchanges=rec["file_verified_exchanges"],
+                        covered_exchanges=rec["covered_exchanges"],
+                        missing_exchanges=rec["missing_exchanges"],
+                        incomplete_coverage_exchanges=rec["incomplete_coverage_exchanges"],
+                        file_verification_status=rec["file_verification_status"],
+                        window_coverage_status=rec["window_coverage_status"],
+                        window_status=rec["window_status"],
+                        detail={
+                            "coverage_gaps": rec["coverage_gaps"],
+                            "mixed_batches": rec["mixed_batches"],
+                            "overlaps": rec["overlaps"],
+                            "unsealed_partials": rec["unsealed_partials"],
+                            "sealed_without_manifest": rec["sealed_without_manifest"],
+                        },
+                        now_iso=now_iso,
+                    )
+                    if is_current_target:
+                        current_rec = rec
+                    elif rec["window_status"] != "COMPLETE":
+                        pending_prior_windows.append(w_desc["window_id"])
+                        pending_prior_window_details.append(
+                            {
+                                "window_id": w_desc["window_id"],
+                                "window_span_id": w_desc.get("window_span_id"),
+                                "file_verification_status": rec["file_verification_status"],
+                                "window_coverage_status": rec["window_coverage_status"],
+                                "missing_exchanges": rec["missing_exchanges"],
+                                "incomplete_coverage_exchanges": rec["incomplete_coverage_exchanges"],
+                                "coverage_gaps": rec["coverage_gaps"],
+                            }
+                        )
+                    cur_s += step_s
+
+                # Also include any other unverified rows in STATE_SEALED not in the contiguous range
+                for prow in pending_unverified_rows:
+                    pwid = str(prow.get("window_id") or f"{prow['date_utc']}T{prow['hour_utc']}:00Z")
+                    if pwid != expected_win_desc["window_id"] and pwid not in pending_prior_windows:
+                        pending_prior_windows.append(pwid)
+                pending_prior_windows.sort()
+
+                assert current_rec is not None
+                errors.extend(current_rec["errors"])
+                if verify_remote:
+                    for pwid in pending_prior_windows:
+                        errors.append(f"pending_prior_window_unverified:{pwid}")
+
+                expected_hour_reconciliation = {
+                    k: v for k, v in current_rec.items() if k != "errors"
+                }
+                expected_hour_reconciliation["pending_prior_windows"] = pending_prior_windows
+                expected_hour_reconciliation["pending_prior_window_details"] = pending_prior_window_details
+
             # Atomically export deterministic cloud-readable verified archive index BEFORE meta/ sync
-            # so GitHub Incremental QA discovers only remotely verified partitions.
+            # so GitHub Incremental QA discovers only remotely verified partitions and window states.
             archive_index_path = export_archive_manifest_index(sealed_root, ledger)
 
             # Upload changed meta/ files incrementally (excluding WAL/SHM/lock/partial files)
@@ -2469,147 +3041,6 @@ def sync_sealed_directory(
                         meta_uploaded.append(rel)
                     except Exception as exc:
                         errors.append(f"{rel}: {type(exc).__name__}: {exc}")
-
-            # Atomically export compatibility projection to verified_archive_ledger.compat.jsonl
-            # (never overwriting any pre-existing legacy verified_archive_ledger.jsonl).
-            export_verified_jsonl_projection(sealed_root, ledger)
-
-            all_verified_rows = ledger.list_partitions(states=(STATE_VERIFIED, STATE_PRUNED))
-            pending_unverified_rows = ledger.list_partitions(states=(STATE_SEALED,))
-            expected_hour_reconciliation: dict[str, Any] | None = None
-            if expected_hourly_exchanges is not None and expected_win_desc is not None:
-                expected_date = expected_win_desc["date_utc"]
-                expected_hour = expected_win_desc["hour_utc"]
-                expected_window_id = expected_win_desc["window_id"]
-                expected_pm = int(expected_win_desc["partition_minutes"])
-                if not verify_remote:
-                    errors.append("verify_remote_required_when_config_enforced")
-
-                per_exchange_segments: dict[str, list[dict[str, Any]]] = {
-                    ex: [] for ex in sorted(expected_hourly_exchanges)
-                }
-                for row in all_verified_rows:
-                    ex = str(row["exchange"])
-                    if ex not in per_exchange_segments:
-                        continue
-                    if not (row["remote_data_verified"] and row["remote_manifest_verified"]):
-                        continue
-                    if row["has_conflict"] or row["last_error_code"]:
-                        continue
-                    row_pm = int(row.get("partition_minutes") or 60)
-                    row_min = str(row.get("minute_utc") or "00").zfill(2)
-                    row_wid = row.get("window_id") or f"{row['date_utc']}T{row['hour_utc']}:{row_min}Z"
-                    matches_win = (row_wid == expected_window_id and row_pm == expected_pm) or (
-                        expected_pm == 60
-                        and row["date_utc"] == expected_date
-                        and row["hour_utc"] == expected_hour
-                        and row_pm == 60
-                    )
-                    if not matches_win:
-                        continue
-                    if expected_run_id is not None and row.get("collection_run_id") not in (None, expected_run_id):
-                        continue
-                    has_data = int(row.get("data_lines") or 0) > 0 or row["rel_manifest_path"] in manifests_with_data
-                    if not has_data:
-                        continue
-                    per_exchange_segments[ex].append(row)
-
-                verified: set[str] = set()
-                segment_summaries: dict[str, dict[str, Any]] = {}
-                overlaps: list[dict[str, Any]] = []
-                for ex in sorted(expected_hourly_exchanges):
-                    segs = sorted(
-                        per_exchange_segments[ex],
-                        key=lambda r: (
-                            r.get("start_wall_ns") if r.get("start_wall_ns") is not None else 0,
-                            r.get("first_rx_seq") if r.get("first_rx_seq") is not None else 0,
-                            r["rel_data_path"],
-                        ),
-                    )
-                    if segs:
-                        verified.add(ex)
-                    starts = [int(r["start_wall_ns"]) for r in segs if r.get("start_wall_ns") is not None]
-                    ends = [int(r["end_wall_ns"]) for r in segs if r.get("end_wall_ns") is not None]
-                    # Detect overlapping segments (same boot rx_seq overlap or wall_ns overlap)
-                    for prev_r, cur_r in zip(segs, segs[1:]):
-                        same_boot_seq_overlap = (
-                            prev_r["boot_id"] == cur_r["boot_id"]
-                            and prev_r.get("last_rx_seq") is not None
-                            and cur_r.get("first_rx_seq") is not None
-                            and int(cur_r["first_rx_seq"]) <= int(prev_r["last_rx_seq"])
-                        )
-                        wall_overlap = (
-                            prev_r.get("end_wall_ns") is not None
-                            and cur_r.get("start_wall_ns") is not None
-                            and int(cur_r["start_wall_ns"]) < int(prev_r["end_wall_ns"])
-                        )
-                        if same_boot_seq_overlap or wall_overlap:
-                            ov = {
-                                "exchange": ex,
-                                "window_id": expected_window_id,
-                                "first_segment": prev_r["rel_data_path"],
-                                "second_segment": cur_r["rel_data_path"],
-                                "same_boot_seq_overlap": same_boot_seq_overlap,
-                                "wall_overlap": wall_overlap,
-                            }
-                            overlaps.append(ov)
-                            if same_boot_seq_overlap:
-                                errors.append(
-                                    f"segment_seq_overlap_in_expected_window:{ex}:{expected_window_id}"
-                                )
-                    segment_summaries[ex] = {
-                        "segment_count": len(segs),
-                        "segments": [r["rel_data_path"] for r in segs],
-                        "boot_ids": sorted({str(r["boot_id"]) for r in segs}),
-                        "total_data_lines": sum(int(r.get("data_lines") or 0) for r in segs),
-                        "merged_start_wall_ns": min(starts) if starts else None,
-                        "merged_end_wall_ns": max(ends) if ends else None,
-                        "has_startup_stub": any(bool(r.get("is_startup_stub")) for r in segs),
-                        "settled_by_timer": any(bool(r.get("settled_by_timer")) for r in segs),
-                    }
-
-                missing_exchanges = sorted(expected_hourly_exchanges - verified)
-                window_label = f"{expected_date}T{expected_hour}Z" if expected_pm == 60 else expected_window_id
-                errors.extend(
-                    f"expected_hour_not_verified:{exchange}:{window_label}"
-                    for exchange in missing_exchanges
-                )
-                unsealed_partials, sealed_without_manifest = _find_window_files(
-                    raw_root, sealed_root, expected_hourly_exchanges, expected_win_desc
-                )
-                for rel_p in sealed_without_manifest:
-                    errors.append(f"sealed_file_without_manifest:{rel_p}")
-                for rel_part in unsealed_partials:
-                    errors.append(f"unsealed_partial_in_expected_hour:{rel_part}")
-
-                # Track any prior windows still unverified in SQLite so they never drop silently
-                pending_prior_windows = sorted(
-                    {
-                        str(r.get("window_id") or f"{r['date_utc']}T{r['hour_utc']}:00Z")
-                        for r in pending_unverified_rows
-                    }
-                )
-                if verify_remote:
-                    for pwid in pending_prior_windows:
-                        if pwid != expected_window_id:
-                            errors.append(f"pending_prior_window_unverified:{pwid}")
-                expected_hour_reconciliation = {
-                    "expected_hour_utc": window_label,
-                    "expected_window_id": expected_window_id,
-                    "partition_minutes": expected_pm,
-                    "expected_run_id": expected_run_id,
-                    "expected_exchanges": sorted(expected_hourly_exchanges),
-                    "verified_exchanges": sorted(verified),
-                    "missing_exchanges": missing_exchanges,
-                    "per_exchange_segments": segment_summaries,
-                    "overlaps": overlaps,
-                    "unsealed_partials": unsealed_partials,
-                    "sealed_without_manifest": sealed_without_manifest,
-                    "pending_prior_windows": pending_prior_windows,
-                    "seal_wait_attempts": seal_wait_attempts,
-                    "seal_waited_seconds": round(seal_waited_seconds, 3),
-                    "verify_remote_enforced": bool(verify_remote),
-                }
 
             # Compare committed recovery state to the last successfully copied snapshot, even
             # after a crash or a retry with zero new uploads. Exclude the snapshot's own metadata.

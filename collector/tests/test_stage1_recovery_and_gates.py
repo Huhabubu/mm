@@ -396,11 +396,15 @@ def test_stage1_archive_service_audit_and_60m_gate(tmp_path: Path) -> None:
     expected_ex = {"binance_futures", "bybit_linear", "bitget_v3", "gate_futures"}
     sealed_root = tmp_path / "sealed"
     wall_ns = int(prev_dt.timestamp() * 1e9) + 1_000_000
+    wall_tail_ns = int(prev_dt.timestamp() * 1e9) + 3598 * 1_000_000_000
+    full_hour_rows = [
+        f"{wall_ns}\t100\tA\t1\t1\tDATA\t{{\"ok\":true}}",
+        f"{wall_tail_ns}\t200\tA\t1\t2\tDATA\t{{\"ok\":true}}",
+    ]
 
     # Seed only 3 of 4 exchanges (gate_futures missing)
     for ex in ("binance_futures", "bybit_linear", "bitget_v3"):
-        row = f"{wall_ns}\t100\tA\t1\t1\tDATA\t{{\"ok\":true}}"
-        _write_sealed_partition(sealed_root, exchange=ex, dt_hour=prev_dt, rows=[row])
+        _write_sealed_partition(sealed_root, exchange=ex, dt_hour=prev_dt, rows=full_hour_rows)
 
     backend = _MemoryBackend()
     hc_calls: list[tuple[str, bytes]] = []
@@ -426,8 +430,7 @@ def test_stage1_archive_service_audit_and_60m_gate(tmp_path: Path) -> None:
     assert hc_calls[-1][0].endswith("/fail")
 
     # Add 4th exchange BUT also leave an unsealed .partial in expected hour -> still blocked!
-    row_g = f"{wall_ns}\t100\tA\t1\t1\tDATA\t{{\"ok\":true}}"
-    _write_sealed_partition(sealed_root, exchange="gate_futures", dt_hour=prev_dt, rows=[row_g])
+    _write_sealed_partition(sealed_root, exchange="gate_futures", dt_hour=prev_dt, rows=full_hour_rows)
     leftover_partial = sealed_root / "raw/gate_futures/2026-12-03/gate_futures_20261203_09_seg2.tsv.zst.partial"
     leftover_partial.write_bytes(b"unsealed")
 

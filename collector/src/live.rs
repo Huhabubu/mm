@@ -177,6 +177,8 @@ struct StreamTelemetryRow {
     buffered_wait_anchor_frames: u64,
     last_written_wall_ns: Option<i64>,
     written_frames: u64,
+    last_rejected_late_wall_ns: Option<i64>,
+    rejected_late_frames: u64,
     /// Per `(conn_id, epoch)` explicit subscription ACK wall_ns.
     ack_epochs: HashMap<(ConnId, u64), i64>,
     /// Per `(conn_id, epoch)` valid market/buffered frame observed wall_ns.
@@ -349,6 +351,21 @@ impl StreamActivity {
         row.written_frames = row.written_frames.saturating_add(1);
     }
 
+    fn record_rejected_late(&mut self, ex: ExchangeId, symbol: String, channel: String, wall_ns: i64) {
+        let ex_str = ex.as_dir_name().to_string();
+        let ep = owning_endpoint(&ex_str, &channel);
+        let row = self
+            .streams
+            .entry((ex_str, symbol.to_uppercase(), channel))
+            .or_default();
+        row.endpoint.get_or_insert(ep);
+        row.last_rejected_late_wall_ns = Some(
+            row.last_rejected_late_wall_ns
+                .map_or(wall_ns, |prev| prev.max(wall_ns)),
+        );
+        row.rejected_late_frames = row.rejected_late_frames.saturating_add(1);
+    }
+
     fn build_payload(
         &mut self,
         wall_ns: i64,
@@ -471,6 +488,8 @@ impl StreamActivity {
                     "written": row.written_frames > 0,
                     "last_written_wall_ns": row.last_written_wall_ns.unwrap_or(0),
                     "written_frames": row.written_frames,
+                    "rejected_late_frames": row.rejected_late_frames,
+                    "last_rejected_late_wall_ns": row.last_rejected_late_wall_ns,
                     "depth_state": depth_state,
                 })
             })
@@ -1433,26 +1452,32 @@ fn process_engine_event(
         }
 
         let mut written_wall_ns = None;
+        let mut rejected_late_wall_ns = None;
         if let Some(writer) = writers.get_mut(&ex) {
             for rec in &out.records {
-                match writer.write_record(rec) {
-                    Ok(Some(s)) => {
-                        info!(
-                            "Rolled and sealed {} -> {} (bytes={}, data_lines={}, sha256={})",
-                            ex,
-                            s.data_path.display(),
-                            s.manifest.bytes,
-                            s.manifest.data_lines,
-                            s.manifest.sha256
-                        );
-                        flush_stderr();
-                        if !matches!(rec.kind, crate::types::RecordKind::Meta) {
-                            written_wall_ns = Some(rec.recv_wall_ns);
+                match writer.write_record_with_outcome(rec) {
+                    Ok(outcome) => {
+                        if let Some(s) = outcome.sealed {
+                            info!(
+                                "Rolled and sealed {} -> {} (bytes={}, data_lines={}, sha256={})",
+                                ex,
+                                s.data_path.display(),
+                                s.manifest.bytes,
+                                s.manifest.data_lines,
+                                s.manifest.sha256
+                            );
+                            flush_stderr();
                         }
-                    }
-                    Ok(None) => {
-                        if !matches!(rec.kind, crate::types::RecordKind::Meta) {
+                        if outcome.accepted_as_market_data {
                             written_wall_ns = Some(rec.recv_wall_ns);
+                        } else if let Some(target_wid) = outcome.rejected_late_target_window_id {
+                            if !matches!(rec.kind, crate::types::RecordKind::Meta) {
+                                rejected_late_wall_ns = Some(rec.recv_wall_ns);
+                                warn!(
+                                    "Rejected expired late market-data frame on {} for closed window {} (orig_recv_wall_ns={})",
+                                    ex, target_wid, rec.recv_wall_ns
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -1467,11 +1492,19 @@ fn process_engine_event(
         }
         if let Some(wall_ns) = written_wall_ns {
             if !out.written_streams.is_empty() {
-                for (symbol, channel) in out.written_streams {
-                    activity.record_written(ex, symbol, channel, wall_ns);
+                for (symbol, channel) in &out.written_streams {
+                    activity.record_written(ex, symbol.clone(), channel.clone(), wall_ns);
                 }
-            } else if let Some((symbol, channel)) = out.market_data {
-                activity.record_written(ex, symbol, channel, wall_ns);
+            } else if let Some((symbol, channel)) = &out.market_data {
+                activity.record_written(ex, symbol.clone(), channel.clone(), wall_ns);
+            }
+        } else if let Some(wall_ns) = rejected_late_wall_ns {
+            if !out.written_streams.is_empty() {
+                for (symbol, channel) in &out.written_streams {
+                    activity.record_rejected_late(ex, symbol.clone(), channel.clone(), wall_ns);
+                }
+            } else if let Some((symbol, channel)) = &out.market_data {
+                activity.record_rejected_late(ex, symbol.clone(), channel.clone(), wall_ns);
             }
         }
         if !allow_actions {

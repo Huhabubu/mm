@@ -287,13 +287,18 @@ def window_descriptor(start_epoch_s: int, partition_minutes: int) -> dict[str, A
     aligned_s = (int(start_epoch_s) // step_s) * step_s
     end_s = aligned_s + step_s
     dt = datetime.fromtimestamp(aligned_s, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_s, tz=timezone.utc)
+    win_id = dt.strftime("%Y-%m-%dT%H:%MZ")
+    end_id = end_dt.strftime("%Y-%m-%dT%H:%MZ")
     return {
         "partition_minutes": partition_minutes,
         "date_utc": dt.strftime("%Y-%m-%d"),
         "yyyymmdd": dt.strftime("%Y%m%d"),
         "hour_utc": dt.strftime("%H"),
         "minute_utc": dt.strftime("%M"),
-        "window_id": dt.strftime("%Y-%m-%dT%H:%MZ"),
+        "window_id": win_id,
+        "planned_end_id": end_id,
+        "window_span_id": f"{win_id}__{end_id}_{partition_minutes}m",
         "planned_start_s": aligned_s,
         "planned_end_s": end_s,
         "planned_start_wall_ns": aligned_s * _NS_PER_SEC,
@@ -367,9 +372,25 @@ def normalize_manifest_window(
     computed_start_ns = computed_start_s * _NS_PER_SEC
     computed_end_ns = computed_start_ns + partition_minutes * _NS_PER_MIN
 
-    planned_start_ns = int(manifest.get("planned_start_wall_ns") or computed_start_ns)
-    planned_end_ns = int(manifest.get("planned_end_wall_ns") or computed_end_ns)
+    raw_p_start = manifest.get("planned_start_wall_ns")
+    raw_p_end = manifest.get("planned_end_wall_ns")
+    planned_start_ns = int(raw_p_start) if raw_p_start is not None else computed_start_ns
+    planned_end_ns = int(raw_p_end) if raw_p_end is not None else computed_end_ns
+    span_ns = planned_end_ns - planned_start_ns
+    if span_ns <= 0 or span_ns % _NS_PER_MIN != 0:
+        raise ValueError(f"invalid planned window span in manifest: {planned_start_ns}..{planned_end_ns}")
+    span_pm = int(span_ns // _NS_PER_MIN)
+    if span_pm not in VALID_PARTITION_MINUTES:
+        raise ValueError(f"planned window span {span_pm}m is not a valid partition duration")
+    if raw_pm is not None and int(raw_pm) != span_pm:
+        raise ValueError(
+            f"manifest partition_minutes={raw_pm} conflicts with planned window span {span_pm}m"
+        )
+    partition_minutes = span_pm
+
     window_id = str(manifest.get("window_id") or format_window_id(planned_start_ns // _NS_PER_SEC))
+    planned_end_id = format_window_id(planned_end_ns // _NS_PER_SEC)
+    window_span_id = f"{window_id}__{planned_end_id}_{partition_minutes}m"
     segment_id = str(manifest.get("segment_id") or manifest.get("partition_id") or stem)
     boot_id = str(manifest.get("boot_id") or "unknown_boot")
     run_id = manifest.get("run_id")
@@ -381,6 +402,8 @@ def normalize_manifest_window(
         "minute_utc": minute_utc,
         "partition_minutes": partition_minutes,
         "window_id": window_id,
+        "planned_end_id": planned_end_id,
+        "window_span_id": window_span_id,
         "planned_start_wall_ns": planned_start_ns,
         "planned_end_wall_ns": planned_end_ns,
         "planned_start_s": planned_start_ns // _NS_PER_SEC,
@@ -555,6 +578,8 @@ class CompleteDayCoverage:
         self.max_gap_ns = max_gap_s * _NS_PER_SEC
         self.partitions: set[tuple[str, int]] = set()
         self.window_segments: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+        self.mismatched_partitions: list[dict[str, Any]] = []
+        self.observed_run_ids: set[str] = set()
         self.windows_by_stream: dict[tuple[str, str, str], set[int]] = defaultdict(set)
         self.hours_by_stream: dict[tuple[str, str, str], set[int]] = defaultdict(set)
         self.timing: dict[tuple[str, str, str], tuple[int, int, int]] = {}
@@ -563,16 +588,33 @@ class CompleteDayCoverage:
         norm = normalize_manifest_window(manifest)
         if norm["date_utc"] != self.date:
             return
+        if norm["run_id"]:
+            self.observed_run_ids.add(str(norm["run_id"]))
+        if int(norm["partition_minutes"]) != self.partition_minutes:
+            self.mismatched_partitions.append(
+                {
+                    "exchange": norm["exchange"],
+                    "file_name": norm["file_name"],
+                    "window_id": norm["window_id"],
+                    "partition_minutes": norm["partition_minutes"],
+                    "expected_partition_minutes": self.partition_minutes,
+                }
+            )
+            return
+        if (norm["planned_start_s"] - self.start_s) % self.window_seconds != 0:
+            self.mismatched_partitions.append(
+                {
+                    "exchange": norm["exchange"],
+                    "file_name": norm["file_name"],
+                    "window_id": norm["window_id"],
+                    "reason": "unaligned_window_start",
+                }
+            )
+            return
         idx = (norm["planned_start_s"] - self.start_s) // self.window_seconds
         if 0 <= idx < self.windows_per_day:
             self.partitions.add((norm["exchange"], idx))
             self.window_segments[(norm["exchange"], idx)].append(norm)
-            # If a legacy 60m partition covers a day configured with shorter windows, mark all covered sub-windows
-            if norm["partition_minutes"] > self.partition_minutes:
-                span = norm["partition_minutes"] // self.partition_minutes
-                for offset in range(span):
-                    if 0 <= idx + offset < self.windows_per_day:
-                        self.partitions.add((norm["exchange"], idx + offset))
 
     def observe_record(self, exchange: str, record: dict[str, Any]) -> None:
         if record["kind"] not in ("DATA", "DATA_ESCAPED"):
@@ -667,9 +709,12 @@ class CompleteDayCoverage:
                     "max_gap_seconds": longest / 1e9,
                     "allowed_gap_seconds": limit_ns / 1e9,
                 })
+        mixed_run_ids = sorted(self.observed_run_ids) if len(self.observed_run_ids) > 1 else []
         complete = bool(
             len(certified_minutes) == 1440
             and not missing_partitions
+            and not self.mismatched_partitions
+            and not mixed_run_ids
             and not missing_stream_hours
             and not missing_stream_windows
             and not stream_gaps
@@ -680,6 +725,9 @@ class CompleteDayCoverage:
             "partition_minutes": self.partition_minutes,
             "expected_windows_per_day": self.windows_per_day,
             "expected_stream_count": len(self.expected),
+            "observed_run_ids": sorted(self.observed_run_ids),
+            "mixed_run_ids": mixed_run_ids,
+            "mismatched_partitions": self.mismatched_partitions,
             "missing_partitions": missing_partitions,
             "missing_stream_hours": missing_stream_hours,
             "missing_stream_windows": missing_stream_windows,
