@@ -1,0 +1,29 @@
+name: Tokyo L2 schedule trigger probe (5m)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/tokyo-l2-schedule-probe.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Record trigger event and UTC time
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+          SCHEDULE_EXPR: ${{ github.event.schedule }}
+          REPOSITORY_REF: ${{ github.ref }}
+        run: |
+          echo "trigger_event=$TRIGGER_EVENT"
+          echo "schedule_expr=$SCHEDULE_EXPR"
+          echo "repository_ref=$REPOSITORY_REF"
+          date -u +"runner_utc=%Y-%m-%dT%H:%M:%SZ"
