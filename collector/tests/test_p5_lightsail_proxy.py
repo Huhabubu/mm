@@ -439,14 +439,42 @@ def test_p5_deploy_templates_strict_isolation_and_proxy_verify_cli(tmp_path: Pat
         assert ver["fail_closed_probe"]["local_source_preserved"] is True
         assert ver["fallback_probe"]["used_route"] == "direct_fallback"
 
-        # Cost math check: 500 GB upload uses 1000 GB Lightsail quota (2x IN+OUT) & billing gate starts False
+        # Cost math check: default same-AZ (1a) VPC Peering is $0/GB EC2->Lightsail; public fallback ($0.01/GB) preserved as comparison
         cost = lp_mod.estimate_lightsail_monthly_cost(500.0, plan_usd=5.0, plan_quota_gb=1024.0)
+        assert cost["monthly_upload_is_hypothetical_sample"] is True
         assert cost["ec2_direct"]["billable_gb"] == 400.0
         assert cost["ec2_direct"]["estimated_cost_usd"] == 45.6
+        assert cost["lightsail_relay"]["transfer_mode"] == "vpc_peering_same_az"
+        assert cost["lightsail_relay"]["same_physical_az"] is True
         assert cost["lightsail_relay"]["quota_consumed_gb"] == 1000.0
         assert cost["lightsail_relay"]["overage_gb"] == 0.0
-        assert cost["lightsail_relay"]["estimated_total_usd"] == 10.0
+        assert cost["lightsail_relay"]["assumed_ec2_to_lightsail_per_gb_usd"] == 0.0
+        assert cost["lightsail_relay"]["estimated_ec2_to_lightsail_usd"] == 0.0
+        assert cost["lightsail_relay"]["estimated_total_usd"] == 5.0
         assert cost["lightsail_relay"]["billing_gate_verified"] is False
+        assert cost["scenarios"]["vpc_peering_same_az"]["estimated_total_usd"] == 5.0
+        assert cost["scenarios"]["public_ipv4"]["estimated_ec2_to_lightsail_usd"] == 5.0
+        assert cost["scenarios"]["public_ipv4"]["estimated_total_usd"] == 10.0
+
+        # Public mode & cross-AZ edge checks + overage beyond 1 TB (2x IN+OUT quota)
+        cost_pub = lp_mod.estimate_lightsail_monthly_cost(
+            500.0, transfer_mode="public_ipv4", plan_usd=5.0, plan_quota_gb=1024.0
+        )
+        assert cost_pub["lightsail_relay"]["estimated_ec2_to_lightsail_usd"] == 5.0
+        assert cost_pub["lightsail_relay"]["estimated_total_usd"] == 10.0
+
+        cost_cross = lp_mod.estimate_lightsail_monthly_cost(
+            500.0, transfer_mode="vpc_peering_same_az", same_physical_az=False
+        )
+        assert cost_cross["lightsail_relay"]["assumed_ec2_to_lightsail_per_gb_usd"] == 0.01
+        assert cost_cross["lightsail_relay"]["estimated_total_usd"] == 10.0
+
+        cost_over = lp_mod.estimate_lightsail_monthly_cost(600.0, plan_usd=5.0, plan_quota_gb=1024.0)
+        assert cost_over["lightsail_relay"]["quota_consumed_gb"] == 1200.0
+        assert cost_over["lightsail_relay"]["overage_gb"] == 176.0
+        assert cost_over["lightsail_relay"]["overage_usd"] == 24.64
+        assert cost_over["lightsail_relay"]["estimated_total_usd"] == 29.64
+        assert cost_over["scenarios"]["public_ipv4"]["estimated_total_usd"] == 35.64
 
         # Real CLI wrapper test (`collector/bin/proxy-verify compare-report --skip-live-egress`)
         out_md = tmp_path / "compare_report.md"
@@ -458,6 +486,12 @@ def test_p5_deploy_templates_strict_isolation_and_proxy_verify_cli(tmp_path: Pat
                 "--proxy-url",
                 socks.url,
                 "--skip-live-egress",
+                "--transfer-mode",
+                "vpc_peering_same_az",
+                "--ec2-az",
+                "ap-northeast-1a",
+                "--lightsail-az",
+                "ap-northeast-1a",
                 "--monthly-upload-gb",
                 "500",
                 "--out-md",
@@ -472,7 +506,13 @@ def test_p5_deploy_templates_strict_isolation_and_proxy_verify_cli(tmp_path: Pat
         rep = json.loads(proc.stdout)
         assert rep["status"] == "ok"
         assert rep["cost_estimate"]["lightsail_relay"]["quota_consumed_gb"] == 1000.0
-        assert "Lightsail" in out_md.read_text(encoding="utf-8")
+        assert rep["cost_estimate"]["lightsail_relay"]["estimated_total_usd"] == 5.0
+        assert rep["cost_estimate"]["scenarios"]["public_ipv4"]["estimated_total_usd"] == 10.0
+        md_txt = out_md.read_text(encoding="utf-8")
+        assert "Lightsail" in md_txt
+        assert "172.26.12.211" in md_txt
+        assert "13.192.29.63" in md_txt
+        assert "NOT Measured Collection Traffic" in md_txt
         assert out_json.is_file()
     finally:
         socks.stop()
@@ -527,53 +567,164 @@ def test_p5_meta_daemon_tunnel_monitoring_opt_in_only(
     assert r_up["alert_dispatch"]["sent_recoveries"] == ["lightsail_proxy_unavailable"]
 
 
-def test_p5_check_takeover_port_conflict_and_systemd_readiness(tmp_path: Path) -> None:
-    """Verify controlled :1080 takeover checks, archive lock blocking, CLI exit codes, and key/pinning audits."""
+def test_p5_check_takeover_fail_closed_ownership_and_private_peering_templates(tmp_path: Path) -> None:
+    """Verify fail-closed check-takeover gates (--data-root, lock, systemd, PID ownership) & VPC Peering templates."""
     import fcntl
     import shutil
 
-    # 1. Free port + idle archive -> ready_for_systemd_takeover=True, status='ok'
+    data_root = tmp_path / "tokyo_l2"
+    data_root.mkdir(parents=True, exist_ok=True)
+    idle_units = lambda u: {  # noqa: E731
+        "unit": u,
+        "available": True,
+        "load_state": "loaded",
+        "active_state": "inactive",
+        "sub_state": "dead",
+        "main_pid": None,
+        "control_group": None,
+    }
+    no_listeners = lambda h, p: {  # noqa: E731
+        "available": True,
+        "pids": [],
+        "entries": [],
+        "pid_visibility_denied": False,
+        "error": None,
+    }
+
+    # 1. Missing data_root -> blocked fail-closed (never skip .archive_sync.lock!)
+    missing_root_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        data_root=None,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+        unit_state_fn=idle_units,
+        listener_owner_fn=no_listeners,
+    )
+    assert missing_root_res["status"] == "blocked"
+    assert missing_root_res["conflict"] == "missing_data_root"
+    assert missing_root_res["ready_for_systemd_takeover"] is False
+
+    # 2. Non-existent data_root or lock check failure -> blocked fail-closed
+    nonexistent_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        data_root=tmp_path / "does_not_exist",
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+        unit_state_fn=idle_units,
+        listener_owner_fn=no_listeners,
+    )
+    assert nonexistent_res["status"] == "blocked"
+    assert nonexistent_res["conflict"] == "archive_lock_check_failed"
+    assert nonexistent_res["ready_for_systemd_takeover"] is False
+
+    lock_err_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        data_root=data_root,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+        unit_state_fn=idle_units,
+        lock_check_fn=lambda _p: {
+            "checked": False,
+            "lock_path": str(data_root / ".archive_sync.lock"),
+            "lock_held": False,
+            "error": "EACCES permission denied",
+        },
+        listener_owner_fn=no_listeners,
+    )
+    assert lock_err_res["status"] == "blocked"
+    assert lock_err_res["conflict"] == "archive_lock_check_failed"
+
+    # 3. Systemd unavailable or unclear/transitioning unit state -> blocked fail-closed
+    sys_unavail = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        data_root=data_root,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+        unit_state_fn=lambda u: {
+            "unit": u,
+            "available": False,
+            "load_state": "unknown",
+            "active_state": "unknown",
+            "sub_state": "unknown",
+            "main_pid": None,
+            "control_group": None,
+        },
+        listener_owner_fn=no_listeners,
+    )
+    assert sys_unavail["status"] == "blocked"
+    assert sys_unavail["conflict"] == "systemd_unavailable"
+    assert sys_unavail["ready_for_systemd_takeover"] is False
+
+    unclear_res = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        data_root=data_root,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
+        unit_state_fn=lambda u: {
+            "unit": u,
+            "available": True,
+            "load_state": "loaded",
+            "active_state": "activating" if u == lp_mod.SYSTEMD_PROXY_UNIT else "inactive",
+            "sub_state": "auto-restart",
+            "main_pid": None,
+            "control_group": None,
+        },
+        listener_owner_fn=no_listeners,
+    )
+    assert unclear_res["status"] == "blocked"
+    assert unclear_res["conflict"] == "proxy_state_unclear"
+
+    # 4. Free port + idle loaded archive + free lock + systemd available -> status='ok', ready=True
     free_res = lp_mod.check_takeover_readiness(
         host="127.0.0.1",
         port=1080,
+        data_root=data_root,
         port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
-        unit_state_fn=lambda u: {"unit": u, "available": True, "active_state": "inactive", "sub_state": "dead", "main_pid": None},
+        unit_state_fn=idle_units,
+        listener_owner_fn=no_listeners,
     )
     assert free_res["status"] == "ok"
     assert free_res["ready_for_systemd_takeover"] is True
     assert free_res["conflict"] is None
 
-    # 2. Occupied port + systemd proxy inactive -> blocked (manual tunnel conflict)
+    # 5. Occupied port + systemd proxy inactive (manual SSH tunnel) -> blocked
     occ_res = lp_mod.check_takeover_readiness(
         host="127.0.0.1",
         port=1080,
+        data_root=data_root,
         port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": True},
-        unit_state_fn=lambda u: {"unit": u, "available": True, "active_state": "inactive", "sub_state": "dead", "main_pid": None},
+        unit_state_fn=idle_units,
+        listener_owner_fn=lambda h, p: {
+            "available": True,
+            "pids": [9999],
+            "entries": [{"local_address": "127.0.0.1:1080", "pids": [9999]}],
+            "pid_visibility_denied": False,
+        },
     )
     assert occ_res["status"] == "blocked"
     assert occ_res["ready_for_systemd_takeover"] is False
     assert occ_res["conflict"] == "port_occupied_by_non_systemd_process"
 
-    # 3. Active archive unit OR held .archive_sync.lock -> blocked with archive_active
+    # 6. Active archive unit OR held .archive_sync.lock -> blocked with archive_active
     arch_res = lp_mod.check_takeover_readiness(
         host="127.0.0.1",
         port=1080,
+        data_root=data_root,
         port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
         unit_state_fn=lambda u: {
             "unit": u,
             "available": True,
+            "load_state": "loaded",
             "active_state": "active" if u == lp_mod.SYSTEMD_ARCHIVE_UNIT else "inactive",
             "sub_state": "running" if u == lp_mod.SYSTEMD_ARCHIVE_UNIT else "dead",
             "main_pid": 1234 if u == lp_mod.SYSTEMD_ARCHIVE_UNIT else None,
         },
+        listener_owner_fn=no_listeners,
     )
     assert arch_res["status"] == "blocked"
     assert arch_res["conflict"] == "archive_active"
-    assert arch_res["ready_for_systemd_takeover"] is False
 
-    lock_dir = tmp_path / "data_root"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = lock_dir / ".archive_sync.lock"
+    lock_file = data_root / ".archive_sync.lock"
     lock_file.write_text("1234\n", encoding="utf-8")
     with lock_file.open("r+", encoding="utf-8") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -581,9 +732,10 @@ def test_p5_check_takeover_port_conflict_and_systemd_readiness(tmp_path: Path) -
             lock_res = lp_mod.check_takeover_readiness(
                 host="127.0.0.1",
                 port=1080,
-                data_root=lock_dir,
+                data_root=data_root,
                 port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": False},
-                unit_state_fn=lambda u: {"unit": u, "available": False, "active_state": "unknown", "sub_state": "unknown", "main_pid": None},
+                unit_state_fn=idle_units,
+                listener_owner_fn=no_listeners,
             )
             assert lock_res["status"] == "blocked"
             assert lock_res["archive_lock_held"] is True
@@ -591,72 +743,199 @@ def test_p5_check_takeover_port_conflict_and_systemd_readiness(tmp_path: Path) -
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
-    # 4. Occupied port + systemd proxy active + archive idle -> already_managed_by_systemd=True, status='ok'
+    # 7. Active systemd proxy MUST still prove actual listener PID ownership!
+    active_proxy_units = lambda u: {  # noqa: E731
+        "unit": u,
+        "available": True,
+        "load_state": "loaded",
+        "active_state": "active" if u == lp_mod.SYSTEMD_PROXY_UNIT else "inactive",
+        "sub_state": "running" if u == lp_mod.SYSTEMD_PROXY_UNIT else "dead",
+        "main_pid": 4321 if u == lp_mod.SYSTEMD_PROXY_UNIT else None,
+        "control_group": "/system.slice/tokyo-l2-lightsail-proxy.service" if u == lp_mod.SYSTEMD_PROXY_UNIT else None,
+    }
+    # 7a. Active proxy MainPID=4321, but port 1080 owned by different PID 9999 -> BLOCKED!
+    wrong_owner = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        data_root=data_root,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": True},
+        unit_state_fn=active_proxy_units,
+        listener_owner_fn=lambda h, p: {
+            "available": True,
+            "pids": [9999],
+            "entries": [{"local_address": "127.0.0.1:1080", "pids": [9999]}],
+            "pid_visibility_denied": False,
+        },
+    )
+    assert wrong_owner["status"] == "blocked"
+    assert wrong_owner["already_managed_by_systemd"] is False
+    assert wrong_owner["port_owned_by_proxy_unit"] is False
+    assert wrong_owner["conflict"] == "port_owned_by_different_process"
+
+    # 7b. Active proxy, but listener PID cannot be determined (ss unavailable / pid_visibility_denied) -> BLOCKED!
+    unverified_owner = lp_mod.check_takeover_readiness(
+        host="127.0.0.1",
+        port=1080,
+        data_root=data_root,
+        port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": True},
+        unit_state_fn=active_proxy_units,
+        listener_owner_fn=lambda h, p: {
+            "available": True,
+            "pids": [],
+            "entries": [{"local_address": "127.0.0.1:1080", "pids": []}],
+            "pid_visibility_denied": True,
+        },
+    )
+    assert unverified_owner["status"] == "blocked"
+    assert unverified_owner["already_managed_by_systemd"] is False
+    assert unverified_owner["conflict"] == "port_owner_unverified"
+
+    # 7c. Active proxy MainPID=4321 AND listener PID=[4321] -> status='ok', already_managed_by_systemd=True
     managed_res = lp_mod.check_takeover_readiness(
         host="127.0.0.1",
         port=1080,
+        data_root=data_root,
         port_probe_fn=lambda h, p: {"host": h, "port": p, "in_use": True},
-        unit_state_fn=lambda u: {
-            "unit": u,
+        unit_state_fn=active_proxy_units,
+        listener_owner_fn=lambda h, p: {
             "available": True,
-            "active_state": "active" if u == lp_mod.SYSTEMD_PROXY_UNIT else "inactive",
-            "sub_state": "running" if u == lp_mod.SYSTEMD_PROXY_UNIT else "dead",
-            "main_pid": 4321 if u == lp_mod.SYSTEMD_PROXY_UNIT else None,
+            "pids": [4321],
+            "entries": [{"local_address": "127.0.0.1:1080", "pids": [4321]}],
+            "pid_visibility_denied": False,
         },
     )
     assert managed_res["status"] == "ok"
+    assert managed_res["port_owned_by_proxy_unit"] is True
     assert managed_res["already_managed_by_systemd"] is True
     assert managed_res["conflict"] is None
 
-    # 5. Real CLI execution (`collector/bin/proxy-verify check-takeover`) against bound vs unused port
+    # 8. Real CLI subprocess execution:
+    #    - missing `--data-root` fails immediately (rc=2)
+    #    - running without systemd in container fails closed (`systemd_unavailable`, rc=2)
+    #    - with simulated systemd + REAL `ss -H -ltnp` against live loopback socket owned by os.getpid():
+    #        * MainPID=os.getpid() passes ownership gate (`rc=0`, `port_owned_by_proxy_unit=True`)
+    #        * MainPID=999999 rejects mismatched listener (`rc=2`, `port_owned_by_different_process`)
     cli_bin = str(COLLECTOR_DIR / "bin" / "proxy-verify")
-    socks = _LoopbackSocks5Server()
-    free_port = _unused_local_port()
-    try:
-        proc_busy = subprocess.run(
-            [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(socks.port)],
-            capture_output=True,
-            text=True,
-        )
-        assert proc_busy.returncode == 2
-        busy_payload = json.loads(proc_busy.stdout)
-        assert busy_payload["status"] == "blocked"
-        assert busy_payload["port_in_use"] is True
-        assert busy_payload["conflict"] == "port_occupied_by_non_systemd_process"
-    finally:
-        socks.stop()
-
-    proc_free = subprocess.run(
-        [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(free_port)],
+    proc_no_root = subprocess.run(
+        [cli_bin, "check-takeover", "--port", "1080"],
         capture_output=True,
         text=True,
     )
-    assert proc_free.returncode == 0
-    free_payload = json.loads(proc_free.stdout)
-    assert free_payload["status"] == "ok"
-    assert free_payload["ready_for_systemd_takeover"] is True
+    assert proc_no_root.returncode == 2
+    assert "--data-root" in proc_no_root.stderr
 
-    # 6. Audit real deploy templates & ensure wrong key path or blind ssh-keyscan pipe is rejected
+    free_port = _unused_local_port()
+    proc_no_systemd = subprocess.run(
+        [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(free_port), "--data-root", str(data_root)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc_no_systemd.returncode == 2
+    no_sys_payload = json.loads(proc_no_systemd.stdout)
+    assert no_sys_payload["status"] == "blocked"
+    assert "systemd_unavailable" in no_sys_payload["blocking_reasons"]
+
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        "UNIT=\"$2\"\n"
+        "if [ \"$UNIT\" = \"tokyo-l2-lightsail-proxy.service\" ]; then\n"
+        "  echo \"LoadState=loaded\"\n"
+        "  echo \"ActiveState=${FAKE_PROXY_ACTIVE:-inactive}\"\n"
+        "  echo \"SubState=${FAKE_PROXY_SUB:-dead}\"\n"
+        "  echo \"MainPID=${FAKE_PROXY_PID:-0}\"\n"
+        "  echo \"ControlGroup=/system.slice/tokyo-l2-lightsail-proxy.service\"\n"
+        "else\n"
+        "  echo \"LoadState=loaded\"\n"
+        "  echo \"ActiveState=inactive\"\n"
+        "  echo \"SubState=dead\"\n"
+        "  echo \"MainPID=0\"\n"
+        "  echo \"ControlGroup=/system.slice/tokyo-l2-archive.service\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_systemctl.chmod(0o755)
+    env_fake = dict(os.environ)
+    env_fake["PATH"] = f"{fake_bin}:{os.environ.get('PATH', '')}"
+
+    # 8a. Free port + fake systemctl idle -> rc=0, ready=True
+    proc_ready = subprocess.run(
+        [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(free_port), "--data-root", str(data_root)],
+        env=env_fake,
+        capture_output=True,
+        text=True,
+    )
+    assert proc_ready.returncode == 0
+    assert json.loads(proc_ready.stdout)["ready_for_systemd_takeover"] is True
+
+    # 8b. Live socket bound by os.getpid() tested through REAL `ss` + fake `systemctl`
+    socks = _LoopbackSocks5Server()
+    try:
+        env_wrong = dict(env_fake, FAKE_PROXY_ACTIVE="active", FAKE_PROXY_SUB="running", FAKE_PROXY_PID="999999")
+        proc_mismatch = subprocess.run(
+            [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(socks.port), "--data-root", str(data_root)],
+            env=env_wrong,
+            capture_output=True,
+            text=True,
+        )
+        assert proc_mismatch.returncode == 2
+        mismatch_payload = json.loads(proc_mismatch.stdout)
+        assert mismatch_payload["conflict"] == "port_owned_by_different_process"
+        assert mismatch_payload["already_managed_by_systemd"] is False
+
+        env_owned = dict(env_fake, FAKE_PROXY_ACTIVE="active", FAKE_PROXY_SUB="running", FAKE_PROXY_PID=str(os.getpid()))
+        proc_owned = subprocess.run(
+            [cli_bin, "check-takeover", "--host", "127.0.0.1", "--port", str(socks.port), "--data-root", str(data_root)],
+            env=env_owned,
+            capture_output=True,
+            text=True,
+        )
+        assert proc_owned.returncode == 0
+        owned_payload = json.loads(proc_owned.stdout)
+        assert owned_payload["port_owned_by_proxy_unit"] is True
+        assert owned_payload["already_managed_by_systemd"] is True
+        assert os.getpid() in owned_payload["matched_listener_pids"]
+    finally:
+        socks.stop()
+
+    # 9. Audit real deploy templates (VPC Peering private IP 172.26.12.211, HostKeyAlias 13.192.29.63,
+    #    temp 1081 flow, --data-root /data/tokyo_l2, no fallback_direct, no --prune-hours 24, zero Rust collector proxy)
     real_iso = lp_mod.audit_proxy_isolation(DEPLOY_DIR)
     assert real_iso["isolated"] is True, real_iso["violations"]
     proxy_env_txt = (DEPLOY_DIR / "env" / "proxy.env.example").read_text(encoding="utf-8")
+    proxy_unit_txt = (DEPLOY_DIR / "systemd" / "tokyo-l2-lightsail-proxy.service").read_text(encoding="utf-8")
+    archive_unit_txt = (DEPLOY_DIR / "systemd" / "tokyo-l2-archive.service").read_text(encoding="utf-8")
     guide_txt = (DEPLOY_DIR / "LIGHTSAIL_PROXY.md").read_text(encoding="utf-8")
+    assert "TOKYO_L2_LIGHTSAIL_HOST=172.26.12.211" in proxy_env_txt
+    assert "TOKYO_L2_LIGHTSAIL_PUBLIC_FALLBACK_HOST=13.192.29.63" in proxy_env_txt
+    assert "TOKYO_L2_LIGHTSAIL_HOSTKEY_ALIAS=13.192.29.63" in proxy_env_txt
+    assert "TOKYO_L2_ARCHIVE_PROXY_MODE=required" in proxy_env_txt
     assert "/etc/tokyo-l2/tokyo_l2_lightsail" in proxy_env_txt
-    assert "/etc/tokyo-l2/tokyo_l2_lightsail" in guide_txt
+    assert "-o HostKeyAlias=${TOKYO_L2_LIGHTSAIL_HOSTKEY_ALIAS}" in proxy_unit_txt
+    assert "--prune-hours" not in [ln for ln in archive_unit_txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    assert "1081" in guide_txt
+    assert "--data-root /data/tokyo_l2" in guide_txt
     assert "ssh-keygen -lf" in guide_txt
 
     tmp_deploy = tmp_path / "deploy_copy"
     shutil.copytree(DEPLOY_DIR, tmp_deploy)
     (tmp_deploy / "LIGHTSAIL_PROXY.md").write_text(
-        "# Broken Guide\nssh-keyscan -H 13.192.29.63 | sudo tee /etc/tokyo-l2/lightsail_known_hosts\n",
+        "# Broken Guide\nssh -o StrictHostKeyChecking=accept-new ubuntu@172.26.12.211\n"
+        "ssh-keyscan -H 13.192.29.63 | sudo tee /etc/tokyo-l2/lightsail_known_hosts\n",
         encoding="utf-8",
     )
     (tmp_deploy / "env" / "proxy.env.example").write_text(
-        "TOKYO_L2_LIGHTSAIL_KEY=/etc/tokyo-l2/lightsail_ed25519\n",
+        "TOKYO_L2_LIGHTSAIL_HOST=13.192.29.63\n"
+        "TOKYO_L2_LIGHTSAIL_KEY=/etc/tokyo-l2/lightsail_ed25519\n"
+        "TOKYO_L2_ARCHIVE_PROXY_MODE=fallback_direct\n",
         encoding="utf-8",
     )
     bad_iso = lp_mod.audit_proxy_isolation(tmp_deploy)
     assert bad_iso["isolated"] is False
     assert any("lightsail_ed25519" in v for v in bad_iso["violations"])
-    assert any("ssh-keygen -lf" in v for v in bad_iso["violations"])
+    assert any("172.26.12.211" in v for v in bad_iso["violations"])
+    assert any("fallback_direct" in v for v in bad_iso["violations"])
+    assert any("StrictHostKeyChecking" in v or "auto-accepting" in v for v in bad_iso["violations"])
     assert any("lightsail_known_hosts" in v for v in bad_iso["violations"])

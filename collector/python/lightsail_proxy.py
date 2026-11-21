@@ -13,6 +13,7 @@ Strict architectural boundaries:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -357,6 +358,10 @@ def audit_proxy_isolation(
             violations.append(
                 f"{archive_unit.name} sets global {bad_a}; must only scope via TOKYO_L2_ARCHIVE_PROXY_* so Healthchecks stays direct"
             )
+        for line in a_txt.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and "--prune-hours" in s:
+                violations.append(f"{archive_unit.name} must keep --prune-hours disabled by default")
 
     if archive_dropin.is_file():
         checked_files.append(str(archive_dropin))
@@ -379,13 +384,33 @@ def audit_proxy_isolation(
             violations.append(f"{proxy_env.name} references wrong key name lightsail_ed25519; expected /etc/tokyo-l2/tokyo_l2_lightsail")
         if "TOKYO_L2_LIGHTSAIL_KEY=" in pe_txt and "/etc/tokyo-l2/tokyo_l2_lightsail" not in pe_txt:
             violations.append(f"{proxy_env.name} must configure TOKYO_L2_LIGHTSAIL_KEY=/etc/tokyo-l2/tokyo_l2_lightsail")
+        if "REPLACE_WITH_LIGHTSAIL_PUBLIC_IP" in pe_txt:
+            violations.append(f"{proxy_env.name} still contains unconfigured placeholder REPLACE_WITH_LIGHTSAIL_PUBLIC_IP")
+        if "TOKYO_L2_LIGHTSAIL_HOST=" in pe_txt and not re.search(r"(?m)^\s*TOKYO_L2_LIGHTSAIL_HOST=172\.26\.12\.211\s*$", pe_txt):
+            violations.append(f"{proxy_env.name} must set primary TOKYO_L2_LIGHTSAIL_HOST=172.26.12.211")
+        if "TOKYO_L2_LIGHTSAIL_HOSTKEY_ALIAS=13.192.29.63" not in pe_txt:
+            violations.append(f"{proxy_env.name} must pin TOKYO_L2_LIGHTSAIL_HOSTKEY_ALIAS=13.192.29.63")
+        if "TOKYO_L2_LIGHTSAIL_PUBLIC_FALLBACK_HOST=13.192.29.63" not in pe_txt:
+            violations.append(f"{proxy_env.name} must retain TOKYO_L2_LIGHTSAIL_PUBLIC_FALLBACK_HOST=13.192.29.63")
+        if re.search(r"(?m)^\s*TOKYO_L2_ARCHIVE_PROXY_MODE\s*=\s*fallback_direct\b", pe_txt):
+            violations.append(f"{proxy_env.name} must NOT enable fallback_direct")
+        if "TOKYO_L2_ARCHIVE_PROXY_MODE=" in pe_txt and not re.search(r"(?m)^\s*TOKYO_L2_ARCHIVE_PROXY_MODE=required\s*$", pe_txt):
+            violations.append(f"{proxy_env.name} must enforce TOKYO_L2_ARCHIVE_PROXY_MODE=required")
 
     if proxy_unit.is_file():
         checked_files.append(str(proxy_unit))
         pu_txt = proxy_unit.read_text(encoding="utf-8")
-        for req in ("ExitOnForwardFailure=yes", "StrictHostKeyChecking=yes", "BatchMode=yes", "Restart=always"):
+        for req in (
+            "ExitOnForwardFailure=yes",
+            "StrictHostKeyChecking=yes",
+            "HostKeyAlias=${TOKYO_L2_LIGHTSAIL_HOSTKEY_ALIAS}",
+            "BatchMode=yes",
+            "Restart=always",
+        ):
             if req not in pu_txt:
                 violations.append(f"{proxy_unit.name} missing hardened option {req!r}")
+        if re.search(r"StrictHostKeyChecking\s*=\s*(?:no|accept-new)", pu_txt):
+            violations.append(f"{proxy_unit.name} must never disable or auto-accept SSH host keys")
 
     guide_doc = deploy_dir / "LIGHTSAIL_PROXY.md"
     if guide_doc.is_file():
@@ -393,10 +418,18 @@ def audit_proxy_isolation(
         gd_txt = guide_doc.read_text(encoding="utf-8")
         if "tokyo_l2_lightsail" not in gd_txt or "lightsail_ed25519" in gd_txt:
             violations.append(f"{guide_doc.name} must reference /etc/tokyo-l2/tokyo_l2_lightsail (not lightsail_ed25519)")
+        if "172.26.12.211" not in gd_txt or "13.192.29.63" not in gd_txt or "HostKeyAlias" not in gd_txt:
+            violations.append(f"{guide_doc.name} must document private IP 172.26.12.211, public fallback 13.192.29.63, and HostKeyAlias")
+        if "1081" not in gd_txt:
+            violations.append(f"{guide_doc.name} must document temporary port 1081 pre-cutover verification")
+        if "--data-root /data/tokyo_l2" not in gd_txt:
+            violations.append(f"{guide_doc.name} must require check-takeover --data-root /data/tokyo_l2")
         if "ssh-keygen -lf" not in gd_txt:
             violations.append(f"{guide_doc.name} must verify host key SHA-256 fingerprint via ssh-keygen -lf before pinning")
         if re.search(r"ssh-keyscan[^\n]*\|[^\n]*tee[^\n]*lightsail_known_hosts", gd_txt):
             violations.append(f"{guide_doc.name} must not pipe ssh-keyscan blindly into lightsail_known_hosts")
+        if re.search(r"StrictHostKeyChecking\s*=\s*(?:no|accept-new)", gd_txt):
+            violations.append(f"{guide_doc.name} must never instruct auto-accepting unknown SSH host keys")
 
     if collector_systemd_env_text is not None:
         live_keys = _extract_env_assignments(collector_systemd_env_text)
@@ -415,12 +448,18 @@ def _default_port_in_use(host: str, port: int) -> dict[str, Any]:
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     bind_failed = False
     bind_error: str | None = None
+    bind_errno: int | None = None
+    probe_error: str | None = None
     sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         sock.bind((host, int(port)))
     except OSError as exc:
-        bind_failed = True
+        bind_errno = exc.errno
         bind_error = str(exc)
+        if exc.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE)):
+            bind_failed = True
+        else:
+            probe_error = f"bind probe error (errno={exc.errno}): {exc}"
     finally:
         try:
             sock.close()
@@ -435,20 +474,262 @@ def _default_port_in_use(host: str, port: int) -> dict[str, Any]:
     except OSError:
         connect_ok = False
 
+    if probe_error and connect_ok:
+        # Another user's non-privileged port (<1024) or bind restriction still reachable -> port is in use
+        probe_error = None
+        bind_failed = True
+
     return {
         "host": host,
         "port": int(port),
         "in_use": bool(bind_failed or connect_ok),
         "bind_failed": bind_failed,
+        "bind_errno": bind_errno,
         "bind_error": bind_error,
         "connect_reachable": connect_ok,
+        "probe_error": probe_error,
     }
+
+
+def _addr_conflicts_with_host(local_addr: str, host: str, port: int) -> bool:
+    s = local_addr.strip()
+    if ":" not in s:
+        return False
+    addr_part, port_part = s.rsplit(":", 1)
+    if port_part != str(int(port)):
+        return False
+    addr_clean = addr_part.strip("[]").split("%", 1)[0].lower()
+    target = host.strip("[]").lower()
+    if addr_clean in ("*", "0.0.0.0", "::", ""):
+        return True
+    if target in ("", "0.0.0.0", "::", "*"):
+        return True
+    return addr_clean == target
+
+
+def _default_port_listener_owners(host: str, port: int) -> dict[str, Any]:
+    port_i = int(port)
+    try:
+        proc = subprocess.run(
+            ["ss", "-H", "-ltnp", f"sport = :{port_i}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "available": False,
+            "pids": [],
+            "entries": [],
+            "pid_visibility_denied": False,
+            "error": str(exc),
+        }
+    if proc.returncode != 0:
+        return {
+            "available": False,
+            "pids": [],
+            "entries": [],
+            "pid_visibility_denied": False,
+            "error": (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip(),
+        }
+
+    pids: list[int] = []
+    entries: list[dict[str, Any]] = []
+    pid_visibility_denied = False
+
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local_addr = parts[3]
+        if not _addr_conflicts_with_host(local_addr, host, port_i):
+            continue
+        proc_matches = re.findall(r'\("([^"]+)",pid=(\d+)(?:,fd=\d+)?\)', line)
+        line_pids = [int(pid_s) for _, pid_s in proc_matches]
+        line_procs = [{"comm": comm, "pid": int(pid_s)} for comm, pid_s in proc_matches]
+        if not line_pids:
+            pid_visibility_denied = True
+        for pid in line_pids:
+            if pid not in pids:
+                pids.append(pid)
+        entries.append(
+            {
+                "local_address": local_addr,
+                "pids": line_pids,
+                "processes": line_procs,
+                "raw": line,
+            }
+        )
+
+    return {
+        "available": True,
+        "pids": pids,
+        "entries": entries,
+        "pid_visibility_denied": pid_visibility_denied,
+        "error": None,
+    }
+
+
+def _pid_in_control_group(pid: int, control_group: str | None) -> bool:
+    if not control_group:
+        return False
+    cg_path = Path(f"/proc/{int(pid)}/cgroup")
+    try:
+        content = cg_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in content.splitlines():
+        if ":" in line:
+            path_part = line.rsplit(":", 1)[-1].strip()
+            if path_part == control_group or path_part.startswith(f"{control_group}/"):
+                return True
+    return False
+
+
+def _default_archive_lock_status(data_root: Path) -> dict[str, Any]:
+    try:
+        root = Path(data_root)
+        if not root.exists():
+            return {
+                "checked": False,
+                "data_root": str(root),
+                "lock_path": str(root / ".archive_sync.lock"),
+                "lock_file_exists": False,
+                "lock_held": False,
+                "error": f"data_root does not exist: {root}",
+            }
+        if not root.is_dir():
+            return {
+                "checked": False,
+                "data_root": str(root),
+                "lock_path": str(root / ".archive_sync.lock"),
+                "lock_file_exists": False,
+                "lock_held": False,
+                "error": f"data_root is not a directory: {root}",
+            }
+        if not os.access(root, os.R_OK | os.X_OK):
+            return {
+                "checked": False,
+                "data_root": str(root),
+                "lock_path": str(root / ".archive_sync.lock"),
+                "lock_file_exists": False,
+                "lock_held": False,
+                "error": f"data_root is not readable/traversable: {root}",
+            }
+    except OSError as exc:
+        return {
+            "checked": False,
+            "data_root": str(data_root),
+            "lock_path": None,
+            "lock_file_exists": False,
+            "lock_held": False,
+            "error": f"data_root stat failed: {exc}",
+        }
+
+    lock_file = root / ".archive_sync.lock"
+    try:
+        os.stat(lock_file)
+    except FileNotFoundError:
+        return {
+            "checked": True,
+            "data_root": str(root),
+            "lock_path": str(lock_file),
+            "lock_file_exists": False,
+            "lock_held": False,
+            "error": None,
+        }
+    except OSError as exc:
+        return {
+            "checked": False,
+            "data_root": str(root),
+            "lock_path": str(lock_file),
+            "lock_file_exists": False,
+            "lock_held": False,
+            "error": f"cannot stat lock file {lock_file}: {exc}",
+        }
+
+    try:
+        import fcntl
+    except ImportError as exc:
+        return {
+            "checked": False,
+            "data_root": str(root),
+            "lock_path": str(lock_file),
+            "lock_file_exists": True,
+            "lock_held": False,
+            "error": f"fcntl unavailable: {exc}",
+        }
+
+    fd: int | None = None
+    acquired = False
+    try:
+        fd = os.open(str(lock_file), os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquired = True
+        return {
+            "checked": True,
+            "data_root": str(root),
+            "lock_path": str(lock_file),
+            "lock_file_exists": True,
+            "lock_held": False,
+            "error": None,
+        }
+    except BlockingIOError:
+        return {
+            "checked": True,
+            "data_root": str(root),
+            "lock_path": str(lock_file),
+            "lock_file_exists": True,
+            "lock_held": True,
+            "error": None,
+        }
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            return {
+                "checked": True,
+                "data_root": str(root),
+                "lock_path": str(lock_file),
+                "lock_file_exists": True,
+                "lock_held": True,
+                "error": None,
+            }
+        return {
+            "checked": False,
+            "data_root": str(root),
+            "lock_path": str(lock_file),
+            "lock_file_exists": True,
+            "lock_held": False,
+            "error": f"cannot verify archive lock {lock_file}: {exc}",
+        }
+    finally:
+        if fd is not None:
+            if acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _default_systemd_unit_state(unit: str) -> dict[str, Any]:
     try:
         proc = subprocess.run(
-            ["systemctl", "show", unit, "--property=ActiveState", "--property=SubState", "--property=MainPID"],
+            [
+                "systemctl",
+                "show",
+                unit,
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=MainPID",
+                "--property=ControlGroup",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -457,18 +738,22 @@ def _default_systemd_unit_state(unit: str) -> dict[str, Any]:
         return {
             "unit": unit,
             "available": False,
+            "load_state": "unknown",
             "active_state": "unknown",
             "sub_state": "unknown",
             "main_pid": None,
+            "control_group": None,
             "error": str(exc),
         }
     if proc.returncode != 0:
         return {
             "unit": unit,
             "available": False,
+            "load_state": "unknown",
             "active_state": "unknown",
             "sub_state": "unknown",
             "main_pid": None,
+            "control_group": None,
             "error": (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip(),
         }
     vals: dict[str, str] = {}
@@ -476,14 +761,31 @@ def _default_systemd_unit_state(unit: str) -> dict[str, Any]:
         if "=" in line:
             k, v = line.split("=", 1)
             vals[k.strip()] = v.strip()
+    load_state = vals.get("LoadState", "unknown") or "unknown"
+    active_state = vals.get("ActiveState", "unknown") or "unknown"
+    sub_state = vals.get("SubState", "unknown") or "unknown"
     raw_pid = vals.get("MainPID", "").strip()
     main_pid: int | None = int(raw_pid) if raw_pid.isdigit() and int(raw_pid) > 0 else None
+    control_group = vals.get("ControlGroup", "").strip() or None
+    if active_state == "unknown":
+        return {
+            "unit": unit,
+            "available": False,
+            "load_state": load_state,
+            "active_state": "unknown",
+            "sub_state": sub_state,
+            "main_pid": main_pid,
+            "control_group": control_group,
+            "error": "systemctl show returned unknown/empty ActiveState",
+        }
     return {
         "unit": unit,
         "available": True,
-        "active_state": vals.get("ActiveState", "unknown") or "unknown",
-        "sub_state": vals.get("SubState", "unknown") or "unknown",
+        "load_state": load_state,
+        "active_state": active_state,
+        "sub_state": sub_state,
         "main_pid": main_pid,
+        "control_group": control_group,
     }
 
 
@@ -496,48 +798,111 @@ def check_takeover_readiness(
     data_root: Path | None = None,
     port_probe_fn: Callable[[str, int], dict[str, Any]] | None = None,
     unit_state_fn: Callable[[str], dict[str, Any]] | None = None,
+    lock_check_fn: Callable[[Path], dict[str, Any]] | None = None,
+    listener_owner_fn: Callable[[str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     probe_fn = port_probe_fn or _default_port_in_use
     state_fn = unit_state_fn or _default_systemd_unit_state
+    owner_fn = listener_owner_fn or _default_port_listener_owners
+
+    blocking_reasons: list[str] = []
+
+    if data_root is None:
+        lock_status: dict[str, Any] = {
+            "checked": False,
+            "data_root": None,
+            "lock_path": None,
+            "lock_file_exists": False,
+            "lock_held": False,
+            "error": "data_root is required (--data-root /data/tokyo_l2)",
+        }
+        blocking_reasons.append("missing_data_root")
+    else:
+        check_lock = lock_check_fn or _default_archive_lock_status
+        lock_status = dict(check_lock(Path(data_root)))
+        if not lock_status.get("checked"):
+            blocking_reasons.append("archive_lock_check_failed")
+        elif lock_status.get("lock_held"):
+            blocking_reasons.append("archive_active")
 
     port_probe = dict(probe_fn(host, int(port)))
-    port_in_use = bool(port_probe.get("in_use", port_probe.get("reachable", False)))
+    listener_probe = dict(owner_fn(host, int(port)))
     proxy_state = dict(state_fn(proxy_unit))
     archive_state = dict(state_fn(archive_unit))
 
-    archive_lock_held = False
-    archive_lock_path: str | None = None
-    if data_root is not None:
-        lock_file = Path(data_root) / ".archive_sync.lock"
-        if lock_file.exists():
-            archive_lock_path = str(lock_file)
-            try:
-                import fcntl
+    if port_probe.get("probe_error") or port_probe.get("error"):
+        blocking_reasons.append("port_probe_failed")
 
-                with lock_file.open("r", encoding="utf-8") as lf:
-                    try:
-                        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-                    except OSError:
-                        archive_lock_held = True
-            except OSError:
-                pass
+    if "in_use" not in port_probe and "reachable" not in port_probe:
+        blocking_reasons.append("port_probe_failed")
+        raw_port_in_use = True
+    else:
+        raw_port_in_use = bool(port_probe.get("in_use", port_probe.get("reachable", False)))
 
-    archive_busy = (archive_state.get("active_state") == "active") or archive_lock_held
-    proxy_systemd_active = proxy_state.get("active_state") == "active"
-    already_managed_by_systemd = bool(port_in_use and proxy_systemd_active)
+    port_in_use = bool(raw_port_in_use or bool(listener_probe.get("entries")))
 
-    blocking_reasons: list[str] = []
-    if archive_busy:
-        blocking_reasons.append("archive_active")
-    if port_in_use and not proxy_systemd_active:
-        blocking_reasons.append("port_occupied_by_non_systemd_process")
+    proxy_avail = bool(proxy_state.get("available"))
+    archive_avail = bool(archive_state.get("available"))
+    proxy_load = str(proxy_state.get("load_state", "loaded") or "unknown")
+    archive_load = str(archive_state.get("load_state", "loaded") or "unknown")
+    proxy_active = str(proxy_state.get("active_state") or "unknown")
+    archive_active = str(archive_state.get("active_state") or "unknown")
 
+    if not proxy_avail or not archive_avail:
+        blocking_reasons.append("systemd_unavailable")
+    else:
+        if archive_active == "active":
+            if "archive_active" not in blocking_reasons:
+                blocking_reasons.append("archive_active")
+        elif archive_active != "inactive" or archive_load in ("error", "bad-setting", "not-found", "masked", "unknown"):
+            blocking_reasons.append("archive_state_unclear")
+
+        if proxy_active not in ("active", "inactive") or proxy_load in ("error", "bad-setting", "masked", "unknown"):
+            blocking_reasons.append("proxy_state_unclear")
+
+    archive_lock_held = bool(lock_status.get("lock_held"))
+    archive_busy = (archive_active == "active") or archive_lock_held
+    proxy_systemd_active = proxy_avail and (proxy_active == "active")
+
+    listener_pids = [int(p) for p in listener_probe.get("pids") or []]
+    proxy_main_pid = proxy_state.get("main_pid")
+    proxy_cgroup = proxy_state.get("control_group")
+    matched_listener_pids: list[int] = []
+    foreign_listener_pids: list[int] = []
+    port_owned_by_proxy_unit = False
+
+    if port_in_use:
+        if proxy_systemd_active:
+            if (
+                not listener_probe.get("available")
+                or listener_probe.get("pid_visibility_denied")
+                or proxy_main_pid is None
+                or not listener_pids
+            ):
+                blocking_reasons.append("port_owner_unverified")
+            else:
+                for pid in listener_pids:
+                    if (proxy_main_pid is not None and pid == int(proxy_main_pid)) or _pid_in_control_group(pid, proxy_cgroup):
+                        matched_listener_pids.append(pid)
+                    else:
+                        foreign_listener_pids.append(pid)
+                if matched_listener_pids and not foreign_listener_pids:
+                    port_owned_by_proxy_unit = True
+                else:
+                    blocking_reasons.append("port_owned_by_different_process")
+        elif "systemd_unavailable" not in blocking_reasons:
+            blocking_reasons.append("port_occupied_by_non_systemd_process")
+        else:
+            blocking_reasons.append("port_occupied")
+    elif proxy_systemd_active:
+        blocking_reasons.append("proxy_unit_active_but_port_not_listening")
+
+    already_managed_by_systemd = bool(port_in_use and proxy_systemd_active and port_owned_by_proxy_unit)
+    ready_for_systemd_takeover = bool((not blocking_reasons) and (not port_in_use) and (not archive_busy))
     conflict: str | None = blocking_reasons[0] if blocking_reasons else None
-    ready_for_systemd_takeover = bool((not port_in_use) and (not archive_busy))
     status = (
         "ok"
-        if (conflict is None and (ready_for_systemd_takeover or already_managed_by_systemd))
+        if (not blocking_reasons and (ready_for_systemd_takeover or already_managed_by_systemd))
         else "blocked"
     )
 
@@ -547,11 +912,17 @@ def check_takeover_readiness(
         "port": int(port),
         "port_in_use": port_in_use,
         "port_probe": port_probe,
+        "port_listeners": listener_probe,
+        "matched_listener_pids": matched_listener_pids,
+        "foreign_listener_pids": foreign_listener_pids,
+        "port_owned_by_proxy_unit": port_owned_by_proxy_unit,
         "proxy_unit": proxy_unit,
         "proxy_unit_state": proxy_state,
         "archive_unit": archive_unit,
         "archive_unit_state": archive_state,
-        "archive_lock_path": archive_lock_path,
+        "data_root": str(data_root) if data_root is not None else None,
+        "archive_lock_status": lock_status,
+        "archive_lock_path": lock_status.get("lock_path"),
         "archive_lock_held": archive_lock_held,
         "archive_busy": archive_busy,
         "already_managed_by_systemd": already_managed_by_systemd,
@@ -583,13 +954,28 @@ def estimate_lightsail_monthly_cost(
     plan_quota_gb: float = 1024.0,
     ec2_direct_per_gb: float = 0.114,
     ec2_free_gb: float = 100.0,
-    ec2_to_lightsail_per_gb: float | None = 0.01,
+    transfer_mode: str = "vpc_peering_same_az",
+    ec2_to_lightsail_per_gb: float | None = None,
+    ec2_to_lightsail_public_per_gb: float = 0.01,
+    ec2_to_lightsail_cross_az_per_gb: float = 0.01,
+    ec2_az: str = "ap-northeast-1a",
+    lightsail_az: str = "ap-northeast-1a",
+    same_physical_az: bool = True,
     lightsail_overage_per_gb: float = 0.14,
 ) -> dict[str, Any]:
     """Estimate EC2 direct vs Lightsail relay egress costs (accounting for Lightsail 2x IN+OUT quota).
 
-    Note: `ec2_to_lightsail_transfer_rate_verified` stays False until verified against real AWS Cost Explorer.
+    Defaults to same-physical-AZ (`ap-northeast-1a`) VPC Peering ($0.00/GB EC2 -> Lightsail) while
+    retaining the $0.01/GB public IPv4 comparison path. Monthly volume is treated strictly as a
+    hypothetical modeling scenario (not measured live traffic), and subsequent AWS bills serve only
+    for post-cutover reconciliation.
     """
+    mode_norm = str(transfer_mode or "vpc_peering_same_az").strip().lower()
+    if mode_norm not in ("vpc_peering_same_az", "public_ipv4"):
+        raise ValueError(
+            f"Unsupported transfer_mode {transfer_mode!r}; expected 'vpc_peering_same_az' or 'public_ipv4'"
+        )
+
     up_gb = max(0.0, float(monthly_upload_gb))
     direct_billable_gb = max(0.0, up_gb - max(0.0, float(ec2_free_gb)))
     direct_cost_usd = round(direct_billable_gb * float(ec2_direct_per_gb), 2)
@@ -598,19 +984,46 @@ def estimate_lightsail_monthly_cost(
     lightsail_quota_consumed_gb = round(up_gb * 2.0, 2)
     lightsail_overage_gb = max(0.0, round(lightsail_quota_consumed_gb - float(plan_quota_gb), 2))
     lightsail_overage_usd = round(lightsail_overage_gb * float(lightsail_overage_per_gb), 2)
-    ec2_relay_transfer_usd = (
-        round(up_gb * float(ec2_to_lightsail_per_gb), 2)
-        if ec2_to_lightsail_per_gb is not None
-        else None
-    )
-    total_lightsail_est = (
-        round(float(plan_usd) + lightsail_overage_usd + (ec2_relay_transfer_usd or 0.0), 2)
-        if ec2_relay_transfer_usd is not None
-        else None
-    )
+
+    same_az_peering_rate = 0.0 if same_physical_az else float(ec2_to_lightsail_cross_az_per_gb)
+    same_az_peering_transfer_usd = round(up_gb * same_az_peering_rate, 2)
+    same_az_peering_total_usd = round(float(plan_usd) + lightsail_overage_usd + same_az_peering_transfer_usd, 2)
+
+    public_rate = float(ec2_to_lightsail_public_per_gb)
+    public_transfer_usd = round(up_gb * public_rate, 2)
+    public_total_usd = round(float(plan_usd) + lightsail_overage_usd + public_transfer_usd, 2)
+
+    if ec2_to_lightsail_per_gb is not None:
+        selected_rate = float(ec2_to_lightsail_per_gb)
+        billing_condition = f"Caller explicit EC2->Lightsail override (${selected_rate}/GB)."
+    elif mode_norm == "vpc_peering_same_az":
+        selected_rate = same_az_peering_rate
+        if same_physical_az:
+            billing_condition = (
+                f"Same-physical-AZ VPC Peering ({ec2_az} -> {lightsail_az} via 172.26.12.211): "
+                "$0/GB under AWS VPC Peering same-AZ rule (cross-physical-AZ or public fallback is billed)."
+            )
+        else:
+            billing_condition = (
+                f"Cross-physical-AZ VPC Peering ({ec2_az} -> {lightsail_az}, same_physical_az=False): "
+                f"NOT eligible for $0/GB same-AZ transfer; estimated at ${selected_rate}/GB."
+            )
+    else:
+        selected_rate = public_rate
+        billing_condition = (
+            f"Public IPv4 fallback comparison (13.192.29.63, EC2={ec2_az}, Lightsail={lightsail_az}): "
+            f"estimated at ${selected_rate}/GB."
+        )
+
+    ec2_relay_transfer_usd = round(up_gb * selected_rate, 2)
+    total_lightsail_est = round(float(plan_usd) + lightsail_overage_usd + ec2_relay_transfer_usd, 2)
 
     return {
         "monthly_upload_gb": up_gb,
+        "monthly_upload_is_hypothetical_sample": True,
+        "volume_disclaimer": (
+            f"Hypothetical modeling volume ({up_gb} GB/month scenario only; NOT measured live production collection rate)."
+        ),
         "ec2_direct": {
             "account_free_tier_gb": float(ec2_free_gb),
             "rate_per_gb_usd": float(ec2_direct_per_gb),
@@ -618,16 +1031,51 @@ def estimate_lightsail_monthly_cost(
             "estimated_cost_usd": direct_cost_usd,
         },
         "lightsail_relay": {
+            "transfer_mode": mode_norm,
             "plan_usd": float(plan_usd),
             "plan_quota_gb": float(plan_quota_gb),
-            "quota_note": "Lightsail counts BOTH inbound + outbound against allowance (~2x uploaded volume)",
+            "quota_note": "Lightsail counts BOTH inbound (from EC2) + outbound (to Google Drive) against monthly 1 TB allowance (~2x uploaded volume)",
             "quota_consumed_gb": lightsail_quota_consumed_gb,
             "overage_gb": lightsail_overage_gb,
             "overage_usd": lightsail_overage_usd,
-            "assumed_ec2_to_lightsail_per_gb_usd": ec2_to_lightsail_per_gb,
+            "ec2_az": ec2_az,
+            "lightsail_az": lightsail_az,
+            "same_physical_az": bool(same_physical_az),
+            "billing_condition": billing_condition,
+            "reconciliation_note": "Subsequent AWS Cost Explorer bills are used only for post-cutover reconciliation.",
+            "assumed_ec2_to_lightsail_per_gb_usd": selected_rate,
             "estimated_ec2_to_lightsail_usd": ec2_relay_transfer_usd,
             "estimated_total_usd": total_lightsail_est,
             "billing_gate_verified": False,
+        },
+        "scenarios": {
+            "vpc_peering_same_az": {
+                "ssh_target": "172.26.12.211",
+                "ec2_az": ec2_az,
+                "lightsail_az": lightsail_az,
+                "same_physical_az": bool(same_physical_az),
+                "ec2_to_lightsail_per_gb_usd": same_az_peering_rate,
+                "estimated_ec2_to_lightsail_usd": same_az_peering_transfer_usd,
+                "quota_consumed_gb": lightsail_quota_consumed_gb,
+                "overage_gb": lightsail_overage_gb,
+                "overage_usd": lightsail_overage_usd,
+                "estimated_total_usd": same_az_peering_total_usd,
+                "condition": (
+                    "AWS VPC Peering same-physical-AZ intra-region transfer ($0/GB)"
+                    if same_physical_az
+                    else "Cross-physical-AZ VPC Peering does NOT qualify for $0/GB"
+                ),
+            },
+            "public_ipv4": {
+                "ssh_target": "13.192.29.63",
+                "ec2_to_lightsail_per_gb_usd": public_rate,
+                "estimated_ec2_to_lightsail_usd": public_transfer_usd,
+                "quota_consumed_gb": lightsail_quota_consumed_gb,
+                "overage_gb": lightsail_overage_gb,
+                "overage_usd": lightsail_overage_usd,
+                "estimated_total_usd": public_total_usd,
+                "condition": "Same-region public IPv4 comparison ($0.01/GB)",
+            },
         },
     }
 
@@ -794,6 +1242,9 @@ def format_compare_report(
     fb = verification.get("fallback_probe") or {}
     ls_est = cost_estimate.get("lightsail_relay") or {}
     ec2_est = cost_estimate.get("ec2_direct") or {}
+    scenarios = cost_estimate.get("scenarios") or {}
+    priv_sc = scenarios.get("vpc_peering_same_az") or {}
+    pub_sc = scenarios.get("public_ipv4") or {}
 
     lines = [
         "# Tokyo L2 Archive Egress: EC2 Direct vs Lightsail Proxy Verification Report",
@@ -843,15 +1294,19 @@ def format_compare_report(
     lines.extend(
         [
             "",
-            "## 5. Monthly Egress Cost & Lightsail Quota Estimate (Billing Verification Pending)",
-            f"- **Assumed Monthly Google Drive Upload**: `{cost_estimate.get('monthly_upload_gb')} GB`",
-            f"- **EC2 Direct Estimate**: `{ec2_est.get('billable_gb')} GB` billable × `${ec2_est.get('rate_per_gb_usd')}/GB` = **`${ec2_est.get('estimated_cost_usd')}`**",
-            f"- **Lightsail Quota Consumed (Ingress + Egress = 2× upload)**: `{ls_est.get('quota_consumed_gb')} GB` / `{ls_est.get('plan_quota_gb')} GB` "
-            f"(overage=`{ls_est.get('overage_gb')} GB`, overage_cost=`${ls_est.get('overage_usd')}`)",
-            f"- **Lightsail Total Estimate**: `${ls_est.get('estimated_total_usd')}` "
-            f"(includes plan `${ls_est.get('plan_usd')}` + assumed EC2→Lightsail `${ls_est.get('estimated_ec2_to_lightsail_usd')}`)",
-            f"- **AWS Cost Explorer Billing Verified**: `{ls_est.get('billing_gate_verified')}` "
-            "(MUST verify actual EC2→Lightsail transfer billing item on real AWS bill before permanent cutover; keep `--prune-hours 24` disabled during verification).",
+            "## 5. Monthly Egress Cost & Lightsail Quota Model (Hypothetical Scenario; Post-Cutover Bill Reconciliation Only)",
+            f"- **Hypothetical Modeling Volume (NOT Measured Collection Traffic)**: `{cost_estimate.get('monthly_upload_gb')} GB` / month (`{cost_estimate.get('volume_disclaimer')}`)",
+            f"- **Physical AZ Topology & Transfer Condition**: EC2 AZ=`{ls_est.get('ec2_az')}`, Lightsail AZ=`{ls_est.get('lightsail_az')}`, "
+            f"`same_physical_az={ls_est.get('same_physical_az')}`, selected mode=`{ls_est.get('transfer_mode')}` — {ls_est.get('billing_condition')}",
+            f"- **EC2 Direct Baseline**: `{ec2_est.get('billable_gb')} GB` billable × `${ec2_est.get('rate_per_gb_usd')}/GB` = **`${ec2_est.get('estimated_cost_usd')}`**",
+            f"- **Lightsail Fixed Plan & 2× Quota (`Ingress + Egress`)**: `${ls_est.get('plan_usd')}/month` for `{ls_est.get('plan_quota_gb')} GB` (`1 TB`); "
+            f"quota consumed=`{ls_est.get('quota_consumed_gb')} GB`, overage=`{ls_est.get('overage_gb')} GB`, overage_cost=`${ls_est.get('overage_usd')}`",
+            f"- **Scenario A — Primary Private VPC Peering (`172.26.12.211`, same physical AZ `1a`)**: "
+            f"EC2→Lightsail `${priv_sc.get('ec2_to_lightsail_per_gb_usd')}/GB` (`${priv_sc.get('estimated_ec2_to_lightsail_usd')}`) + plan/overage = **`${priv_sc.get('estimated_total_usd')}`**",
+            f"- **Scenario B — Public IPv4 Fallback Comparison (`13.192.29.63`)**: "
+            f"EC2→Lightsail `${pub_sc.get('ec2_to_lightsail_per_gb_usd')}/GB` (`${pub_sc.get('estimated_ec2_to_lightsail_usd')}`) + plan/overage = **`${pub_sc.get('estimated_total_usd')}`**",
+            f"- **Selected Mode Total Estimate (`{ls_est.get('transfer_mode')}`)**: **`${ls_est.get('estimated_total_usd')}`**",
+            f"- **Reconciliation Note**: {ls_est.get('reconciliation_note')} (`billing_gate_verified={ls_est.get('billing_gate_verified')}`; keep `--prune-hours 24` disabled independently).",
             "",
         ]
     )
@@ -914,6 +1369,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--monthly-upload-gb", type=float, default=500.0)
     p_rep.add_argument("--plan-usd", type=float, default=5.0)
     p_rep.add_argument("--plan-quota-gb", type=float, default=1024.0)
+    p_rep.add_argument(
+        "--transfer-mode",
+        choices=("vpc_peering_same_az", "public_ipv4"),
+        default="vpc_peering_same_az",
+        help="Primary EC2 -> Lightsail path for estimate (default: same-AZ VPC Peering $0/GB)",
+    )
+    p_rep.add_argument("--ec2-az", default="ap-northeast-1a")
+    p_rep.add_argument("--lightsail-az", default="ap-northeast-1a")
+    p_rep.add_argument(
+        "--cross-physical-az",
+        action="store_true",
+        help="Set when EC2 and Lightsail are NOT in the same physical AZ (disables $0/GB VPC Peering rate)",
+    )
     p_rep.add_argument("--deploy-dir", type=Path, default=DEPLOY_DIR)
     p_rep.add_argument("--skip-live-egress", action="store_true")
     p_rep.add_argument("--out-md", type=Path, default=None)
@@ -921,13 +1389,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_takeover = sub.add_parser(
         "check-takeover",
-        help="Check whether local SOCKS5 port and archive timer are clear for controlled systemd takeover",
+        help="Fail-closed readiness check for controlled systemd takeover of 127.0.0.1:1080",
     )
     p_takeover.add_argument("--host", default="127.0.0.1")
     p_takeover.add_argument("--port", type=int, default=1080)
     p_takeover.add_argument("--proxy-unit", default=SYSTEMD_PROXY_UNIT)
     p_takeover.add_argument("--archive-unit", default=SYSTEMD_ARCHIVE_UNIT)
-    p_takeover.add_argument("--data-root", type=Path, default=None)
+    p_takeover.add_argument(
+        "--data-root",
+        type=Path,
+        required=True,
+        help="Required archive data root directory containing .archive_sync.lock (e.g. /data/tokyo_l2)",
+    )
 
     return p
 
@@ -1006,6 +1479,10 @@ def main() -> int:
             args.monthly_upload_gb,
             plan_usd=args.plan_usd,
             plan_quota_gb=args.plan_quota_gb,
+            transfer_mode=args.transfer_mode,
+            ec2_az=args.ec2_az,
+            lightsail_az=args.lightsail_az,
+            same_physical_az=not args.cross_physical_az,
         )
         md_text = format_compare_report(
             verification=ver,

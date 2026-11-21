@@ -16,6 +16,7 @@ ExecStart=/usr/bin/ssh \
   -o ExitOnForwardFailure=yes \
   -o StrictHostKeyChecking=yes \
   -o UserKnownHostsFile=${TOKYO_L2_LIGHTSAIL_KNOWN_HOSTS} \
+  -o HostKeyAlias=${TOKYO_L2_LIGHTSAIL_HOSTKEY_ALIAS} \
   -o IdentitiesOnly=yes \
   -o ServerAliveInterval=15 \
   -o ServerAliveCountMax=3 \
