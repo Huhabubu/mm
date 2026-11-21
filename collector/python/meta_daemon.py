@@ -101,6 +101,7 @@ _RE_GAP_END_TEXT_EP = re.compile(
     r"(?:GAP_END(?:\s+endpoint=|\s+on\s+|\s+)|dual A/B outage recovered(?:\s+on\s+|\s+))([a-z0-9_]+)\b",
     re.IGNORECASE,
 )
+_RE_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def redact_secrets(text: str, extra_secrets: list[str] | None = None) -> str:
@@ -792,7 +793,7 @@ def inspect_collector_logs(lines: list[str]) -> dict[str, Any]:
         )
 
     for raw in lines:
-        line = str(raw).strip()
+        line = _RE_ANSI.sub("", str(raw)).strip()
         if not line:
             continue
         if "dual A/B outage exceeded" in line or (
@@ -1348,6 +1349,11 @@ class CollectorMonitor:
         self.restart_recovery_seconds = int(meta_cfg.get("restart_recovery_seconds", 600))
         self.outage_recovery_seconds = int(meta_cfg.get("outage_recovery_seconds", 60))
         self.loss_recovery_seconds = int(meta_cfg.get("loss_recovery_seconds", 300))
+        self.dual_outage_recovery_mode = str(
+            meta_cfg.get("dual_outage_recovery_mode", "conservative")
+        ).strip().lower()
+        if self.dual_outage_recovery_mode not in ("conservative", "explicit_gap_end"):
+            self.dual_outage_recovery_mode = "conservative"
         self.hourly_report_enabled = bool(meta_cfg.get("hourly_report_enabled", True))
         self.hourly_report_minute_utc = int(meta_cfg.get("hourly_report_minute_utc", 10))
         self.collector_service_name = str(meta_cfg.get("collector_service_name", "tokyo-l2-collector.service"))
@@ -1393,6 +1399,42 @@ class CollectorMonitor:
         self.last_rtt_rows: list[dict[str, Any]] = []
         self.last_spec_res: dict[str, Any] | None = None
         self.state = self._load_state()
+
+    def acknowledge_dual_outage(
+        self,
+        endpoint: str | None = None,
+        *,
+        now_epoch_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Manually acknowledge and clear conservative dual A/B outage state after verification."""
+        now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
+        ep_outages = self.state.setdefault("dual_outage_endpoints", {})
+        if not isinstance(ep_outages, dict):
+            ep_outages = {}
+            self.state["dual_outage_endpoints"] = ep_outages
+
+        target = None if endpoint in (None, "", "ALL", "all") else str(endpoint)
+        cleared: list[str] = []
+        if target is None:
+            cleared = sorted(ep_outages.keys())
+            ep_outages.clear()
+        elif target in ep_outages:
+            ep_outages.pop(target, None)
+            cleared = [target]
+
+        # Leave active_alerts['dual_ab_outage_gt_5s'] intact until the next _update_alerts()
+        # sweep so the daemon naturally dispatches the Telegram recovery message.
+        self.state["last_outage_ack"] = {
+            "ts_utc": datetime.fromtimestamp(now_s, tz=timezone.utc).isoformat(),
+            "target": target or "ALL",
+            "cleared_endpoints": cleared,
+            "remaining_endpoints": sorted(ep_outages.keys()),
+        }
+        self._save_state()
+        return {
+            "status": "ok",
+            **self.state["last_outage_ack"],
+        }
 
     def _default_state(self) -> dict[str, Any]:
         return {
@@ -1560,6 +1602,23 @@ class CollectorMonitor:
             "notify_failures": notify_failures,
         }
 
+    def _sync_external_ack(self) -> None:
+        """Pick up external `--ack-outage` edits made via CLI while daemon runs in memory."""
+        if not self.state_path.is_file():
+            return
+        try:
+            disk = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(disk, dict):
+            return
+        disk_ack = disk.get("last_outage_ack")
+        if disk_ack and disk_ack != self.state.get("last_outage_ack"):
+            disk_eps = disk.get("dual_outage_endpoints")
+            if isinstance(disk_eps, dict):
+                self.state["dual_outage_endpoints"] = disk_eps
+            self.state["last_outage_ack"] = disk_ack
+
     def run_sweep(
         self,
         *,
@@ -1571,6 +1630,7 @@ class CollectorMonitor:
         force_hourly_report: bool = False,
     ) -> dict[str, Any]:
         """Run one complete non-blocking monitoring, alert, Healthchecks & report sweep."""
+        self._sync_external_ack()
         now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
         today = utc_date_str(int(now_s * 1e9))
         dt_now = datetime.fromtimestamp(now_s, tz=timezone.utc)
@@ -1790,7 +1850,8 @@ class CollectorMonitor:
                 "details": stale_details,
             }
 
-        # D. Dual A/B outage > 5s (endpoint-level tracking; NEVER recovers from time/sibling data alone!)
+        # D. Dual A/B outage > 5s (strict conservative endpoint tracking; NEVER clears from
+        #    `Connected` handshake or sibling-shared `.partial` disk activity!)
         ep_outages: dict[str, dict[str, Any]] = self.state.setdefault("dual_outage_endpoints", {})
         if not isinstance(ep_outages, dict):
             ep_outages = {}
@@ -1802,64 +1863,55 @@ class CollectorMonitor:
                 self.state["last_dual_outage_epoch_s"] = now_s
                 ep_outages[ep] = {
                     "outage_at_s": now_s,
-                    "connected_clean_at_s": None,
                     "explicit_recovered_at_s": None,
                     "sample_message": (ev.get("outage_messages") or [""])[-1],
+                    "diagnostics": {
+                        "last_ws_connected_at_s": None,
+                        "ws_errors_since_outage": 0,
+                    },
                 }
                 continue
             if ep not in ep_outages:
                 continue
             ep_rec = ep_outages[ep]
+            diag = ep_rec.setdefault(
+                "diagnostics",
+                {"last_ws_connected_at_s": None, "ws_errors_since_outage": 0},
+            )
             if ev.get("explicit_recovered"):
                 ep_rec["explicit_recovered_at_s"] = now_s
             elif ev.get("saw_error_after_connect"):
-                ep_rec["connected_clean_at_s"] = None
                 ep_rec["explicit_recovered_at_s"] = None
+                diag["last_ws_connected_at_s"] = None
+                diag["ws_errors_since_outage"] = int(diag.get("ws_errors_since_outage") or 0) + 1
             elif ev.get("connected_clean"):
-                if ep_rec.get("connected_clean_at_s") is None:
-                    ep_rec["connected_clean_at_s"] = now_s
+                # Recorded ONLY as diagnostic telemetry: WS handshake before subscribe NEVER proves
+                # subscription success or live market data flow, so it NEVER clears `ep_outages`!
+                diag["last_ws_connected_at_s"] = now_s
 
-        # Evaluate endpoint-specific recovery ONLY on explicit GAP_END recovery OR clean endpoint
-        # reconnect stabilization + fresh parent-exchange write activity after reconnect.
-        for ep in list(ep_outages.keys()):
-            ep_rec = ep_outages[ep]
-            parent_ex = ENDPOINT_TO_EXCHANGE.get(ep)
-            if parent_ex and parent_ex in data_tree["per_exchange"]:
-                ex_info = data_tree["per_exchange"][parent_ex]
-                ex_fresh = bool(not ex_info.get("is_stale") and ex_info.get("last_activity_epoch_s") is not None)
-                last_ex_act_s = float(ex_info["last_activity_epoch_s"]) if ex_info.get("last_activity_epoch_s") is not None else None
-            else:
-                ex_fresh = False
-                last_ex_act_s = None
-
-            exp_rec_s = ep_rec.get("explicit_recovered_at_s")
-            conn_rec_s = ep_rec.get("connected_clean_at_s")
-
-            recovered = False
-            if exp_rec_s is not None and collector_running_verified:
-                if parent_ex is None:
-                    recovered = not data_tree["stale_exchanges"]
-                else:
-                    recovered = ex_fresh
-            elif (
-                conn_rec_s is not None
-                and collector_running_verified
-                and ex_fresh
-                and last_ex_act_s is not None
-                and last_ex_act_s >= float(conn_rec_s)
-                and (now_s - float(conn_rec_s)) >= self.outage_recovery_seconds
-            ):
-                recovered = True
-
-            if recovered:
-                ep_outages.pop(ep, None)
+        # Auto-recovery ONLY if `dual_outage_recovery_mode == "explicit_gap_end"` AND logs contain
+        # an explicit endpoint-level GAP_END event cleanly after the outage while collector is active.
+        # Under the default `"conservative"` mode (matching current Rust binaries whose GAP_END is only
+        # written inside `.tsv.zst`), zero automatic clearing occurs and operator clearance requires
+        # `--ack-outage` after verification.
+        if self.dual_outage_recovery_mode == "explicit_gap_end":
+            for ep in list(ep_outages.keys()):
+                ep_rec = ep_outages[ep]
+                if ep_rec.get("explicit_recovered_at_s") is not None and collector_running_verified:
+                    ep_outages.pop(ep, None)
 
         if ep_outages:
             pending_eps = sorted(ep_outages.keys())
+            mode_note = (
+                "保守模式(需人工确认恢复后执行 --ack-outage)"
+                if self.dual_outage_recovery_mode == "conservative"
+                else "需明确端点 GAP_END 恢复事件"
+            )
             observed["dual_ab_outage_gt_5s"] = {
                 "severity": "CRITICAL",
-                "summary": f"检测到 A/B 双线中断超过 5 秒 (待恢复端点: {', '.join(pending_eps)})",
+                "summary": f"检测到 A/B 双线中断超过 5 秒 (待恢复端点: {', '.join(pending_eps)}; {mode_note})",
                 "details": {
+                    "recovery_mode": self.dual_outage_recovery_mode,
                     "pending_endpoints": pending_eps,
                     "endpoint_states": ep_outages,
                     "recent_events": log_events["dual_outages"][-5:],
@@ -2181,7 +2233,19 @@ def main() -> int:
         action="store_true",
         help="Disable outbound Telegram/Webhook/Healthchecks HTTP requests during dry-run",
     )
+    p.add_argument(
+        "--ack-outage",
+        nargs="?",
+        const="ALL",
+        default=None,
+        help="Acknowledge and clear conservative dual A/B outage alert (optionally specify endpoint name, or ALL)",
+    )
     args = p.parse_args()
+    if args.ack_outage is not None:
+        mon = CollectorMonitor(args.config, allow_notify=False)
+        res = mon.acknowledge_dual_outage(None if args.ack_outage == "ALL" else args.ack_outage)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
     return run_daemon(
         args.config,
         once=args.once,

@@ -508,15 +508,23 @@ def test_p3_dual_outage_local_loss_disk_and_clock_alerts_with_recovery(tmp_path:
         "clock_unsynced",
     }
 
-    # Once binance_public logs clean Connected + stabilizes >= 60s with fresh binance_futures writes, it recovers!
+    # Even if binance_public logs Connected and binance_futures .partial continues updating (e.g. from sibling stream),
+    # conservative default MUST NOT auto-recover dual_ab_outage_gt_5s without explicit operator acknowledgement.
     journal_queue.append("INFO tokyo_l2_collector::live: Connected binance_public conn=A epoch=2")
     r_conn = mon.run_sweep(now_epoch_s=t0 + 410.0)
-    assert "dual_ab_outage_gt_5s" in r_conn["active_alerts"]  # Still within 60s stabilization window
+    assert "dual_ab_outage_gt_5s" in r_conn["active_alerts"]
 
     for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
         p_path = next((data_root / "raw" / ex / "2026-12-03").glob("*.partial"))
         os.utime(p_path, (t0 + 475.0, t0 + 475.0))
-    r_rec = mon.run_sweep(now_epoch_s=t0 + 480.0, run_chrony=True)
+    r_still = mon.run_sweep(now_epoch_s=t0 + 480.0, run_chrony=True)
+    assert r_still["active_alerts"] == ["dual_ab_outage_gt_5s"]
+    assert r_still["alert_dispatch"]["sent_recoveries"] == []
+
+    # Operator explicitly acknowledges binance_public outage once endpoint health is verified -> recovers!
+    ack = mon.acknowledge_dual_outage("binance_public", now_epoch_s=t0 + 482.0)
+    assert ack["cleared_endpoints"] == ["binance_public"]
+    r_rec = mon.run_sweep(now_epoch_s=t0 + 485.0, run_chrony=True)
     assert r_rec["active_alerts"] == []
     assert r_rec["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
 
@@ -913,7 +921,9 @@ def test_p3_probe_failures_and_unverified_startup_block_healthy_heartbeat(tmp_pa
 
 
 def test_p3_dual_outage_no_premature_recovery_without_endpoint_evidence(tmp_path: Path) -> None:
-    """Review Issue 2: Sibling traffic & elapsed time MUST NOT clear dual A/B outage without endpoint proof."""
+    """Connected handshake + sibling stream .partial writes MUST NOT clear dual A/B outage in conservative mode."""
+    import subprocess
+
     data_root = tmp_path / "tokyo_l2"
     cfg_path = _write_test_config(tmp_path, data_root)
     t0 = 1_796_292_720.0
@@ -932,8 +942,10 @@ def test_p3_dual_outage_no_premature_recovery_without_endpoint_evidence(tmp_path
 
     transport = FakeTransport()
     mon = _build_monitor(cfg_path, transport, journal_reader=j_reader)
+    assert mon.dual_outage_recovery_mode == "conservative"
     assert mon.run_sweep(now_epoch_s=t0)["active_alerts"] == []
     transport.tg_messages.clear()
+    transport.hc_calls.clear()
 
     # Two endpoints go into dual outage simultaneously: binance_public + gate_public
     journal_queue.extend(
@@ -942,35 +954,114 @@ def test_p3_dual_outage_no_premature_recovery_without_endpoint_evidence(tmp_path
             "ERROR live: [ALERT CRITICAL] gate_public dual A/B outage exceeded 5s",
         ]
     )
-    r1 = mon.run_sweep(now_epoch_s=t0 + 10.0)
+    r1 = mon.run_sweep(now_epoch_s=t0 + 10.0, force_collector_hc=True)
     assert "dual_ab_outage_gt_5s" in r1["active_alerts"]
+    assert r1["collector_healthcheck"]["healthy"] is False
+    assert transport.hc_calls[-1]["is_fail"] is True
 
-    # Wait 30 minutes while binance_market & others continuously update ALL .partial files -> MUST NOT recover!
-    for step in (75.0, 600.0, 1200.0, 1800.0):
+    # Scenario: WebSocket connected cleanly (`Connected binance_public`), subscription never succeeded / zero
+    # binance_public market frames arrive, while sibling stream (`binance_market`) continuously writes the shared
+    # binance_futures `.partial` file for 30+ minutes -> MUST stay FIRING and HC MUST remain `/fail`!
+    journal_queue.append("INFO tokyo_l2_collector::live: Connected binance_public conn=A epoch=2")
+    for step in (75.0, 600.0, 1200.0, 1800.0, 2100.0):
         for pp in partials.values():
             os.utime(pp, (t0 + step - 1.0, t0 + step - 1.0))
-        r_still = mon.run_sweep(now_epoch_s=t0 + step)
+        r_still = mon.run_sweep(now_epoch_s=t0 + step, force_collector_hc=(step == 1800.0))
         assert "dual_ab_outage_gt_5s" in r_still["active_alerts"]
         assert r_still["alert_dispatch"]["sent_recoveries"] == []
         assert r_still["collector_healthcheck"]["healthy"] in (None, False)
+        if step == 1800.0:
+            assert r_still["collector_healthcheck"]["healthy"] is False
+            assert transport.hc_calls[-1]["is_fail"] is True
 
-    # Flapping: binance_public logs Connected, then Subscribe write error right after -> resets stabilization!
+    # External CLI partial ack (`--ack-outage gate_public`) clears ONLY gate_public; binance_public remains locked.
+    res_part = subprocess.run(
+        [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage", "gate_public"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    ack_part_payload = json.loads(res_part.stdout)
+    assert ack_part_payload["cleared_endpoints"] == ["gate_public"]
+    assert ack_part_payload["remaining_endpoints"] == ["binance_public"]
+
+    for pp in partials.values():
+        os.utime(pp, (t0 + 2150.0, t0 + 2150.0))
+    r_partial = mon.run_sweep(now_epoch_s=t0 + 2155.0, force_collector_hc=True)
+    assert "dual_ab_outage_gt_5s" in r_partial["active_alerts"]
+    assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
+    assert r_partial["alert_dispatch"]["sent_recoveries"] == []
+    assert r_partial["collector_healthcheck"]["healthy"] is False
+
+    # External CLI full ack (`--ack-outage`) syncs into running monitor, dispatches recovery & restores HC green!
+    res_all = subprocess.run(
+        [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    ack_all_payload = json.loads(res_all.stdout)
+    assert ack_all_payload["cleared_endpoints"] == ["binance_public"]
+    assert ack_all_payload["remaining_endpoints"] == []
+
+    for pp in partials.values():
+        os.utime(pp, (t0 + 2200.0, t0 + 2200.0))
+    r_rec = mon.run_sweep(now_epoch_s=t0 + 2205.0, force_collector_hc=True)
+    assert r_rec["active_alerts"] == []
+    assert r_rec["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
+    assert r_rec["collector_healthcheck"]["healthy"] is True
+    assert transport.hc_calls[-1]["is_fail"] is False
+
+
+def test_p3_dual_outage_explicit_gap_end_mode_ignores_connected_and_sibling_partial(tmp_path: Path) -> None:
+    """Even under explicit_gap_end mode, Connected (even w/o subscribe errors) + sibling writes MUST NOT auto-clear."""
+    data_root = tmp_path / "tokyo_l2"
+    cfg_path = _write_test_config(tmp_path, data_root)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["meta_daemon"]["dual_outage_recovery_mode"] = "explicit_gap_end"
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    t0 = 1_796_292_720.0
+    partials: dict[str, Path] = {}
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        pp, dp, mp = _seed_exchange_files(data_root, ex, now_s=t0, partial_age_s=2.0)
+        partials[ex] = pp
+        _seed_ledger_row(data_root, dp, mp, exchange=ex, state="VERIFIED")
+
+    journal_queue: list[str] = []
+
+    def j_reader(_u: str, cur: str | None) -> tuple[list[str], str | None]:
+        out = list(journal_queue)
+        journal_queue.clear()
+        return out, f"cur_{len(out)}_{cur or '0'}"
+
+    transport = FakeTransport()
+    mon = _build_monitor(cfg_path, transport, journal_reader=j_reader)
+    assert mon.dual_outage_recovery_mode == "explicit_gap_end"
+    assert mon.run_sweep(now_epoch_s=t0)["active_alerts"] == []
+    transport.hc_calls.clear()
+
+    # Include ANSI color escapes (matching tracing_subscriber real output)
     journal_queue.extend(
         [
-            "INFO live: Connected binance_public conn=A epoch=2",
-            "WARN live: Subscribe write error on binance_public A: connection reset",
+            "\x1b[31mERROR\x1b[0m tokyo_l2_collector::live: [ALERT CRITICAL] binance_public dual A/B outage exceeded 5s",
+            "\x1b[31mERROR\x1b[0m tokyo_l2_collector::live: [ALERT CRITICAL] gate_public dual A/B outage exceeded 5s",
         ]
     )
-    for pp in partials.values():
-        os.utime(pp, (t0 + 1850.0, t0 + 1850.0))
-    r_flap = mon.run_sweep(now_epoch_s=t0 + 1855.0)
-    assert "dual_ab_outage_gt_5s" in r_flap["active_alerts"]
+    r1 = mon.run_sweep(now_epoch_s=t0 + 10.0)
+    assert "dual_ab_outage_gt_5s" in r1["active_alerts"]
 
-    # After waiting > 60s since that failed Connected, still MUST NOT recover because error invalidated it!
-    for pp in partials.values():
-        os.utime(pp, (t0 + 1950.0, t0 + 1950.0))
-    r_still_flap = mon.run_sweep(now_epoch_s=t0 + 1955.0)
-    assert "dual_ab_outage_gt_5s" in r_still_flap["active_alerts"]
+    # Clean ANSI Connected log without market frames + sibling .partial continuously written for 30+ min -> stays FIRING!
+    journal_queue.append("\x1b[32mINFO\x1b[0m tokyo_l2_collector::live: Connected binance_public conn=A epoch=2")
+    for step in (75.0, 900.0, 1900.0):
+        for pp in partials.values():
+            os.utime(pp, (t0 + step - 1.0, t0 + step - 1.0))
+        r_still = mon.run_sweep(now_epoch_s=t0 + step, force_collector_hc=(step == 1900.0))
+        assert "dual_ab_outage_gt_5s" in r_still["active_alerts"]
+        assert r_still["alert_dispatch"]["sent_recoveries"] == []
+        if step == 1900.0:
+            assert r_still["collector_healthcheck"]["healthy"] is False
+            assert transport.hc_calls[-1]["is_fail"] is True
 
     # gate_public recovers cleanly via explicit GAP_END, while binance_public stays broken -> stays FIRING!
     journal_queue.append('INFO live: {"event":"GAP_END","endpoint":"gate_public","recovered_conn":"A"}')
@@ -1054,5 +1145,681 @@ def test_p3_hourly_report_prev_hour_vs_cumulative_metrics(tmp_path: Path) -> Non
     mid_report = r_mid["hourly_report"]["text"]
     assert mid_report is not None
     assert "上小时(2026-12-03T23): 封口=1 DATA=9,999" in mid_report
+
+
+def _ws_encode_frame(opcode: int, payload: bytes) -> bytes:
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header.extend(
+            __import__("struct").pack("!H", n)
+        )
+    else:
+        header.append(127)
+        header.extend(
+            __import__("struct").pack("!Q", n)
+        )
+    return bytes(header) + payload
+
+
+def _ws_read_pending(conn: Any, rx_buf: bytearray) -> bool:
+    """Drain masked client WS frames, answer Ping with Pong, return False on EOF/Close."""
+    import select
+    import struct
+
+    try:
+        readable, _, _ = select.select([conn], [], [], 0.0)
+        if not readable:
+            return True
+        chunk = conn.recv(4096)
+    except (TimeoutError, BlockingIOError):
+        return True
+    except (OSError, ValueError):
+        return False
+    if not chunk:
+        return False
+    rx_buf.extend(chunk)
+    while len(rx_buf) >= 2:
+        b0, b1 = rx_buf[0], rx_buf[1]
+        opcode = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        plen = b1 & 0x7F
+        idx = 2
+        if plen == 126:
+            if len(rx_buf) < 4:
+                break
+            plen = struct.unpack("!H", rx_buf[2:4])[0]
+            idx = 4
+        elif plen == 127:
+            if len(rx_buf) < 10:
+                break
+            plen = struct.unpack("!Q", rx_buf[2:10])[0]
+            idx = 10
+        mask_len = 4 if masked else 0
+        total = idx + mask_len + plen
+        if len(rx_buf) < total:
+            break
+        mask = rx_buf[idx : idx + 4] if masked else b""
+        raw_payload = bytes(rx_buf[idx + mask_len : total])
+        del rx_buf[:total]
+        payload = (
+            bytes(raw_payload[i] ^ mask[i % 4] for i in range(len(raw_payload)))
+            if masked
+            else raw_payload
+        )
+        if opcode == 0x8:  # CLOSE
+            try:
+                conn.sendall(_ws_encode_frame(0x8, b""))
+            except OSError:
+                pass
+            return False
+        if opcode == 0x9:  # PING -> PONG
+            try:
+                conn.sendall(_ws_encode_frame(0xA, payload))
+            except OSError:
+                return False
+    return True
+
+
+class _LoopbackBinanceWsServer:
+    """Tiny pure-stdlib RFC-6455 loopback WS endpoint supporting streaming / reject / silent_connected modes."""
+
+    def __init__(self, kind: str) -> None:
+        import socket
+        import threading
+
+        self.kind = kind
+        self.mode = "streaming"
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._conns: set[socket.socket] = set()
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(32)
+        self._srv.settimeout(0.1)
+        self.port = int(self._srv.getsockname()[1])
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
+
+    def set_mode(self, mode: str, *, close_existing: bool = True) -> None:
+        import socket
+
+        with self._lock:
+            self.mode = mode
+            conns = list(self._conns) if close_existing else []
+        for c in conns:
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.set_mode("reject", close_existing=True)
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        self._accept_thread.join(timeout=2.0)
+
+    def _accept_loop(self) -> None:
+        import threading
+
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            t = threading.Thread(target=self._handle_client, args=(conn,), daemon=True)
+            t.start()
+
+    def _handle_client(self, conn: Any) -> None:
+        import base64
+        import hashlib
+        import time
+
+        try:
+            conn.settimeout(1.0)
+            req = bytearray()
+            while b"\r\n\r\n" not in req:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                req.extend(chunk)
+                if len(req) > 65536:
+                    return
+
+            with self._lock:
+                cur_mode = self.mode
+            if cur_mode == "reject":
+                conn.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                return
+
+            ws_key = ""
+            for line in bytes(req).decode("latin1", errors="ignore").split("\r\n"):
+                if line.lower().startswith("sec-websocket-key:"):
+                    ws_key = line.split(":", 1)[1].strip()
+                    break
+            if not ws_key:
+                return
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                ).digest()
+            ).decode("ascii")
+            conn.sendall(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode("ascii")
+            )
+            with self._lock:
+                if self._stop.is_set() or self.mode == "reject":
+                    return
+                self._conns.add(conn)
+
+            conn.settimeout(1.0)
+            rx_buf = bytearray()
+            seq = 1000
+            prev_u = 999
+            agg_id = 50_000
+            last_send = 0.0
+
+            while not self._stop.is_set():
+                if not _ws_read_pending(conn, rx_buf):
+                    break
+                with self._lock:
+                    cur_mode = self.mode
+                if cur_mode == "reject":
+                    break
+                if cur_mode == "silent_connected":
+                    time.sleep(0.05)
+                    continue
+
+                now_mono = time.monotonic()
+                interval_s = 0.10 if self.kind == "public" else 0.02
+                if now_mono - last_send < interval_s:
+                    time.sleep(0.01)
+                    continue
+                last_send = now_mono
+                now_ms = int(time.time() * 1000)
+
+                if self.kind == "public":
+                    fu = seq
+                    lu = seq + 5
+                    depth_payload = json.dumps(
+                        {
+                            "stream": "btcusdt@depth@100ms",
+                            "data": {
+                                "e": "depthUpdate",
+                                "E": now_ms,
+                                "T": now_ms,
+                                "s": "BTCUSDT",
+                                "U": fu,
+                                "u": lu,
+                                "pu": prev_u,
+                                "b": [["95000.0", "3.5"], ["94999.9", "2.1"]],
+                                "a": [["95000.1", "2.9"], ["95000.2", "4.4"]],
+                            },
+                        }
+                    ).encode("utf-8")
+                    conn.sendall(_ws_encode_frame(0x1, depth_payload))
+                    prev_u = lu
+                    seq = lu + 1
+
+                    bt_payload = json.dumps(
+                        {
+                            "stream": "btcusdt@bookTicker",
+                            "data": {
+                                "e": "bookTicker",
+                                "u": lu,
+                                "s": "BTCUSDT",
+                                "b": "95000.0",
+                                "B": "3.5",
+                                "a": "95000.1",
+                                "A": "2.9",
+                                "T": now_ms,
+                                "E": now_ms,
+                            },
+                        }
+                    ).encode("utf-8")
+                    conn.sendall(_ws_encode_frame(0x1, bt_payload))
+                else:
+                    frames = bytearray()
+                    for _ in range(30):
+                        agg_id += 1
+                        px = 95000.0 + ((agg_id * 37) % 997) * 0.1
+                        qty = 0.01 + ((agg_id * 19) % 89) * 0.01
+                        trade_payload = json.dumps(
+                            {
+                                "stream": "btcusdt@aggTrade",
+                                "data": {
+                                    "e": "aggTrade",
+                                    "E": now_ms + (agg_id % 17),
+                                    "a": agg_id,
+                                    "s": "BTCUSDT",
+                                    "p": f"{px:.1f}",
+                                    "q": f"{qty:.2f}",
+                                    "f": agg_id * 2,
+                                    "l": agg_id * 2 + 1,
+                                    "T": now_ms + (agg_id % 17),
+                                    "m": bool(agg_id % 2),
+                                },
+                            }
+                        ).encode("utf-8")
+                        frames.extend(_ws_encode_frame(0x1, trade_payload))
+                    conn.sendall(bytes(frames))
+        except OSError:
+            pass
+        finally:
+            with self._lock:
+                self._conns.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+class _LoopbackBinanceCluster:
+    """Localhost REST depth + split /public & /market WS cluster for real Rust collector testing."""
+
+    def __init__(self) -> None:
+        import socket
+        import threading
+
+        self._stop = threading.Event()
+        self.rest_hits = 0
+        self._rest_lock = threading.Lock()
+        self._rest_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._rest_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._rest_srv.bind(("127.0.0.1", 0))
+        self._rest_srv.listen(16)
+        self._rest_srv.settimeout(0.1)
+        self.rest_port = int(self._rest_srv.getsockname()[1])
+        self._rest_thread = threading.Thread(target=self._serve_rest, daemon=True)
+        self._rest_thread.start()
+
+        self.pub_ws = _LoopbackBinanceWsServer("public")
+        self.mkt_ws = _LoopbackBinanceWsServer("market")
+
+    def _serve_rest(self) -> None:
+        body = '{"lastUpdateId":1005,"bids":[["95000.0","5.0"]],"asks":[["95000.1","4.0"]]}'
+        resp = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+            + body
+        ).encode("utf-8")
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._rest_srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            try:
+                conn.settimeout(0.5)
+                _ = conn.recv(1024)
+                conn.sendall(resp)
+                with self._rest_lock:
+                    self.rest_hits += 1
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._rest_srv.close()
+        except OSError:
+            pass
+        self.pub_ws.stop()
+        self.mkt_ws.stop()
+        self._rest_thread.join(timeout=2.0)
+
+
+def _wait_until(pred: Any, *, timeout_s: float = 15.0, desc: str = "condition", on_timeout: Any = None) -> None:
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if pred():
+            return
+        time.sleep(0.05)
+    extra = f" | diag={on_timeout()}" if on_timeout is not None else ""
+    raise AssertionError(f"Timed out after {timeout_s}s waiting for: {desc}{extra}")
+
+
+def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path: Path) -> None:
+    """Real Rust collector stderr linkage: no GAP_END in stderr, silent Connected + sibling .partial never clears."""
+    import signal
+    import subprocess
+    import threading
+    import time
+
+    rust_bin = cli_mod._find_or_build_rust_binary()
+    cluster = _LoopbackBinanceCluster()
+    data_root = tmp_path / "tokyo_l2"
+    cfg_path = _write_test_config(tmp_path, data_root)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["deployment"]["silence_watchdog_seconds"] = 5
+    cfg["meta_daemon"]["dual_outage_alert_seconds"] = 1
+    cfg["meta_daemon"]["dual_outage_recovery_mode"] = "conservative"
+    cfg["exchanges"]["binance_futures"]["enabled"] = True
+    cfg["exchanges"]["binance_futures"]["symbols"] = ["BTCUSDT"]
+    cfg["exchanges"]["binance_futures"]["public_ws_url"] = f"ws://127.0.0.1:{cluster.pub_ws.port}/public/stream"
+    cfg["exchanges"]["binance_futures"]["market_ws_url"] = f"ws://127.0.0.1:{cluster.mkt_ws.port}/market/stream"
+    cfg["exchanges"]["binance_futures"]["rest_depth_url"] = f"http://127.0.0.1:{cluster.rest_port}/fapi/v1/depth"
+    cfg["exchanges"]["bybit_linear"]["enabled"] = False
+    cfg["exchanges"]["bitget_v3"]["enabled"] = False
+    cfg["exchanges"]["gate_futures"]["enabled"] = False
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    stderr_lines: list[str] = []
+    stderr_lock = threading.Lock()
+    child_env = os.environ.copy()
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        child_env.pop(k, None)
+    child_env["NO_PROXY"] = "127.0.0.1,localhost"
+    child_env["no_proxy"] = "127.0.0.1,localhost"
+    child_env["TOKYO_L2_LIVE_AUTHORIZED"] = "1"
+    child_env["TOKYO_L2_ALLOW_LOCALHOST_TEST_ENDPOINTS"] = "1"
+    child_env["RUST_LOG"] = "info"
+
+    proc = subprocess.Popen(
+        [
+            str(rust_bin),
+            "collect",
+            "--config",
+            str(cfg_path),
+            "--run-id",
+            "p3_real_link",
+            "--allow-live-run",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=child_env,
+    )
+
+    def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            with stderr_lock:
+                stderr_lines.append(line.rstrip("\r\n"))
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    try:
+        # Incremental journal_reader wired directly to REAL `tokyo-l2-collector` stderr output!
+        def real_journal_reader(_unit: str, cur: str | None) -> tuple[list[str], str | None]:
+            idx = int(cur or "0")
+            with stderr_lock:
+                new_lines = list(stderr_lines[idx:])
+            return new_lines, str(idx + len(new_lines))
+
+        def snapshot_stderr(start: int = 0) -> list[str]:
+            with stderr_lock:
+                return list(stderr_lines[start:])
+
+        def _diag() -> dict[str, Any]:
+            parts = [
+                (p.name, p.stat().st_size)
+                for p in (data_root / "raw" / "binance_futures").rglob("*.partial")
+            ] if (data_root / "raw" / "binance_futures").exists() else []
+            return {
+                "rc": proc.poll(),
+                "rest_hits": cluster.rest_hits,
+                "partials": parts,
+                "stderr_tail": snapshot_stderr()[-15:],
+            }
+
+        transport = FakeTransport()
+        mon = _build_monitor(cfg_path, transport, journal_reader=real_journal_reader)
+        assert mon.enabled_exchanges == ["binance_futures"]
+        assert mon.dual_outage_recovery_mode == "conservative"
+
+        # Stage 1: Healthy streaming + initial REST depth snapshots + active binance_futures .partial
+        _wait_until(
+            lambda: (
+                any("Connected binance_public" in ln for ln in snapshot_stderr())
+                and any("Connected binance_market" in ln for ln in snapshot_stderr())
+                and cluster.rest_hits >= 2
+                and len(list((data_root / "raw" / "binance_futures").rglob("*.tsv.zst.partial"))) == 1
+                and next((data_root / "raw" / "binance_futures").rglob("*.tsv.zst.partial")).stat().st_size > 0
+            ),
+            timeout_s=15.0,
+            desc="initial Rust WS connects, REST snapshots, and non-empty .partial",
+            on_timeout=_diag,
+        )
+        partial_path = next((data_root / "raw" / "binance_futures").rglob("*.tsv.zst.partial"))
+
+        r_init = mon.run_sweep(now_epoch_s=time.time(), force_collector_hc=True)
+        assert r_init["active_alerts"] == []
+        assert r_init["collector_healthcheck"]["healthy"] is True
+        transport.tg_messages.clear()
+        transport.hc_calls.clear()
+
+        # Stage 2: Drop binance_public A & B completely (`reject`), while sibling binance_market keeps writing .partial
+        cluster.pub_ws.set_mode("reject", close_existing=True)
+        _wait_until(
+            lambda: any(
+                "binance_public dual A/B outage exceeded" in md_mod._RE_ANSI.sub("", ln)
+                for ln in snapshot_stderr()
+            ),
+            timeout_s=15.0,
+            desc="real Rust collector dual A/B outage alert in stderr",
+            on_timeout=_diag,
+        )
+        size_outage_1 = partial_path.stat().st_size
+        _wait_until(
+            lambda: partial_path.stat().st_size > size_outage_1,
+            timeout_s=8.0,
+            desc="sibling binance_market keeps growing shared .partial during outage",
+            on_timeout=_diag,
+        )
+
+        r_outage = mon.run_sweep(now_epoch_s=time.time(), force_collector_hc=True)
+        assert "dual_ab_outage_gt_5s" in r_outage["active_alerts"]
+        assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
+        assert r_outage["collector_healthcheck"]["healthy"] is False
+        assert transport.hc_calls[-1]["is_fail"] is True
+        assert any("dual_ab_outage_gt_5s" in m["text"] for m in transport.tg_messages)
+        transport.tg_messages.clear()
+
+        # Stage 3: binance_public WS reconnects cleanly (`silent_connected` = Connected logged, ZERO frames),
+        # while sibling binance_market CONTINUES growing the shared binance_futures .partial!
+        mark_stage3 = len(snapshot_stderr())
+        rest_before_s3 = cluster.rest_hits
+        size_stage3_start = partial_path.stat().st_size
+        cluster.pub_ws.set_mode("silent_connected", close_existing=True)
+        _wait_until(
+            lambda: (
+                any("Connected binance_public conn=A" in md_mod._RE_ANSI.sub("", ln) for ln in snapshot_stderr(mark_stage3))
+                and any("Connected binance_public conn=B" in md_mod._RE_ANSI.sub("", ln) for ln in snapshot_stderr(mark_stage3))
+                and cluster.rest_hits > rest_before_s3
+                and partial_path.stat().st_size > size_stage3_start
+            ),
+            timeout_s=15.0,
+            desc="Connected binance_public A+B + Stage 3 REST attempt while sibling .partial keeps growing",
+            on_timeout=_diag,
+        )
+
+        # Advance monitor clock +90s (> legacy 60s): conservative lock MUST remain FIRING!
+        t_stage3 = time.time() + 90.0
+        r_silent = mon.run_sweep(now_epoch_s=t_stage3, force_collector_hc=True)
+        assert "dual_ab_outage_gt_5s" in r_silent["active_alerts"]
+        assert r_silent["alert_dispatch"]["sent_recoveries"] == []
+        assert not any("[已恢复]" in m["text"] for m in transport.tg_messages)
+        assert r_silent["collector_healthcheck"]["healthy"] is False
+        assert transport.hc_calls[-1]["is_fail"] is True
+        assert (
+            mon.state["dual_outage_endpoints"]["binance_public"]["diagnostics"]["last_ws_connected_at_s"]
+            is not None
+        ), f"ep_state={mon.state['dual_outage_endpoints']}; cursor={mon.state.get('journal_cursor')}; stderr={snapshot_stderr()}"
+
+        # Stage 4a: Reconnecting live stream (`streaming`) still leaves unmodified Rust collector unable to recover
+        # logs cleanly (Connected + sibling .partial keeps growing, ZERO `GAP_END` in stderr).
+        # Conservative monitor MUST stay FIRING until explicit CLI `--ack-outage`.
+        mark_stage4 = len(snapshot_stderr())
+        cluster.pub_ws.set_mode("streaming", close_existing=True)
+        _wait_until(
+            lambda: any("Connected binance_public" in md_mod._RE_ANSI.sub("", ln) for ln in snapshot_stderr(mark_stage4)),
+            timeout_s=15.0,
+            desc="binance_public reconnect under streaming mode",
+            on_timeout=_diag,
+        )
+        size_resumed = partial_path.stat().st_size
+        _wait_until(
+            lambda: partial_path.stat().st_size > size_resumed,
+            timeout_s=8.0,
+            desc="post-outage .partial continues growing from sibling stream",
+            on_timeout=_diag,
+        )
+
+        r_still_locked = mon.run_sweep(now_epoch_s=t_stage3 + 10.0, force_collector_hc=True)
+        assert "dual_ab_outage_gt_5s" in r_still_locked["active_alerts"]
+        assert r_still_locked["alert_dispatch"]["sent_recoveries"] == []
+        assert not any("GAP_END" in md_mod._RE_ANSI.sub("", ln) for ln in snapshot_stderr())
+
+        # Operator runs `--ack-outage binance_public` after verifying live recovery -> clears lock & HC turns green!
+        ack_res = subprocess.run(
+            [
+                sys.executable,
+                str(PYTHON_DIR / "meta_daemon.py"),
+                "--config",
+                str(cfg_path),
+                "--ack-outage",
+                "binance_public",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        ack_json = json.loads(ack_res.stdout)
+        assert ack_json["cleared_endpoints"] == ["binance_public"]
+
+        r_acked = mon.run_sweep(now_epoch_s=t_stage3 + 15.0, force_collector_hc=True)
+        assert r_acked["active_alerts"] == []
+        assert r_acked["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
+        assert any("[已恢复]" in m["text"] and "dual_ab_outage_gt_5s" in m["text"] for m in transport.tg_messages)
+        assert r_acked["collector_healthcheck"]["healthy"] is True
+        assert transport.hc_calls[-1]["is_fail"] is False
+
+        # Stage 4b: SIGINT seals binance_futures; confirm real Rust wrote GAP_START/META only inside .tsv.zst,
+        # never to stderr (where GAP_END never appears either).
+        proc.send_signal(signal.SIGINT)
+        rc = proc.wait(timeout=15)
+        assert rc == 0, f"tokyo-l2-collector exited {rc}; stderr tail: {snapshot_stderr()[-20:]}"
+        stderr_thread.join(timeout=3.0)
+
+        live_stderr_all = snapshot_stderr()
+        assert not any("GAP_END" in md_mod._RE_ANSI.sub("", ln) for ln in live_stderr_all)
+        assert not any("GAP_START" in md_mod._RE_ANSI.sub("", ln) for ln in live_stderr_all)
+        sealed_files = list((data_root / "raw" / "binance_futures").rglob("*.tsv.zst"))
+        assert len(sealed_files) == 1
+        dctx = zstd.ZstdDecompressor()
+        with sealed_files[0].open("rb") as fh:
+            raw_tsv = dctx.stream_reader(fh).read().decode("utf-8", errors="replace")
+        meta_lines = [ln for ln in raw_tsv.splitlines() if "\tMETA\t" in ln]
+        assert '"event":"GAP_START"' in raw_tsv, f"Missing GAP_START. meta_lines={meta_lines}"
+        assert '"endpoint":"binance_public"' in raw_tsv, f"Missing binance_public META. meta_lines={meta_lines}"
+
+        # Stage 5: Confirm via real `tokyo-l2-collector replay-fixture` that even when CausalSelector emits GAP_END,
+        # the unmodified Rust binary writes GAP_END exclusively to compressed `.tsv.zst` (NEVER stdout/stderr!).
+        replay_cfg = json.loads((SPECS_DIR / "config.example.json").read_text(encoding="utf-8"))
+        replay_out = tmp_path / "replay_out"
+        replay_cfg["deployment"]["data_root"] = str(replay_out)
+        replay_cfg["exchanges"]["binance_futures"]["symbols"] = ["BTCUSDT"]
+        replay_cfg["exchanges"]["bybit_linear"]["enabled"] = False
+        replay_cfg["exchanges"]["bitget_v3"]["enabled"] = False
+        replay_cfg["exchanges"]["gate_futures"]["enabled"] = False
+        replay_cfg_path = tmp_path / "replay_cfg.json"
+        replay_cfg_path.write_text(json.dumps(replay_cfg), encoding="utf-8")
+
+        depth_frame = json.dumps(
+            {
+                "stream": "btcusdt@depth@100ms",
+                "data": {
+                    "e": "depthUpdate",
+                    "E": 1796292720000,
+                    "T": 1796292720000,
+                    "s": "BTCUSDT",
+                    "U": 1000,
+                    "u": 1005,
+                    "pu": 999,
+                    "b": [["95000.0", "1.0"]],
+                    "a": [["95000.1", "1.0"]],
+                },
+            }
+        )
+        rest_snap = '{"lastUpdateId":1005,"bids":[],"asks":[]}'
+        fixture_path = tmp_path / "gap_recovery.jsonl"
+        fixture_events = [
+            {"op": "reconnect", "recv_mono_ns": 10, "endpoint": "binance_public", "conn_id": "A", "epoch": 1},
+            {"op": "frame", "recv_wall_ns": 1796292720000000000, "recv_mono_ns": 20, "endpoint": "binance_public", "conn_id": "A", "epoch": 1, "payload": depth_frame},
+            {"op": "rest_snapshot", "recv_wall_ns": 1796292720100000000, "recv_mono_ns": 30, "endpoint": "binance_public", "conn_id": "A", "symbol": "BTCUSDT", "last_update_id": 1005, "raw_json": rest_snap},
+            {"op": "disconnect", "recv_wall_ns": 1796292721000000000, "recv_mono_ns": 100, "endpoint": "binance_public", "conn_id": "A", "reason": "simulated_dual_loss"},
+            {"op": "reconnect", "recv_mono_ns": 200, "endpoint": "binance_public", "conn_id": "A", "epoch": 2},
+            {"op": "frame", "recv_wall_ns": 1796292725000000000, "recv_mono_ns": 210, "endpoint": "binance_public", "conn_id": "A", "epoch": 2, "payload": depth_frame},
+            {"op": "rest_snapshot", "recv_wall_ns": 1796292725100000000, "recv_mono_ns": 220, "endpoint": "binance_public", "conn_id": "A", "symbol": "BTCUSDT", "last_update_id": 1005, "raw_json": rest_snap},
+        ]
+        fixture_path.write_text("\n".join(json.dumps(ev) for ev in fixture_events) + "\n", encoding="utf-8")
+
+        replay_proc = subprocess.run(
+            [
+                str(rust_bin),
+                "replay-fixture",
+                "--config",
+                str(replay_cfg_path),
+                "--fixture",
+                str(fixture_path),
+                "--out",
+                str(replay_out),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "GAP_END" not in replay_proc.stdout
+        assert "GAP_END" not in replay_proc.stderr
+        assert md_mod.inspect_collector_logs(replay_proc.stderr.splitlines())["endpoint_timeline"] == {}
+        replay_tsv_files = list(replay_out.rglob("*.tsv.zst"))
+        assert len(replay_tsv_files) == 1
+        with replay_tsv_files[0].open("rb") as rfh:
+            replay_tsv = zstd.ZstdDecompressor().stream_reader(rfh).read().decode("utf-8", errors="replace")
+        assert '"event":"GAP_START"' in replay_tsv
+        assert '"event":"GAP_END"' in replay_tsv
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        stderr_thread.join(timeout=2.0)
+        cluster.stop()
 
 
