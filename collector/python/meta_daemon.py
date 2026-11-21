@@ -33,12 +33,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 USER_AGENT = "tokyo-l2-meta-daemon/1.4"
+OUTAGE_ACK_REQUEST_DIRNAME = "outage_ack_requests"
 
 REST_SPEC_ENDPOINTS = {
     "binance_futures": {
@@ -1311,6 +1313,60 @@ def format_hourly_report(
     return "\n".join(lines)
 
 
+def submit_outage_ack_request(
+    data_root: Path,
+    endpoint: str | None = None,
+    *,
+    now_epoch_s: float | None = None,
+) -> dict[str, Any]:
+    """Queue an atomic operator outage-ack request without modifying monitor_state.json.
+
+    NOTE: This submits an acknowledgement request only; it does NOT verify live market data flow.
+    Only the running CollectorMonitor daemon owns writes to `monitor_state.json`.
+    """
+    now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
+    req_dir = Path(data_root) / "meta" / OUTAGE_ACK_REQUEST_DIRNAME
+    req_dir.mkdir(parents=True, exist_ok=True)
+
+    target = None if endpoint in (None, "", "ALL", "all") else str(endpoint)
+    req_id = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    req_obj = {
+        "schema_version": 1,
+        "request_id": req_id,
+        "requested_at_utc": datetime.fromtimestamp(now_s, tz=timezone.utc).isoformat(),
+        "requested_at_epoch_s": now_s,
+        "target": target or "ALL",
+    }
+    req_path = req_dir / f"req_{req_id}.json"
+    tmp_path = req_dir / f".req_{req_id}.tmp.{os.getpid()}"
+    tmp_path.write_text(json.dumps(req_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp_path, req_path)
+
+    # Best-effort read-only peek of monitor_state.json for immediate operator visibility only
+    pending_snapshot: list[str] = []
+    state_path = Path(data_root) / "meta" / "monitor_state.json"
+    if state_path.is_file():
+        try:
+            snap = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(snap, dict) and isinstance(snap.get("dual_outage_endpoints"), dict):
+                pending_snapshot = sorted(snap["dual_outage_endpoints"].keys())
+        except Exception:
+            pass
+
+    return {
+        "status": "queued",
+        "request_id": req_id,
+        "request_file": str(req_path),
+        "target": req_obj["target"],
+        "requested_at_utc": req_obj["requested_at_utc"],
+        "pending_endpoints_snapshot": pending_snapshot,
+        "warning": (
+            "--ack-outage only queues acknowledgement to clear the conservative alert lock and "
+            "does NOT verify live market data recovery; confirm live market frames first."
+        ),
+    }
+
+
 class CollectorMonitor:
     """Stateful, offline-testable P3 monitor orchestrating dedup, recovery, HC & hourly reports."""
 
@@ -1394,6 +1450,7 @@ class CollectorMonitor:
         self.sleeper = sleeper
 
         self.state_path = self.data_root / "meta" / "monitor_state.json"
+        self.ack_requests_dir = self.data_root / "meta" / OUTAGE_ACK_REQUEST_DIRNAME
         self.manifest_cache: dict[str, dict[str, Any]] = {}
         self.last_chrony_row: dict[str, Any] | None = None
         self.last_rtt_rows: list[dict[str, Any]] = []
@@ -1406,7 +1463,7 @@ class CollectorMonitor:
         *,
         now_epoch_s: float | None = None,
     ) -> dict[str, Any]:
-        """Manually acknowledge and clear conservative dual A/B outage state after verification."""
+        """Manually acknowledge and clear conservative dual A/B outage state in-process."""
         now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
         ep_outages = self.state.setdefault("dual_outage_endpoints", {})
         if not isinstance(ep_outages, dict):
@@ -1434,6 +1491,7 @@ class CollectorMonitor:
         return {
             "status": "ok",
             **self.state["last_outage_ack"],
+            "warning": "--ack-outage does NOT verify live market data flow; verify endpoint recovery separately.",
         }
 
     def _default_state(self) -> dict[str, Any]:
@@ -1602,22 +1660,52 @@ class CollectorMonitor:
             "notify_failures": notify_failures,
         }
 
-    def _sync_external_ack(self) -> None:
-        """Pick up external `--ack-outage` edits made via CLI while daemon runs in memory."""
-        if not self.state_path.is_file():
-            return
-        try:
-            disk = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        if not isinstance(disk, dict):
-            return
-        disk_ack = disk.get("last_outage_ack")
-        if disk_ack and disk_ack != self.state.get("last_outage_ack"):
-            disk_eps = disk.get("dual_outage_endpoints")
-            if isinstance(disk_eps, dict):
-                self.state["dual_outage_endpoints"] = disk_eps
-            self.state["last_outage_ack"] = disk_ack
+    def _consume_outage_ack_requests(self, *, now_s: float) -> tuple[list[Path], list[dict[str, Any]]]:
+        """Drain pending `--ack-outage` request files inside the single-writer monitor process.
+
+        Request files remain on disk until `self._save_state()` succeeds at the end of `run_sweep()`.
+        """
+        if not self.ack_requests_dir.is_dir():
+            return [], []
+
+        ep_outages = self.state.setdefault("dual_outage_endpoints", {})
+        if not isinstance(ep_outages, dict):
+            ep_outages = {}
+            self.state["dual_outage_endpoints"] = ep_outages
+
+        consumed_paths: list[Path] = []
+        applied_summaries: list[dict[str, Any]] = []
+        for req_path in sorted(self.ack_requests_dir.glob("req_*.json")):
+            try:
+                raw = json.loads(req_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(raw, dict):
+                continue
+
+            raw_target = raw.get("target")
+            target = None if raw_target in (None, "", "ALL", "all") else str(raw_target)
+            cleared: list[str] = []
+            if target is None:
+                cleared = sorted(ep_outages.keys())
+                ep_outages.clear()
+            elif target in ep_outages:
+                ep_outages.pop(target, None)
+                cleared = [target]
+
+            ack_record = {
+                "ts_utc": datetime.fromtimestamp(now_s, tz=timezone.utc).isoformat(),
+                "request_id": raw.get("request_id"),
+                "requested_at_utc": raw.get("requested_at_utc"),
+                "target": target or "ALL",
+                "cleared_endpoints": cleared,
+                "remaining_endpoints": sorted(ep_outages.keys()),
+            }
+            self.state["last_outage_ack"] = ack_record
+            consumed_paths.append(req_path)
+            applied_summaries.append(ack_record)
+
+        return consumed_paths, applied_summaries
 
     def run_sweep(
         self,
@@ -1630,7 +1718,6 @@ class CollectorMonitor:
         force_hourly_report: bool = False,
     ) -> dict[str, Any]:
         """Run one complete non-blocking monitoring, alert, Healthchecks & report sweep."""
-        self._sync_external_ack()
         now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
         today = utc_date_str(int(now_s * 1e9))
         dt_now = datetime.fromtimestamp(now_s, tz=timezone.utc)
@@ -1852,6 +1939,9 @@ class CollectorMonitor:
 
         # D. Dual A/B outage > 5s (strict conservative endpoint tracking; NEVER clears from
         #    `Connected` handshake or sibling-shared `.partial` disk activity!)
+        #    Single-writer ack order: drain queued `--ack-outage` request files FIRST, then process
+        #    any new outage events from this sweep's journal batch so concurrent faults are never wiped.
+        consumed_ack_paths, applied_outage_acks = self._consume_outage_ack_requests(now_s=now_s)
         ep_outages: dict[str, dict[str, Any]] = self.state.setdefault("dual_outage_endpoints", {})
         if not isinstance(ep_outages, dict):
             ep_outages = {}
@@ -2118,6 +2208,11 @@ class CollectorMonitor:
                 self.state["last_hourly_report_hour"] = hour_key
 
         self._save_state()
+        for req_path in consumed_ack_paths:
+            try:
+                req_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return {
             "status": "ok",
             "utc": dt_now.isoformat(),
@@ -2128,6 +2223,7 @@ class CollectorMonitor:
             "data_tree": data_tree,
             "archive_ledger": ledger_info,
             "active_alerts": list(sorted(self.state["active_alerts"].keys())),
+            "outage_acks_applied": applied_outage_acks,
             "alert_dispatch": dispatch_res,
             "spec_change_alerts": spec_change_alerts,
             "collector_healthcheck": hc_result,
@@ -2238,12 +2334,17 @@ def main() -> int:
         nargs="?",
         const="ALL",
         default=None,
-        help="Acknowledge and clear conservative dual A/B outage alert (optionally specify endpoint name, or ALL)",
+        help=(
+            "Submit an acknowledgement request to clear the conservative dual A/B outage lock "
+            "(optionally specify endpoint name, or ALL). NOTE: does NOT verify live market data flow; "
+            "confirm live market frames first."
+        ),
     )
     args = p.parse_args()
     if args.ack_outage is not None:
-        mon = CollectorMonitor(args.config, allow_notify=False)
-        res = mon.acknowledge_dual_outage(None if args.ack_outage == "ALL" else args.ack_outage)
+        cfg_obj = json.loads(args.config.read_text(encoding="utf-8"))
+        data_root = Path(cfg_obj["deployment"]["data_root"])
+        res = submit_outage_ack_request(data_root, None if args.ack_outage == "ALL" else args.ack_outage)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
     return run_daemon(

@@ -974,7 +974,8 @@ def test_p3_dual_outage_no_premature_recovery_without_endpoint_evidence(tmp_path
             assert r_still["collector_healthcheck"]["healthy"] is False
             assert transport.hc_calls[-1]["is_fail"] is True
 
-    # External CLI partial ack (`--ack-outage gate_public`) clears ONLY gate_public; binance_public remains locked.
+    # External CLI partial ack (`--ack-outage gate_public`) MUST ONLY queue a request file without modifying monitor_state.json!
+    state_before = mon.state_path.read_text(encoding="utf-8")
     res_part = subprocess.run(
         [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage", "gate_public"],
         capture_output=True,
@@ -982,18 +983,22 @@ def test_p3_dual_outage_no_premature_recovery_without_endpoint_evidence(tmp_path
         check=True,
     )
     ack_part_payload = json.loads(res_part.stdout)
-    assert ack_part_payload["cleared_endpoints"] == ["gate_public"]
-    assert ack_part_payload["remaining_endpoints"] == ["binance_public"]
+    assert ack_part_payload["status"] == "queued"
+    assert ack_part_payload["target"] == "gate_public"
+    assert "does NOT verify" in ack_part_payload["warning"]
+    assert mon.state_path.read_text(encoding="utf-8") == state_before
 
     for pp in partials.values():
         os.utime(pp, (t0 + 2150.0, t0 + 2150.0))
     r_partial = mon.run_sweep(now_epoch_s=t0 + 2155.0, force_collector_hc=True)
     assert "dual_ab_outage_gt_5s" in r_partial["active_alerts"]
+    assert r_partial["outage_acks_applied"][0]["cleared_endpoints"] == ["gate_public"]
     assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
+    assert list(mon.ack_requests_dir.glob("req_*.json")) == []
     assert r_partial["alert_dispatch"]["sent_recoveries"] == []
     assert r_partial["collector_healthcheck"]["healthy"] is False
 
-    # External CLI full ack (`--ack-outage`) syncs into running monitor, dispatches recovery & restores HC green!
+    # External CLI full ack (`--ack-outage`) queues request -> running monitor consumes it cleanly, dispatches recovery & restores HC green!
     res_all = subprocess.run(
         [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage"],
         capture_output=True,
@@ -1001,13 +1006,15 @@ def test_p3_dual_outage_no_premature_recovery_without_endpoint_evidence(tmp_path
         check=True,
     )
     ack_all_payload = json.loads(res_all.stdout)
-    assert ack_all_payload["cleared_endpoints"] == ["binance_public"]
-    assert ack_all_payload["remaining_endpoints"] == []
+    assert ack_all_payload["status"] == "queued"
+    assert ack_all_payload["target"] == "ALL"
 
     for pp in partials.values():
         os.utime(pp, (t0 + 2200.0, t0 + 2200.0))
     r_rec = mon.run_sweep(now_epoch_s=t0 + 2205.0, force_collector_hc=True)
     assert r_rec["active_alerts"] == []
+    assert r_rec["outage_acks_applied"][0]["cleared_endpoints"] == ["binance_public"]
+    assert list(mon.ack_requests_dir.glob("req_*.json")) == []
     assert r_rec["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
     assert r_rec["collector_healthcheck"]["healthy"] is True
     assert transport.hc_calls[-1]["is_fail"] is False
@@ -1718,10 +1725,12 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
             check=True,
         )
         ack_json = json.loads(ack_res.stdout)
-        assert ack_json["cleared_endpoints"] == ["binance_public"]
+        assert ack_json["status"] == "queued"
+        assert ack_json["target"] == "binance_public"
 
         r_acked = mon.run_sweep(now_epoch_s=t_stage3 + 15.0, force_collector_hc=True)
         assert r_acked["active_alerts"] == []
+        assert r_acked["outage_acks_applied"][0]["cleared_endpoints"] == ["binance_public"]
         assert r_acked["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
         assert any("[已恢复]" in m["text"] and "dual_ab_outage_gt_5s" in m["text"] for m in transport.tg_messages)
         assert r_acked["collector_healthcheck"]["healthy"] is True
@@ -1821,5 +1830,148 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
                 proc.wait(timeout=5)
         stderr_thread.join(timeout=2.0)
         cluster.stop()
+
+
+def test_p3_ack_outage_concurrent_with_daemon_sweep_never_overwrites_state(tmp_path: Path) -> None:
+    """Single-writer state: concurrent CLI --ack-outage never clobbers concurrent monitor_state.json updates."""
+    import concurrent.futures
+    import subprocess
+    import threading
+
+    data_root = tmp_path / "tokyo_l2"
+    cfg_path = _write_test_config(tmp_path, data_root)
+    t0 = 1_796_292_720.0
+    partials: dict[str, Path] = {}
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        pp, dp, mp = _seed_exchange_files(data_root, ex, now_s=t0, partial_age_s=2.0)
+        partials[ex] = pp
+        _seed_ledger_row(data_root, dp, mp, exchange=ex, state="VERIFIED")
+
+    journal_queue: list[str] = []
+    in_hc_barrier = threading.Event()
+    release_hc_barrier = threading.Event()
+    armed = [False]
+
+    def j_reader(_u: str, cur: str | None) -> tuple[list[str], str | None]:
+        out = list(journal_queue)
+        journal_queue.clear()
+        return out, f"cur_{len(out)}_{cur or '0'}"
+
+    class _BarrierTransport(FakeTransport):
+        def send(self, url: str, body: bytes, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+            res = super().send(url, body, headers, timeout)
+            if armed[0] and "/fail" in url:
+                armed[0] = False
+                in_hc_barrier.set()
+                assert release_hc_barrier.wait(timeout=5.0), "timed out waiting to release sweep barrier"
+            return res
+
+    transport = _BarrierTransport()
+    mon = _build_monitor(cfg_path, transport, journal_reader=j_reader)
+    assert mon.run_sweep(now_epoch_s=t0)["active_alerts"] == []
+
+    # 1. Existing outage on binance_public saved on disk
+    journal_queue.append("ERROR live: [ALERT CRITICAL] binance_public dual A/B outage exceeded 5s")
+    for pp in partials.values():
+        os.utime(pp, (t0 + 10.0, t0 + 10.0))
+    r1 = mon.run_sweep(now_epoch_s=t0 + 12.0, force_collector_hc=True)
+    assert "dual_ab_outage_gt_5s" in r1["active_alerts"]
+    assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
+    disk_before_mid = mon.state_path.read_text(encoding="utf-8")
+
+    # 2. Daemon starts a sweep discovering NEW gate_public outage, pausing mid-sweep BEFORE _save_state().
+    journal_queue.append("ERROR live: [ALERT CRITICAL] gate_public dual A/B outage exceeded 5s")
+    for pp in partials.values():
+        os.utime(pp, (t0 + 25.0, t0 + 25.0))
+    armed[0] = True
+    sweep_box: list[dict[str, Any]] = []
+    sweep_err: list[BaseException] = []
+
+    def _run_paused_sweep() -> None:
+        try:
+            sweep_box.append(mon.run_sweep(now_epoch_s=t0 + 30.0, force_collector_hc=True))
+        except BaseException as exc:  # pragma: no cover
+            sweep_err.append(exc)
+
+    daemon_thr = threading.Thread(target=_run_paused_sweep, daemon=True)
+    daemon_thr.start()
+    assert in_hc_barrier.wait(timeout=5.0), "daemon sweep did not hit HC barrier"
+
+    try:
+        # Meanwhile operator runs TWO concurrent CLI acks (`binance_public` + `bybit_public`) while sweep is in flight!
+        def _cli_ack(ep: str) -> dict[str, Any]:
+            proc = subprocess.run(
+                [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage", ep],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(proc.stdout)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_bin = pool.submit(_cli_ack, "binance_public")
+            f_byb = pool.submit(_cli_ack, "bybit_public")
+            res_bin = f_bin.result(timeout=5.0)
+            res_byb = f_byb.result(timeout=5.0)
+
+        assert res_bin["status"] == "queued"
+        assert res_byb["status"] == "queued"
+        assert res_bin["request_id"] != res_byb["request_id"]
+        assert len(list(mon.ack_requests_dir.glob("req_*.json"))) == 2
+        # Critical concurrency guarantee: CLI NEVER mutated or overwrote monitor_state.json!
+        assert mon.state_path.read_text(encoding="utf-8") == disk_before_mid
+    finally:
+        release_hc_barrier.set()
+        daemon_thr.join(timeout=5.0)
+
+    assert not sweep_err
+    assert len(sweep_box) == 1
+    # Newly discovered gate_public fault MUST be persisted cleanly alongside binance_public on disk!
+    disk_after_mid = json.loads(mon.state_path.read_text(encoding="utf-8"))
+    assert set(disk_after_mid["dual_outage_endpoints"].keys()) == {"binance_public", "gate_public"}
+    assert len(list(mon.ack_requests_dir.glob("req_*.json"))) == 2
+
+    # 3. Next sweep consumes both queued CLI acks atomically: clears binance_public, preserves gate_public!
+    for pp in partials.values():
+        os.utime(pp, (t0 + 40.0, t0 + 40.0))
+    r_drained = mon.run_sweep(now_epoch_s=t0 + 45.0, force_collector_hc=True)
+    assert "dual_ab_outage_gt_5s" in r_drained["active_alerts"]
+    assert len(r_drained["outage_acks_applied"]) == 2
+    assert mon.state["dual_outage_endpoints"].keys() == {"gate_public"}
+    assert list(mon.ack_requests_dir.glob("req_*.json")) == []
+    assert r_drained["alert_dispatch"]["sent_recoveries"] == []
+    assert r_drained["collector_healthcheck"]["healthy"] is False
+
+    # 4. `--ack-outage ALL` concurrent with an inbound `bitget_public` outage in the same sweep MUST clear gate_public
+    #    while preserving the new bitget_public outage (drain happens BEFORE new journal outage ingestion)!
+    subprocess.run(
+        [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    journal_queue.append("ERROR live: [ALERT CRITICAL] bitget_public dual A/B outage exceeded 5s")
+    for pp in partials.values():
+        os.utime(pp, (t0 + 55.0, t0 + 55.0))
+    r_overlap = mon.run_sweep(now_epoch_s=t0 + 60.0, force_collector_hc=True)
+    assert "dual_ab_outage_gt_5s" in r_overlap["active_alerts"]
+    assert mon.state["dual_outage_endpoints"].keys() == {"bitget_public"}
+    assert list(mon.ack_requests_dir.glob("req_*.json")) == []
+
+    # 5. Final ack clears bitget_public -> full recovery & HC green
+    subprocess.run(
+        [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage", "bitget_public"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for pp in partials.values():
+        os.utime(pp, (t0 + 70.0, t0 + 70.0))
+    r_clean = mon.run_sweep(now_epoch_s=t0 + 75.0, force_collector_hc=True)
+    assert r_clean["active_alerts"] == []
+    assert r_clean["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
+    assert r_clean["collector_healthcheck"]["healthy"] is True
+    assert list(mon.ack_requests_dir.glob("req_*.json")) == []
+
 
 
