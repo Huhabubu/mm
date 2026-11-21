@@ -37,6 +37,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Callable
 
 USER_AGENT = "tokyo-l2-meta-daemon/1.4"
@@ -953,6 +954,26 @@ def inspect_data_tree(
         latest_manifest = manifests[-1] if manifests else None
         prev_hour_mfs = [m for m in manifests if m["hour_key"] == prev_hour_key]
 
+        # Compare with recent *earlier* clean sealed hours. Aggregate split manifests
+        # for one UTC hour before computing the reference, and never read zstd payloads.
+        earlier_hours: dict[str, int] = {}
+        for m in manifests:
+            if (
+                m["hour_key"] < prev_hour_key
+                and m["local_loss_lines"] == 0
+                and m["gap_start_lines"] == 0
+            ):
+                key = m["hour_key"]
+                earlier_hours[key] = earlier_hours.get(key, 0) + (
+                    m["data_lines"] + m["data_escaped_lines"]
+                )
+        reference_samples = [
+            count for _, count in sorted(earlier_hours.items())[-48:] if count > 0
+        ]
+        reference_data_lines = (
+            int(median(reference_samples)) if len(reference_samples) >= 3 else None
+        )
+
         activity_candidates: list[float] = []
         if latest_partial is not None:
             activity_candidates.append(latest_partial[0])
@@ -1003,6 +1024,8 @@ def inspect_data_tree(
             "prev_hour_key": prev_hour_key,
             "prev_hour_manifest_count": len(prev_hour_mfs),
             "prev_hour_data_lines": prev_data,
+            "reference_data_lines": reference_data_lines,
+            "reference_hour_count": len(reference_samples),
             "prev_hour_meta_lines": prev_meta,
             "prev_hour_local_loss_lines": prev_loss,
             "prev_hour_gap_start_lines": prev_gap,
@@ -1040,6 +1063,50 @@ def inspect_data_tree(
         "manifests_with_local_loss": manifests_with_local_loss,
         "in_startup_grace": in_startup_grace,
     }
+
+
+def assess_hourly_data_volume(
+    data_tree: dict[str, Any], *, now_s: float, report_minute: int = 10
+) -> dict[str, Any]:
+    """Flag empty or extremely low previous-hour DATA even when META files keep growing.
+
+    Heuristic: fewer than 10% of the median of up to 48 earlier, nonempty,
+    gap-free sealed hours (at least three reference hours). Zero is always
+    anomalous when an hourly manifest exists. This is a lightweight operational
+    gate, not a substitute for per-symbol/channel deep QA.
+    """
+    dt = datetime.fromtimestamp(now_s, tz=timezone.utc)
+    result: dict[str, Any] = {
+        "hour_key": data_tree.get("prev_hour_key"),
+        "ready": False,
+        "affected": {},
+    }
+    if dt.minute < report_minute:
+        return result
+    per_ex = data_tree.get("per_exchange") or {}
+    # Fresh P2 runs may not yet have finished their first hour.
+    if not any(int(v.get("cumulative_manifest_count") or 0) > 0 for v in per_ex.values()):
+        return result
+    result["ready"] = True
+    for ex, info in per_ex.items():
+        sealed = int(info.get("prev_hour_manifest_count") or 0)
+        lines = int(info.get("prev_hour_data_lines") or 0)
+        baseline = info.get("reference_data_lines")
+        why = None
+        if sealed == 0:
+            why = "上一完整小时缺少封口文件"
+        elif lines == 0:
+            why = "上一完整小时有效行情为零"
+        elif baseline is not None and baseline > 0 and lines < baseline * 0.10:
+            why = "有效行情低于近48个参考小时中位数的10%"
+        if why:
+            result["affected"][ex] = {
+                "reason": why,
+                "data_lines": lines,
+                "manifest_count": sealed,
+                "reference_data_lines": baseline,
+            }
+    return result
 
 
 def inspect_shutdown_audits(data_root: Path, seen_files: set[str] | None = None) -> list[dict[str, Any]]:
