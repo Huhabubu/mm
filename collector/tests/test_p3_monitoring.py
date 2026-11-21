@@ -300,7 +300,7 @@ def test_p3_healthy_run_hourly_battle_report_and_zero_zstd_decompression(
     assert r1["hourly_report"]["sent"] is True
     assert len(transport.tg_messages) == 1
     report = transport.tg_messages[0]["text"]
-    assert "东京 L2 小时战报" in report
+    assert "东京 L2｜小时采集报告" in report
     assert "云端归档：VERIFIED" in report
     assert "深度数据质量：PENDING" in report
     for ex in ("Binance", "Bybit", "Bitget", "Gate"):
@@ -1658,7 +1658,7 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
         assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
         assert r_outage["collector_healthcheck"]["healthy"] is False
         assert transport.hc_calls[-1]["is_fail"] is True
-        assert any("dual_ab_outage_gt_5s" in m["text"] for m in transport.tg_messages)
+        assert any("行情双连接中断" in m["text"] for m in transport.tg_messages)
         transport.tg_messages.clear()
 
         # Stage 3: binance_public WS reconnects cleanly (`silent_connected` = Connected logged, ZERO frames),
