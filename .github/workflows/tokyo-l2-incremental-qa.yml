@@ -175,34 +175,41 @@ jobs:
               with open(md_path, "a", encoding="utf-8") as out:
                   out.write(f"## Tokyo L2 Incremental QA\n\nFailed to parse QA summary JSON: `{exc}`\n")
               with open(env_path, "a", encoding="utf-8") as env_out:
+                  env_out.write("QA_HEARTBEAT_STATUS=failed\n")
                   env_out.write("QA_JOB_EXECUTION_STATUS=failed\n")
                   env_out.write("QA_CURRENT_WINDOW_COMPLETED=false\n")
                   env_out.write("QA_CURRENT_WINDOW_VERIFICATION_STATUS=parse_error\n")
               sys.exit(0)
 
+          hb_status = str(data.get("heartbeat_status") or ("ok" if data.get("status") == "ok" else "failed"))
           job_status = str(data.get("job_execution_status") or "failed")
           cur_wid = str(data.get("current_window_id") or "")
           cur_done = "true" if data.get("current_window_completed") is True else "false"
           cur_vstatus = str(data.get("current_window_verification_status") or "unknown")
           hist_status = str(data.get("historical_data_quality_status") or "unknown")
           hist_wins = data.get("historical_damaged_windows") or []
+          hist_overdue = data.get("historical_overdue_windows") or []
           hist_parts = data.get("historical_damaged_partitions") or []
+          hist_loss_mfs = data.get("historical_loss_manifests") or []
 
           with open(env_path, "a", encoding="utf-8") as env_out:
+              env_out.write(f"QA_HEARTBEAT_STATUS={hb_status}\n")
               env_out.write(f"QA_JOB_EXECUTION_STATUS={job_status}\n")
               env_out.write(f"QA_CURRENT_WINDOW_ID={cur_wid}\n")
               env_out.write(f"QA_CURRENT_WINDOW_COMPLETED={cur_done}\n")
               env_out.write(f"QA_CURRENT_WINDOW_VERIFICATION_STATUS={cur_vstatus}\n")
               env_out.write(f"QA_HISTORICAL_DATA_QUALITY_STATUS={hist_status}\n")
               env_out.write(f"QA_HISTORICAL_DAMAGED_WINDOWS_COUNT={len(hist_wins)}\n")
+              env_out.write(f"QA_HISTORICAL_OVERDUE_WINDOWS_COUNT={len(hist_overdue)}\n")
+              env_out.write(f"QA_HISTORICAL_LOSS_MANIFESTS_COUNT={len(hist_loss_mfs)}\n")
 
           lines = [
               "## Tokyo L2 Incremental QA Summary",
               f"- **1. Job Execution Status**: `{job_status}` (discovery=`{data.get('discovery_mode')}`, retry_needed=`{data.get('retry_needed')}`)",
-              f"- **2. Current Due Window**: `{cur_wid}` | completed=`{cur_done}` | verification_status=`{cur_vstatus}`",
-              f"- **3. Historical Data Quality**: `{hist_status}` | damaged_windows=`{hist_wins}` | damaged_partitions_count=`{len(hist_parts)}`",
+              f"- **2. Current Due Window**: `{cur_wid}` | completed=`{cur_done}` | verification_status=`{cur_vstatus}` | heartbeat_status=`{hb_status}`",
+              f"- **3. Historical Data Quality**: `{hist_status}` | damaged_windows=`{hist_wins}` | historical_overdue_windows=`{hist_overdue}` | damaged_partitions_count=`{len(hist_parts)}` | historical_loss_manifests_count=`{len(hist_loss_mfs)}`",
               f"- **Overall Gate**: `qa_status={data.get('qa_status')}` (`status={data.get('status')}`)",
-              f"- **Binding**: config=`{data.get('partition_minutes')}m` | run_id=`{data.get('run_id_filter')}` | since_window=`{data.get('since_window')}`",
+              f"- **Binding**: config=`{data.get('partition_minutes')}m` | effective_run_id=`{data.get('effective_run_id') or data.get('run_id')}` | index_effective_run_id=`{data.get('index_effective_run_id')}` | effective_since_window=`{data.get('effective_since_window')}`",
               f"- **Checker Commit**: `{data.get('checker_commit_sha')}` (`qa_version={data.get('qa_version')}`)",
               f"- **Partitions**: eligible=`{data.get('eligible_manifest_count')}`, attempted=`{data.get('attempted')}`, ok=`{data.get('ok')}`, blocked=`{data.get('blocked')}`, needs_review=`{data.get('needs_review')}`, already_checked=`{data.get('already_checked')}`, backlog=`{data.get('remaining_backlog')}`",
               f"- **Reports Written**: windows=`{data.get('window_reports_written')}`, days=`{data.get('day_reports_written')}`",
@@ -264,31 +271,37 @@ jobs:
             exit 0
           fi
           url="${QA_HEALTHCHECKS_URL%/}"
+          hb_status="${QA_HEARTBEAT_STATUS:-failed}"
           job_status="${QA_JOB_EXECUTION_STATUS:-failed}"
           cur_wid="${QA_CURRENT_WINDOW_ID:-none}"
           cur_done="${QA_CURRENT_WINDOW_COMPLETED:-false}"
           cur_vstatus="${QA_CURRENT_WINDOW_VERIFICATION_STATUS:-unknown}"
           hist_status="${QA_HISTORICAL_DATA_QUALITY_STATUS:-unknown}"
           hist_count="${QA_HISTORICAL_DAMAGED_WINDOWS_COUNT:-0}"
+          hist_overdue_count="${QA_HISTORICAL_OVERDUE_WINDOWS_COUNT:-0}"
+          hist_loss_mfs_count="${QA_HISTORICAL_LOSS_MANIFESTS_COUNT:-0}"
 
-          # Heartbeat reflects job execution + current due window completion & verification,
-          # while historical damaged windows are reported separately in the payload without
-          # permanently failing future heartbeats once current due windows verify cleanly.
+          # Heartbeat reflects job execution + current due window completion & verification independently,
+          # while historical damaged or missing/overdue windows and historical loss-marked manifests are
+          # preserved and reported separately in the payload without failing latest-window heartbeats.
           # When the current window is still pending_archive (cur_done != true), NEVER send a false success ping.
           status="success"
-          if [[ "$INSPECT_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
+          if [[ "$INSPECT_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
             status="failure"
             url="${url}/fail"
           fi
           curl --fail --silent --show-error --retry 3 --max-time 15 \
             --request POST \
             --data-urlencode "status=${status}" \
+            --data-urlencode "heartbeat_status=${hb_status}" \
             --data-urlencode "job_execution_status=${job_status}" \
             --data-urlencode "current_window_id=${cur_wid}" \
             --data-urlencode "current_window_completed=${cur_done}" \
             --data-urlencode "current_window_verification_status=${cur_vstatus}" \
             --data-urlencode "historical_data_quality_status=${hist_status}" \
             --data-urlencode "historical_damaged_windows_count=${hist_count}" \
+            --data-urlencode "historical_overdue_windows_count=${hist_overdue_count}" \
+            --data-urlencode "historical_loss_manifests_count=${hist_loss_mfs_count}" \
             --data-urlencode "run_id=${QA_BOUND_RUN_ID:-unbound}" \
             --data-urlencode "since_window=${QA_BOUND_SINCE_WINDOW:-unbound}" \
             --data-urlencode "checker_commit=${TOKYO_L2_QA_CHECKER_COMMIT:-unknown}" \
