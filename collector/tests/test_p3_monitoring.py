@@ -1674,18 +1674,23 @@ def test_p3_real_rust_collector_dual_outage_logs_and_conservative_lock(tmp_path:
         )
 
         # Advance monitor clock +90s (> legacy 60s): conservative lock MUST remain FIRING!
+        stage3_clean_logs = [md_mod._RE_ANSI.sub("", ln) for ln in snapshot_stderr(mark_stage3)]
+        assert any("Connected binance_public conn=A" in ln for ln in stage3_clean_logs)
+        assert any("Connected binance_public conn=B" in ln for ln in stage3_clean_logs)
+
         t_stage3 = time.time() + 90.0
         r_silent = mon.run_sweep(now_epoch_s=t_stage3, force_collector_hc=True)
         assert "dual_ab_outage_gt_5s" in r_silent["active_alerts"]
+        assert mon.state["dual_outage_endpoints"].keys() == {"binance_public"}
         assert r_silent["alert_dispatch"]["sent_recoveries"] == []
         assert not any("[已恢复]" in m["text"] for m in transport.tg_messages)
         assert r_silent["collector_healthcheck"]["healthy"] is False
         assert transport.hc_calls[-1]["is_fail"] is True
         diag_s3 = mon.state["dual_outage_endpoints"]["binance_public"]["diagnostics"]
-        assert (
-            diag_s3["last_ws_connected_at_s"] is not None
-            or int(diag_s3.get("ws_errors_since_outage") or 0) >= 1
-        ), f"ep_state={mon.state['dual_outage_endpoints']}; cursor={mon.state.get('journal_cursor')}; stderr={snapshot_stderr()}"
+        assert int(diag_s3.get("ws_connects_since_outage") or 0) >= 2, (
+            f"Expected ingested Connected telemetry in ep_state={mon.state['dual_outage_endpoints']}; "
+            f"stderr={snapshot_stderr()}"
+        )
 
         # Stage 4a: Reconnecting live stream (`streaming`) still leaves unmodified Rust collector unable to recover
         # logs cleanly (Connected + sibling .partial keeps growing, ZERO `GAP_END` in stderr).
@@ -1973,6 +1978,95 @@ def test_p3_ack_outage_concurrent_with_daemon_sweep_never_overwrites_state(tmp_p
     assert r_clean["alert_dispatch"]["sent_recoveries"] == ["dual_ab_outage_gt_5s"]
     assert r_clean["collector_healthcheck"]["healthy"] is True
     assert list(mon.ack_requests_dir.glob("req_*.json")) == []
+
+
+def test_p3_ack_outage_idempotent_on_crash_after_state_save_before_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crash after _save_state() before req_*.unlink() must NOT re-apply old `--ack-outage ALL` on restart."""
+    import subprocess
+
+    data_root = tmp_path / "tokyo_l2"
+    cfg_path = _write_test_config(tmp_path, data_root)
+    t0 = 1_796_292_720.0
+    partials: dict[str, Path] = {}
+    for ex in ("binance_futures", "bybit_linear", "bitget_v3", "gate_futures"):
+        pp, dp, mp = _seed_exchange_files(data_root, ex, now_s=t0, partial_age_s=2.0)
+        partials[ex] = pp
+        _seed_ledger_row(data_root, dp, mp, exchange=ex, state="VERIFIED")
+
+    journal_queue: list[str] = []
+
+    def j_reader(_u: str, cur: str | None) -> tuple[list[str], str | None]:
+        out = list(journal_queue)
+        journal_queue.clear()
+        return out, f"cur_{len(out)}_{cur or '0'}"
+
+    transport = FakeTransport()
+    mon1 = _build_monitor(cfg_path, transport, journal_reader=j_reader)
+    assert mon1.run_sweep(now_epoch_s=t0)["active_alerts"] == []
+
+    # 1. Existing outage A (binance_public) committed to monitor_state.json
+    journal_queue.append("ERROR live: [ALERT CRITICAL] binance_public dual A/B outage exceeded 5s")
+    for pp in partials.values():
+        os.utime(pp, (t0 + 10.0, t0 + 10.0))
+    r1 = mon1.run_sweep(now_epoch_s=t0 + 12.0, force_collector_hc=True)
+    assert "dual_ab_outage_gt_5s" in r1["active_alerts"]
+    assert mon1.state["dual_outage_endpoints"].keys() == {"binance_public"}
+
+    # 2. Operator submits `--ack-outage ALL` intending to clear old outage A;
+    #    meanwhile new outage B (gate_public) enters the journal batch.
+    ack_proc = subprocess.run(
+        [sys.executable, str(PYTHON_DIR / "meta_daemon.py"), "--config", str(cfg_path), "--ack-outage"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    req_id = json.loads(ack_proc.stdout)["request_id"]
+    req_files = list(mon1.ack_requests_dir.glob("req_*.json"))
+    assert len(req_files) == 1
+
+    journal_queue.append("ERROR live: [ALERT CRITICAL] gate_public dual A/B outage exceeded 5s")
+    for pp in partials.values():
+        os.utime(pp, (t0 + 25.0, t0 + 25.0))
+
+    # 3. Inject simulated crash strictly AFTER _save_state() succeeds and BEFORE req_path.unlink() finishes!
+    orig_unlink = Path.unlink
+
+    def _crash_on_req_unlink(self_path: Path, *args: Any, **kwargs: Any) -> None:
+        if self_path.parent == mon1.ack_requests_dir and self_path.name.startswith("req_"):
+            raise RuntimeError("simulated SIGKILL after _save_state before req unlink")
+        orig_unlink(self_path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", _crash_on_req_unlink)
+    with pytest.raises(RuntimeError, match="simulated SIGKILL"):
+        mon1.run_sweep(now_epoch_s=t0 + 30.0, force_collector_hc=True)
+    monkeypatch.undo()
+
+    # Verify post-crash disk state: monitor_state.json has ONLY new outage B + persisted processed req_id,
+    # while stale req_<id>.json still lingers in outage_ack_requests/.
+    persisted = json.loads(mon1.state_path.read_text(encoding="utf-8"))
+    assert list(persisted["dual_outage_endpoints"].keys()) == ["gate_public"]
+    assert req_id in persisted["processed_outage_ack_ids"]
+    assert len(list(mon1.ack_requests_dir.glob("req_*.json"))) == 1
+
+    # 4. Restart a fresh CollectorMonitor from disk and run sweep:
+    #    Leftover `--ack-outage ALL` request MUST be ignored idempotently (NOT wipe gate_public!) & deleted!
+    transport2 = FakeTransport()
+    mon2 = _build_monitor(cfg_path, transport2, journal_reader=j_reader)
+    for pp in partials.values():
+        os.utime(pp, (t0 + 40.0, t0 + 40.0))
+    r_restart = mon2.run_sweep(now_epoch_s=t0 + 45.0, force_collector_hc=True)
+
+    assert "dual_ab_outage_gt_5s" in r_restart["active_alerts"]
+    assert mon2.state["dual_outage_endpoints"].keys() == {"gate_public"}
+    assert r_restart["outage_acks_applied"] == []
+    assert list(mon2.ack_requests_dir.glob("req_*.json")) == []
+    assert r_restart["alert_dispatch"]["sent_recoveries"] == []
+    assert r_restart["collector_healthcheck"]["healthy"] is False
+    assert transport2.hc_calls[-1]["is_fail"] is True
+
 
 
 

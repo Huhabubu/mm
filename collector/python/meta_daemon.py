@@ -789,6 +789,7 @@ def inspect_collector_logs(lines: list[str]) -> dict[str, Any]:
                 "saw_outage": False,
                 "outage_messages": [],
                 "connected_clean": False,
+                "ws_connect_count": 0,
                 "explicit_recovered": False,
                 "saw_error_after_connect": False,
             },
@@ -807,6 +808,7 @@ def inspect_collector_logs(lines: list[str]) -> dict[str, Any]:
             rec = _ep_rec(ep)
             rec["saw_outage"] = True
             rec["connected_clean"] = False
+            rec["ws_connect_count"] = 0
             rec["explicit_recovered"] = False
             rec["outage_messages"].append(line)
 
@@ -829,6 +831,7 @@ def inspect_collector_logs(lines: list[str]) -> dict[str, Any]:
             ep = m_conn.group(1)
             rec = _ep_rec(ep)
             rec["connected_clean"] = True
+            rec["ws_connect_count"] = int(rec.get("ws_connect_count") or 0) + 1
             rec["saw_error_after_connect"] = False
 
         if "LOCAL_LOSS" in line:
@@ -1507,6 +1510,7 @@ class CollectorMonitor:
             "last_restart_event_epoch_s": None,
             "last_dual_outage_epoch_s": None,
             "dual_outage_endpoints": {},
+            "processed_outage_ack_ids": [],
             "last_local_loss_epoch_s": None,
             "acknowledged_loss_manifests": [],
             "seen_shutdown_files": [],
@@ -1664,9 +1668,12 @@ class CollectorMonitor:
         }
 
     def _consume_outage_ack_requests(self, *, now_s: float) -> tuple[list[Path], list[dict[str, Any]]]:
-        """Drain pending `--ack-outage` request files inside the single-writer monitor process.
+        """Drain pending `--ack-outage` request files idempotently inside the single-writer monitor.
 
-        Request files remain on disk until `self._save_state()` succeeds at the end of `run_sweep()`.
+        Persists consumed `request_id`s inside `self.state['processed_outage_ack_ids']` before
+        `_save_state()` runs, so a crash between `_save_state()` and `req_path.unlink()` never
+        re-applies a previously processed acknowledgement (e.g. clearing newly discovered outages)
+        upon daemon restart; already-processed request files are simply unlinked on the next sweep.
         """
         if not self.ack_requests_dir.is_dir():
             return [], []
@@ -1676,6 +1683,10 @@ class CollectorMonitor:
             ep_outages = {}
             self.state["dual_outage_endpoints"] = ep_outages
 
+        processed_raw = self.state.get("processed_outage_ack_ids")
+        processed_list = list(processed_raw) if isinstance(processed_raw, list) else []
+        processed_set = set(str(x) for x in processed_list)
+
         consumed_paths: list[Path] = []
         applied_summaries: list[dict[str, Any]] = []
         for req_path in sorted(self.ack_requests_dir.glob("req_*.json")):
@@ -1684,6 +1695,12 @@ class CollectorMonitor:
             except Exception:
                 continue
             if not isinstance(raw, dict):
+                continue
+
+            req_id = str(raw.get("request_id") or f"file:{req_path.name}")
+            if req_id in processed_set:
+                # Already persisted in a prior committed sweep; queue only for cleanup without re-applying.
+                consumed_paths.append(req_path)
                 continue
 
             raw_target = raw.get("target")
@@ -1696,9 +1713,12 @@ class CollectorMonitor:
                 ep_outages.pop(target, None)
                 cleared = [target]
 
+            processed_set.add(req_id)
+            processed_list.append(req_id)
+
             ack_record = {
                 "ts_utc": datetime.fromtimestamp(now_s, tz=timezone.utc).isoformat(),
-                "request_id": raw.get("request_id"),
+                "request_id": req_id,
                 "requested_at_utc": raw.get("requested_at_utc"),
                 "target": target or "ALL",
                 "cleared_endpoints": cleared,
@@ -1708,6 +1728,7 @@ class CollectorMonitor:
             consumed_paths.append(req_path)
             applied_summaries.append(ack_record)
 
+        self.state["processed_outage_ack_ids"] = processed_list[-500:]
         return consumed_paths, applied_summaries
 
     def run_sweep(
@@ -1960,6 +1981,7 @@ class CollectorMonitor:
                     "sample_message": (ev.get("outage_messages") or [""])[-1],
                     "diagnostics": {
                         "last_ws_connected_at_s": None,
+                        "ws_connects_since_outage": int(ev.get("ws_connect_count") or 0),
                         "ws_errors_since_outage": 0,
                     },
                 }
@@ -1969,8 +1991,12 @@ class CollectorMonitor:
             ep_rec = ep_outages[ep]
             diag = ep_rec.setdefault(
                 "diagnostics",
-                {"last_ws_connected_at_s": None, "ws_errors_since_outage": 0},
+                {"last_ws_connected_at_s": None, "ws_connects_since_outage": 0, "ws_errors_since_outage": 0},
             )
+            if ev.get("ws_connect_count"):
+                diag["ws_connects_since_outage"] = int(diag.get("ws_connects_since_outage") or 0) + int(
+                    ev["ws_connect_count"]
+                )
             if ev.get("explicit_recovered"):
                 ep_rec["explicit_recovered_at_s"] = now_s
             elif ev.get("saw_error_after_connect"):
