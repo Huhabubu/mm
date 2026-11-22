@@ -676,6 +676,50 @@ def cmd_qa_convert(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "ok" else 2
 
 
+def cmd_qa_dispatch(args: argparse.Namespace) -> int:
+    from data_coverage import configured_partition_minutes, resolve_effective_run_id
+    from qa_dispatch import dispatch_pending_qa, get_dispatch_status
+
+    run_id_filter = args.run_id
+    pm_filter: int | None = None
+    if args.config is not None and args.config.is_file():
+        cfg_obj = json.loads(args.config.read_text(encoding="utf-8"))
+        pm_filter = configured_partition_minutes(cfg_obj)
+        run_id_filter = resolve_effective_run_id(cfg_obj, args.run_id)
+
+    if args.status_only:
+        res = get_dispatch_status(args.dir, run_id_filter=run_id_filter)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+
+    res = dispatch_pending_qa(
+        args.dir,
+        repo=args.repo,
+        workflow_file=args.workflow,
+        ref=args.ref,
+        token_env=args.token_env,
+        run_id_filter=run_id_filter,
+        partition_minutes_filter=pm_filter,
+        max_dispatches=args.max_dispatches,
+        max_age_hours=args.max_age_hours,
+        connect_timeout_s=args.connect_timeout,
+        total_timeout_s=args.total_timeout,
+        base_backoff_s=args.base_backoff,
+        max_backoff_s=args.max_backoff,
+        qa_state_dir=args.qa_state_dir,
+        qa_state_branch=args.qa_state_branch,
+        qa_source_ref=args.qa_source_ref,
+        accepted_stale_timeout_s=args.accepted_stale_timeout,
+        require_protocol_report=args.require_protocol_report,
+        expected_checker_commit=args.expected_checker_commit,
+        expected_protocol_checker=args.expected_protocol_checker,
+        reconcile_accepted=not args.no_reconcile,
+        require_token=args.require_token,
+    )
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res["status"] in ("ok", "disabled_no_token", "busy") else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tokyo-l2-cli",
@@ -726,6 +770,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_qa.add_argument("--remote", default=None, help="Optional rclone remote root to restore PRUNED partitions")
     p_qa.add_argument("--restore-cache-dir", type=Path, default=None, help="Optional cache dir for restored PRUNED files")
     p_qa.set_defaults(func=cmd_qa_convert)
+
+    p_disp = sub.add_parser("qa-dispatch", help="Dispatch pending verified archive windows to GitHub Actions QA")
+    p_disp.add_argument("--dir", type=Path, required=True)
+    p_disp.add_argument("--config", type=Path, default=None)
+    p_disp.add_argument("--run-id", default=None)
+    p_disp.add_argument("--repo", default=None)
+    p_disp.add_argument("--workflow", default=None)
+    p_disp.add_argument("--ref", default=None)
+    p_disp.add_argument("--token-env", default="TOKYO_L2_GITHUB_QA_DISPATCH_TOKEN")
+    p_disp.add_argument("--max-dispatches", type=int, default=2)
+    p_disp.add_argument("--max-age-hours", type=float, default=None)
+    p_disp.add_argument("--connect-timeout", type=float, default=5.0)
+    p_disp.add_argument("--total-timeout", type=float, default=15.0)
+    p_disp.add_argument("--base-backoff", type=float, default=30.0)
+    p_disp.add_argument("--max-backoff", type=float, default=900.0)
+    p_disp.add_argument("--qa-state-dir", type=Path, default=None)
+    p_disp.add_argument("--qa-state-branch", default=None)
+    p_disp.add_argument("--qa-source-ref", default=None)
+    p_disp.add_argument("--accepted-stale-timeout", type=float, default=None)
+    p_disp.add_argument("--require-protocol-report", action="store_true", default=None)
+    p_disp.add_argument("--expected-checker-commit", default=None)
+    p_disp.add_argument("--expected-protocol-checker", default=None)
+    p_disp.add_argument("--no-reconcile", action="store_true")
+    p_disp.add_argument("--require-token", action="store_true")
+    p_disp.add_argument("--status-only", action="store_true")
+    p_disp.set_defaults(func=cmd_qa_dispatch)
 
     return parser
 

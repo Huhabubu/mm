@@ -597,6 +597,39 @@ class ArchiveLedger:
                     data_sha256 TEXT PRIMARY KEY,
                     stats_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS qa_dispatch_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    target_window_utc TEXT NOT NULL,
+                    archive_revision TEXT NOT NULL,
+                    partition_minutes INTEGER NOT NULL,
+                    window_span_id TEXT,
+                    index_sha256 TEXT NOT NULL,
+                    index_synced_at_utc TEXT NOT NULL,
+                    manifest_count INTEGER NOT NULL,
+                    manifests_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('PENDING', 'ACCEPTED', 'QA_COMPLETED', 'FAILED_PERMANENT')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at_epoch_s REAL NOT NULL DEFAULT 0,
+                    first_enqueued_at_utc TEXT NOT NULL,
+                    last_attempt_at_utc TEXT,
+                    api_accepted_at_utc TEXT,
+                    workflow_run_id INTEGER,
+                    workflow_run_url TEXT,
+                    workflow_run_started_at_utc TEXT,
+                    qa_completed_at_utc TEXT,
+                    qa_result_status TEXT,
+                    last_http_status INTEGER,
+                    last_error_code TEXT,
+                    last_error_message TEXT,
+                    discovery_source TEXT NOT NULL DEFAULT 'archive_sync',
+                    updated_at_utc TEXT NOT NULL,
+                    UNIQUE (run_id, target_window_utc, archive_revision)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_qa_dispatch_outbox_state
+                    ON qa_dispatch_outbox(state, next_attempt_at_epoch_s);
                 """
             )
             self._migrate_window_columns()
@@ -1250,6 +1283,238 @@ class ArchiveLedger:
                 (rel_path, size_bytes, sha256, now_iso),
             )
 
+    def get_qa_dispatch(
+        self,
+        *,
+        run_id: str,
+        target_window_utc: str,
+        archive_revision: str,
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT * FROM qa_dispatch_outbox
+            WHERE run_id = ? AND target_window_utc = ? AND archive_revision = ?
+            """,
+            (str(run_id), str(target_window_utc), str(archive_revision)),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def enqueue_qa_dispatch(
+        self,
+        *,
+        run_id: str,
+        target_window_utc: str,
+        archive_revision: str,
+        partition_minutes: int,
+        window_span_id: str | None,
+        index_sha256: str,
+        index_synced_at_utc: str,
+        manifests: list[dict[str, Any]],
+        now_iso: str,
+        discovery_source: str = "archive_sync",
+    ) -> tuple[bool, dict[str, Any]]:
+        """Insert a durable PENDING QA dispatch record deduplicated by `(run_id, target_window_utc, archive_revision)`."""
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO qa_dispatch_outbox (
+                    run_id, target_window_utc, archive_revision, partition_minutes,
+                    window_span_id, index_sha256, index_synced_at_utc, manifest_count,
+                    manifests_json, state, attempt_count, next_attempt_at_epoch_s,
+                    first_enqueued_at_utc, discovery_source, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, ?, ?, ?)
+                """,
+                (
+                    str(run_id),
+                    str(target_window_utc),
+                    str(archive_revision),
+                    int(partition_minutes),
+                    window_span_id,
+                    str(index_sha256),
+                    str(index_synced_at_utc),
+                    len(manifests),
+                    json.dumps(manifests, sort_keys=True, separators=(",", ":")),
+                    now_iso,
+                    str(discovery_source),
+                    now_iso,
+                ),
+            )
+            inserted = cur.rowcount == 1
+        row = self.get_qa_dispatch(
+            run_id=str(run_id),
+            target_window_utc=str(target_window_utc),
+            archive_revision=str(archive_revision),
+        )
+        assert row is not None
+        return inserted, row
+
+    def list_qa_dispatches(
+        self,
+        *,
+        states: tuple[str, ...] | None = None,
+        run_id: str | None = None,
+        due_before_epoch_s: float | None = None,
+        newest_first: bool = True,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(states)
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(str(run_id))
+        if due_before_epoch_s is not None:
+            clauses.append("next_attempt_at_epoch_s <= ?")
+            params.append(float(due_before_epoch_s))
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_sql = (
+            "ORDER BY target_window_utc DESC, id DESC"
+            if newest_first
+            else "ORDER BY target_window_utc ASC, id ASC"
+        )
+        rows = self.conn.execute(
+            f"SELECT * FROM qa_dispatch_outbox {where_sql} {order_sql}",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_qa_dispatch_accepted(
+        self,
+        dispatch_id: int,
+        *,
+        accepted_at_utc: str,
+        http_status: int = 204,
+        now_iso: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE qa_dispatch_outbox
+                SET state = 'ACCEPTED',
+                    attempt_count = attempt_count + 1,
+                    last_attempt_at_utc = ?,
+                    api_accepted_at_utc = ?,
+                    last_http_status = ?,
+                    last_error_code = NULL,
+                    last_error_message = NULL,
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (now_iso, accepted_at_utc, int(http_status), now_iso, int(dispatch_id)),
+            )
+
+    def mark_qa_dispatch_requeue(
+        self,
+        dispatch_id: int,
+        *,
+        next_attempt_at_epoch_s: float,
+        error_code: str,
+        error_message: str,
+        now_iso: str,
+    ) -> None:
+        """Return a stale/replaced ACCEPTED outbox entry to PENDING so it can be re-dispatched or tracked as awaiting QA."""
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE qa_dispatch_outbox
+                SET state = 'PENDING',
+                    next_attempt_at_epoch_s = ?,
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    updated_at_utc = ?
+                WHERE id = ? AND state = 'ACCEPTED'
+                """,
+                (
+                    float(next_attempt_at_epoch_s),
+                    str(error_code),
+                    str(error_message)[:500],
+                    now_iso,
+                    int(dispatch_id),
+                ),
+            )
+
+    def mark_qa_dispatch_retry(
+        self,
+        dispatch_id: int,
+        *,
+        next_attempt_at_epoch_s: float,
+        http_status: int | None,
+        error_code: str,
+        error_message: str,
+        now_iso: str,
+        permanent: bool = False,
+    ) -> None:
+        new_state = "FAILED_PERMANENT" if permanent else "PENDING"
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE qa_dispatch_outbox
+                SET state = ?,
+                    attempt_count = attempt_count + 1,
+                    next_attempt_at_epoch_s = ?,
+                    last_attempt_at_utc = ?,
+                    last_http_status = ?,
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    updated_at_utc = ?
+                WHERE id = ?
+                """,
+                (
+                    new_state,
+                    float(next_attempt_at_epoch_s),
+                    now_iso,
+                    int(http_status) if http_status is not None else None,
+                    str(error_code),
+                    str(error_message)[:500],
+                    now_iso,
+                    int(dispatch_id),
+                ),
+            )
+
+    def mark_qa_dispatch_completed(
+        self,
+        *,
+        run_id: str,
+        target_window_utc: str,
+        archive_revision: str,
+        qa_result_status: str,
+        qa_completed_at_utc: str,
+        workflow_run_id: int | None = None,
+        workflow_run_url: str | None = None,
+        workflow_run_started_at_utc: str | None = None,
+        now_iso: str,
+    ) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                UPDATE qa_dispatch_outbox
+                SET state = 'QA_COMPLETED',
+                    qa_result_status = ?,
+                    qa_completed_at_utc = COALESCE(qa_completed_at_utc, ?),
+                    workflow_run_id = COALESCE(?, workflow_run_id),
+                    workflow_run_url = COALESCE(?, workflow_run_url),
+                    workflow_run_started_at_utc = COALESCE(?, workflow_run_started_at_utc),
+                    last_error_code = NULL,
+                    last_error_message = NULL,
+                    updated_at_utc = ?
+                WHERE run_id = ? AND target_window_utc = ? AND archive_revision = ?
+                """,
+                (
+                    str(qa_result_status),
+                    str(qa_completed_at_utc),
+                    int(workflow_run_id) if workflow_run_id is not None else None,
+                    workflow_run_url,
+                    workflow_run_started_at_utc,
+                    now_iso,
+                    str(run_id),
+                    str(target_window_utc),
+                    str(archive_revision),
+                ),
+            )
+            return cur.rowcount > 0
+
     def create_consistent_snapshot(self, dest_path: Path) -> dict[str, Any]:
         """Create a crash-consistent standalone SQLite snapshot using sqlite3.Connection.backup()."""
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1691,15 +1956,42 @@ def export_archive_manifest_index(
         for e in entries
         if int(e.get("local_loss_lines") or 0) > 0 or int(e.get("late_frames_rejected") or 0) > 0
     ]
-    window_ledger = [
-        {
+    from data_coverage import canonical_window_manifest_entries, compute_window_archive_revision
+
+    entries_by_window: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+    for e in entries:
+        e_key = (
+            str(e.get("collection_run_id") or ""),
+            str(e["window_id"]),
+            int(e.get("partition_minutes") or 60),
+        )
+        entries_by_window.setdefault(e_key, []).append(e)
+
+    window_ledger = []
+    for wr in win_rows:
+        w_run_id = str(wr["collection_run_id"] or "")
+        w_id = str(wr["window_id"])
+        w_pm = int(wr["partition_minutes"])
+        w_entries = entries_by_window.get((w_run_id, w_id, w_pm), [])
+        w_rev: str | None = None
+        if w_entries:
+            try:
+                w_rev = compute_window_archive_revision(
+                    w_entries,
+                    run_id=w_run_id or None,
+                    window_id=w_id,
+                    partition_minutes=w_pm,
+                )
+            except ValueError:
+                w_rev = None
+        w_item: dict[str, Any] = {
             "window_key": wr["window_key"],
-            "window_id": wr["window_id"],
+            "window_id": w_id,
             "window_span_id": wr["window_span_id"],
             "date_utc": wr["date_utc"],
             "hour_utc": wr["hour_utc"],
             "minute_utc": wr["minute_utc"],
-            "partition_minutes": int(wr["partition_minutes"]),
+            "partition_minutes": w_pm,
             "planned_start_wall_ns": int(wr["planned_start_wall_ns"]),
             "planned_end_wall_ns": int(wr["planned_end_wall_ns"]),
             "collection_run_id": wr["collection_run_id"],
@@ -1711,9 +2003,12 @@ def export_archive_manifest_index(
             "file_verification_status": wr["file_verification_status"],
             "window_coverage_status": wr["window_coverage_status"],
             "window_status": wr["window_status"],
+            "manifest_count": len(w_entries),
         }
-        for wr in win_rows
-    ]
+        if w_rev is not None:
+            w_item["archive_revision"] = w_rev
+        window_ledger.append(w_item)
+
     doc: dict[str, Any] = {
         "schema_version": 2,
         "effective_run_id": effective_run_id,
@@ -1737,6 +2032,218 @@ def export_archive_manifest_index(
         os.fsync(fh.fileno())
     os.replace(tmp_path, out_path)
     return out_path
+
+
+def discover_and_enqueue_qa_dispatches(
+    sealed_root: Path,
+    ledger: ArchiveLedger,
+    *,
+    now_epoch_s: float | None = None,
+    run_id_filter: str | None = None,
+    partition_minutes_filter: int | None = None,
+    discovery_source: str = "archive_sync",
+    max_age_hours: float | None = None,
+) -> dict[str, Any]:
+    """Discover COMPLETE windows whose verified manifests are already synced in Google Drive's
+    `meta/archive_manifest_index.json` and enqueue deduplicated durable QA dispatch records.
+
+    Preconditions enforced strictly per window (independent of overall archive exit code):
+      1. `meta/archive_manifest_index.json` exists locally AND its current SHA-256/size matches
+         `meta_sync_state` (proving GitHub-readable index sync to Google Drive succeeded).
+      2. Window status in the synced index is `COMPLETE` (`file_verification_status == "verified"`
+         and `window_coverage_status == "complete"`). Startup stubs and incomplete/pending windows
+         are NEVER enqueued.
+      3. All expected exchanges for the window have remotely verified entries in the synced index.
+      4. Deduplicated by `(run_id, target_window_utc, archive_revision)`.
+
+    Safe to call both at the end of `sync_sealed_directory()` and on startup of the independent
+    dispatcher process to recover from a crash between Drive index sync and outbox persistence.
+    """
+    from data_coverage import canonical_window_manifest_entries, compute_window_archive_revision
+
+    now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
+    now_iso = _iso_utc(now_s)
+    index_path = sealed_root / ARCHIVE_MANIFEST_INDEX_RELPATH
+    try:
+        raw_index_bytes = index_path.read_bytes()
+    except FileNotFoundError:
+        return {
+            "index_synced": False,
+            "reason": "archive_manifest_index_missing",
+            "enqueued": [],
+            "already_queued": [],
+            "skipped_not_complete": [],
+        }
+    except OSError as exc:
+        return {
+            "index_synced": False,
+            "reason": f"archive_manifest_index_read_error:{type(exc).__name__}",
+            "enqueued": [],
+            "already_queued": [],
+            "skipped_not_complete": [],
+        }
+
+    idx_sha256 = hashlib.sha256(raw_index_bytes).hexdigest()
+    idx_bytes = len(raw_index_bytes)
+    sync_row = ledger.get_meta_sync(ARCHIVE_MANIFEST_INDEX_RELPATH)
+    if (
+        sync_row is None
+        or str(sync_row.get("sha256") or "").lower() != idx_sha256.lower()
+        or int(sync_row.get("size_bytes") or -1) != idx_bytes
+    ):
+        return {
+            "index_synced": False,
+            "reason": "archive_manifest_index_not_synced",
+            "local_index_sha256": idx_sha256,
+            "synced_index_sha256": sync_row.get("sha256") if sync_row else None,
+            "enqueued": [],
+            "already_queued": [],
+            "skipped_not_complete": [],
+        }
+
+    try:
+        doc = json.loads(raw_index_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return {
+            "index_synced": False,
+            "reason": f"archive_manifest_index_parse_error:{type(exc).__name__}",
+            "enqueued": [],
+            "already_queued": [],
+            "skipped_not_complete": [],
+        }
+
+    idx_hashes = {"bytes": idx_bytes, "sha256": idx_sha256}
+    raw_entries = doc.get("entries") if isinstance(doc, dict) else None
+    window_ledger = doc.get("window_ledger") if isinstance(doc, dict) else None
+    if not isinstance(raw_entries, list) or not isinstance(window_ledger, list):
+        return {
+            "index_synced": True,
+            "index_sha256": idx_sha256,
+            "index_synced_at_utc": str(sync_row["synced_at_utc"]),
+            "reason": "no_window_ledger_in_index",
+            "enqueued": [],
+            "already_queued": [],
+            "skipped_not_complete": [],
+        }
+
+    verified_by_window: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            continue
+        if not (entry.get("verified") is True and entry.get("remote_manifest_verified", True) is True):
+            continue
+        e_run_id = str(entry.get("collection_run_id") or "")
+        e_wid = str(entry.get("window_id") or "")
+        e_pm = int(entry.get("partition_minutes") or 60)
+        if not e_wid:
+            continue
+        verified_by_window.setdefault((e_run_id, e_wid, e_pm), []).append(entry)
+
+    enqueued: list[dict[str, Any]] = []
+    already_queued: list[dict[str, Any]] = []
+    skipped_not_complete: list[dict[str, Any]] = []
+
+    for wrow in window_ledger:
+        if not isinstance(wrow, dict):
+            continue
+        wid = str(wrow.get("window_id") or "")
+        w_pm = int(wrow.get("partition_minutes") or 60)
+        w_run_id = str(wrow.get("collection_run_id") or doc.get("effective_run_id") or "")
+        w_status = str(wrow.get("window_status") or "")
+        file_status = str(wrow.get("file_verification_status") or "")
+        cov_status = str(wrow.get("window_coverage_status") or "")
+
+        if run_id_filter is not None and w_run_id != str(run_id_filter):
+            continue
+        if partition_minutes_filter is not None and w_pm != int(partition_minutes_filter):
+            continue
+        if max_age_hours is not None and wrow.get("planned_end_wall_ns") is not None:
+            end_s = int(wrow["planned_end_wall_ns"]) / 1_000_000_000.0
+            if (now_s - end_s) > float(max_age_hours) * 3600.0:
+                continue
+
+        if w_status != "COMPLETE" or file_status != "verified" or cov_status != "complete":
+            skipped_not_complete.append(
+                {
+                    "run_id": w_run_id,
+                    "target_window_utc": wid,
+                    "window_status": w_status,
+                    "file_verification_status": file_status,
+                    "window_coverage_status": cov_status,
+                }
+            )
+            continue
+
+        expected_exchanges = {str(x) for x in (wrow.get("expected_exchanges") or []) if x}
+        win_entries = verified_by_window.get((w_run_id, wid, w_pm), [])
+        present_exchanges = {str(e.get("exchange") or "") for e in win_entries if e.get("exchange")}
+        if not expected_exchanges or not expected_exchanges.issubset(present_exchanges):
+            skipped_not_complete.append(
+                {
+                    "run_id": w_run_id,
+                    "target_window_utc": wid,
+                    "window_status": w_status,
+                    "reason": "missing_verified_entries_in_synced_index",
+                    "missing_exchanges": sorted(expected_exchanges - present_exchanges),
+                }
+            )
+            continue
+
+        canonical_manifests = canonical_window_manifest_entries(win_entries)
+        archive_revision = compute_window_archive_revision(
+            canonical_manifests,
+            run_id=w_run_id or None,
+            window_id=wid,
+            partition_minutes=w_pm,
+        )
+        inserted, record = ledger.enqueue_qa_dispatch(
+            run_id=w_run_id,
+            target_window_utc=wid,
+            archive_revision=archive_revision,
+            partition_minutes=w_pm,
+            window_span_id=wrow.get("window_span_id"),
+            index_sha256=str(idx_hashes["sha256"]),
+            index_synced_at_utc=str(sync_row["synced_at_utc"]),
+            manifests=canonical_manifests,
+            now_iso=now_iso,
+            discovery_source=discovery_source,
+        )
+        item_summary = {
+            "id": record["id"],
+            "run_id": record["run_id"],
+            "target_window_utc": record["target_window_utc"],
+            "archive_revision": record["archive_revision"],
+            "partition_minutes": record["partition_minutes"],
+            "manifest_count": record["manifest_count"],
+            "state": record["state"],
+            "discovery_source": record["discovery_source"],
+        }
+        if inserted:
+            enqueued.append(item_summary)
+            ledger.record_event(
+                ts_utc=now_iso,
+                run_id=w_run_id or "archive_sync",
+                event_type="QA_DISPATCH_ENQUEUED",
+                detail={
+                    "target_window_utc": wid,
+                    "archive_revision": archive_revision,
+                    "partition_minutes": w_pm,
+                    "manifest_count": len(canonical_manifests),
+                    "index_sha256": idx_hashes["sha256"],
+                    "discovery_source": discovery_source,
+                },
+            )
+        else:
+            already_queued.append(item_summary)
+
+    return {
+        "index_synced": True,
+        "index_sha256": str(idx_hashes["sha256"]),
+        "index_synced_at_utc": str(sync_row["synced_at_utc"]),
+        "enqueued": enqueued,
+        "already_queued": already_queued,
+        "skipped_not_complete": skipped_not_complete,
+    }
 
 
 def _verify_remote_object_matches(
@@ -3371,6 +3878,37 @@ def sync_sealed_directory(
                     except Exception as exc:
                         errors.append(f"{rel}: {type(exc).__name__}: {exc}")
 
+            # Enqueue durable deduplicated GitHub QA dispatch records strictly per COMPLETE window
+            # ONLY after `meta/archive_manifest_index.json` is verified synced to Google Drive.
+            # Evaluated independently of outer archive errors (such as historical missing windows),
+            # and strictly isolated so an outbox persistence error never interrupts archive finalization.
+            qa_dispatch_outbox: dict[str, Any] = {
+                "index_synced": False,
+                "reason": "verify_remote_disabled",
+                "enqueued": [],
+                "already_queued": [],
+                "skipped_not_complete": [],
+            }
+            if verify_remote and archive_index_path is not None:
+                try:
+                    qa_dispatch_outbox = discover_and_enqueue_qa_dispatches(
+                        sealed_root,
+                        ledger,
+                        now_epoch_s=now_s,
+                        run_id_filter=expected_run_id,
+                        partition_minutes_filter=expected_pm if expected_hourly_exchanges else None,
+                        discovery_source="archive_sync",
+                    )
+                except Exception as exc:
+                    qa_dispatch_outbox = {
+                        "index_synced": False,
+                        "reason": f"outbox_enqueue_error:{type(exc).__name__}",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "enqueued": [],
+                        "already_queued": [],
+                        "skipped_not_complete": [],
+                    }
+
             # Compare committed recovery state to the last successfully copied snapshot, even
             # after a crash or a retry with zero new uploads. Exclude the snapshot's own metadata.
             snapshot_remote_path: str | None = None
@@ -3452,6 +3990,7 @@ def sync_sealed_directory(
                     "expected_hour_reconciliation": expected_hour_reconciliation,
                     "expected_window_reconciliation": expected_hour_reconciliation,
                     "archive_manifest_index_path": str(archive_index_path) if archive_index_path else None,
+                    "qa_dispatch_outbox": qa_dispatch_outbox,
                     "conflicts": conflicts,
                     "failed_items": errors + [f"remote_hash_conflict:{c['remote_path']}" for c in conflicts],
                     "minimal_fixes": [
@@ -3482,6 +4021,7 @@ def sync_sealed_directory(
                 "expected_hour_reconciliation": expected_hour_reconciliation,
                 "expected_window_reconciliation": expected_hour_reconciliation,
                 "archive_manifest_index_path": str(archive_index_path) if archive_index_path else None,
+                "qa_dispatch_outbox": qa_dispatch_outbox,
                 "meta_uploaded_count": len(meta_uploaded),
                 "meta_skipped_count": meta_skipped,
                 "pruned_local_files": pruned,

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -844,3 +846,92 @@ class CompleteDayCoverage:
             "category_thresholds_seconds": self.thresholds,
             "clock_certified_minutes": len(certified_minutes),
         }
+
+
+def canonical_window_manifest_entries(
+    entries: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a stably sorted list of canonical verified manifest descriptors for a window."""
+    canonical: list[dict[str, Any]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        source_manifest = str(
+            item.get("source_manifest")
+            or item.get("remote_manifest_path")
+            or item.get("rel_manifest_path")
+            or ""
+        ).strip()
+        source_data = str(
+            item.get("source_data")
+            or item.get("remote_path")
+            or item.get("rel_data_path")
+            or (source_manifest.removesuffix(".manifest.json") + ".tsv.zst" if source_manifest else "")
+        ).strip()
+        manifest_sha = str(item.get("manifest_sha256") or "").strip().lower()
+        data_sha = str(
+            item.get("data_sha256")
+            or item.get("sha256")
+            or item.get("local_sha256")
+            or ""
+        ).strip().lower()
+        if not source_manifest or not manifest_sha or not data_sha:
+            raise ValueError(
+                f"verified manifest entry missing required digest/path fields: {source_manifest!r}"
+            )
+        raw_data_bytes = item.get("data_bytes")
+        if raw_data_bytes is None:
+            raw_data_bytes = item.get("bytes")
+        if raw_data_bytes is None:
+            raw_data_bytes = item.get("local_bytes")
+        raw_mf_bytes = item.get("manifest_bytes")
+        canonical.append(
+            {
+                "exchange": str(item.get("exchange") or "").strip(),
+                "source_manifest": source_manifest,
+                "source_data": source_data,
+                "manifest_sha256": manifest_sha,
+                "data_sha256": data_sha,
+                "manifest_bytes": int(raw_mf_bytes) if raw_mf_bytes is not None else None,
+                "data_bytes": int(raw_data_bytes) if raw_data_bytes is not None else None,
+            }
+        )
+    canonical.sort(
+        key=lambda x: (
+            x["exchange"],
+            x["source_manifest"],
+            x["source_data"],
+            x["manifest_sha256"],
+            x["data_sha256"],
+        )
+    )
+    return canonical
+
+
+def compute_window_archive_revision(
+    entries: Iterable[dict[str, Any]],
+    *,
+    run_id: str | None,
+    window_id: str,
+    partition_minutes: int,
+) -> str:
+    """Compute a deterministic SHA-256 revision digest over a window's verified manifest set.
+
+    Shared by EC2 archive outbox generation and GitHub incremental QA validation so both sides
+    derive identical `archive_revision` values regardless of row/file enumeration order.
+    """
+    manifests = canonical_window_manifest_entries(entries)
+    if not manifests:
+        raise ValueError(
+            f"cannot compute archive_revision for empty verified manifest set ({window_id})"
+        )
+    payload = {
+        "schema_version": 1,
+        "run_id": str(run_id or ""),
+        "window_id": str(window_id),
+        "partition_minutes": int(partition_minutes),
+        "manifests": manifests,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+

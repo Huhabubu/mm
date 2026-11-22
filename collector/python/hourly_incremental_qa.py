@@ -29,6 +29,7 @@ from data_coverage import (
     _data_streams,
     channel_silence_thresholds,
     classify_channel,
+    compute_window_archive_revision,
     configured_partition_minutes,
     effective_config_hash,
     enabled_exchanges,
@@ -47,6 +48,7 @@ MAX_PARTITION_BYTES = 8 * 1024**3
 QA_STATUS_PASSED = "passed"
 QA_STATUS_FAILED = "failed"
 QA_STATUS_PENDING_ARCHIVE = "pending_archive"
+QA_STATUS_ARCHIVED_PENDING_QA = "archived_pending_qa"
 QA_STATUS_NEEDS_REVIEW = "needs_review"
 QA_STATUS_OVERDUE = "overdue"
 
@@ -1274,6 +1276,7 @@ def _is_memoized_up_to_date(
     *,
     cfg_hash: str,
     config_pm: int,
+    checker_commit: str | None = None,
 ) -> bool:
     if previous.get("qa_version") != QA_VERSION:
         return False
@@ -1282,6 +1285,8 @@ def _is_memoized_up_to_date(
     if previous.get("effective_config_sha256") != cfg_hash:
         return False
     if int(previous.get("partition_minutes") or 0) != int(config_pm):
+        return False
+    if checker_commit is not None and previous.get("checker_commit_sha") != checker_commit:
         return False
     if previous.get("qa_status") not in {QA_STATUS_PASSED, QA_STATUS_FAILED, QA_STATUS_NEEDS_REVIEW}:
         return False
@@ -1292,6 +1297,82 @@ def _is_memoized_up_to_date(
     if previous.get("manifest_sha256") != cand["manifest_sha256"]:
         return False
     return True
+
+
+def _can_reuse_target_window_report(
+    state_dir: Path,
+    *,
+    target_wd: dict[str, Any],
+    target_cands: list[dict[str, Any]],
+    run_id: str | None,
+    pm: int,
+    cfg_hash: str,
+    checker_commit: str,
+    expected_archive_revision: str,
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """Return `(can_reuse, cached_file_reports)` if the target window already has a terminal
+    report matching `(run_id, window_id, archive_revision, checker_commit_sha, qa_version, config_hash)`.
+    """
+    wid = str(target_wd["window_id"])
+    w_span_id = str(target_wd["window_span_id"])
+    date_utc = str(target_wd["date_utc"])
+    batch_folder = _safe_window_filename(run_id or "default")
+    candidate_paths = [
+        state_dir / "qa_reports" / "windows" / batch_folder / date_utc / f"{_safe_window_filename(w_span_id)}.window.qa.json",
+        state_dir / "qa_reports" / "windows" / date_utc / f"{_safe_window_filename(wid)}.window.qa.json",
+    ]
+    win_rep: dict[str, Any] | None = None
+    for path in candidate_paths:
+        if path.is_file():
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    win_rep = parsed
+                    break
+            except (ValueError, OSError):
+                continue
+    if win_rep is None:
+        return False, {}
+    if win_rep.get("qa_version") != QA_VERSION:
+        return False, {}
+    if win_rep.get("effective_config_sha256") != cfg_hash:
+        return False, {}
+    if int(win_rep.get("partition_minutes") or 0) != int(pm):
+        return False, {}
+    if win_rep.get("window_id") != wid:
+        return False, {}
+    if win_rep.get("run_id") != run_id:
+        return False, {}
+    if win_rep.get("checker_commit_sha") != checker_commit:
+        return False, {}
+    if win_rep.get("archive_revision") != expected_archive_revision:
+        return False, {}
+    if win_rep.get("qa_status") not in {QA_STATUS_PASSED, QA_STATUS_FAILED, QA_STATUS_NEEDS_REVIEW}:
+        return False, {}
+    expected_files = {c["source_manifest"] for c in target_cands}
+    if set(win_rep.get("files") or []) != expected_files:
+        return False, {}
+
+    loaded_files: dict[str, dict[str, Any]] = {}
+    for cand in target_cands:
+        rel = cand["source_manifest"]
+        fpath = state_dir / "qa_reports" / (rel + ".qa.json")
+        if not fpath.is_file():
+            return False, {}
+        try:
+            fobj = json.loads(fpath.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return False, {}
+        if not _is_memoized_up_to_date(
+            fobj,
+            cand,
+            cfg_hash=cfg_hash,
+            config_pm=pm,
+            checker_commit=checker_commit,
+        ):
+            return False, {}
+        loaded_files[rel] = fobj
+    return True, loaded_files
 
 
 def _build_window_reports(
@@ -1306,7 +1387,9 @@ def _build_window_reports(
     sla_grace_seconds: float,
     run_id_filter: str | None = None,
     unchecked_windows: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    archived_exchanges_by_window: dict[str, set[str]] | None = None,
+    archive_revision_by_window: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[str]]:
     """Aggregate single-file QA reports into whole-window reports isolated by batch (run_id) and [start, end) duration."""
     expected_ex = sorted(enabled_exchanges(config).keys())
     all_expected_streams = expected_streams(config)
@@ -1314,6 +1397,8 @@ def _build_window_reports(
     config_pm = configured_partition_minutes(config)
     expected_span_ns = config_pm * 60 * 1_000_000_000
     unchecked = unchecked_windows or set()
+    archived_ex_map = archived_exchanges_by_window or {}
+    revision_map = archive_revision_by_window or {}
 
     for rep in file_reports.values():
         if "intrinsic_local_loss_events" not in rep:
@@ -1434,6 +1519,7 @@ def _build_window_reports(
     window_reports: list[dict[str, Any]] = []
     overdue_windows: list[str] = []
     pending_windows: list[str] = []
+    archived_pending_qa_windows: list[str] = []
 
     default_batch_key = str(run_id_filter or "__default__")
 
@@ -1596,10 +1682,18 @@ def _build_window_reports(
                     else:
                         hard_problems.append(msg)
 
+            archived_ex = archived_ex_map.get(wid, set())
+            archive_complete_in_index = bool(expected_ex) and set(expected_ex).issubset(archived_ex)
+            window_archive_revision = revision_map.get(wid)
+
             if has_mixed_batches or attr_losses:
                 win_status = QA_STATUS_FAILED
             elif missing_exchanges or wid in unchecked:
-                if is_overdue_time:
+                if archive_complete_in_index:
+                    win_status = QA_STATUS_ARCHIVED_PENDING_QA
+                    if wid not in archived_pending_qa_windows:
+                        archived_pending_qa_windows.append(wid)
+                elif is_overdue_time:
                     win_status = QA_STATUS_OVERDUE
                     if wid not in overdue_windows:
                         overdue_windows.append(wid)
@@ -1654,6 +1748,8 @@ def _build_window_reports(
                 "planned_start_wall_ns": start_ns,
                 "planned_end_wall_ns": end_ns,
                 "run_id": eff_batch_out,
+                "archive_revision": window_archive_revision,
+                "archive_complete_in_index": archive_complete_in_index,
                 "observed_batches": [None if b == "__default__" else b for b in span_batches],
                 "qa_status": win_status,
                 "status": "ok" if win_status == QA_STATUS_PASSED else "blocked",
@@ -1699,7 +1795,7 @@ def _build_window_reports(
                 _atomic_write_json(canonical_win_path, win_obj)
             window_reports.append(win_obj)
 
-    return window_reports, overdue_windows, pending_windows
+    return window_reports, overdue_windows, pending_windows, archived_pending_qa_windows
 
 
 def _count_chrony_certified_minutes(
@@ -1791,6 +1887,9 @@ def _build_day_reports(
         overdue_w = [wid for wid, w in sorted(win_by_id.items()) if w["qa_status"] == QA_STATUS_OVERDUE]
         review_w = [wid for wid, w in sorted(win_by_id.items()) if w["qa_status"] == QA_STATUS_NEEDS_REVIEW]
         pending_w = [wid for wid, w in sorted(win_by_id.items()) if w["qa_status"] == QA_STATUS_PENDING_ARCHIVE]
+        archived_pending_qa_w = [
+            wid for wid, w in sorted(win_by_id.items()) if w["qa_status"] == QA_STATUS_ARCHIVED_PENDING_QA
+        ]
 
         # Cross-window sequence continuity per (exchange, boot_id) & restart tracking
         cross_window_seq_issues: list[str] = []
@@ -1875,6 +1974,8 @@ def _build_day_reports(
             day_status = QA_STATUS_FAILED
         elif overdue_w or (day_complete_time and missing_windows):
             day_status = QA_STATUS_OVERDUE
+        elif archived_pending_qa_w:
+            day_status = QA_STATUS_ARCHIVED_PENDING_QA
         elif missing_windows or pending_w or not day_complete_time:
             day_status = QA_STATUS_PENDING_ARCHIVE
         elif review_w or chrony_certified is None:
@@ -1897,6 +1998,7 @@ def _build_day_reports(
             "failed_windows": failed_windows,
             "overdue_windows": overdue_w,
             "pending_windows": pending_w,
+            "archived_pending_qa_windows": archived_pending_qa_w,
             "review_windows": review_w,
             "cross_window_sequence_issues": cross_window_seq_issues,
             "restarts_by_exchange": restarts_by_exchange,
@@ -1928,6 +2030,9 @@ def run(
     *,
     since_window: str | None = None,
     run_id: str | None = None,
+    target_window_utc: str | None = None,
+    archive_revision: str | None = None,
+    trigger_mode: str | None = None,
     checker_commit: str | None = None,
     now_epoch_s: float | None = None,
     sla_grace_minutes: float | None = None,
@@ -1936,13 +2041,19 @@ def run(
 ) -> dict[str, Any]:
     """Run incremental QA across verified archive candidates and emit file/window/day reports.
 
+    When `target_window_utc` is supplied (event-driven archive dispatch), validates `(run_id,
+    target_window_utc, archive_revision)` against Drive's verified `meta/archive_manifest_index.json`,
+    reuses verified results keyed by `(run_id, target_window_utc, archive_revision, checker_commit_sha)`,
+    checks the target window FIRST, and spends any remaining `limit` budget on oldest-first historical
+    catch-up.
+
     Separates:
       1) `job_execution_status`: whether the QA runner itself executed cleanly (`"ok"` vs `"failed"`)
       2) `current_window_completed`, `current_window_verification_status`, & `heartbeat_status`:
-         whether the latest expected/due window completed verification and passed/failed/is pending
-      3) `historical_data_quality_status`, `historical_damaged_windows`, `historical_overdue_windows`,
-         `historical_damaged_partitions`, & `historical_loss_manifests`:
-         persistent historical damaged/missing window and loss-marked manifest evidence across batch cutovers.
+         whether the active window (target window on dispatch, or latest expected window on catch-up)
+         completed verification and passed/failed/is pending
+      3) 4-way window classification (`not_archived`, `archived_pending_qa`, `verified_failed`,
+         `verified_passed`) and historical damage evidence across batch cutovers.
     """
     from data_coverage import (
         previous_complete_window,
@@ -1950,6 +2061,7 @@ def run(
         resolve_effective_run_id,
     )
 
+    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     config = json.loads(config_path.read_text(encoding="utf-8"))
     effective_run_id = resolve_effective_run_id(config, run_id)
     effective_since_spec = resolve_cutover_window_utc(config, since_window or since_hour)
@@ -1964,6 +2076,25 @@ def run(
         else (10.0 if pm < 60 else 20.0)
     )
     sla_grace_seconds = max(0.0, eff_sla_min * 60.0)
+
+    target_spec = str(target_window_utc or "").strip() or None
+    expected_archive_revision = str(archive_revision or "").strip() or None
+    effective_trigger_mode = (
+        str(trigger_mode).strip()
+        if trigger_mode and str(trigger_mode).strip()
+        else ("archive_dispatch" if target_spec is not None else "scheduled_or_manual")
+    )
+    target_wd: dict[str, Any] | None = None
+    target_wid: str | None = None
+    if target_spec is not None:
+        target_start_s = parse_window_start_s(target_spec)
+        if target_start_s % (pm * 60) != 0:
+            raise ValueError(
+                f"target_window_utc {target_spec!r} is not aligned to configured partition_minutes={pm}"
+            )
+        target_wd = window_descriptor(target_start_s, pm)
+        target_wid = str(target_wd["window_id"])
+
     meta_files = _list_meta_files(remote)
 
     (
@@ -1995,12 +2126,44 @@ def run(
 
         candidates = []
     index_available = discovery_mode != "verified_index_unavailable" and not wrong_index_batch
+
+    # Compute per-window archived exchange sets and deterministic archive_revision from verified index.
+    expected_ex_set = set(enabled_exchanges(config).keys())
+    cands_by_window: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for cand in candidates:
+        cands_by_window[str(cand["window_id"])].append(cand)
+    archived_exchanges_by_window: dict[str, set[str]] = {
+        wid: {str(c["exchange"]) for c in w_cands if c.get("exchange")}
+        for wid, w_cands in cands_by_window.items()
+    }
+    archive_revision_by_window: dict[str, str] = {}
+    for wid, w_cands in cands_by_window.items():
+        try:
+            archive_revision_by_window[wid] = compute_window_archive_revision(
+                w_cands,
+                run_id=effective_run_id,
+                window_id=wid,
+                partition_minutes=pm,
+            )
+        except ValueError:
+            pass
+
     attempted = ok = blocked = review_cnt = skipped = transient = 0
+    target_transient = historical_transient = 0
+    historical_blocked = 0
     remaining_backlog = 0
     unchecked_windows: set[str] = set()
+    transient_windows: set[str] = set()
     newly_failed_windows: set[str] = set()
     summary: list[str] = []
     file_reports: dict[str, dict[str, Any]] = {}
+
+    observed_target_revision: str | None = None
+    target_revision_matched: bool | None = None
+    target_validation_error: str | None = None
+    target_window_reused_result = False
+    target_cands: list[dict[str, Any]] = []
+    target_manifest_set: set[str] = set()
 
     if wrong_index_batch:
         summary.append("ERROR verified_archive_index_batch_mismatch: " + discovery_warnings[-1])
@@ -2009,19 +2172,103 @@ def run(
             "ERROR verified_archive_index_unavailable: trusted meta/archive_manifest_index.json could not be downloaded or parsed"
         )
 
-    for cand in candidates:
+    if target_wid is not None:
+        target_cands = sorted(
+            cands_by_window.get(target_wid, []),
+            key=lambda c: (c["exchange"], c["source_manifest"]),
+        )
+        target_manifest_set = {c["source_manifest"] for c in target_cands}
+        observed_target_revision = archive_revision_by_window.get(target_wid)
+        target_missing_ex = sorted(expected_ex_set - archived_exchanges_by_window.get(target_wid, set()))
+
+        if wrong_index_batch:
+            target_validation_error = "target_batch_mismatch"
+            target_revision_matched = False
+        elif not index_available:
+            target_validation_error = "verified_archive_index_unavailable"
+            target_revision_matched = False
+        elif not target_cands or target_missing_ex:
+            target_validation_error = (
+                f"target_window_incomplete_in_index:{target_wid}:missing={','.join(target_missing_ex)}"
+            )
+            target_revision_matched = False if expected_archive_revision else None
+        elif expected_archive_revision is not None:
+            if observed_target_revision != expected_archive_revision:
+                target_validation_error = (
+                    f"target_archive_revision_mismatch:{target_wid}:"
+                    f"expected={expected_archive_revision},observed={observed_target_revision}"
+                )
+                target_revision_matched = False
+            else:
+                target_revision_matched = True
+        else:
+            target_revision_matched = True if observed_target_revision else False
+
+        summary.append(
+            f"TARGET_DISPATCH trigger={effective_trigger_mode} run_id={effective_run_id or 'none'} "
+            f"target_window_utc={target_wid} expected_archive_revision={expected_archive_revision or 'none'} "
+            f"observed_archive_revision={observed_target_revision or 'none'} checker_commit={commit_sha}"
+        )
+        if target_validation_error is not None:
+            summary.append(f"ERROR {target_validation_error}")
+
+    # Prioritize target window candidates FIRST (sharing results by run_id + window + archive_revision + checker_commit),
+    # then process historical backlog oldest-first within remaining budget.
+    ordered_candidates: list[tuple[dict[str, Any], bool]] = []
+    if target_wid is not None and target_validation_error is None and target_wd is not None and observed_target_revision:
+        if not force:
+            can_reuse, cached_target_files = _can_reuse_target_window_report(
+                state_dir,
+                target_wd=target_wd,
+                target_cands=target_cands,
+                run_id=effective_run_id,
+                pm=pm,
+                cfg_hash=cfg_hash,
+                checker_commit=commit_sha,
+                expected_archive_revision=observed_target_revision,
+            )
+            if can_reuse:
+                target_window_reused_result = True
+                for rel, fobj in cached_target_files.items():
+                    file_reports[rel] = fobj
+                    skipped += 1
+                summary.append(
+                    f"REUSED_TARGET_RESULT run_id={effective_run_id or 'none'} "
+                    f"target_window_utc={target_wid} archive_revision={observed_target_revision} "
+                    f"checker_commit={commit_sha} files={len(cached_target_files)}"
+                )
+        if not target_window_reused_result:
+            for cand in target_cands:
+                ordered_candidates.append((cand, True))
+        for cand in candidates:
+            if cand["window_id"] != target_wid:
+                ordered_candidates.append((cand, False))
+    else:
+        for cand in candidates:
+            if target_wid is not None and cand["window_id"] == target_wid and target_validation_error is not None:
+                unchecked_windows.add(cand["window_id"])
+                continue
+            ordered_candidates.append((cand, False))
+
+    for cand, is_target_cand in ordered_candidates:
         rel = cand["source_manifest"]
         result_path = state_dir / "qa_reports" / (rel + ".qa.json")
         if not force and result_path.is_file():
             try:
                 previous = json.loads(result_path.read_text(encoding="utf-8"))
-                if _is_memoized_up_to_date(previous, cand, cfg_hash=cfg_hash, config_pm=pm):
+                if _is_memoized_up_to_date(
+                    previous,
+                    cand,
+                    cfg_hash=cfg_hash,
+                    config_pm=pm,
+                    checker_commit=commit_sha if is_target_cand else None,
+                ):
                     skipped += 1
                     file_reports[rel] = previous
                     continue
             except (ValueError, OSError):
                 pass
-        if attempted >= limit:
+        if not is_target_cand and attempted >= limit:
             remaining_backlog += 1
             unchecked_windows.add(cand["window_id"])
             continue
@@ -2035,8 +2282,15 @@ def run(
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                 transient += 1
+                if is_target_cand:
+                    target_transient += 1
+                else:
+                    historical_transient += 1
                 unchecked_windows.add(cand["window_id"])
-                summary.append(f"RETRY {rel}: manifest download {type(exc).__name__}")
+                transient_windows.add(cand["window_id"])
+                summary.append(
+                    f"{'TARGET ' if is_target_cand else 'HISTORICAL '}RETRY {rel}: manifest download {type(exc).__name__}"
+                )
                 continue
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2056,8 +2310,15 @@ def run(
                     )
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                     transient += 1
+                    if is_target_cand:
+                        target_transient += 1
+                    else:
+                        historical_transient += 1
                     unchecked_windows.add(cand["window_id"])
-                    summary.append(f"RETRY {rel}: data download {type(exc).__name__}")
+                    transient_windows.add(cand["window_id"])
+                    summary.append(
+                        f"{'TARGET ' if is_target_cand else 'HISTORICAL '}RETRY {rel}: data download {type(exc).__name__}"
+                    )
                     continue
                 _verify_three_way_index_manifest_data(
                     cand=cand,
@@ -2107,10 +2368,14 @@ def run(
                 review_cnt += 1
             else:
                 blocked += 1
+                if not is_target_cand:
+                    historical_blocked += 1
                 newly_failed_windows.add(str(result.get("window_id") or cand["window_id"]))
-            summary.append(f"{qst.upper()} {rel}: {len(result.get('problems', []))} issues")
+            prefix = "TARGET " if is_target_cand else ""
+            summary.append(f"{prefix}{qst.upper()} {rel}: {len(result.get('problems', []))} issues")
 
-    # Load previously checked reports for eligible candidates so historical damaged partitions remain queryable.
+    # Load previously checked reports for eligible candidates so historical damaged partitions remain queryable,
+    # strictly checking memoization currency so stale reports for updated archive revisions are never reused.
     unresolved_failed = 0
     unresolved_review = 0
     for cand in candidates:
@@ -2119,10 +2384,13 @@ def run(
         if report.is_file():
             try:
                 obj = json.loads(report.read_text(encoding="utf-8"))
-                if (
-                    obj.get("qa_version") == QA_VERSION
-                    and obj.get("effective_config_sha256") == cfg_hash
-                    and int(obj.get("partition_minutes") or 0) == pm
+                is_tgt = target_wid is not None and rel in target_manifest_set
+                if _is_memoized_up_to_date(
+                    obj,
+                    cand,
+                    cfg_hash=cfg_hash,
+                    config_pm=pm,
+                    checker_commit=commit_sha if is_tgt else None,
                 ):
                     file_reports.setdefault(rel, obj)
                     qst = obj.get("qa_status")
@@ -2140,8 +2408,10 @@ def run(
         expected_windows = iter_expected_windows(effective_since_spec, now_s, pm)
     elif not candidates and index_available:
         expected_windows = iter_expected_windows(f"{since_date}T00:00Z", now_s, pm)
+    if target_wd is not None and all(w["window_id"] != target_wid for w in expected_windows):
+        expected_windows.append(target_wd)
 
-    window_reports, overdue_windows, pending_windows = _build_window_reports(
+    window_reports, overdue_windows, pending_windows, archived_pending_qa_windows = _build_window_reports(
         state_dir=state_dir,
         config=config,
         cfg_hash=cfg_hash,
@@ -2152,6 +2422,8 @@ def run(
         sla_grace_seconds=sla_grace_seconds,
         run_id_filter=effective_run_id,
         unchecked_windows=unchecked_windows,
+        archived_exchanges_by_window=archived_exchanges_by_window,
+        archive_revision_by_window=archive_revision_by_window,
     )
     day_reports = _build_day_reports(
         remote=remote,
@@ -2245,24 +2517,71 @@ def run(
         pass
 
     # Separate:
-    # 1) Job execution status
-    # 2) Current due/expected window completion, status, and independent heartbeat
-    # 3) Historical damaged/overdue windows & partitions (including prior 4 loss-marked manifests across batches)
-    job_execution_status = "ok" if (index_available and transient == 0) else "failed"
+    # 1) Active target execution status vs historical catch-up execution status
+    # 2) Active window (target window on event dispatch, or latest due window on scheduled catch-up)
+    # 3) 4-way window classification: not_archived, archived_pending_qa, verified_failed, verified_passed
+    # 4) Historical damaged/overdue windows & partitions (including prior loss-marked manifests across batches)
+    active_transient = target_transient if target_wid is not None else transient
+    job_execution_status = "ok" if (index_available and active_transient == 0) else "failed"
+    target_window_execution_status = (
+        "failed"
+        if (not index_available or target_validation_error is not None)
+        else ("retry_needed" if target_transient > 0 else "ok")
+    )
+    historical_catchup_status = (
+        "retry_needed"
+        if historical_transient > 0
+        else ("has_failures" if historical_blocked > 0 else "ok")
+    )
 
     latest_complete_wd = previous_complete_window(now_s, pm)
     sorted_win_reports = sorted(
         window_reports,
         key=lambda w: (int(w.get("planned_start_wall_ns") or 0), str(w.get("window_id") or "")),
     )
-    current_win_rep = sorted_win_reports[-1] if sorted_win_reports else None
-    current_window_id = (
-        str(current_win_rep["window_id"])
-        if current_win_rep is not None
+    win_rep_by_id: dict[str, dict[str, Any]] = {}
+    for w in sorted_win_reports:
+        w_id = str(w["window_id"])
+        if w_id not in win_rep_by_id or w["qa_status"] == QA_STATUS_FAILED:
+            win_rep_by_id[w_id] = w
+
+    latest_due_win_rep = sorted_win_reports[-1] if sorted_win_reports else None
+    latest_due_window_id = (
+        str(latest_due_win_rep["window_id"])
+        if latest_due_win_rep is not None
         else str(latest_complete_wd["window_id"])
     )
+    latest_due_window_verification_status = (
+        str(latest_due_win_rep["qa_status"])
+        if latest_due_win_rep is not None
+        else (
+            QA_STATUS_OVERDUE
+            if now_s >= (int(latest_complete_wd["planned_end_s"]) + sla_grace_seconds)
+            else QA_STATUS_PENDING_ARCHIVE
+        )
+    )
 
-    if not index_available:
+    verified_win_reports = [
+        w
+        for w in sorted_win_reports
+        if w["qa_status"] in {QA_STATUS_PASSED, QA_STATUS_FAILED, QA_STATUS_NEEDS_REVIEW}
+    ]
+    latest_verified_win_rep = verified_win_reports[-1] if verified_win_reports else None
+    latest_verified_window_id = (
+        str(latest_verified_win_rep["window_id"]) if latest_verified_win_rep is not None else None
+    )
+    latest_verified_window_status = (
+        str(latest_verified_win_rep["qa_status"]) if latest_verified_win_rep is not None else None
+    )
+
+    if target_wid is not None:
+        current_win_rep = win_rep_by_id.get(target_wid)
+        current_window_id = target_wid
+    else:
+        current_win_rep = latest_due_win_rep
+        current_window_id = latest_due_window_id
+
+    if not index_available or target_validation_error is not None:
         current_window_verification_status = QA_STATUS_FAILED
         current_window_completed = False
     elif current_win_rep is not None:
@@ -2282,12 +2601,20 @@ def run(
         )
         current_window_completed = False
 
+    passed_win_ids = [w["window_id"] for w in sorted_win_reports if w["qa_status"] == QA_STATUS_PASSED]
     failed_win_ids = [w["window_id"] for w in sorted_win_reports if w["qa_status"] == QA_STATUS_FAILED]
     review_win_ids = [w["window_id"] for w in sorted_win_reports if w["qa_status"] == QA_STATUS_NEEDS_REVIEW]
+    not_archived_windows = sorted(set(overdue_windows) | set(pending_windows))
 
     current_overdue_windows = [wid for wid in overdue_windows if wid == current_window_id]
     historical_overdue_windows = [wid for wid in overdue_windows if wid != current_window_id]
     current_pending_windows = [wid for wid in pending_windows if wid == current_window_id]
+    current_archived_pending_qa_windows = [
+        wid for wid in archived_pending_qa_windows if wid == current_window_id
+    ]
+    historical_archived_pending_qa_windows = [
+        wid for wid in archived_pending_qa_windows if wid != current_window_id
+    ]
 
     current_damaged_windows = [
         wid for wid in failed_win_ids if wid == current_window_id
@@ -2371,12 +2698,14 @@ def run(
         if rep.get("window_id") == current_window_id and rep.get("qa_status") == QA_STATUS_NEEDS_REVIEW
     ]
 
-    # Latest window QA status & heartbeat determination:
-    # Determined independently by job execution status and the current due window's verification status,
-    # while historical damaged or historical missing/overdue windows are preserved and reported separately!
+    # Active window QA status & heartbeat determination:
+    # Determined independently by active window execution & verification status,
+    # while historical damaged, unarchived/overdue, archived-pending-QA backlog, or historical
+    # catch-up download retries are preserved and reported separately!
     if (
         not index_available
-        or transient
+        or target_validation_error is not None
+        or active_transient
         or current_damaged_windows
         or current_window_failed_files
         or current_window_verification_status == QA_STATUS_FAILED
@@ -2385,9 +2714,14 @@ def run(
     elif (
         current_overdue_windows
         or current_window_verification_status == QA_STATUS_OVERDUE
-        or (not current_window_completed and overdue_windows)
+        or (not current_window_completed and overdue_windows and not current_archived_pending_qa_windows)
     ):
         overall_qa_status = QA_STATUS_OVERDUE
+    elif (
+        current_archived_pending_qa_windows
+        or current_window_verification_status == QA_STATUS_ARCHIVED_PENDING_QA
+    ):
+        overall_qa_status = QA_STATUS_ARCHIVED_PENDING_QA
     elif (
         current_pending_windows
         or current_window_verification_status == QA_STATUS_PENDING_ARCHIVE
@@ -2399,10 +2733,19 @@ def run(
     else:
         overall_qa_status = QA_STATUS_PASSED
 
+    active_window_ready_for_protocol_qa = bool(
+        index_available
+        and target_validation_error is None
+        and current_window_completed
+        and current_window_verification_status == QA_STATUS_PASSED
+        and current_window_id not in transient_windows
+    )
+
     heartbeat_status = (
         "ok"
         if (
             job_execution_status == "ok"
+            and target_validation_error is None
             and current_window_completed
             and current_window_verification_status == QA_STATUS_PASSED
             and overall_qa_status == QA_STATUS_PASSED
@@ -2410,18 +2753,38 @@ def run(
         else "failed"
     )
     overall_status = "ok" if heartbeat_status == "ok" else "blocked"
+    completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     out_summary = {
         "status": overall_status,
         "qa_status": overall_qa_status,
         "heartbeat_status": heartbeat_status,
         "job_execution_status": job_execution_status,
+        "target_window_execution_status": target_window_execution_status,
+        "historical_catchup_status": historical_catchup_status,
+        "active_window_ready_for_protocol_qa": active_window_ready_for_protocol_qa,
+        "trigger_mode": effective_trigger_mode,
+        "started_at_utc": started_at_utc,
+        "completed_at_utc": completed_at_utc,
+        "target_window_utc": target_wid,
+        "expected_archive_revision": expected_archive_revision,
+        "observed_archive_revision": observed_target_revision
+        if target_wid is not None
+        else archive_revision_by_window.get(current_window_id),
+        "target_revision_matched": target_revision_matched,
+        "target_validation_error": target_validation_error,
+        "target_window_reused_result": target_window_reused_result,
         "current_window_id": current_window_id,
         "current_window_completed": current_window_completed,
         "current_window_verification_status": current_window_verification_status,
+        "latest_due_window_id": latest_due_window_id,
+        "latest_due_window_verification_status": latest_due_window_verification_status,
+        "latest_verified_window_id": latest_verified_window_id,
+        "latest_verified_window_status": latest_verified_window_status,
         "historical_data_quality_status": historical_data_quality_status,
         "historical_damaged_windows": historical_damaged_windows,
         "historical_overdue_windows": historical_overdue_windows,
+        "historical_archived_pending_qa_windows": historical_archived_pending_qa_windows,
         "historical_damaged_partitions": historical_damaged_partitions,
         "historical_loss_manifests": historical_loss_manifests_out,
         "current_damaged_windows": current_damaged_windows,
@@ -2441,6 +2804,8 @@ def run(
         "blocked": blocked,
         "needs_review": review_cnt,
         "retry_needed": transient,
+        "target_retry_needed": target_transient,
+        "historical_retry_needed": historical_transient,
         "remaining_backlog": remaining_backlog,
         "unresolved_blocked": unresolved_failed,
         "unresolved_review": unresolved_review,
@@ -2449,10 +2814,24 @@ def run(
         "expected_window_count": len(expected_windows),
         "window_reports_written": len(window_reports),
         "day_reports_written": len(day_reports),
-        "overdue_windows": overdue_windows,
-        "pending_archive_windows": pending_windows,
+        "passed_windows": passed_win_ids,
         "failed_windows": failed_win_ids,
         "review_windows": review_win_ids,
+        "archived_pending_qa_windows": archived_pending_qa_windows,
+        "not_archived_windows": not_archived_windows,
+        "not_archived_overdue_windows": overdue_windows,
+        "not_archived_pending_grace_windows": pending_windows,
+        "overdue_windows": overdue_windows,
+        "pending_archive_windows": pending_windows,
+        "window_classification": {
+            "not_archived": not_archived_windows,
+            "not_archived_overdue": overdue_windows,
+            "not_archived_pending_grace": pending_windows,
+            "archived_pending_qa": archived_pending_qa_windows,
+            "verified_failed": failed_win_ids,
+            "verified_passed": passed_win_ids,
+            "verified_needs_review": review_win_ids,
+        },
         "details": summary,
     }
     try:
@@ -2473,6 +2852,9 @@ def main() -> int:
     parser.add_argument("--since-hour", default=None, help="Backward-compatible inclusive UTC hour (YYYY-MM-DDTHH)")
     parser.add_argument("--since-window", default=None, help="Inclusive planned UTC window start (YYYY-MM-DDTHH:MMZ)")
     parser.add_argument("--run-id", default=None, help="Collection batch run_id filter")
+    parser.add_argument("--target-window", default=None, help="Explicit target UTC window start to verify first (YYYY-MM-DDTHH:MMZ)")
+    parser.add_argument("--archive-revision", default=None, help="Expected archive_revision digest for --target-window")
+    parser.add_argument("--trigger-mode", default=None, help="Trigger label recorded in logs and summary (e.g. archive_dispatch, schedule_catchup)")
     parser.add_argument("--checker-commit", default=None, help="Git commit SHA of checker recorded in every report")
     parser.add_argument("--sla-grace-minutes", type=float, default=None, help="Minutes after window end before missing archive becomes overdue")
     parser.add_argument("--download-retries", type=int, default=3, help="Retry count for transient cloud download errors")
@@ -2491,6 +2873,9 @@ def main() -> int:
         args.since_hour,
         since_window=args.since_window,
         run_id=args.run_id,
+        target_window_utc=args.target_window,
+        archive_revision=args.archive_revision,
+        trigger_mode=args.trigger_mode,
         checker_commit=args.checker_commit,
         sla_grace_minutes=args.sla_grace_minutes,
         download_retries=args.download_retries,
