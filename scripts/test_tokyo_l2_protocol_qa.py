@@ -20,6 +20,134 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual([200], plan_windows([100, 200, 300, 400], {100: {}, 400: {}}, 400))
         # Explicit target window in the middle of backlog is prioritized ahead of oldest pending window.
         self.assertEqual([300, 200], plan_windows([100, 200, 300, 400], {100: {}}, 300))
+        # Schedule catch-up expands bounded backlog budget to drain multiple missed windows.
+        self.assertEqual(
+            [500, 100, 200, 300, 400],
+            plan_windows([100, 200, 300, 400, 500], {}, 500, max_catchup=4),
+        )
+
+    def test_recurring_surfaces_per_market_protocol_failure_diagnostics_and_catchup_completion(self):
+        import json
+        from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
+        import tokyo_l2_recurring_qa as recurring
+
+        w0 = 1_795_276_800  # 2026-11-21T16:00Z (missed/concurrency-replaced historical window)
+        w1 = w0 + 900       # 2026-11-21T16:15Z (latest window)
+        run_id = "trial15_run"
+        checker_sha = "abc123def456"
+        checker = f"{checker_sha}/rules123"
+        cfg = {"deployment": {"partition_minutes": 15}}
+
+        def make_cand(start):
+            wid = coverage.window_descriptor(start, 15)["window_id"]
+            mf = f"raw/gate_futures/{wid[:10]}/gate_{start}.manifest.json"
+            return {
+                "exchange": "gate_futures",
+                "source_manifest": mf,
+                "source_data": mf.replace(".manifest.json", ".tsv.zst"),
+                "manifest_sha256": f"{start:064x}",
+                "data_sha256": f"{start + 1:064x}",
+                "manifest_bytes": 100,
+                "data_bytes": 200,
+                "planned_start_s": start,
+            }
+
+        cands = [make_cand(w0), make_cand(w1)]
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            for c in cands:
+                wid = coverage.window_descriptor(c["planned_start_s"], 15)["window_id"]
+                wpath = (
+                    state / "qa_reports" / "windows" / wid[:10]
+                    / f"{archive._safe_window_filename(wid)}.window.qa.json"
+                )
+                wpath.parent.mkdir(parents=True, exist_ok=True)
+                wpath.write_text(
+                    json.dumps(
+                        {
+                            "qa_status": "passed",
+                            "run_id": run_id,
+                            "partition_minutes": 15,
+                            "checker_commit_sha": checker_sha,
+                            "files": [c["source_manifest"]],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            audited_starts = []
+
+            def fake_audit(_remote, _cfg, _rid, start, window, _replay_s, _warmup, **_kw):
+                audited_starts.append(start)
+                if start == w1:
+                    return {
+                        "status": "data_failed",
+                        "run_id": run_id,
+                        "window_id": window,
+                        "protocol_status": "failed",
+                        "target_inputs": recurring.input_digests([cands[1]]),
+                        "protocol": {
+                            "frames": [{"exchange": "gate_futures", "symbol": "ETHUSDT", "count": 42}],
+                            "issues": [
+                                {
+                                    "exchange": "gate_futures",
+                                    "symbol": "ETHUSDT",
+                                    "issue": "missing_same_connection_anchor",
+                                    "count": 12,
+                                }
+                            ],
+                        },
+                        "missing_anchor_sources": [
+                            {"exchange": "gate_futures", "symbol": "ETHUSDT", "connection": "A", "epoch": 1}
+                        ],
+                        "boundary_events": [],
+                        "archive_file_checks": [
+                            {"exchange": "gate_futures", "qa_status": "passed", "problem_count": 0}
+                        ],
+                        "end_sequence_checkpoint": [],
+                        "replay": {},
+                    }
+                return {
+                    "status": "passed",
+                    "run_id": run_id,
+                    "window_id": window,
+                    "protocol_status": "passed",
+                    "target_inputs": recurring.input_digests([cands[0]]),
+                    "protocol": {"frames": [], "issues": []},
+                    "missing_anchor_sources": [],
+                    "boundary_events": [],
+                    "archive_file_checks": [
+                        {"exchange": "gate_futures", "qa_status": "passed", "problem_count": 0}
+                    ],
+                    "end_sequence_checkpoint": [],
+                    "replay": {},
+                }
+
+            with patch.object(recurring, "verified_candidates", return_value=cands), \
+                 patch.object(recurring, "audit_window", side_effect=fake_audit):
+                res = recurring.run(
+                    "qa:", cfg, run_id, w0, w1, state, checker,
+                    trigger_mode="schedule_catchup",
+                )
+
+            # Low-frequency catch-up verified BOTH latest W1 and missed historical W0!
+            self.assertEqual([w1, w0], audited_starts)
+            self.assertEqual("data_failed", res["status"])
+            self.assertEqual("failed", res["protocol_status"])
+            self.assertEqual(["gate_futures:ETHUSDT"], res["failed_markets"])
+            self.assertEqual("missing_same_connection_anchor", res["protocol_issues"][0]["issue"])
+            self.assertEqual(1, len(res["missing_anchor_sources"]))
+            self.assertEqual(0, res["pending_ready_windows"])
+            # Persisted protocol report for missed W0 includes completed_at_utc & archive_revision for outbox reconciliation!
+            pdir = state / "qa_reports" / "protocol"
+            saved_reports = list(pdir.rglob("*.json"))
+            self.assertEqual(2, len(saved_reports))
+            for sp in saved_reports:
+                doc = json.loads(sp.read_text(encoding="utf-8"))
+                self.assertIn("completed_at_utc", doc)
+                self.assertTrue(str(doc.get("archive_revision") or "").startswith("sha256:"))
 
     def test_recurring_rejects_mismatched_archive_revision(self):
         from unittest.mock import patch

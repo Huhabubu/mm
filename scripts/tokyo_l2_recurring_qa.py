@@ -21,10 +21,11 @@ def read_report(path):
         return {}
 
 
-def plan_windows(ready, recorded, current):
-    # Prioritize the notified target / latest due window, then one bounded unit of catch-up.
+def plan_windows(ready, recorded, current, *, max_catchup=1):
+    # Prioritize the notified target / latest due window, then bounded oldest-first catch-up.
     backlog = sorted(set(ready) - set(recorded) - {current})
-    return ([current] if current in ready and current not in recorded else []) + backlog[:1]
+    budget = max(0, int(max_catchup))
+    return ([current] if current in ready and current not in recorded else []) + backlog[:budget]
 
 
 def _window_archive_revision(items, run_id, window_id, pm):
@@ -37,7 +38,41 @@ def _window_archive_revision(items, run_id, window_id, pm):
     return None
 
 
-def run(remote, config, run_id, cutover, current, state, checker, *, archive_revision=None, trigger_mode=None):
+def _summarize_protocol_diagnostics(report):
+    """Extract structural per-market failure reasons (zero raw prices/sizes/payloads)."""
+    if not isinstance(report, dict):
+        return {
+            "protocol_issues": [],
+            "failed_markets": [],
+            "missing_anchor_sources": [],
+            "boundary_events": [],
+            "archive_file_checks": [],
+        }
+    issues = list((report.get("protocol") or {}).get("issues") or [])
+    failed_markets = sorted(
+        {
+            f"{item.get('exchange')}:{item.get('symbol')}"
+            for item in issues
+            if isinstance(item, dict) and item.get("exchange") and item.get("symbol")
+        }
+    )
+    out = {
+        "protocol_issues": issues,
+        "failed_markets": failed_markets,
+        "missing_anchor_sources": list(report.get("missing_anchor_sources") or []),
+        "boundary_events": list(report.get("boundary_events") or []),
+        "archive_file_checks": list(report.get("archive_file_checks") or []),
+    }
+    if report.get("error_type"):
+        out["error_type"] = report.get("error_type")
+    if report.get("error_stage"):
+        out["error_stage"] = report.get("error_stage")
+    if report.get("spec_error_type"):
+        out["spec_error_type"] = report.get("spec_error_type")
+    return out
+
+
+def run(remote, config, run_id, cutover, current, state, checker, *, archive_revision=None, trigger_mode=None, max_catchup=None):
     started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     pm = coverage.configured_partition_minutes(config)
     step = pm * 60
@@ -63,8 +98,14 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             "archive_revision": observed_current_rev,
             "reused_current_result": False,
             "protocol_status": "revision_mismatch",
+            "protocol_issues": [],
+            "failed_markets": [],
+            "missing_anchor_sources": [],
+            "boundary_events": [],
+            "archive_file_checks": [],
             "hourly_replay_window": wid(current - current % 3600),
             "hourly_btc_replay": {},
+            "checked_windows": [],
             "historical_failed_windows": [],
             "pending_ready_windows": 0,
             "started_at_utc": started_at_utc,
@@ -101,7 +142,13 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             reports[start] = proof
 
     reused_current_result = current in reports
-    for start in plan_windows(ready, reports, current):
+    eff_max_catchup = (
+        int(max_catchup)
+        if max_catchup is not None
+        else (4 if trigger_mode == "schedule_catchup" else 1)
+    )
+    checked_windows = []
+    for start in plan_windows(ready, reports, current, max_catchup=eff_max_catchup):
         replay_seconds = 660 if start % 3600 == 0 else 0
         previous = reports.get(start - step, {})
         checkpoint = previous.get("end_sequence_checkpoint") if previous.get("protocol_status") == "passed" else None
@@ -112,18 +159,21 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             checker=checker,
             archive_revision=revisions.get(start),
             previous_inputs=input_digests(groups[start - step]),
+            completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         archive._atomic_write_json(report_path(start), report)
         reports[start] = report
+        checked_windows.append(wid(start))
 
     current_report = reports.get(current, {})
+    diag = _summarize_protocol_diagnostics(current_report)
     # Use the most recent due hourly sample for visibility even on intervening windows.
     latest_hour = current - current % 3600
     hourly = reports.get(latest_hour, {})
     historical = [wid(start) for start, report in sorted(reports.items())
                   if start != current and report["status"] == "data_failed"]
     completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {
+    out = {
         "status": current_report.get("status", "pending"),
         "run_id": run_id,
         "trigger_mode": trigger_mode or "unknown",
@@ -132,13 +182,16 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         "archive_revision": observed_current_rev,
         "reused_current_result": reused_current_result,
         "protocol_status": current_report.get("protocol_status", "pending"),
+        **diag,
         "hourly_replay_window": wid(latest_hour),
         "hourly_btc_replay": {ex: v["status"] for ex, v in hourly.get("replay", {}).items()},
+        "checked_windows": checked_windows,
         "historical_failed_windows": historical,
         "pending_ready_windows": len(set(ready) - reports.keys()),
         "started_at_utc": started_at_utc,
         "completed_at_utc": completed_at_utc,
     }
+    return out
 
 
 def main():
@@ -152,16 +205,30 @@ def main():
     parser.add_argument("--checker", required=True)
     parser.add_argument("--archive-revision", default=None)
     parser.add_argument("--trigger-mode", default=None)
+    parser.add_argument("--max-catchup", type=int, default=None)
     args = parser.parse_args()
     data = run(args.remote, json.loads(args.config.read_text()), args.run_id,
                coverage.parse_window_start_s(args.cutover), coverage.parse_window_start_s(args.current),
                args.state_dir, args.checker,
-               archive_revision=args.archive_revision, trigger_mode=args.trigger_mode)
+               archive_revision=args.archive_revision, trigger_mode=args.trigger_mode,
+               max_catchup=args.max_catchup)
     body = json.dumps(data, indent=2)
     print(body)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as dest:
-            dest.write("\n## Archive protocol QA and hourly BTC replay\n\n" + body + "\n")
+            dest.write("\n## Archive protocol QA and hourly BTC replay\n\n")
+            if data.get("protocol_issues"):
+                issue_str = "; ".join(
+                    f"{x.get('exchange')}:{x.get('symbol')}={x.get('issue')}({x.get('count')})"
+                    for x in data["protocol_issues"]
+                )
+                dest.write(f"- **Failed markets**: `{data.get('failed_markets')}`\n")
+                dest.write(f"- **Protocol issues**: `{issue_str}`\n")
+            if data.get("missing_anchor_sources"):
+                dest.write(f"- **Missing anchor sources**: `{data['missing_anchor_sources']}`\n")
+            if data.get("error_type"):
+                dest.write(f"- **Execution error**: `{data.get('error_type')}` at `{data.get('error_stage')}`\n")
+            dest.write("\n```json\n" + body + "\n```\n")
     if os.environ.get("GITHUB_ENV"):
         with open(os.environ["GITHUB_ENV"], "a") as dest:
             dest.write(f"QA_PROTOCOL_STATUS={data['protocol_status']}\n")

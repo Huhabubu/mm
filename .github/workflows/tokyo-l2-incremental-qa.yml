@@ -224,6 +224,12 @@ jobs:
           echo "QA_BOUND_SINCE_WINDOW=${QA_SINCE_WINDOW}" >> "$GITHUB_ENV"
           echo "QA_BOUND_CONFIG_PATH=${QA_CONFIG_PATH}" >> "$GITHUB_ENV"
 
+          HELP_OUT="$(python source/collector/python/hourly_incremental_qa.py --help 2>&1 || true)"
+          if [[ "$HELP_OUT" != *"--target-window"* || "$HELP_OUT" != *"--trigger-mode"* ]]; then
+            echo "::error::Checked-out collector QA code (${TOKYO_L2_QA_CHECKER_COMMIT}) does not support --target-window / --trigger-mode. Merge feat/tokyo-l2-archive-triggered-qa into feat/tokyo-l2-reliability-fixes (or pass preview_recurring=true with source_ref=feat/tokyo-l2-archive-triggered-qa) before deploying this workflow."
+            exit 2
+          fi
+
           extra=(
             --since-window "$QA_SINCE_WINDOW"
             --run-id "$QA_RUN_ID"
@@ -263,15 +269,26 @@ jobs:
               with open(env_path, "a", encoding="utf-8") as env_out:
                   env_out.write("QA_HEARTBEAT_STATUS=failed\n")
                   env_out.write("QA_JOB_EXECUTION_STATUS=failed\n")
+                  env_out.write("QA_TARGET_WINDOW_EXECUTION_STATUS=failed\n")
+                  env_out.write("QA_HISTORICAL_CATCHUP_STATUS=failed\n")
+                  env_out.write("QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA=false\n")
                   env_out.write("QA_CURRENT_WINDOW_COMPLETED=false\n")
                   env_out.write("QA_CURRENT_WINDOW_VERIFICATION_STATUS=parse_error\n")
               sys.exit(0)
 
           hb_status = str(data.get("heartbeat_status") or ("ok" if data.get("status") == "ok" else "failed"))
           job_status = str(data.get("job_execution_status") or "failed")
+          target_exec_status = str(data.get("target_window_execution_status") or job_status)
+          hist_catchup_status = str(data.get("historical_catchup_status") or "ok")
+          target_retry = int(data.get("target_retry_needed") or 0)
+          hist_retry = int(data.get("historical_retry_needed") or 0)
           cur_wid = str(data.get("current_window_id") or "")
           cur_done = "true" if data.get("current_window_completed") is True else "false"
           cur_vstatus = str(data.get("current_window_verification_status") or "unknown")
+          if "active_window_ready_for_protocol_qa" in data:
+              ready_for_proto = "true" if data.get("active_window_ready_for_protocol_qa") is True else "false"
+          else:
+              ready_for_proto = "true" if (cur_done == "true" and cur_vstatus == "passed" and job_status == "ok") else "false"
           hist_status = str(data.get("historical_data_quality_status") or "unknown")
           hist_wins = data.get("historical_damaged_windows") or []
           hist_overdue = data.get("historical_overdue_windows") or []
@@ -295,6 +312,11 @@ jobs:
           with open(env_path, "a", encoding="utf-8") as env_out:
               env_out.write(f"QA_HEARTBEAT_STATUS={hb_status}\n")
               env_out.write(f"QA_JOB_EXECUTION_STATUS={job_status}\n")
+              env_out.write(f"QA_TARGET_WINDOW_EXECUTION_STATUS={target_exec_status}\n")
+              env_out.write(f"QA_HISTORICAL_CATCHUP_STATUS={hist_catchup_status}\n")
+              env_out.write(f"QA_TARGET_RETRY_NEEDED={target_retry}\n")
+              env_out.write(f"QA_HISTORICAL_RETRY_NEEDED={hist_retry}\n")
+              env_out.write(f"QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA={ready_for_proto}\n")
               env_out.write(f"QA_CURRENT_WINDOW_ID={cur_wid}\n")
               env_out.write(f"QA_CURRENT_WINDOW_COMPLETED={cur_done}\n")
               env_out.write(f"QA_CURRENT_WINDOW_VERIFICATION_STATUS={cur_vstatus}\n")
@@ -318,7 +340,7 @@ jobs:
               "## Tokyo L2 Incremental QA Summary",
               f"- **Trigger & Traceability**: mode=`{data.get('trigger_mode')}` | run_id=`{data.get('effective_run_id') or data.get('run_id')}` | target_window_utc=`{target_wid or 'none'}` | expected_revision=`{exp_rev or 'none'}` | observed_revision=`{obs_rev or 'none'}` | revision_matched=`{data.get('target_revision_matched')}` | reused_result=`{reused}`",
               f"- **Timestamps (UTC)**: index_ready=`{os.environ.get('QA_INDEX_MODTIME_UTC', '') or 'unavailable'}` | job_started=`{os.environ.get('QA_JOB_STARTED_AT_UTC', '')}` | inspect_started=`{data.get('started_at_utc')}` | inspect_completed=`{data.get('completed_at_utc')}`",
-              f"- **1. Job Execution Status**: `{job_status}` (discovery=`{data.get('discovery_mode')}`, retry_needed=`{data.get('retry_needed')}`)",
+              f"- **1. Job Execution Status**: job=`{job_status}` | target_window=`{target_exec_status}` (target_retry=`{target_retry}`) | historical_catchup=`{hist_catchup_status}` (historical_retry=`{hist_retry}`) | ready_for_protocol_qa=`{ready_for_proto}` | discovery=`{data.get('discovery_mode')}`",
               f"- **2. Active Window**: `{cur_wid}` | completed=`{cur_done}` | verification_status=`{cur_vstatus}` | heartbeat_status=`{hb_status}` | latest_verified=`{latest_ver_wid or 'none'}` (`{latest_ver_status or 'none'}`)",
               f"- **3. 4-Way Window Classification**: not_archived=`{len(not_archived)}` | archived_pending_qa=`{len(archived_pending_qa)}` | verified_failed=`{len(verified_failed)}` | verified_passed=`{len(verified_passed)}` | needs_review=`{len(verified_review)}`",
               f"- **4. Historical Data Quality**: `{hist_status}` | damaged_windows=`{hist_wins}` | historical_overdue_windows=`{hist_overdue}` | damaged_partitions_count=`{len(hist_parts)}` | historical_loss_manifests_count=`{len(hist_loss_mfs)}`",
@@ -338,7 +360,7 @@ jobs:
 
       - name: Validate current archive protocols and hourly representative replay
         id: protocols
-        if: ${{ !cancelled() && steps.inspect.outcome == 'success' }}
+        if: ${{ !cancelled() && env.QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA == 'true' && env.QA_CURRENT_WINDOW_ID != '' }}
         env:
           PYTHONPATH: source/collector/python
         shell: bash
@@ -433,6 +455,10 @@ jobs:
             --data-urlencode "trigger_mode=${QA_TRIGGER_MODE:-unknown}" \
             --data-urlencode "heartbeat_status=${hb_status}" \
             --data-urlencode "job_execution_status=${job_status}" \
+            --data-urlencode "target_window_execution_status=${QA_TARGET_WINDOW_EXECUTION_STATUS:-unknown}" \
+            --data-urlencode "historical_catchup_status=${QA_HISTORICAL_CATCHUP_STATUS:-unknown}" \
+            --data-urlencode "historical_retry_needed=${QA_HISTORICAL_RETRY_NEEDED:-0}" \
+            --data-urlencode "active_window_ready_for_protocol_qa=${QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA:-false}" \
             --data-urlencode "current_window_id=${cur_wid}" \
             --data-urlencode "current_window_completed=${cur_done}" \
             --data-urlencode "current_window_verification_status=${cur_vstatus}" \
