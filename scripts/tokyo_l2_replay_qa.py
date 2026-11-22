@@ -209,6 +209,13 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             in_target = wall >= start_ns
             if kind == "META" and obj.get("event") in {"LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SWITCH"}:
                 event_name = obj["event"]
+                # Binance trades and public depth use independent connections.
+                if (
+                    exchange == BINANCE
+                    and obj.get("endpoint") == "binance_market"
+                    and event_name in {"SWITCH", "GAP_START", "LOCAL_LOSS"}
+                ):
+                    continue
                 symbol = symbol_key(str(obj.get("symbol") or "ALL"))
                 if in_target:
                     boundary_events.count(exchange, symbol, event_name)

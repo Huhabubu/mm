@@ -1,0 +1,33 @@
+name: Tokyo L2 protocol QA unit tests
+
+on:
+  pull_request:
+    paths:
+      - "scripts/tokyo_l2_protocol_qa.py"
+      - "scripts/tokyo_l2_replay_qa.py"
+      - "scripts/tokyo_l2_recurring_qa.py"
+      - "scripts/test_tokyo_l2_protocol_qa.py"
+      - ".github/workflows/tokyo-l2-protocol-unit.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  protocol-regressions:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out QA changes
+        uses: actions/checkout@v4
+      - name: Check out pinned collector QA dependencies
+        uses: actions/checkout@v4
+        with:
+          ref: dfd1e51b3e3d929611cbe39947bb73f770ec5d8e
+          path: source
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned test dependencies
+        run: python -m pip install hftbacktest==2.4.4 numpy numba zstandard
+      - name: Run protocol and partition regression tests
+        run: PYTHONPATH="$PWD/source/collector/python:$PWD/scripts" python -m unittest discover -s scripts -p 'test_tokyo_l2_protocol_qa.py'

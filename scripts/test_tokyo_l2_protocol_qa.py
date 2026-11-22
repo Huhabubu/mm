@@ -476,6 +476,73 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual("missing_same_connection_anchor", s5["proven_protocol_issues"][0]["issue"])
             self.assertEqual("BTCUSDT", s5["proven_protocol_issues"][0]["symbol"])
 
+    def test_binance_market_switch_does_not_invalidate_public_depth(self):
+        """Market trades failover is independent; public depth failover still needs an anchor."""
+        import json
+        import zstandard as zstd
+        from unittest.mock import patch
+        import hourly_incremental_qa as archive
+        from tokyo_l2_replay_qa import NS, scan
+
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {"binance_futures": {
+                "enabled": True, "symbols": ["BTCUSDT"],
+                "public_channels": ["depth@100ms"], "market_channels": ["aggTrade"],
+            }},
+        }
+        begin = 1_795_276_800 * NS
+        snap = {
+            "event": "REST_SNAPSHOT_ANCHOR", "symbol": "BTCUSDT",
+            "snapshot": {"lastUpdateId": 100, "bids": [["100", "2"]], "asks": [["101", "3"]]},
+        }
+        delta = {
+            "e": "depthUpdate", "s": "BTCUSDT", "U": 100, "u": 101, "pu": 100,
+            "b": [["100", "4"]], "a": [], "T": 1795277700001,
+        }
+
+        def write(path, recs):
+            with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as out:
+                for idx, (wall, conn, epoch, kind, obj) in enumerate(recs, 1):
+                    out.write(f"{wall}\t{idx}\t{conn}\t{epoch}\t{idx}\t{kind}\t{json.dumps(obj)}\n")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            archive, "check_partition", return_value={"qa_status": "passed", "problems": []},
+        ):
+            p0, p1 = Path(tmp) / "warmup.tsv.zst", Path(tmp) / "target.tsv.zst"
+            write(p1, [(begin + 1, "A", 1, "DATA", delta)])
+            m0 = {"boot_id": "boot", "start_wall_ns": begin - 900 * NS,
+                  "first_rx_seq": 1, "file_name": "warmup.tsv.zst"}
+            m1 = dict(m0, start_wall_ns=begin, file_name="target.tsv.zst")
+            cases = (
+                ("binance_market", "SWITCH", "passed"),
+                ("binance_market", "GAP_START", "passed"),
+                ("binance_market", "LOCAL_LOSS", "passed"),
+                ("binance_public", "SWITCH", "failed"),
+                ("binance_public", "DEPTH_UNAVAILABLE", "failed"),
+                ("binance_market", "DEPTH_UNAVAILABLE", "failed"),
+                (None, "SWITCH", "failed"),
+            )
+            for endpoint, marker, expected in cases:
+                with self.subTest(endpoint=endpoint, event=marker):
+                    write(p0, [
+                        (begin - 3, "A", 1, "META", snap),
+                        (begin - 2, "B", 1, "META", {"event": marker, "endpoint": endpoint, "symbol": "ALL"}),
+                    ])
+                    report = {}
+                    scan([
+                        ({"exchange": "binance_futures", "planned_start_s": begin // NS - 900}, m0, p0),
+                        ({"exchange": "binance_futures", "planned_start_s": begin // NS}, m1, p1),
+                    ], cfg, begin, begin + 900 * NS, begin, {}, report)
+                    self.assertEqual(expected, report["protocol_status"])
+                    if expected == "passed":
+                        proof, = report["end_sequence_checkpoint"]
+                        self.assertEqual(["boot", "A", 1], proof["connection"])
+                        self.assertEqual(101, proof["seq"])
+                    else:
+                        self.assertEqual("missing_same_connection_anchor",
+                                         report["proven_protocol_issues"][0]["issue"])
+
     def test_anchor_unverified_window_does_not_starve_subsequent_windows_and_wakes_on_predecessor_checkpoint(self):
         """Review Round 4 P1:
         Reproduce 3+ consecutive catch-up runs when the earliest ready window W0 returns
