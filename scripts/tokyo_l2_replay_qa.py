@@ -371,7 +371,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                 for ex, sym, channel in coverage._data_streams(exchange, obj):
                     stream = (ex, symbol_key(sym), channel)
                     if stream in evidence.limits and coverage.classify_channel(exchange, channel) != coverage.CHANNEL_CATEGORY_DEPTH:
-                        if valid_non_depth_frame(ex, sym, channel, obj):
+                        if valid_non_depth_frame(ex, stream[1], channel, obj):
                             evidence.observe(stream, wall)
                         else:
                             evidence.interrupt(ex, wall, "INVALID_STREAM_FRAME", sym, channel=channel)
