@@ -1,4 +1,4 @@
-name: Tokyo L2 incremental partitioned QA (15m)
+name: Tokyo L2 incremental partitioned QA (event-driven + 3h catch-up)
 
 on:
   push:
@@ -6,54 +6,76 @@ on:
     paths:
       - ".github/workflows/tokyo-l2-incremental-qa.yml"
   schedule:
-    # Every 15 minutes (~2 min after EC2's *:01,16,31,46 UTC 15m archive run).
-    # Resilient to GitHub Actions schedule queue/delay/skips via archive index catch-up.
-    - cron: "3,18,33,48 * * * *"
+    # Low-frequency staggered 3-hour catch-up (primary trigger is EC2 archive-verified workflow_dispatch).
+    # Recovers missed notifications or runs replaced in the concurrency queue and reports 4-way window status.
+    - cron: "17 */3 * * *"
   workflow_dispatch:
     inputs:
-      replay_window:
-        description: 'Run isolated real-data QA for this complete UTC window'
+      target_window_utc:
+        description: "Explicit verified UTC window start to inspect first (YYYY-MM-DDTHH:MMZ; set by EC2 archive notifier)"
         required: false
         type: string
-      replay_seconds:
-        description: 'BTC input duration including 600s strategy warmup (0 for protocol-only)'
+        default: ""
+      archive_revision:
+        description: "Expected deterministic sha256 archive_revision for target_window_utc verified manifests"
         required: false
         type: string
-        default: '660'
-      preview_recurring:
-        description: 'Exercise the normal QA jobs with temporary report state and no notifications'
-        required: false
-        type: boolean
-        default: false
-      config_path:
-        description: "Effective collector config path in source repo (defaults to vars.TOKYO_L2_QA_CONFIG_PATH)"
-        required: false
-        default: ""
-      since_date:
-        description: "Earliest UTC date to inspect (YYYY-MM-DD; auto-derived from since_window when empty)"
-        required: false
-        default: ""
-      since_window:
-        description: "Actual cutover UTC window start (YYYY-MM-DDTHH:MMZ; defaults to vars.TOKYO_L2_QA_SINCE_WINDOW)"
-        required: false
         default: ""
       run_id:
         description: "Active collection batch run_id (defaults to vars.TOKYO_L2_QA_RUN_ID)"
         required: false
+        type: string
+        default: ""
+      since_window:
+        description: "Actual cutover UTC window start (YYYY-MM-DDTHH:MMZ; defaults to vars.TOKYO_L2_QA_SINCE_WINDOW)"
+        required: false
+        type: string
+        default: ""
+      since_date:
+        description: "Earliest UTC date to inspect (YYYY-MM-DD; auto-derived from since_window when empty)"
+        required: false
+        type: string
+        default: ""
+      config_path:
+        description: "Effective collector config path in source repo (defaults to vars.TOKYO_L2_QA_CONFIG_PATH)"
+        required: false
+        type: string
         default: ""
       limit:
-        description: "Max unchecked partitions processed per run (controls backlog/runtime)"
+        description: "Max unchecked partitions per run (default: 16 dispatch, 48 3h catch-up, 4 push)"
         required: false
-        default: "16"
+        type: string
+        default: ""
       sla_grace_minutes:
-        description: "Minutes after window end before missing archive/result becomes overdue"
+        description: "Minutes after window end before missing archive becomes overdue"
         required: false
+        type: string
         default: "10"
       force:
         description: "Recheck already recorded partitions"
         type: boolean
         required: false
         default: false
+      replay_window:
+        description: "Run isolated real-data QA for this complete UTC window"
+        required: false
+        type: string
+        default: ""
+      replay_seconds:
+        description: "BTC input duration including 600s strategy warmup (0 for protocol-only)"
+        required: false
+        type: string
+        default: "660"
+      preview_recurring:
+        description: "Exercise the normal QA jobs with temporary report state and no notifications"
+        required: false
+        type: boolean
+        default: false
+      source_ref:
+        description: "Preview-only collector QA branch/SHA override (ignored outside preview_recurring / replay_window)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -65,10 +87,34 @@ concurrency:
 jobs:
   hourly-qa:
     if: ${{ inputs.replay_window == '' || inputs.replay_window == null }}
-    name: Incremental partitioned QA (file / window / UTC day)
+    name: Incremental partitioned QA (file / window / UTC day / protocol)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
+      - name: Record job start timestamp and trigger mode
+        id: job_meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TARGET_WINDOW: ${{ inputs.target_window_utc }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          JOB_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            TRIGGER_MODE="schedule_catchup"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            TRIGGER_MODE="push_smoke"
+          elif [[ -n "$INPUT_TARGET_WINDOW" ]]; then
+            TRIGGER_MODE="archive_dispatch"
+          else
+            TRIGGER_MODE="manual_dispatch"
+          fi
+          echo "QA_JOB_STARTED_AT_UTC=${JOB_STARTED_AT_UTC}" >> "$GITHUB_ENV"
+          echo "QA_TRIGGER_MODE=${TRIGGER_MODE}" >> "$GITHUB_ENV"
+          echo "job_started_at_utc=${JOB_STARTED_AT_UTC}" >> "$GITHUB_OUTPUT"
+          echo "trigger_mode=${TRIGGER_MODE}" >> "$GITHUB_OUTPUT"
+          echo "QA job started at ${JOB_STARTED_AT_UTC} (trigger_mode=${TRIGGER_MODE}, target_window_utc=${INPUT_TARGET_WINDOW:-none})"
+
       - name: Check out GitHub protocol and replay validation
         uses: actions/checkout@v4
         with:
@@ -84,7 +130,7 @@ jobs:
       - name: Checkout collector QA code
         uses: actions/checkout@v4
         with:
-          ref: feat/tokyo-l2-reliability-fixes
+          ref: ${{ inputs.preview_recurring && inputs.source_ref || 'feat/tokyo-l2-reliability-fixes' }}
           path: source
           persist-credentials: false
 
@@ -140,6 +186,9 @@ jobs:
             > "$RUNNER_TEMP/tokyo-qa-auth/rclone.conf"
           echo "RCLONE_CONFIG=$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" >> "$GITHUB_ENV"
           RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsf qa:meta --max-depth 1 > /dev/null
+          INDEX_MODTIME_UTC="$(RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsjson qa:meta --include archive_manifest_index.json --max-depth 1 2>/dev/null | python -c 'import json, sys; arr = json.load(sys.stdin); print(arr[0].get("ModTime", "") if isinstance(arr, list) and arr else "")' 2>/dev/null || true)"
+          echo "QA_INDEX_MODTIME_UTC=${INDEX_MODTIME_UTC}" >> "$GITHUB_ENV"
+          echo "Drive archive_manifest_index.json ModTime (UTC): ${INDEX_MODTIME_UTC:-unavailable}"
 
       - name: Inspect verified archived partitions (file, window, UTC day)
         id: inspect
@@ -148,7 +197,9 @@ jobs:
           QA_SINCE_DATE: ${{ inputs.since_date || vars.TOKYO_L2_QA_SINCE_DATE }}
           QA_SINCE_WINDOW: ${{ inputs.since_window || vars.TOKYO_L2_QA_SINCE_WINDOW }}
           QA_RUN_ID: ${{ inputs.run_id || vars.TOKYO_L2_QA_RUN_ID }}
-          QA_LIMIT: ${{ github.event_name == 'push' && '4' || inputs.limit || '16' }}
+          QA_TARGET_WINDOW_UTC: ${{ inputs.target_window_utc }}
+          QA_ARCHIVE_REVISION: ${{ inputs.archive_revision }}
+          QA_LIMIT: ${{ inputs.limit != '' && inputs.limit || (github.event_name == 'push' && '4' || (github.event_name == 'schedule' && '48' || '16')) }}
           QA_SLA_GRACE_MINUTES: ${{ inputs.sla_grace_minutes || '10' }}
           QA_FORCE: ${{ inputs.force || 'false' }}
         shell: bash
@@ -176,7 +227,14 @@ jobs:
           extra=(
             --since-window "$QA_SINCE_WINDOW"
             --run-id "$QA_RUN_ID"
+            --trigger-mode "$QA_TRIGGER_MODE"
           )
+          if [[ -n "$QA_TARGET_WINDOW_UTC" ]]; then
+            extra+=(--target-window "$QA_TARGET_WINDOW_UTC")
+          fi
+          if [[ -n "$QA_ARCHIVE_REVISION" ]]; then
+            extra+=(--archive-revision "$QA_ARCHIVE_REVISION")
+          fi
           if [[ "$QA_FORCE" == "true" ]]; then
             extra+=(--force)
           fi
@@ -195,7 +253,7 @@ jobs:
           set -e
 
           python - "$RUNNER_TEMP/qa_summary.json" "$GITHUB_STEP_SUMMARY" "$GITHUB_ENV" <<'PY'
-          import json, sys
+          import json, os, sys
           summary_path, md_path, env_path = sys.argv[1], sys.argv[2], sys.argv[3]
           try:
               data = json.loads(open(summary_path, encoding="utf-8").read())
@@ -220,12 +278,37 @@ jobs:
           hist_parts = data.get("historical_damaged_partitions") or []
           hist_loss_mfs = data.get("historical_loss_manifests") or []
 
+          wc = data.get("window_classification") or {}
+          not_archived = wc.get("not_archived", data.get("not_archived_windows") or [])
+          archived_pending_qa = wc.get("archived_pending_qa", data.get("archived_pending_qa_windows") or [])
+          verified_failed = wc.get("verified_failed", data.get("failed_windows") or [])
+          verified_passed = wc.get("verified_passed", data.get("passed_windows") or [])
+          verified_review = wc.get("verified_needs_review", data.get("review_windows") or [])
+
+          target_wid = str(data.get("target_window_utc") or "")
+          obs_rev = str(data.get("observed_archive_revision") or "")
+          exp_rev = str(data.get("expected_archive_revision") or "")
+          reused = "true" if data.get("target_window_reused_result") is True else "false"
+          latest_ver_wid = str(data.get("latest_verified_window_id") or "")
+          latest_ver_status = str(data.get("latest_verified_window_status") or "")
+
           with open(env_path, "a", encoding="utf-8") as env_out:
               env_out.write(f"QA_HEARTBEAT_STATUS={hb_status}\n")
               env_out.write(f"QA_JOB_EXECUTION_STATUS={job_status}\n")
               env_out.write(f"QA_CURRENT_WINDOW_ID={cur_wid}\n")
               env_out.write(f"QA_CURRENT_WINDOW_COMPLETED={cur_done}\n")
               env_out.write(f"QA_CURRENT_WINDOW_VERIFICATION_STATUS={cur_vstatus}\n")
+              env_out.write(f"QA_TARGET_WINDOW_RESOLVED={target_wid}\n")
+              env_out.write(f"QA_OBSERVED_ARCHIVE_REVISION={obs_rev}\n")
+              env_out.write(f"QA_TARGET_WINDOW_REUSED={reused}\n")
+              env_out.write(f"QA_INSPECT_STARTED_AT_UTC={data.get('started_at_utc') or ''}\n")
+              env_out.write(f"QA_INSPECT_COMPLETED_AT_UTC={data.get('completed_at_utc') or ''}\n")
+              env_out.write(f"QA_LATEST_VERIFIED_WINDOW_ID={latest_ver_wid}\n")
+              env_out.write(f"QA_LATEST_VERIFIED_WINDOW_STATUS={latest_ver_status}\n")
+              env_out.write(f"QA_NOT_ARCHIVED_WINDOWS_COUNT={len(not_archived)}\n")
+              env_out.write(f"QA_ARCHIVED_PENDING_QA_WINDOWS_COUNT={len(archived_pending_qa)}\n")
+              env_out.write(f"QA_FAILED_WINDOWS_COUNT={len(verified_failed)}\n")
+              env_out.write(f"QA_PASSED_WINDOWS_COUNT={len(verified_passed)}\n")
               env_out.write(f"QA_HISTORICAL_DATA_QUALITY_STATUS={hist_status}\n")
               env_out.write(f"QA_HISTORICAL_DAMAGED_WINDOWS_COUNT={len(hist_wins)}\n")
               env_out.write(f"QA_HISTORICAL_OVERDUE_WINDOWS_COUNT={len(hist_overdue)}\n")
@@ -233,16 +316,19 @@ jobs:
 
           lines = [
               "## Tokyo L2 Incremental QA Summary",
+              f"- **Trigger & Traceability**: mode=`{data.get('trigger_mode')}` | run_id=`{data.get('effective_run_id') or data.get('run_id')}` | target_window_utc=`{target_wid or 'none'}` | expected_revision=`{exp_rev or 'none'}` | observed_revision=`{obs_rev or 'none'}` | revision_matched=`{data.get('target_revision_matched')}` | reused_result=`{reused}`",
+              f"- **Timestamps (UTC)**: index_ready=`{os.environ.get('QA_INDEX_MODTIME_UTC', '') or 'unavailable'}` | job_started=`{os.environ.get('QA_JOB_STARTED_AT_UTC', '')}` | inspect_started=`{data.get('started_at_utc')}` | inspect_completed=`{data.get('completed_at_utc')}`",
               f"- **1. Job Execution Status**: `{job_status}` (discovery=`{data.get('discovery_mode')}`, retry_needed=`{data.get('retry_needed')}`)",
-              f"- **2. Current Due Window**: `{cur_wid}` | completed=`{cur_done}` | verification_status=`{cur_vstatus}` | heartbeat_status=`{hb_status}`",
-              f"- **3. Historical Data Quality**: `{hist_status}` | damaged_windows=`{hist_wins}` | historical_overdue_windows=`{hist_overdue}` | damaged_partitions_count=`{len(hist_parts)}` | historical_loss_manifests_count=`{len(hist_loss_mfs)}`",
+              f"- **2. Active Window**: `{cur_wid}` | completed=`{cur_done}` | verification_status=`{cur_vstatus}` | heartbeat_status=`{hb_status}` | latest_verified=`{latest_ver_wid or 'none'}` (`{latest_ver_status or 'none'}`)",
+              f"- **3. 4-Way Window Classification**: not_archived=`{len(not_archived)}` | archived_pending_qa=`{len(archived_pending_qa)}` | verified_failed=`{len(verified_failed)}` | verified_passed=`{len(verified_passed)}` | needs_review=`{len(verified_review)}`",
+              f"- **4. Historical Data Quality**: `{hist_status}` | damaged_windows=`{hist_wins}` | historical_overdue_windows=`{hist_overdue}` | damaged_partitions_count=`{len(hist_parts)}` | historical_loss_manifests_count=`{len(hist_loss_mfs)}`",
               f"- **Overall Gate**: `qa_status={data.get('qa_status')}` (`status={data.get('status')}`)",
-              f"- **Binding**: config=`{data.get('partition_minutes')}m` | effective_run_id=`{data.get('effective_run_id') or data.get('run_id')}` | index_effective_run_id=`{data.get('index_effective_run_id')}` | effective_since_window=`{data.get('effective_since_window')}`",
+              f"- **Binding**: config=`{data.get('partition_minutes')}m` | index_effective_run_id=`{data.get('index_effective_run_id')}` | effective_since_window=`{data.get('effective_since_window')}`",
               f"- **Checker Commit**: `{data.get('checker_commit_sha')}` (`qa_version={data.get('qa_version')}`)",
               f"- **Partitions**: eligible=`{data.get('eligible_manifest_count')}`, attempted=`{data.get('attempted')}`, ok=`{data.get('ok')}`, blocked=`{data.get('blocked')}`, needs_review=`{data.get('needs_review')}`, already_checked=`{data.get('already_checked')}`, backlog=`{data.get('remaining_backlog')}`",
               f"- **Reports Written**: windows=`{data.get('window_reports_written')}`, days=`{data.get('day_reports_written')}`",
-              f"- **Overdue Windows**: `{data.get('overdue_windows')}`",
-              f"- **Pending Archive Windows**: `{data.get('pending_archive_windows')}`",
+              f"- **Not Archived (Overdue / Grace)**: `{not_archived}`",
+              f"- **Archived Pending QA**: `{archived_pending_qa}`",
           ]
           with open(md_path, "a", encoding="utf-8") as out:
               out.write("\n".join(lines) + "\n")
@@ -259,10 +345,18 @@ jobs:
         run: |
           set -euo pipefail
           rules_sha="$(sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum | cut -d ' ' -f1)"
+          extra_proto=()
+          if [[ -n "${QA_OBSERVED_ARCHIVE_REVISION:-}" ]]; then
+            extra_proto+=(--archive-revision "$QA_OBSERVED_ARCHIVE_REVISION")
+          fi
+          if [[ -n "${QA_TRIGGER_MODE:-}" ]]; then
+            extra_proto+=(--trigger-mode "$QA_TRIGGER_MODE")
+          fi
           python workflow_code/scripts/tokyo_l2_recurring_qa.py \
             --remote qa: --state-dir state --config "source/$QA_BOUND_CONFIG_PATH" \
             --run-id "$QA_BOUND_RUN_ID" --cutover "$QA_BOUND_SINCE_WINDOW" \
-            --current "$QA_CURRENT_WINDOW_ID" --checker "$TOKYO_L2_QA_CHECKER_COMMIT/$rules_sha"
+            --current "$QA_CURRENT_WINDOW_ID" --checker "$TOKYO_L2_QA_CHECKER_COMMIT/$rules_sha" \
+            "${extra_proto[@]}"
 
       - name: Persist QA summary reports to tokyo-l2-qa-state
         id: persist
@@ -324,10 +418,10 @@ jobs:
           hist_overdue_count="${QA_HISTORICAL_OVERDUE_WINDOWS_COUNT:-0}"
           hist_loss_mfs_count="${QA_HISTORICAL_LOSS_MANIFESTS_COUNT:-0}"
 
-          # Heartbeat reflects job execution + current due window completion & verification independently,
-          # while historical damaged or missing/overdue windows and historical loss-marked manifests are
-          # preserved and reported separately in the payload without failing latest-window heartbeats.
-          # When the current window is still pending_archive (cur_done != true), NEVER send a false success ping.
+          # Heartbeat reflects job execution + active window completion & verification independently,
+          # while historical damaged, unarchived/overdue, or archived-pending-QA backlog windows are
+          # preserved and reported separately in the payload without failing active-window heartbeats.
+          # When the active window is not completed (cur_done != true), NEVER send a false success ping.
           status="success"
           if [[ "$INSPECT_OUTCOME" != "success" || "$PROTOCOL_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
             status="failure"
@@ -336,11 +430,20 @@ jobs:
           curl --fail --silent --show-error --retry 3 --max-time 15 \
             --request POST \
             --data-urlencode "status=${status}" \
+            --data-urlencode "trigger_mode=${QA_TRIGGER_MODE:-unknown}" \
             --data-urlencode "heartbeat_status=${hb_status}" \
             --data-urlencode "job_execution_status=${job_status}" \
             --data-urlencode "current_window_id=${cur_wid}" \
             --data-urlencode "current_window_completed=${cur_done}" \
             --data-urlencode "current_window_verification_status=${cur_vstatus}" \
+            --data-urlencode "target_window_utc=${QA_TARGET_WINDOW_RESOLVED:-none}" \
+            --data-urlencode "archive_revision=${QA_OBSERVED_ARCHIVE_REVISION:-none}" \
+            --data-urlencode "latest_verified_window_id=${QA_LATEST_VERIFIED_WINDOW_ID:-none}" \
+            --data-urlencode "latest_verified_window_status=${QA_LATEST_VERIFIED_WINDOW_STATUS:-none}" \
+            --data-urlencode "not_archived_windows_count=${QA_NOT_ARCHIVED_WINDOWS_COUNT:-0}" \
+            --data-urlencode "archived_pending_qa_windows_count=${QA_ARCHIVED_PENDING_QA_WINDOWS_COUNT:-0}" \
+            --data-urlencode "failed_windows_count=${QA_FAILED_WINDOWS_COUNT:-0}" \
+            --data-urlencode "passed_windows_count=${QA_PASSED_WINDOWS_COUNT:-0}" \
             --data-urlencode "historical_data_quality_status=${hist_status}" \
             --data-urlencode "historical_damaged_windows_count=${hist_count}" \
             --data-urlencode "historical_overdue_windows_count=${hist_overdue_count}" \
@@ -375,13 +478,13 @@ jobs:
       - name: Check out collector converter
         uses: actions/checkout@v4
         with:
-          ref: feat/tokyo-l2-reliability-fixes
+          ref: ${{ inputs.source_ref || 'feat/tokyo-l2-reliability-fixes' }}
           path: source
           persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install replay dependencies and test wire validators
         shell: bash
