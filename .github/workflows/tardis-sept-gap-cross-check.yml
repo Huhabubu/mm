@@ -1,0 +1,51 @@
+name: Audit Tardis Sep 1 OKX SOL two simultaneous quote gaps
+on:
+  push:
+    branches: [audit/tardis-full-day-continuity-2026]
+    paths: ['.github/workflows/tardis-sept-gap-cross-check.yml']
+permissions:
+  contents: read
+jobs:
+  crosscheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [okx-sol-trades, okx-btc-trades, binance-sol-bbo]
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Check other live feed messages during OKX SOL L2/BBO silence
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv,gzip,io,json,urllib.request
+          cases={
+              'okx-sol-trades':('okex-swap','trades','SOL-USDT-SWAP'),
+              'okx-btc-trades':('okex-swap','trades','BTC-USDT-SWAP'),
+              'binance-sol-bbo':('binance-futures','book_ticker','SOLUSDT'),
+          }
+          venue,kind,symbol=cases['${{ matrix.case }}']
+          gaps=[('g1',1788253729814000,1788253748414000),('g2',1788254043912000,1788254070317000)]
+          # Assert these are the reported 2026-09-01 UTC windows.
+          from datetime import datetime,timezone
+          for name,a,b in gaps:
+              print(name,datetime.fromtimestamp(a/1e6,timezone.utc).isoformat(),datetime.fromtimestamp(b/1e6,timezone.utc).isoformat())
+          counts={name:{'rows':0,'first_utc':None,'last_utc':None,'price_min':None,'price_max':None} for name,_,_ in gaps}
+          url=f'https://datasets.tardis.dev/v1/{venue}/{kind}/2026/09/01/{symbol}.csv.gz'
+          with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'mm-tardis-cross-check/1.0'}),timeout=180) as resp:
+              with io.TextIOWrapper(gzip.GzipFile(fileobj=resp),encoding='utf-8',newline='') as gz:
+                  for row in csv.DictReader(gz):
+                      t=int(row['local_timestamp'])
+                      for name,a,b in gaps:
+                          if a<=t<=b:
+                              z=counts[name]
+                              z['rows']+=1
+                              if z['first_utc'] is None:z['first_utc']=t
+                              z['last_utc']=t
+                              px=float(row['price'] if kind=='trades' else row['bid_price'])
+                              z['price_min']=px if z['price_min'] is None else min(z['price_min'],px)
+                              z['price_max']=px if z['price_max'] is None else max(z['price_max'],px)
+          print('GAP_CROSSCHECK_RESULT',json.dumps({'venue':venue,'kind':kind,'symbol':symbol,'gaps':counts},sort_keys=True),flush=True)
+          PY
