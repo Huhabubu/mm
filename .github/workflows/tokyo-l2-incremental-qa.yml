@@ -1,6 +1,9 @@
 name: Tokyo L2 incremental partitioned QA (event-driven + 3h catch-up)
 
 on:
+  pull_request:
+    types: [synchronize]
+    branches: [main]
   push:
     branches: [main]
     paths:
@@ -81,12 +84,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: ${{ (inputs.replay_window || inputs.preview_recurring) && format('tokyo-l2-qa-preview-{0}', github.ref_name) || 'tokyo-l2-incremental-qa' }}
+  group: ${{ (github.event_name == 'pull_request' || inputs.replay_window || inputs.preview_recurring) && format('tokyo-l2-qa-preview-{0}', github.ref_name) || 'tokyo-l2-incremental-qa' }}
   cancel-in-progress: false
 
 jobs:
   hourly-qa:
-    if: ${{ inputs.replay_window == '' || inputs.replay_window == null }}
+    if: ${{ github.event_name != 'pull_request' && (inputs.replay_window == '' || inputs.replay_window == null) }}
     name: Incremental partitioned QA (file / window / UTC day / protocol)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -487,7 +490,7 @@ jobs:
             "$url"
 
   real-data-qa:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.replay_window != '' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.replay_window != '') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'fix/tokyo-l2-market-availability') }}
     name: Real Tokyo window protocol QA and BTC short replay
     permissions:
       contents: read
@@ -509,7 +512,7 @@ jobs:
       - name: Check out collector converter
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref || 'feat/tokyo-l2-reliability-fixes' }}
+          ref: ${{ github.event_name == 'pull_request' && 'fix/tokyo-l2-availability-converter' || inputs.source_ref || 'feat/tokyo-l2-reliability-fixes' }}
           path: source
           persist-credentials: false
 
@@ -552,8 +555,8 @@ jobs:
       - name: Verify archived frames and replay a real BTC sample
         env:
           QA_CONFIG_PATH: ${{ inputs.config_path || vars.TOKYO_L2_QA_CONFIG_PATH }}
-          QA_RUN_ID: ${{ inputs.run_id || vars.TOKYO_L2_QA_RUN_ID }}
-          QA_REPLAY_WINDOW: ${{ inputs.replay_window }}
+          QA_RUN_ID: ${{ github.event_name == 'pull_request' && 'trial15_20261122T0745Z' || inputs.run_id || vars.TOKYO_L2_QA_RUN_ID }}
+          QA_REPLAY_WINDOW: ${{ github.event_name == 'pull_request' && '2026-11-22T07:45Z..2026-11-22T10:00Z' || inputs.replay_window }}
           QA_REPLAY_SECONDS: ${{ inputs.replay_seconds || '660' }}
           PYTHONPATH: source/collector/python
         shell: bash
@@ -564,10 +567,73 @@ jobs:
             --window "$QA_REPLAY_WINDOW" --replay-seconds "$QA_REPLAY_SECONDS" \
             --summary "$RUNNER_TEMP/tokyo-replay-summary.json"
 
+      - name: Verify real archive acceptance criteria
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          python - "$RUNNER_TEMP/tokyo-replay-summary.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          result = json.loads(Path(sys.argv[1]).read_text())
+          assert result["status"] == "completed", result["counts"]
+          windows = {item["window_id"]: item for item in result["windows"]}
+          assert len(windows) == 10, len(windows)
+          depth_channels = {"depth@100ms", "futures.obu", "books50", "orderbook.50"}
+
+          def has(row, status):
+              return any(span["status"] == status for span in row["intervals"])
+
+          first = windows["2026-11-22T07:45Z"]
+          markets = [row for row in first["market_availability"] if row["channel"] in depth_channels]
+          assert first["status"] == "passed", first["status"]
+          assert len(markets) == 24 and all(has(row, "verified_usable") for row in markets), markets
+          incidents = {
+              "2026-11-22T08:00Z": "binance_futures",
+              "2026-11-22T09:15Z": "bitget_v3",
+              "2026-11-22T09:45Z": "bitget_v3",
+          }
+          for window, exchange in incidents.items():
+              report = windows[window]
+              assert report["status"] == "data_failed", (window, report["status"])
+              markets = [row for row in report["market_availability"] if row["channel"] in depth_channels]
+              affected = [row for row in markets if row["exchange"] == exchange and has(row, "known_gap")]
+              preserved = [row for row in markets if row["exchange"] != exchange and has(row, "verified_usable")]
+              assert affected and len(preserved) == 18, (window, len(affected), len(preserved))
+              example = next((row for row in affected if row["symbol"] == "BTCUSDT"), affected[0])
+              print(f"{window} affected_depth={len(affected)} preserved_depth={len(preserved)} "
+                    f"gap_example={json.dumps([span for span in example['intervals'] if span['status'] == 'known_gap'])}")
+          later = windows["2026-11-22T08:15Z"]
+          assert len(later["end_sequence_checkpoint"]) >= 18, later["end_sequence_checkpoint"]
+          print(f"Accepted 10 windows, first-window verified depth markets={len(first['end_sequence_checkpoint'])}, "
+                f"continuing depth markets at 08:15 UTC={len(later['end_sequence_checkpoint'])}")
+          PY
+
+      - name: Backfill verified archive batches separately
+        if: github.event_name == 'pull_request'
+        env:
+          QA_CONFIG_PATH: ${{ vars.TOKYO_L2_QA_CONFIG_PATH }}
+          PYTHONPATH: source/collector/python
+        shell: bash
+        run: |
+          set -uo pipefail
+          cfg="${QA_CONFIG_PATH:-collector/specs/config.trial_15m.json}"
+          rc=0
+          python workflow_code/scripts/tokyo_l2_replay_qa.py \
+            --remote qa: --config "source/$cfg" --run-id trial15_20261121T1400Z \
+            --window '2026-11-21T14:00Z..2026-11-22T07:15Z' --replay-seconds 0 \
+            --summary "$RUNNER_TEMP/tokyo-archive-historical-15m.json" || rc=2
+          python workflow_code/scripts/tokyo_l2_replay_qa.py \
+            --remote qa: --config "source/$cfg" --run-id legacy-60m \
+            --window '2026-11-21T08:00Z..2026-11-21T13:00Z' --replay-seconds 0 \
+            --summary "$RUNNER_TEMP/tokyo-archive-historical-60m.json" || rc=2
+          exit "$rc"
+
       - name: Upload summary only
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tokyo-l2-real-replay-summary
-          path: ${{ runner.temp }}/tokyo-replay-summary.json
+          path: |
+            ${{ runner.temp }}/tokyo-replay-summary.json
+            ${{ runner.temp }}/tokyo-archive-historical-*.json
           if-no-files-found: warn
