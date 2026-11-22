@@ -1,0 +1,48 @@
+name: Audit Tardis remaining five backtest days (research only)
+on:
+  push:
+    branches: [audit/tardis-full-day-continuity-2026]
+    paths:
+      - '.github/workflows/tardis-remaining-days-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        day: ['2026-07-01', '2026-08-01', '2026-09-01', '2026-10-01', '2026-11-01']
+        case: [okx-btc, okx-sol, bitget-btc, bitget-sol, binance-btc, binance-sol]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Full-day Tardis source snapshot and gap scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ matrix.case }}' in
+            okx-btc) venue='okex-swap'; symbol='BTC-USDT-SWAP'; kinds='incremental_book_L2,book_ticker,trades' ;;
+            okx-sol) venue='okex-swap'; symbol='SOL-USDT-SWAP'; kinds='incremental_book_L2,book_ticker,trades' ;;
+            bitget-btc) venue='bitget-futures'; symbol='BTCUSDT'; kinds='incremental_book_L2,book_ticker,trades' ;;
+            bitget-sol) venue='bitget-futures'; symbol='SOLUSDT'; kinds='incremental_book_L2,book_ticker,trades' ;;
+            binance-btc) venue='binance-futures'; symbol='BTCUSDT'; kinds='book_ticker' ;;
+            binance-sol) venue='binance-futures'; symbol='SOLUSDT'; kinds='book_ticker' ;;
+            *) exit 2 ;;
+          esac
+          python -u scripts/tardis_full_day_continuity_audit.py \
+            --day '${{ matrix.day }}' --venue "$venue" --symbol "$symbol" --kinds "$kinds"
+      - name: Upload aggregated read-only QA (no raw data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tardis-continuity-${{ matrix.day }}-${{ matrix.case }}
+          path: reports/tardis_full_day/*.json
+          retention-days: 14
+          if-no-files-found: warn
