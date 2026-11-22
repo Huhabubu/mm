@@ -1713,8 +1713,11 @@ def run(
             pass
 
     attempted = ok = blocked = review_cnt = skipped = transient = 0
+    target_transient = historical_transient = 0
+    historical_blocked = 0
     remaining_backlog = 0
     unchecked_windows: set[str] = set()
+    transient_windows: set[str] = set()
     newly_failed_windows: set[str] = set()
     summary: list[str] = []
     file_reports: dict[str, dict[str, Any]] = {}
@@ -1843,8 +1846,15 @@ def run(
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                 transient += 1
+                if is_target_cand:
+                    target_transient += 1
+                else:
+                    historical_transient += 1
                 unchecked_windows.add(cand["window_id"])
-                summary.append(f"RETRY {rel}: manifest download {type(exc).__name__}")
+                transient_windows.add(cand["window_id"])
+                summary.append(
+                    f"{'TARGET ' if is_target_cand else 'HISTORICAL '}RETRY {rel}: manifest download {type(exc).__name__}"
+                )
                 continue
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1864,8 +1874,15 @@ def run(
                     )
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
                     transient += 1
+                    if is_target_cand:
+                        target_transient += 1
+                    else:
+                        historical_transient += 1
                     unchecked_windows.add(cand["window_id"])
-                    summary.append(f"RETRY {rel}: data download {type(exc).__name__}")
+                    transient_windows.add(cand["window_id"])
+                    summary.append(
+                        f"{'TARGET ' if is_target_cand else 'HISTORICAL '}RETRY {rel}: data download {type(exc).__name__}"
+                    )
                     continue
                 _verify_three_way_index_manifest_data(
                     cand=cand,
@@ -1915,6 +1932,8 @@ def run(
                 review_cnt += 1
             else:
                 blocked += 1
+                if not is_target_cand:
+                    historical_blocked += 1
                 newly_failed_windows.add(str(result.get("window_id") or cand["window_id"]))
             prefix = "TARGET " if is_target_cand else ""
             summary.append(f"{prefix}{qst.upper()} {rel}: {len(result.get('problems', []))} issues")
@@ -2062,11 +2081,22 @@ def run(
         pass
 
     # Separate:
-    # 1) Job execution status
+    # 1) Active target execution status vs historical catch-up execution status
     # 2) Active window (target window on event dispatch, or latest due window on scheduled catch-up)
     # 3) 4-way window classification: not_archived, archived_pending_qa, verified_failed, verified_passed
     # 4) Historical damaged/overdue windows & partitions (including prior loss-marked manifests across batches)
-    job_execution_status = "ok" if (index_available and transient == 0) else "failed"
+    active_transient = target_transient if target_wid is not None else transient
+    job_execution_status = "ok" if (index_available and active_transient == 0) else "failed"
+    target_window_execution_status = (
+        "failed"
+        if (not index_available or target_validation_error is not None)
+        else ("retry_needed" if target_transient > 0 else "ok")
+    )
+    historical_catchup_status = (
+        "retry_needed"
+        if historical_transient > 0
+        else ("has_failures" if historical_blocked > 0 else "ok")
+    )
 
     latest_complete_wd = previous_complete_window(now_s, pm)
     sorted_win_reports = sorted(
@@ -2233,12 +2263,13 @@ def run(
     ]
 
     # Active window QA status & heartbeat determination:
-    # Determined independently by job execution status and the active window's verification status,
-    # while historical damaged, unarchived/overdue, or archived-pending-QA backlog windows are reported separately!
+    # Determined independently by active window execution & verification status,
+    # while historical damaged, unarchived/overdue, archived-pending-QA backlog, or historical
+    # catch-up download retries are preserved and reported separately!
     if (
         not index_available
         or target_validation_error is not None
-        or transient
+        or active_transient
         or current_damaged_windows
         or current_window_failed_files
         or current_window_verification_status == QA_STATUS_FAILED
@@ -2266,6 +2297,14 @@ def run(
     else:
         overall_qa_status = QA_STATUS_PASSED
 
+    active_window_ready_for_protocol_qa = bool(
+        index_available
+        and target_validation_error is None
+        and current_window_completed
+        and current_window_verification_status == QA_STATUS_PASSED
+        and current_window_id not in transient_windows
+    )
+
     heartbeat_status = (
         "ok"
         if (
@@ -2285,6 +2324,9 @@ def run(
         "qa_status": overall_qa_status,
         "heartbeat_status": heartbeat_status,
         "job_execution_status": job_execution_status,
+        "target_window_execution_status": target_window_execution_status,
+        "historical_catchup_status": historical_catchup_status,
+        "active_window_ready_for_protocol_qa": active_window_ready_for_protocol_qa,
         "trigger_mode": effective_trigger_mode,
         "started_at_utc": started_at_utc,
         "completed_at_utc": completed_at_utc,
@@ -2326,6 +2368,8 @@ def run(
         "blocked": blocked,
         "needs_review": review_cnt,
         "retry_needed": transient,
+        "target_retry_needed": target_transient,
+        "historical_retry_needed": historical_transient,
         "remaining_backlog": remaining_backlog,
         "unresolved_blocked": unresolved_failed,
         "unresolved_review": unresolved_review,

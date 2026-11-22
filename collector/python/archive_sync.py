@@ -1395,7 +1395,7 @@ class ArchiveLedger:
                 SET state = 'ACCEPTED',
                     attempt_count = attempt_count + 1,
                     last_attempt_at_utc = ?,
-                    api_accepted_at_utc = COALESCE(api_accepted_at_utc, ?),
+                    api_accepted_at_utc = ?,
                     last_http_status = ?,
                     last_error_code = NULL,
                     last_error_message = NULL,
@@ -1403,6 +1403,36 @@ class ArchiveLedger:
                 WHERE id = ?
                 """,
                 (now_iso, accepted_at_utc, int(http_status), now_iso, int(dispatch_id)),
+            )
+
+    def mark_qa_dispatch_requeue(
+        self,
+        dispatch_id: int,
+        *,
+        next_attempt_at_epoch_s: float,
+        error_code: str,
+        error_message: str,
+        now_iso: str,
+    ) -> None:
+        """Return a stale/replaced ACCEPTED outbox entry to PENDING so it can be re-dispatched or tracked as awaiting QA."""
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE qa_dispatch_outbox
+                SET state = 'PENDING',
+                    next_attempt_at_epoch_s = ?,
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    updated_at_utc = ?
+                WHERE id = ? AND state = 'ACCEPTED'
+                """,
+                (
+                    float(next_attempt_at_epoch_s),
+                    str(error_code),
+                    str(error_message)[:500],
+                    now_iso,
+                    int(dispatch_id),
+                ),
             )
 
     def mark_qa_dispatch_retry(
@@ -1466,6 +1496,8 @@ class ArchiveLedger:
                     workflow_run_id = COALESCE(?, workflow_run_id),
                     workflow_run_url = COALESCE(?, workflow_run_url),
                     workflow_run_started_at_utc = COALESCE(?, workflow_run_started_at_utc),
+                    last_error_code = NULL,
+                    last_error_message = NULL,
                     updated_at_utc = ?
                 WHERE run_id = ? AND target_window_utc = ? AND archive_revision = ?
                 """,
@@ -2032,7 +2064,9 @@ def discover_and_enqueue_qa_dispatches(
     now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
     now_iso = _iso_utc(now_s)
     index_path = sealed_root / ARCHIVE_MANIFEST_INDEX_RELPATH
-    if not index_path.is_file():
+    try:
+        raw_index_bytes = index_path.read_bytes()
+    except FileNotFoundError:
         return {
             "index_synced": False,
             "reason": "archive_manifest_index_missing",
@@ -2040,18 +2074,27 @@ def discover_and_enqueue_qa_dispatches(
             "already_queued": [],
             "skipped_not_complete": [],
         }
+    except OSError as exc:
+        return {
+            "index_synced": False,
+            "reason": f"archive_manifest_index_read_error:{type(exc).__name__}",
+            "enqueued": [],
+            "already_queued": [],
+            "skipped_not_complete": [],
+        }
 
-    idx_hashes = file_hashes(index_path)
+    idx_sha256 = hashlib.sha256(raw_index_bytes).hexdigest()
+    idx_bytes = len(raw_index_bytes)
     sync_row = ledger.get_meta_sync(ARCHIVE_MANIFEST_INDEX_RELPATH)
     if (
         sync_row is None
-        or str(sync_row.get("sha256") or "").lower() != str(idx_hashes["sha256"]).lower()
-        or int(sync_row.get("size_bytes") or -1) != int(idx_hashes["bytes"])
+        or str(sync_row.get("sha256") or "").lower() != idx_sha256.lower()
+        or int(sync_row.get("size_bytes") or -1) != idx_bytes
     ):
         return {
             "index_synced": False,
             "reason": "archive_manifest_index_not_synced",
-            "local_index_sha256": idx_hashes["sha256"],
+            "local_index_sha256": idx_sha256,
             "synced_index_sha256": sync_row.get("sha256") if sync_row else None,
             "enqueued": [],
             "already_queued": [],
@@ -2059,8 +2102,8 @@ def discover_and_enqueue_qa_dispatches(
         }
 
     try:
-        doc = json.loads(index_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        doc = json.loads(raw_index_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         return {
             "index_synced": False,
             "reason": f"archive_manifest_index_parse_error:{type(exc).__name__}",
@@ -2069,12 +2112,13 @@ def discover_and_enqueue_qa_dispatches(
             "skipped_not_complete": [],
         }
 
+    idx_hashes = {"bytes": idx_bytes, "sha256": idx_sha256}
     raw_entries = doc.get("entries") if isinstance(doc, dict) else None
     window_ledger = doc.get("window_ledger") if isinstance(doc, dict) else None
     if not isinstance(raw_entries, list) or not isinstance(window_ledger, list):
         return {
             "index_synced": True,
-            "index_sha256": idx_hashes["sha256"],
+            "index_sha256": idx_sha256,
             "index_synced_at_utc": str(sync_row["synced_at_utc"]),
             "reason": "no_window_ledger_in_index",
             "enqueued": [],
@@ -3836,7 +3880,8 @@ def sync_sealed_directory(
 
             # Enqueue durable deduplicated GitHub QA dispatch records strictly per COMPLETE window
             # ONLY after `meta/archive_manifest_index.json` is verified synced to Google Drive.
-            # Evaluated independently of outer archive errors (such as historical missing windows).
+            # Evaluated independently of outer archive errors (such as historical missing windows),
+            # and strictly isolated so an outbox persistence error never interrupts archive finalization.
             qa_dispatch_outbox: dict[str, Any] = {
                 "index_synced": False,
                 "reason": "verify_remote_disabled",
@@ -3845,14 +3890,24 @@ def sync_sealed_directory(
                 "skipped_not_complete": [],
             }
             if verify_remote and archive_index_path is not None:
-                qa_dispatch_outbox = discover_and_enqueue_qa_dispatches(
-                    sealed_root,
-                    ledger,
-                    now_epoch_s=now_s,
-                    run_id_filter=expected_run_id,
-                    partition_minutes_filter=expected_pm if expected_hourly_exchanges else None,
-                    discovery_source="archive_sync",
-                )
+                try:
+                    qa_dispatch_outbox = discover_and_enqueue_qa_dispatches(
+                        sealed_root,
+                        ledger,
+                        now_epoch_s=now_s,
+                        run_id_filter=expected_run_id,
+                        partition_minutes_filter=expected_pm if expected_hourly_exchanges else None,
+                        discovery_source="archive_sync",
+                    )
+                except Exception as exc:
+                    qa_dispatch_outbox = {
+                        "index_synced": False,
+                        "reason": f"outbox_enqueue_error:{type(exc).__name__}",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "enqueued": [],
+                        "already_queued": [],
+                        "skipped_not_complete": [],
+                    }
 
             # Compare committed recovery state to the last successfully copied snapshot, even
             # after a crash or a retry with zero new uploads. Exclude the snapshot's own metadata.

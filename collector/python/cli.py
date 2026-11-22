@@ -706,6 +706,11 @@ def cmd_qa_dispatch(args: argparse.Namespace) -> int:
         total_timeout_s=args.total_timeout,
         base_backoff_s=args.base_backoff,
         max_backoff_s=args.max_backoff,
+        qa_state_dir=args.qa_state_dir,
+        qa_state_branch=args.qa_state_branch,
+        accepted_stale_timeout_s=args.accepted_stale_timeout,
+        require_protocol_report=args.require_protocol_report,
+        reconcile_accepted=not args.no_reconcile,
         require_token=args.require_token,
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
@@ -777,6 +782,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_disp.add_argument("--total-timeout", type=float, default=15.0)
     p_disp.add_argument("--base-backoff", type=float, default=30.0)
     p_disp.add_argument("--max-backoff", type=float, default=900.0)
+    p_disp.add_argument("--qa-state-dir", type=Path, default=None)
+    p_disp.add_argument("--qa-state-branch", default=None)
+    p_disp.add_argument("--accepted-stale-timeout", type=float, default=None)
+    p_disp.add_argument("--require-protocol-report", action="store_true", default=None)
+    p_disp.add_argument("--no-reconcile", action="store_true")
     p_disp.add_argument("--require-token", action="store_true")
     p_disp.add_argument("--status-only", action="store_true")
     p_disp.set_defaults(func=cmd_qa_dispatch)
