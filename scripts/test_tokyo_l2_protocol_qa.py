@@ -476,6 +476,24 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual("missing_same_connection_anchor", s5["proven_protocol_issues"][0]["issue"])
             self.assertEqual("BTCUSDT", s5["proven_protocol_issues"][0]["symbol"])
 
+    def test_range_starts_with_verified_predecessor_then_carries_checkpoint(self):
+        from unittest.mock import patch
+        import tokyo_l2_replay_qa as replay
+
+        first = 1_795_276_800
+        start_records = [{"planned_start_s": first - 900}, {"planned_start_s": first}, {"planned_start_s": first + 900}]
+        seq = [{"exchange": GATE, "symbol": "BTCUSDT", "seq": 123}]
+        report = {"status": "passed", "window_id": "test", "end_sequence_checkpoint": seq}
+        cfg = {"deployment": {"partition_minutes": 15}}
+        with patch.object(replay, "verified_candidates", return_value=start_records) as discover, \
+             patch.object(replay, "audit_window", return_value=report) as audit:
+            replay.audit_range("qa:", cfg, "batch", first, first + 900)
+        discover.assert_called_once_with("qa:", cfg, "batch", first - 900, historical=True)
+        self.assertEqual(1, audit.call_args_list[0].args[6])
+        self.assertEqual(start_records[:2], audit.call_args_list[0].kwargs["candidates"])
+        self.assertEqual(start_records[2:], audit.call_args_list[1].kwargs["candidates"])
+        self.assertEqual(seq, audit.call_args_list[1].kwargs["checkpoint"])
+
     def test_market_intervals_keep_other_streams_and_wait_for_verified_recovery(self):
         import json
         import zstandard as zstd

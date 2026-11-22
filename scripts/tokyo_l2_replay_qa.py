@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -69,7 +70,8 @@ def selected_archives(remote, config, run_id, begin, end, tmp, warmup_windows, r
         for c in candidates if c["planned_start_s"] < begin
     ]
     report["target_inputs"] = input_digests(target)
-    for i, c in enumerate(candidates):
+    def prepare(entry):
+        i, c = entry
         dest = tmp / str(i)
         dest.mkdir()
         rel = PurePosixPath(c["source_manifest"])
@@ -84,7 +86,11 @@ def selected_archives(remote, config, run_id, begin, end, tmp, warmup_windows, r
         archive._verify_three_way_index_manifest_data(
             cand=c, manifest_path=mf_path, manifest=manifest, data_path=data_path, run_id_filter=run_id,
         )
-        yield c, manifest, data_path
+        return c, manifest, data_path
+
+    # Each download has its own destination and is verified before its rows are read.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        yield from pool.map(prepare, enumerate(candidates))
 
 
 def load_btc_specs(remote: str, start_ns: int, tmp: Path) -> dict:
@@ -293,7 +299,9 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         discontinuous = exchange in previous_end and previous_end[exchange] < file_start
         audited = archive.check_partition(path, mf, config)
         structural_failure = (
-            bool(audited.get("structural_problems")) or audited.get("coverage_incomplete") is True
+            bool(audited.get("structural_problems"))
+            or (audited.get("coverage_incomplete") is True
+                and not (file_start < start_ns and audited.get("is_startup_stub") is True))
             or exchange in restrictions.get(candidate["planned_start_s"], ())
         )
         if file_start == start_ns:
@@ -775,7 +783,7 @@ def audit_range(remote, config, run_id, first, last):
     step = pm * 60
     if first % step or last % step or not first <= last < first + 96 * step:
         raise ValueError("range must contain 1–96 aligned windows")
-    candidates = verified_candidates(remote, config, run_id, first, historical=True)
+    candidates = verified_candidates(remote, config, run_id, first - step, historical=True)
     by_window = {}
     for item in candidates:
         by_window.setdefault(item["planned_start_s"], []).append(item)
@@ -783,9 +791,10 @@ def audit_range(remote, config, run_id, first, last):
     checkpoint = None
     for start in range(first, last + step, step):
         window = coverage.window_descriptor(start, pm)["window_id"]
+        context = by_window.get(start - step, []) if start == first else []
         report = audit_window(
-            remote, config, run_id, start, window, 0, 0,
-            candidates=by_window.get(start, []), checkpoint=checkpoint,
+            remote, config, run_id, start, window, 0, int(bool(context)),
+            candidates=context + by_window.get(start, []), checkpoint=checkpoint,
         )
         reports.append(report)
         checkpoint = report.get("end_sequence_checkpoint") if report["status"] != "retryable" else None

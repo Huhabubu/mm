@@ -585,6 +585,9 @@ jobs:
 
           first = windows["2026-11-22T07:45Z"]
           markets = [row for row in first["market_availability"] if row["channel"] in depth_channels]
+          print(f"First-window status={first['status']} checkpoints={len(first['end_sequence_checkpoint'])} "
+                f"warmup_markets={len(first.get('observed_snapshot_markets', []))} "
+                f"warmup_files={len(first.get('warmup_inputs', []))}")
           assert first["status"] == "passed", first["status"]
           assert len(markets) == 24 and all(has(row, "verified_usable") for row in markets), markets
           incidents = {
@@ -608,32 +611,116 @@ jobs:
                 f"continuing depth markets at 08:15 UTC={len(later['end_sequence_checkpoint'])}")
           PY
 
-      - name: Backfill verified archive batches separately
-        if: github.event_name == 'pull_request'
-        env:
-          QA_CONFIG_PATH: ${{ vars.TOKYO_L2_QA_CONFIG_PATH }}
-          PYTHONPATH: source/collector/python
-        shell: bash
-        run: |
-          set -uo pipefail
-          cfg="${QA_CONFIG_PATH:-collector/specs/config.trial_15m.json}"
-          rc=0
-          python workflow_code/scripts/tokyo_l2_replay_qa.py \
-            --remote qa: --config "source/$cfg" --run-id trial15_20261121T1400Z \
-            --window '2026-11-21T14:00Z..2026-11-22T07:15Z' --replay-seconds 0 \
-            --summary "$RUNNER_TEMP/tokyo-archive-historical-15m.json" || rc=2
-          python workflow_code/scripts/tokyo_l2_replay_qa.py \
-            --remote qa: --config "source/$cfg" --run-id legacy-60m \
-            --window '2026-11-21T08:00Z..2026-11-21T13:00Z' --replay-seconds 0 \
-            --summary "$RUNNER_TEMP/tokyo-archive-historical-60m.json" || rc=2
-          exit "$rc"
-
       - name: Upload summary only
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tokyo-l2-real-replay-summary
-          path: |
-            ${{ runner.temp }}/tokyo-replay-summary.json
-            ${{ runner.temp }}/tokyo-archive-historical-*.json
+          path: ${{ runner.temp }}/tokyo-replay-summary.json
+          if-no-files-found: warn
+
+  historical-qa:
+    if: github.event_name == 'pull_request' && github.head_ref == 'fix/tokyo-l2-market-availability'
+    needs: real-data-qa
+    name: Historical archive QA (${{ matrix.shard }})
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [binance_futures, bitget_v3, bybit_linear, gate_futures, legacy-60m]
+    steps:
+      - name: Check out replay audit
+        uses: actions/checkout@v4
+        with:
+          path: workflow_code
+          sparse-checkout: |
+            scripts/tokyo_l2_protocol_qa.py
+            scripts/tokyo_l2_replay_qa.py
+            scripts/tokyo_l2_recurring_qa.py
+            scripts/test_tokyo_l2_protocol_qa.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check out collector converter
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && 'fix/tokyo-l2-availability-converter' || inputs.source_ref || 'feat/tokyo-l2-reliability-fixes' }}
+          path: source
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install replay dependencies and test wire validators
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install hftbacktest==2.4.4 numpy numba zstandard==0.23.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          PYTHONPATH=source/collector/python python workflow_code/scripts/test_tokyo_l2_protocol_qa.py
+
+      - name: Configure read-only Google Drive access
+        env:
+          QA_SERVICE_ACCOUNT: ${{ secrets.TOKYO_L2_QA_GDRIVE_SA_JSON }}
+          QA_FOLDER_ID: ${{ secrets.TOKYO_L2_QA_GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          if [[ -z "$QA_SERVICE_ACCOUNT" ]]; then missing+=("TOKYO_L2_QA_GDRIVE_SA_JSON"); fi
+          if [[ -z "$QA_FOLDER_ID" ]]; then missing+=("TOKYO_L2_QA_GDRIVE_FOLDER_ID"); fi
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required GitHub Actions secret(s): ${missing[*]}. Configure read-only Google Drive Viewer credentials under Settings -> Secrets and variables -> Actions."
+            exit 2
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/tokyo-qa-auth"
+          printf '%s' "$QA_SERVICE_ACCOUNT" > "$RUNNER_TEMP/tokyo-qa-auth/service-account.json"
+          printf '[qa]\ntype = drive\nscope = drive.readonly\nservice_account_file = %s\nroot_folder_id = %s\n' \
+            "$RUNNER_TEMP/tokyo-qa-auth/service-account.json" "$QA_FOLDER_ID" \
+            > "$RUNNER_TEMP/tokyo-qa-auth/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" >> "$GITHUB_ENV"
+          RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsf qa:meta --max-depth 1 > /dev/null
+
+      - name: Process the historical shard chronologically
+        env:
+          QA_CONFIG_PATH: ${{ vars.TOKYO_L2_QA_CONFIG_PATH }}
+          QA_SHARD: ${{ matrix.shard }}
+          PYTHONPATH: source/collector/python
+        shell: bash
+        run: |
+          set -euo pipefail
+          cfg="${QA_CONFIG_PATH:-collector/specs/config.trial_15m.json}"
+          if [[ "$QA_SHARD" == "legacy-60m" ]]; then
+            batch=legacy-60m
+            span='2026-11-21T08:00Z..2026-11-21T13:00Z'
+          else
+            batch=trial15_20261121T1400Z
+            span='2026-11-21T14:00Z..2026-11-22T07:15Z'
+          fi
+          python - "source/$cfg" "$RUNNER_TEMP/shard-config.json" "$QA_SHARD" <<'PY'
+          import json, sys
+          from pathlib import Path
+          base, target, shard = sys.argv[1:]
+          config = json.loads(Path(base).read_text())
+          if shard != "legacy-60m":
+              for name, market in config["exchanges"].items():
+                  market["enabled"] = name == shard
+          Path(target).write_text(json.dumps(config))
+          PY
+          python workflow_code/scripts/tokyo_l2_replay_qa.py \
+            --remote qa: --config "$RUNNER_TEMP/shard-config.json" --run-id "$batch" \
+            --window "$span" --replay-seconds 0 --summary "$RUNNER_TEMP/historical-qa.json"
+
+      - name: Upload verified interval ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokyo-l2-historical-${{ matrix.shard }}
+          path: ${{ runner.temp }}/historical-qa.json
           if-no-files-found: warn
