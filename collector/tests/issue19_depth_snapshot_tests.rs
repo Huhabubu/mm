@@ -1170,6 +1170,13 @@ fn test_issue19_bybit_orderbook50_promotion_failover_and_u1_reset() {
     sel.on_depth_refresh_subscribed(ConnId::B, 1, 20);
     wall += 1_000_000;
     mono += 1_000_000;
+    let u1_reset_payload = json!({
+        "topic": "orderbook.50.BTCUSDT",
+        "type": "delta",
+        "ts": 1796256200001i64,
+        "data": {"s": "BTCUSDT", "u": 1, "seq": 10, "b": [["90000.0", "4.0"]], "a": [["90001.0", "4.0"]]}
+    })
+    .to_string();
     let u1_reset = sel.on_frame(raw_frame(
         ExchangeId::BybitLinear,
         EndpointKind::BybitPublic,
@@ -1177,7 +1184,7 @@ fn test_issue19_bybit_orderbook50_promotion_failover_and_u1_reset() {
         1,
         wall,
         mono,
-        bybit_delta("BTCUSDT", 1, 90000.0, "4.0"),
+        u1_reset_payload,
     ));
     assert!(u1_reset.records.iter().any(|r| r.payload.contains("\"DEPTH_RECOVERED\"")));
     archive.extend(u1_reset.records);
@@ -2812,4 +2819,187 @@ fn test_issue19_standby_sequence_break_never_interrupts_healthy_primary_across_e
         assert_eq!(audit.depth_deltas.get("BTCUSDT").copied().unwrap_or(0), 4);
     }
 }
+
+#[test]
+fn test_issue19_invalid_snapshot_missing_levels_never_recovers_wait_state() {
+    // 1. Gate: planned rotation A -> B; malformed full=true on B (missing b/a, empty b/a,
+    //    numeric size, or crossed book) MUST NOT recover wait state or allow following delta!
+    {
+        let mut sel = CausalSelector::new(EndpointKind::GatePublic, vec!["BTC_USDT".to_string()], 3, 5);
+        let mut archive: Vec<CanonicalRecord> = Vec::new();
+        let mut wall = 1_796_258_000_000_000_000i64;
+        let mut mono = 1_000_000u64;
+        let px = 90000.0;
+
+        for conn in [ConnId::A, ConnId::B] {
+            wall += 1_000_000;
+            mono += 1_000_000;
+            archive.extend(
+                sel.on_frame(raw_frame(
+                    ExchangeId::GateFutures,
+                    EndpointKind::GatePublic,
+                    conn,
+                    1,
+                    wall,
+                    mono,
+                    gate_snapshot_frame("BTC_USDT", 100, px),
+                ))
+                .records,
+            );
+        }
+        assert_eq!(sel.primary(), ConnId::A);
+
+        // Planned rotation A -> B (now B is primary waiting for fresh snapshot)
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let rot = sel.on_planned_rotation(ConnId::A, wall, mono);
+        assert_eq!(sel.primary(), ConnId::B);
+        archive.extend(rot.records);
+
+        // Reconnect A to standby cleanly? Leave A disconnected so B stays primary while testing B rejection
+        let _ = sel.on_disconnect(ConnId::A, wall + 500_000, mono + 500_000, "planned_drain");
+
+        let invalid_snaps = [
+            // Missing both b and a
+            json!({"channel": "futures.obu", "event": "update", "result": {"t": 1796258000200i64, "full": true, "s": "ob.BTC_USDT.50", "u": 200}}).to_string(),
+            // Empty b and a arrays
+            json!({"channel": "futures.obu", "event": "update", "result": {"t": 1796258000201i64, "full": true, "s": "ob.BTC_USDT.50", "u": 201, "b": [], "a": []}}).to_string(),
+            // Non-string Gate size
+            json!({"channel": "futures.obu", "event": "update", "result": {"t": 1796258000202i64, "full": true, "s": "ob.BTC_USDT.50", "u": 202, "b": [["90000.00", 2.0]], "a": [["90001.00", "2.0"]]}}).to_string(),
+            // Crossed snapshot book
+            json!({"channel": "futures.obu", "event": "update", "result": {"t": 1796258000203i64, "full": true, "s": "ob.BTC_USDT.50", "u": 203, "b": [["90002.00", "2.0"]], "a": [["90001.00", "2.0"]]}}).to_string(),
+        ];
+
+        for (idx, bad_snap) in invalid_snaps.iter().enumerate() {
+            wall += 1_000_000;
+            mono += 1_000_000;
+            let out = sel.on_frame(raw_frame(
+                ExchangeId::GateFutures,
+                EndpointKind::GatePublic,
+                ConnId::B,
+                1,
+                wall,
+                mono,
+                bad_snap.clone(),
+            ));
+            assert!(
+                !out.records.iter().any(|r| r.kind == RecordKind::Data),
+                "invalid Gate snapshot #{idx} must never write DATA to archive"
+            );
+            assert!(
+                !out.records.iter().any(|r| r.payload.contains("\"DEPTH_RECOVERED\"")),
+                "invalid Gate snapshot #{idx} must never emit DEPTH_RECOVERED"
+            );
+
+            // Contiguous delta after invalid snapshot MUST also be rejected!
+            wall += 1_000_000;
+            mono += 1_000_000;
+            let d_out = sel.on_frame(raw_frame(
+                ExchangeId::GateFutures,
+                EndpointKind::GatePublic,
+                ConnId::B,
+                1,
+                wall,
+                mono,
+                gate_delta_frame("BTC_USDT", 201 + idx as u64, 201 + idx as u64, px, "2.5"),
+            ));
+            assert!(
+                !d_out.records.iter().any(|r| r.kind == RecordKind::Data),
+                "delta after invalid Gate snapshot #{idx} must never write DATA"
+            );
+        }
+
+        // Finally, a valid full=true snapshot with proper decimal-string b/a recovers cleanly!
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let ok_snap = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            gate_snapshot_frame("BTC_USDT", 300, px),
+        ));
+        assert!(ok_snap.records.iter().any(|r| r.kind == RecordKind::Data));
+        assert!(ok_snap.records.iter().any(|r| r.payload.contains("\"DEPTH_RECOVERED\"") || r.payload.contains("\"GAP_END\"")));
+        archive.extend(ok_snap.records);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let ok_delta = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            gate_delta_frame("BTC_USDT", 301, 301, px, "3.0"),
+        ));
+        assert_eq!(ok_delta.records.len(), 1);
+        assert_eq!(ok_delta.records[0].kind, RecordKind::Data);
+        archive.extend(ok_delta.records);
+
+        let _ = verify_gate_records_strict(&archive, &["BTC_USDT"]);
+    }
+
+    // 2. Bybit & Bitget: snapshot missing b/a MUST NOT transition to Live or emit DEPTH_RECOVERED
+    {
+        let mut bybit = CausalSelector::new(EndpointKind::BybitPublic, vec!["BTCUSDT".to_string()], 3, 5);
+        let bad_bybit = json!({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "ts": 1796258100000i64, "data": {"s": "BTCUSDT", "u": 100}}).to_string();
+        let out = bybit.on_frame(raw_frame(
+            ExchangeId::BybitLinear,
+            EndpointKind::BybitPublic,
+            ConnId::A,
+            1,
+            1_796_258_100_000_000_000,
+            1_000_000,
+            bad_bybit,
+        ));
+        assert!(!out.records.iter().any(|r| r.kind == RecordKind::Data));
+        assert_ne!(bybit.conn_state(ConnId::A), ConnState::Live);
+
+        let mut bitget = CausalSelector::new(EndpointKind::BitgetPublic, vec!["BTCUSDT".to_string()], 3, 5);
+        let bad_bitget = json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 100, "pseq": 0}]}).to_string();
+        let out_bg = bitget.on_frame(raw_frame(
+            ExchangeId::BitgetV3,
+            EndpointKind::BitgetPublic,
+            ConnId::A,
+            1,
+            1_796_258_200_000_000_000,
+            1_000_000,
+            bad_bitget,
+        ));
+        assert!(!out_bg.records.iter().any(|r| r.kind == RecordKind::Data));
+        assert_ne!(bitget.conn_state(ConnId::A), ConnState::Live);
+    }
+
+    // 3. Binance: REST snapshot missing bids/asks MUST trigger SNAPSHOT_BRIDGE_RETRY and never anchor
+    {
+        let mut bin = CausalSelector::new(EndpointKind::BinancePublic, vec!["BTCUSDT".to_string()], 3, 5);
+        let wall = 1_796_258_300_000_000_000i64;
+        let mono = 1_000_000u64;
+        let delta = json!({
+            "stream": "btcusdt@depth@100ms",
+            "data": {"e": "depthUpdate", "s": "BTCUSDT", "U": 100, "u": 104, "pu": 99, "b": [["90000.00", "2.0"]], "a": [["90001.00", "2.0"]]}
+        })
+        .to_string();
+        let _ = bin.on_frame(raw_frame(
+            ExchangeId::BinanceFutures,
+            EndpointKind::BinancePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            delta,
+        ));
+        let bad_rest = json!({"lastUpdateId": 102}).to_string();
+        let out = bin.on_rest_snapshot(ConnId::A, "BTCUSDT", 102, &bad_rest, wall + 1_000_000, mono + 1_000_000);
+        assert!(out.snapshot_bridge_failed.is_some());
+        assert!(out.records.iter().any(|r| r.payload.contains("\"SNAPSHOT_BRIDGE_RETRY\"")));
+        assert!(!out.records.iter().any(|r| r.payload.contains("\"REST_SNAPSHOT_ANCHOR\"")));
+        assert_ne!(bin.conn_state(ConnId::A), ConnState::Live);
+    }
+}
+
 

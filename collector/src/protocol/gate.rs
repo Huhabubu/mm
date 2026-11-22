@@ -102,27 +102,6 @@ impl GateValidator {
         }
     }
 
-    fn validate_obu_levels(levels: Option<&Value>) -> Result<(), String> {
-        let Some(arr) = levels.and_then(Value::as_array) else {
-            return Ok(());
-        };
-        for lvl in arr {
-            let pair = lvl
-                .as_array()
-                .ok_or_else(|| "gate obu level is not [price, size] array".to_string())?;
-            if pair.len() < 2 {
-                return Err("gate obu level has fewer than 2 entries".to_string());
-            }
-            if !Self::check_decimal_size_string(&pair[1]) {
-                return Err(format!(
-                    "gate obu size is not a decimal string (X-Gate-Size-Decimal: 1 missing or ignored?): {}",
-                    pair[1]
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn track_trade_id(&mut self, contract: &str, trade_id: u64) -> bool {
         let q = self.seen_trade_ids.entry(contract.to_string()).or_default();
         let set = self.seen_trade_set.entry(contract.to_string()).or_default();
@@ -165,9 +144,21 @@ impl GateValidator {
             }
         };
 
-        if let Err(e) = Self::validate_obu_levels(result.get("b"))
-            .and_then(|_| Self::validate_obu_levels(result.get("a")))
-        {
+        let is_full = result.get("full").and_then(Value::as_bool).unwrap_or(false);
+        if let Err(e) = crate::protocol::validate_book_sides(
+            result.get("b"),
+            result.get("a"),
+            is_full,
+            is_full,
+            true,
+            if is_full { "gate futures.obu snapshot" } else { "gate futures.obu" },
+        ) {
+            let st = self
+                .obu_states
+                .entry(sym.clone())
+                .or_insert_with(GateObuState::new);
+            st.state = ConnState::Invalid;
+            st.prev_u = None;
             self.overall_invalid = true;
             return FrameVerdict::Violation {
                 symbol: Some(sym),
@@ -189,7 +180,6 @@ impl GateValidator {
                 };
             }
         };
-        let is_full = result.get("full").and_then(Value::as_bool).unwrap_or(false);
         let st = self
             .obu_states
             .entry(sym.clone())

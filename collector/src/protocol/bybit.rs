@@ -128,6 +128,36 @@ impl BybitValidator {
             }
         };
 
+        let is_snapshot = msg_type == "snapshot" || u == 1;
+        if let Err(e) = crate::protocol::validate_book_sides(
+            data.get("b"),
+            data.get("a"),
+            is_snapshot,
+            is_snapshot,
+            false,
+            if is_snapshot {
+                "bybit orderbook snapshot"
+            } else {
+                "bybit orderbook delta"
+            },
+        ) {
+            let map = if is_l1 {
+                &mut self.book1_states
+            } else {
+                &mut self.book50_states
+            };
+            let st = map.entry(sym.clone()).or_insert_with(BybitBookState::new);
+            st.state = ConnState::Invalid;
+            st.prev_u = None;
+            self.overall_invalid = true;
+            return FrameVerdict::Violation {
+                symbol: Some(sym),
+                reason: e,
+                needs_resubscribe: true,
+                needs_snapshot_refetch: false,
+            };
+        }
+
         let map = if is_l1 {
             &mut self.book1_states
         } else {
@@ -138,7 +168,7 @@ impl BybitValidator {
 
         // Bybit spec: type == "snapshot" OR u == 1 (service restart) MUST full-reset local book.
         // Also for orderbook.1, 3s silence re-pushes snapshot with identical u.
-        if msg_type == "snapshot" || u == 1 {
+        if is_snapshot {
             let diag = if u == 1 && st.prev_u.is_some() {
                 Some("bybit_server_restart_u_eq_1_reset".to_string())
             } else if is_l1 && st.prev_u == Some(u) {

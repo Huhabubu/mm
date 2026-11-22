@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -145,12 +146,102 @@ def _safe_window_filename(window_id: str) -> str:
     return window_id.replace(":", "").replace("/", "_").replace(" ", "_")
 
 
+def _validate_depth_side(
+    raw_levels: Any,
+    *,
+    required: bool,
+    require_non_empty: bool,
+    require_string_size: bool,
+    is_bid: bool,
+    label: str,
+) -> tuple[bool, float | None, str | None]:
+    if raw_levels is None:
+        if required:
+            return False, None, f"{label} array missing"
+        return True, None, None
+    if not isinstance(raw_levels, list):
+        return False, None, f"{label} is not a list"
+    positive_count = 0
+    best_px: float | None = None
+    for lvl in raw_levels:
+        if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
+            return False, None, f"{label} level is not a [price, size] pair"
+        raw_px, raw_qty = lvl[0], lvl[1]
+        if isinstance(raw_px, bool):
+            return False, None, f"{label} price is boolean"
+        try:
+            px = float(raw_px)
+        except (TypeError, ValueError):
+            return False, None, f"{label} price is not numeric: {raw_px!r}"
+        if not math.isfinite(px) or px <= 0.0:
+            return False, None, f"{label} price must be finite positive: {raw_px!r}"
+        if require_string_size:
+            if not isinstance(raw_qty, str) or not raw_qty.strip():
+                return False, None, f"{label} size must be a decimal string: {raw_qty!r}"
+            try:
+                qty = float(raw_qty)
+            except ValueError:
+                return False, None, f"{label} size is not numeric string: {raw_qty!r}"
+        else:
+            if isinstance(raw_qty, bool):
+                return False, None, f"{label} size is boolean"
+            try:
+                qty = float(raw_qty)
+            except (TypeError, ValueError):
+                return False, None, f"{label} size is not numeric: {raw_qty!r}"
+        if not math.isfinite(qty) or qty < 0.0:
+            return False, None, f"{label} size must be finite non-negative: {raw_qty!r}"
+        if qty > 0.0:
+            positive_count += 1
+            if best_px is None:
+                best_px = px
+            else:
+                best_px = max(best_px, px) if is_bid else min(best_px, px)
+    if require_non_empty and positive_count == 0:
+        return False, None, f"{label} snapshot has no positive-size levels"
+    return True, best_px, None
+
+
+def _validate_depth_book_sides(
+    bids: Any,
+    asks: Any,
+    *,
+    required: bool,
+    require_non_empty: bool,
+    require_string_size: bool,
+    ctx: str,
+) -> str | None:
+    ok_b, best_bid, err_b = _validate_depth_side(
+        bids,
+        required=required,
+        require_non_empty=require_non_empty,
+        require_string_size=require_string_size,
+        is_bid=True,
+        label=f"{ctx} bids",
+    )
+    if not ok_b:
+        return err_b
+    ok_a, best_ask, err_a = _validate_depth_side(
+        asks,
+        required=required,
+        require_non_empty=require_non_empty,
+        require_string_size=require_string_size,
+        is_bid=False,
+        label=f"{ctx} asks",
+    )
+    if not ok_a:
+        return err_a
+    if required and best_bid is not None and best_ask is not None and best_bid >= best_ask:
+        return f"{ctx} snapshot book is crossed (best_bid={best_bid} >= best_ask={best_ask})"
+    return None
+
+
 def _parse_depth_chain_frame(
     exchange: str,
     kind: str,
     payload: Any,
-) -> tuple[str, bool, int, int | None, int | None] | None:
-    """Return (symbol, is_snapshot, seq, parent_seq, first_u) for sequence-bearing depth events."""
+) -> tuple[str, bool, int, int | None, int | None, str | None] | None:
+    """Return (symbol, is_snapshot, seq, parent_seq, first_u, payload_error) for sequence-bearing depth events."""
     if not isinstance(payload, dict):
         return None
     if exchange == "gate_futures":
@@ -167,7 +258,15 @@ def _parse_depth_chain_frame(
         is_snap = bool(res.get("full", False))
         seq = int(res["u"])
         parent = None if is_snap else (int(res["U"]) if res.get("U") is not None else None)
-        return (sym, is_snap, seq, parent, None)
+        payload_err = _validate_depth_book_sides(
+            res.get("b"),
+            res.get("a"),
+            required=is_snap,
+            require_non_empty=is_snap,
+            require_string_size=True,
+            ctx="gate futures.obu",
+        )
+        return (sym, is_snap, seq, parent, None, payload_err)
     if exchange == "bybit_linear":
         if kind == "META":
             return None
@@ -180,7 +279,15 @@ def _parse_depth_chain_frame(
         sym = str(data.get("s") or topic.split(".")[-1]).upper()
         seq = int(data["u"])
         is_snap = payload.get("type") == "snapshot" or seq == 1
-        return (sym, is_snap, seq, None, None)
+        payload_err = _validate_depth_book_sides(
+            data.get("b"),
+            data.get("a"),
+            required=is_snap,
+            require_non_empty=is_snap,
+            require_string_size=False,
+            ctx="bybit orderbook.50",
+        )
+        return (sym, is_snap, seq, None, None, payload_err)
     if exchange == "bitget_v3":
         if kind == "META":
             return None
@@ -201,19 +308,40 @@ def _parse_depth_chain_frame(
         is_snap = action == "snapshot"
         seq = int(item["seq"])
         parent = None if is_snap else (int(item["pseq"]) if item.get("pseq") is not None else None)
-        return (sym, is_snap, seq, parent, None)
+        bids = item["b"] if "b" in item else item.get("bids")
+        asks = item["a"] if "a" in item else item.get("asks")
+        payload_err = _validate_depth_book_sides(
+            bids,
+            asks,
+            required=is_snap,
+            require_non_empty=is_snap,
+            require_string_size=False,
+            ctx="bitget books50",
+        )
+        return (sym, is_snap, seq, parent, None, payload_err)
     if exchange == "binance_futures":
         if kind == "META":
             ev = payload.get("event")
             if ev in ("REST_SNAPSHOT_ANCHOR", "REST_SNAPSHOT"):
-                snap = payload.get("snapshot") or payload.get("raw")
+                snap = payload.get("snapshot") if "snapshot" in payload else payload.get("raw")
                 snap_id = payload.get("lastUpdateId")
                 if snap_id is None and isinstance(snap, dict):
                     snap_id = snap.get("lastUpdateId")
                 if snap_id is None:
                     return None
                 sym = str(payload.get("symbol") or "").upper()
-                return (sym, True, int(snap_id), None, None)
+                if not isinstance(snap, dict):
+                    payload_err: str | None = "binance REST snapshot missing snapshot object"
+                else:
+                    payload_err = _validate_depth_book_sides(
+                        snap.get("bids"),
+                        snap.get("asks"),
+                        required=True,
+                        require_non_empty=True,
+                        require_string_size=False,
+                        ctx="binance REST snapshot",
+                    )
+                return (sym, True, int(snap_id), None, None, payload_err)
             if ev == "DEPTH_BRIDGED_DELTA":
                 raw_obj = payload.get("raw")
                 if isinstance(raw_obj, str):
@@ -224,12 +352,21 @@ def _parse_depth_chain_frame(
                 if data.get("u") is None or data.get("U") is None:
                     return None
                 sym = str(payload.get("symbol") or data.get("s") or "").upper()
+                payload_err = _validate_depth_book_sides(
+                    data.get("b"),
+                    data.get("a"),
+                    required=False,
+                    require_non_empty=False,
+                    require_string_size=False,
+                    ctx="binance bridged delta",
+                )
                 return (
                     sym,
                     False,
                     int(data["u"]),
                     int(data["pu"]) if data.get("pu") is not None else None,
                     int(data["U"]),
+                    payload_err,
                 )
             return None
         stream = str(payload.get("stream") or "")
@@ -239,12 +376,21 @@ def _parse_depth_chain_frame(
         if data.get("u") is None or data.get("U") is None:
             return None
         sym = str(data.get("s") or "").upper()
+        payload_err = _validate_depth_book_sides(
+            data.get("b"),
+            data.get("a"),
+            required=False,
+            require_non_empty=False,
+            require_string_size=False,
+            ctx="binance depthUpdate",
+        )
         return (
             sym,
             False,
             int(data["u"]),
             int(data["pu"]) if data.get("pu") is not None else None,
             int(data["U"]),
+            payload_err,
         )
     return None
 
@@ -441,7 +587,7 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
 
                     depth_evt = _parse_depth_chain_frame(exchange, kind, payload)
                     if depth_evt is not None:
-                        d_sym, is_snap, d_seq, d_parent, d_first_u = depth_evt
+                        d_sym, is_snap, d_seq, d_parent, d_first_u, payload_err = depth_evt
                         if kind == "META" and isinstance(payload, dict):
                             ev_conn = str(payload.get("conn_id") or conn)
                             ev_epoch = (
@@ -453,7 +599,17 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                         else:
                             ev_conn, ev_epoch, ev_wall = conn, epoch_i, wall_ns
 
-                        if is_snap:
+                        if payload_err is not None:
+                            depth_anchors.pop(d_sym, None)
+                            if d_sym in open_planned_depth_waits:
+                                w = open_planned_depth_waits[d_sym]
+                                w["snapshot_seen"] = False
+                                w["end_wall_ns"] = None
+                                w["delta_ok"] = False
+                            problems.append(
+                                f"line {n}: invalid depth {'snapshot' if is_snap else 'delta'} for {d_sym}: {payload_err}"
+                            )
+                        elif is_snap:
                             depth_anchors[d_sym] = {
                                 "conn_id": ev_conn,
                                 "epoch": ev_epoch,

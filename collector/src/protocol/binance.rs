@@ -188,6 +188,23 @@ impl BinanceValidator {
             }
         };
 
+        if let Err(e) = crate::protocol::validate_book_sides(
+            data.get("b"),
+            data.get("a"),
+            false,
+            false,
+            false,
+            "binance depthUpdate",
+        ) {
+            self.overall_invalid = true;
+            return FrameVerdict::Violation {
+                symbol: Some(sym),
+                reason: e,
+                needs_resubscribe: false,
+                needs_snapshot_refetch: true,
+            };
+        }
+
         let buffered_frame = BufferedDepthFrame {
             first_u,
             last_u,

@@ -690,6 +690,38 @@ def test_issue19_replay_fixture_pr18_protocol_qa_equivalence_and_hourly_qa(tmp_p
     assert res_plan_broken_delta["qa_status"] == "failed"
     assert res_plan_broken_delta["depth_unavailable_events"] >= 1
 
+    # Invalid B-line snapshots (missing b/a, empty b/a, numeric size, crossed book) MUST NEVER recover
+    # planned rotation even when followed by a contiguous delta and DEPTH_RECOVERED META!
+    for label, bad_result in [
+        ("missing_ba", {"full": True, "s": "ob.BTC_USDT.50", "u": 200}),
+        ("empty_ba", {"full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [], "a": []}),
+        ("numeric_size", {"full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90000.0", 2.0]], "a": [["90001.0", "2.0"]]}),
+        ("crossed", {"full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90002.0", "2.0"]], "a": [["90001.0", "2.0"]]}),
+    ]:
+        dp_bad_snap, _, mf_bad_snap = _write_custom_15m_partition(
+            tmp_path / "qa_p",
+            exchange="gate_futures",
+            window_start_s=w0_s,
+            boot_id=f"qa_p_bad_{label}",
+            run_id="r",
+            rows=[
+                (t0 + 1_000_000, 100, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "1", "a": "90001.0", "A": "1"}}),
+                (t0 + 2_000_000, 200, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "1"]], "a": [["90001.0", "1"]]}}),
+                (t0 + 3_000_000, 300, "A", 1, 3, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 1, "size": "1", "price": "90000.0"}]}),
+                (t0 + 10_000_000, 1000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+                (t0 + 11_000_000, 1100, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation"}),
+                (t0 + 50_000_000, 5000, "B", 1, 6, "DATA", {"channel": "futures.obu", "event": "update", "result": bad_result}),
+                (t0 + 60_000_000, 6000, "B", 1, 7, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": False, "s": "ob.BTC_USDT.50", "U": 201, "u": 201, "b": [["90000.0", "2.5"]], "a": []}}),
+                (t0 + 61_000_000, 6100, "B", 1, 8, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+            ],
+            segment_suffix=f"planned_bad_{label}",
+        )
+        res_bad_snap = hqa.check_partition(dp_bad_snap, mf_bad_snap, qa_cfg)
+        assert res_bad_snap["qa_status"] == "failed", (label, res_bad_snap)
+        assert res_bad_snap["depth_unavailable_events"] >= 1, (label, res_bad_snap)
+        assert any("invalid depth snapshot" in p for p in res_bad_snap["problems"]), (label, res_bad_snap["problems"])
+        assert all(not iv["recovered"] for iv in res_bad_snap["planned_depth_unavailable_intervals"]), (label, res_bad_snap)
+
     # Genuine planned rotation with on-disk B-line snapshot AND continuous B-line delta passes while preserving depth gap interval!
     dp_plan, _, mf_plan = _write_custom_15m_partition(
         tmp_path / "qa_p",
@@ -855,4 +887,145 @@ def test_issue19_qa_convert_same_day_restart_boot_id_isolation(tmp_path: Path):
         row = good_cal[sym]
         assert row["eligibility_status"] == "eligible", row
         assert row["depth_rebuild_status"] == "ok", row
+
+
+def test_issue19_qa_convert_unrecovered_planned_rotation_blocks_and_gap_clears_stale_book_in_hbt_replay(tmp_path: Path):
+    """Verify both backtest-converter guarantees for planned rotation:
+    1) Unrecovered planned rotation (no B snapshot, META-only DEPTH_RECOVERED, or invalid B snapshot missing b/a)
+       blocks admission (`execution_unverified`, `depth_unavailable_unrecovered`) and omits depth .npz files.
+    2) Recovered planned rotation emits DEPTH_CLEAR_EVENT at cutover so HFTBacktest 2.4.4 replay sees an empty book
+       inside the gap and NEVER fills orders against stale pre-switch A-line depth.
+    """
+    import math
+    import numpy as np
+    from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest, GTC, LIMIT
+
+    w0_s = int(datetime(2026, 11, 21, 14, 0, tzinfo=timezone.utc).timestamp())
+    t0 = w0_s * 1_000_000_000
+    t0_ms = w0_s * 1000
+
+    # --- 1. Unrecovered planned rotations MUST block admission and never export depth .npz ---
+    for case_name, trailing_rows in [
+        ("no_b_snapshot", []),
+        (
+            "meta_only_recovered",
+            [
+                (t0 + 2_500_000_000, 2500, "B", 1, 7, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+            ],
+        ),
+        (
+            "invalid_b_snapshot_missing_ba",
+            [
+                (t0 + 2_500_000_000, 2500, "B", 1, 7, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 2500, "full": True, "s": "ob.BTC_USDT.50", "u": 200}}),
+                (t0 + 2_600_000_000, 2600, "B", 1, 8, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+            ],
+        ),
+    ]:
+        root = tmp_path / f"unrec_{case_name}"
+        rows = [
+            (t0 + 1_000_000_000, 1000, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "5", "a": "90001.0", "A": "5"}}),
+            (t0 + 1_000_000_000, 1001, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 1000, "full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "10.0"]], "a": [["90001.0", "10.0"]]}}),
+            (t0 + 1_100_000_000, 1100, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 1100, "full": False, "s": "ob.BTC_USDT.50", "U": 101, "u": 101, "b": [["90000.0", "11.0"]], "a": []}}),
+            (t0 + 2_000_000_000, 2000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+            (t0 + 2_000_000_000, 2001, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation", "conn_id": "B", "epoch": 1}),
+            (t0 + 2_200_000_000, 2200, "B", 1, 6, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90010.0", "B": "5", "a": "90011.0", "A": "5"}}),
+            *trailing_rows,
+        ]
+        _write_custom_15m_partition(root, exchange="gate_futures", window_start_s=w0_s, boot_id=f"boot_{case_name}", run_id="r", rows=rows, segment_suffix=case_name)
+        summary = run_qa_convert(root, tmp_path / f"out_{case_name}", allow_unverified_local=True)
+        assert summary["status"] == "ok"
+        assert summary["eligible_asset_days"] == 0, (case_name, summary)
+        assert summary["execution_unverified_asset_days"] == 1, (case_name, summary)
+        cal = json.loads(Path(summary["calendar_path"]).read_text(encoding="utf-8"))
+        assert len(cal) == 1
+        row = cal[0]
+        assert row["eligibility_status"] == "execution_unverified", (case_name, row)
+        assert row["depth_rebuild_status"] == "unrebuildable_excluded", (case_name, row)
+        assert "depth_unavailable_unrecovered" in row["unverified_reasons"], (case_name, row)
+        assert "follower_l2_hbt" not in row["files"], (case_name, row)
+        assert "follower_l2_edges" not in row["files"], (case_name, row)
+        assert "follower_l1_bbo" in row["files"], (case_name, row)
+
+    # Also verify Binance unrecovered planned rotation blocks admission and omits binance_depth_diag!
+    bin_root = tmp_path / "unrec_binance"
+    bin_rows = [
+        (t0 + 1_000_000_000, 1000, "A", 1, 1, "DATA", {"stream": "btcusdt@bookTicker", "data": {"e": "bookTicker", "u": 10, "s": "BTCUSDT", "b": "90000.0", "B": "5", "a": "90001.0", "A": "5"}}),
+        (t0 + 1_000_000_000, 1001, "A", 1, 2, "META", {"event": "REST_SNAPSHOT_ANCHOR", "endpoint": "binance_public", "conn_id": "A", "epoch": 1, "symbol": "BTCUSDT", "snapshot": {"lastUpdateId": 102, "bids": [["90000.0", "10.0"]], "asks": [["90001.0", "10.0"]]}}),
+        (t0 + 1_100_000_000, 1100, "A", 1, 3, "META", {"event": "DEPTH_BRIDGED_DELTA", "endpoint": "binance_public", "conn_id": "A", "epoch": 1, "symbol": "BTCUSDT", "U": 100, "u": 104, "pu": 99, "raw": json.dumps({"stream": "btcusdt@depth@100ms", "data": {"e": "depthUpdate", "s": "BTCUSDT", "U": 100, "u": 104, "pu": 99, "b": [["90000.0", "11.0"]], "a": []}})}),
+        (t0 + 2_000_000_000, 2000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+        (t0 + 2_000_000_000, 2001, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTCUSDT", "planned": True, "reason": "planned_rotation", "conn_id": "B", "epoch": 1}),
+    ]
+    _write_custom_15m_partition(bin_root, exchange="binance_futures", window_start_s=w0_s, boot_id="boot_bin_unrec", run_id="r", rows=bin_rows, segment_suffix="bin_unrec")
+    bin_summary = run_qa_convert(bin_root, tmp_path / "out_bin_unrec", allow_unverified_local=True)
+    assert bin_summary["eligible_asset_days"] == 0
+    assert bin_summary["execution_unverified_asset_days"] == 1
+    bin_row = json.loads(Path(bin_summary["calendar_path"]).read_text(encoding="utf-8"))[0]
+    assert bin_row["eligibility_status"] == "execution_unverified"
+    assert "depth_unavailable_unrecovered" in bin_row["unverified_reasons"]
+    assert "binance_depth_diag" not in bin_row["files"]
+
+    # --- 2. Recovered planned rotation MUST clear stale A-line book during gap in HFTBacktest 2.4.4 replay ---
+    rec_root = tmp_path / "rec_planned_replay"
+    rec_rows = [
+        (t0 + 1_000_000_000, 1000, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "5", "a": "90001.0", "A": "5"}}),
+        (t0 + 1_000_000_000, 1001, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 1000, "full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "10.0"]], "a": [["90001.0", "10.0"]]}}),
+        (t0 + 1_100_000_000, 1100, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 1100, "full": False, "s": "ob.BTC_USDT.50", "U": 101, "u": 101, "b": [["90000.0", "12.0"]], "a": []}}),
+        # Planned rotation cutover at t0 + 2.0s: stale A-line book (90000 / 90001) MUST be cleared!
+        (t0 + 2_000_000_000, 2000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+        (t0 + 2_000_000_000, 2001, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation", "conn_id": "B", "epoch": 1}),
+        # Fresh B-line snapshot arrives at t0 + 4.0s at shifted prices (90050 / 90051) + continuous delta
+        (t0 + 4_000_000_000, 4000, "B", 1, 6, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 4000, "full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90050.0", "10.0"]], "a": [["90051.0", "10.0"]]}}),
+        (t0 + 4_001_000_000, 4001, "B", 1, 7, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+        (t0 + 4_100_000_000, 4100, "B", 1, 8, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 4100, "full": False, "s": "ob.BTC_USDT.50", "U": 201, "u": 201, "b": [["90050.0", "11.0"]], "a": []}}),
+    ]
+    _write_custom_15m_partition(rec_root, exchange="gate_futures", window_start_s=w0_s, boot_id="boot_rec_replay", run_id="r", rows=rec_rows, segment_suffix="rec")
+    rec_summary = run_qa_convert(rec_root, tmp_path / "out_rec_replay", allow_unverified_local=True)
+    assert rec_summary["status"] == "ok"
+    assert rec_summary["eligible_asset_days"] == 1, rec_summary
+    rec_row = json.loads(Path(rec_summary["calendar_path"]).read_text(encoding="utf-8"))[0]
+    assert rec_row["eligibility_status"] == "eligible", rec_row
+    assert rec_row["depth_rebuild_status"] == "ok", rec_row
+    l2_path = Path(rec_row["files"]["follower_l2_hbt"])
+    assert l2_path.is_file()
+
+    data = np.load(l2_path)["data"]
+    asset = (
+        BacktestAsset()
+        .data([data])
+        .linear_asset(1.0)
+        .constant_order_latency(1_000_000, 1_000_000)
+        .risk_adverse_queue_model()
+        .no_partial_fill_exchange()
+        .trading_value_fee_model(0.0, 0.0)
+        .tick_size(0.1)
+        .lot_size(1.0)
+        .roi_lb(89900.0)
+        .roi_ub(90200.0)
+    )
+    hbt = ROIVectorMarketDepthBacktest([asset])
+
+    # Pre-rotation (t0 + 1.5s): A-line book is active
+    hbt.elapse(500_000_000)
+    assert hbt.depth(0).best_bid == 90000.0
+    assert hbt.depth(0).best_ask == 90001.0
+
+    # Inside planned rotation gap (t0 + 2.5s): book MUST be empty (cleared), NOT stale 90000/90001!
+    hbt.elapse(1_000_000_000)
+    assert math.isnan(hbt.depth(0).best_bid), f"stale pre-switch bid leaked into gap: {hbt.depth(0).best_bid}"
+    assert math.isnan(hbt.depth(0).best_ask), f"stale pre-switch ask leaked into gap: {hbt.depth(0).best_ask}"
+
+    # Aggressive buy at stale A-line ask (90001.0) during gap MUST NOT fill!
+    hbt.submit_buy_order(0, 1, 90001.0, 1.0, GTC, LIMIT, False)
+    hbt.elapse(500_000_000)  # t0 + 3.0s
+    assert hbt.position(0) == 0.0, f"order filled against stale pre-switch book during gap: pos={hbt.position(0)}"
+    hbt.cancel(0, 1, False)
+
+    # Post-recovery (t0 + 4.5s): fresh B-line book (90050 / 90051) is active and matches normally!
+    hbt.elapse(1_500_000_000)
+    assert hbt.depth(0).best_bid == 90050.0
+    assert hbt.depth(0).best_ask == 90051.0
+    hbt.submit_buy_order(0, 2, 90051.0, 1.0, GTC, LIMIT, False)
+    hbt.elapse(100_000_000)
+    assert hbt.position(0) == 1.0
+
 

@@ -143,6 +143,39 @@ impl BitgetValidator {
         };
         let pseq = Self::parse_u64_flex(item.get("pseq"));
 
+        let is_snapshot = action == "snapshot";
+        let bids = item.get("b").or_else(|| item.get("bids"));
+        let asks = item.get("a").or_else(|| item.get("asks"));
+        if let Err(e) = crate::protocol::validate_book_sides(
+            bids,
+            asks,
+            is_snapshot,
+            is_snapshot,
+            false,
+            if is_snapshot {
+                "bitget book snapshot"
+            } else {
+                "bitget book update"
+            },
+        ) {
+            let map = if topic == "books1" {
+                &mut self.books1_states
+            } else {
+                &mut self.books50_states
+            };
+            let st = map.entry(sym.clone()).or_insert_with(BitgetBookState::new);
+            st.state = ConnState::Invalid;
+            st.prev_seq = None;
+            st.seq_snapshot = None;
+            self.overall_invalid = true;
+            return FrameVerdict::Violation {
+                symbol: Some(sym),
+                reason: e,
+                needs_resubscribe: true,
+                needs_snapshot_refetch: false,
+            };
+        }
+
         let map = if topic == "books1" {
             &mut self.books1_states
         } else {
@@ -152,7 +185,7 @@ impl BitgetValidator {
 
         // Dynamic per-frame action branching: supports both pre-2026-12-01 (all snapshot)
         // and post-2026-12-01 (initial snapshot + incremental update with pseq/seq).
-        if action == "snapshot" {
+        if is_snapshot {
             st.seq_snapshot = Some(seq);
             st.prev_seq = Some(seq);
             st.awaiting_first_delta = true;

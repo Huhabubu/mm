@@ -2192,9 +2192,23 @@ impl DepthRefresh {
                         return Err("Gate rejected depth resubscribe".into());
                     } else if frame.pointer("/result/full").and_then(|v| v.as_bool()) == Some(true)
                     {
-                        if let Some(stream) = frame.pointer("/result/s").and_then(|v| v.as_str()) {
-                            if let Some(sym) = Self::parse_gate_obu_symbol(stream) {
-                                self.awaiting_snapshot.remove(&sym);
+                        if let Some(result) = frame.get("result") {
+                            let valid_snap = result.get("u").and_then(|v| v.as_u64()).is_some()
+                                && crate::protocol::validate_book_sides(
+                                    result.get("b"),
+                                    result.get("a"),
+                                    true,
+                                    true,
+                                    true,
+                                    "gate futures.obu snapshot",
+                                )
+                                .is_ok();
+                            if valid_snap {
+                                if let Some(stream) = result.get("s").and_then(|v| v.as_str()) {
+                                    if let Some(sym) = Self::parse_gate_obu_symbol(stream) {
+                                        self.awaiting_snapshot.remove(&sym);
+                                    }
+                                }
                             }
                         }
                     }
@@ -2242,16 +2256,30 @@ impl DepthRefresh {
                     }
                 } else if let Some(topic) = frame.get("topic").and_then(|v| v.as_str()) {
                     if let Some(sym_raw) = topic.strip_prefix("orderbook.50.") {
-                        let sym = frame
-                            .pointer("/data/s")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(sym_raw)
-                            .to_uppercase();
-                        let is_snap =
-                            frame.get("type").and_then(|v| v.as_str()) == Some("snapshot")
-                                || frame.pointer("/data/u").and_then(|v| v.as_u64()) == Some(1);
-                        if is_snap {
-                            self.awaiting_snapshot.remove(&sym);
+                        if let Some(data) = frame.get("data") {
+                            let sym = data
+                                .get("s")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(sym_raw)
+                                .to_uppercase();
+                            let u_opt = data.get("u").and_then(|v| v.as_u64());
+                            let is_snap =
+                                frame.get("type").and_then(|v| v.as_str()) == Some("snapshot")
+                                    || u_opt == Some(1);
+                            if is_snap
+                                && u_opt.is_some()
+                                && crate::protocol::validate_book_sides(
+                                    data.get("b"),
+                                    data.get("a"),
+                                    true,
+                                    true,
+                                    false,
+                                    "bybit orderbook snapshot",
+                                )
+                                .is_ok()
+                            {
+                                self.awaiting_snapshot.remove(&sym);
+                            }
                         }
                     }
                 }
@@ -2310,13 +2338,41 @@ impl DepthRefresh {
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         if chan == "books50" {
-                            let sym = arg
-                                .get("symbol")
-                                .or_else(|| arg.get("instId"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_uppercase();
-                            self.awaiting_snapshot.remove(&sym);
+                            let valid_snap = frame
+                                .get("data")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first())
+                                .is_some_and(|item| {
+                                    let has_seq = item
+                                        .get("seq")
+                                        .is_some_and(|v| {
+                                            v.as_u64().is_some()
+                                                || v.as_str()
+                                                    .and_then(|s| s.parse::<u64>().ok())
+                                                    .is_some()
+                                        });
+                                    let bids = item.get("b").or_else(|| item.get("bids"));
+                                    let asks = item.get("a").or_else(|| item.get("asks"));
+                                    has_seq
+                                        && crate::protocol::validate_book_sides(
+                                            bids,
+                                            asks,
+                                            true,
+                                            true,
+                                            false,
+                                            "bitget book snapshot",
+                                        )
+                                        .is_ok()
+                                });
+                            if valid_snap {
+                                let sym = arg
+                                    .get("symbol")
+                                    .or_else(|| arg.get("instId"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_uppercase();
+                                self.awaiting_snapshot.remove(&sym);
+                            }
                         }
                     }
                 }
@@ -2572,9 +2628,22 @@ mod tests {
         assert!(frames.lock().unwrap()[2..]
             .iter()
             .all(|row| row["event"] == "subscribe" && row["channel"] == "futures.obu"));
+        // Malformed full=true snapshot missing b/a arrays MUST NOT lift awaiting_snapshot!
+        for symbol in &symbols {
+            let malformed = json!({"channel": "futures.obu", "event": "update", "result": {
+                "full": true, "s": format!("ob.{symbol}.50"), "u": 199
+            }});
+            let step_bad = refresh
+                .on_message(&malformed.to_string(), &mut sink)
+                .await
+                .unwrap();
+            assert!(step_bad.forward_to_selector);
+            assert!(!step_bad.completed);
+        }
         for (index, symbol) in symbols.iter().enumerate() {
             let raw = json!({"channel": "futures.obu", "event": "update", "result": {
-                "full": true, "s": format!("ob.{symbol}.50"), "u": 200
+                "full": true, "s": format!("ob.{symbol}.50"), "u": 200,
+                "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]
             }});
             let step = refresh
                 .on_message(&raw.to_string(), &mut sink)
@@ -2611,24 +2680,24 @@ mod tests {
             // Stale pre-unsubscribe depth message MUST be suppressed while L1 BBO keeps flowing.
             let (stale_depth, live_bbo, unsub_acks, snaps) = match endpoint {
                 EndpointKind::BybitPublic => (
-                    json!({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 50}}),
-                    json!({"topic": "orderbook.1.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 50}}),
+                    json!({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 50, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}}),
+                    json!({"topic": "orderbook.1.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 50, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}}),
                     vec![json!({"op": "unsubscribe", "success": true, "req_id": "depth_unsub_11"})],
                     vec![
-                        json!({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 100}}),
-                        json!({"topic": "orderbook.50.ETHUSDT", "type": "snapshot", "data": {"s": "ETHUSDT", "u": 100}}),
+                        json!({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 100, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}}),
+                        json!({"topic": "orderbook.50.ETHUSDT", "type": "snapshot", "data": {"s": "ETHUSDT", "u": 100, "b": [["3000.0", "1.0"]], "a": [["3001.0", "1.0"]]}}),
                     ],
                 ),
                 EndpointKind::BitgetPublic => (
-                    json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 10, "pseq": 0}]}),
-                    json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books1", "symbol": "BTCUSDT"}, "data": [{"seq": 1, "pseq": 0}]}),
+                    json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 10, "pseq": 0, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}]}),
+                    json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books1", "symbol": "BTCUSDT"}, "data": [{"seq": 1, "pseq": 0, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}]}),
                     vec![
                         json!({"event": "unsubscribe", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}}),
                         json!({"event": "unsubscribe", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "ETHUSDT"}}),
                     ],
                     vec![
-                        json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 200, "pseq": 0}]}),
-                        json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "ETHUSDT"}, "data": [{"seq": 200, "pseq": 0}]}),
+                        json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 200, "pseq": 0, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}]}),
+                        json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "ETHUSDT"}, "data": [{"seq": 200, "pseq": 0, "b": [["3000.0", "1.0"]], "a": [["3001.0", "1.0"]]}]}),
                     ],
                 ),
                 _ => unreachable!(),

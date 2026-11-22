@@ -910,10 +910,18 @@ impl CausalSelector {
         let sym_upper = symbol.to_uppercase();
         let epoch = self.runtime(conn_id).epoch;
 
-        let res = self
-            .runtime_mut(conn_id)
-            .validator
-            .on_rest_snapshot_detailed(&sym_upper, last_update_id);
+        let res = match crate::binance_snapshot::parse_depth_snapshot_body(raw_snapshot_json) {
+            Ok(parsed_uid) if parsed_uid == last_update_id => self
+                .runtime_mut(conn_id)
+                .validator
+                .on_rest_snapshot_detailed(&sym_upper, last_update_id),
+            Ok(parsed_uid) => Err(format!(
+                "binance REST snapshot lastUpdateId mismatch for {sym_upper}: payload={parsed_uid} != expected={last_update_id}"
+            )),
+            Err(e) => Err(format!(
+                "invalid binance REST snapshot payload for {sym_upper}: {e}"
+            )),
+        };
 
         match res {
             Ok(bridge) => {
