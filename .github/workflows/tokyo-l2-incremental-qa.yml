@@ -373,7 +373,7 @@ jobs:
           set -euo pipefail
           rules_sha="$(sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum | cut -d ' ' -f1)"
           extra_proto=()
-          if [[ "${QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA:-false}" == "true" && -n "${QA_OBSERVED_ARCHIVE_REVISION:-}" ]]; then
+          if [[ -n "${QA_OBSERVED_ARCHIVE_REVISION:-}" && "$QA_PROTOCOL_CURRENT_WINDOW_ID" == "$QA_TARGET_WINDOW_RESOLVED" ]]; then
             extra_proto+=(--archive-revision "$QA_OBSERVED_ARCHIVE_REVISION")
           fi
           if [[ -n "${QA_TRIGGER_MODE:-}" ]]; then

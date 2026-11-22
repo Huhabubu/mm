@@ -49,6 +49,8 @@ def depth_event(exchange: str, boot: str, conn: str, epoch: int, kind: str, obj:
     if exchange == BINANCE:
         if kind == "META":
             event = obj.get("event")
+            if event in {"REST_SNAPSHOT_ANCHOR", "REST_SNAPSHOT", "DEPTH_BRIDGED_DELTA"} and obj.get("epoch") is not None:
+                key = (boot, str(obj.get("conn_id") or conn), int(obj["epoch"]))
             if event in {"REST_SNAPSHOT_ANCHOR", "REST_SNAPSHOT"}:
                 data = obj.get("snapshot") or obj["raw"]
                 return Depth(

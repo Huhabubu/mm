@@ -163,12 +163,69 @@ def on_grid(value, step, *, allow_zero=False):
         return False
 
 
+class StreamEvidence:
+    """Track independently scoped feed evidence while walking sealed segments."""
+
+    def __init__(self, config):
+        streams = {(ex, symbol_key(sym), ch) for ex, sym, ch in coverage.expected_streams(config)}
+        self.timeline = convert.MarketAvailability(streams)
+        self.by_exchange = {}
+        self.depth = {}
+        self.last = {}
+        thresholds = coverage.channel_silence_thresholds(config)
+        self.limits = {}
+        for key in sorted(streams):
+            ex, sym, channel = key
+            self.by_exchange.setdefault(ex, []).append(key)
+            category = coverage.classify_channel(ex, channel)
+            if category == coverage.CHANNEL_CATEGORY_DEPTH:
+                self.depth[(ex, sym)] = key
+            limit = "event_trade_quiet_max" if category == coverage.CHANNEL_CATEGORY_EVENT_TRADE else category
+            self.limits[key] = int(thresholds[limit] * NS)
+
+    def interrupt(self, exchange, wall, event, symbol="ALL", endpoint=None):
+        depth_only = event in {"DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"}
+        status = "known_gap" if event in {"DEPTH_UNAVAILABLE", "GAP_START", "SNAPSHOT_BRIDGE_RETRY"} else "unverified"
+        for key in self.by_exchange.get(exchange, ()):
+            _, sym, channel = key
+            if symbol != "ALL" and symbol != sym:
+                continue
+            if endpoint and endpoint != coverage.stream_owning_endpoint(exchange, channel):
+                continue
+            if depth_only and self.depth.get((exchange, sym)) != key:
+                continue
+            self.last.pop(key, None)
+            if self.timeline.state(key) != "known_gap" or status == "known_gap":
+                self.timeline.mark(key, wall, status, event.lower())
+
+    def observe(self, key, wall, status="verified_usable", reason="observed_stream", resume_at=None):
+        if key not in self.limits:
+            return
+        previous = self.last.get(key)
+        if previous is not None and wall < previous:
+            # An earlier raw timestamp cannot move the start of a later recovery.
+            return
+        if previous is not None and wall - previous > self.limits[key]:
+            self.timeline.mark(key, previous + 1, "unverified", "stream_silence")
+        self.last[key] = wall
+        self.timeline.mark(key, wall if resume_at is None else resume_at, status, reason)
+
+    def report(self, start_ns, end_ns, invalid_exchanges):
+        for key, last in self.last.items():
+            if end_ns - last > self.limits[key] and self.timeline.state(key) == "verified_usable":
+                self.timeline.mark(key, last + 1, "unverified", "stream_silence")
+        return self.timeline.report(start_ns, end_ns, invalid_exchanges)
+
+
 def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint=None):
     boundary_checkpoints = {
         (row["exchange"], row["symbol"]): Chain(
             tuple(row["connection"]), row["seq"], row["awaiting_delta"], anchored=True
         )
         for row in checkpoint or ()
+    }
+    checkpoint_wall = {
+        (row["exchange"], row["symbol"]): row.get("last_wall_ns") for row in checkpoint or ()
     }
     chains = {}
     replay_warmup_chains = {}
@@ -178,11 +235,11 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     unanchored_sources = {}
     summary["boundary_checkpoint_markets"] = len(boundary_checkpoints)
     book_proofs = ProtocolReport()
-    expected_depths = {
-        (exchange, symbol_key(symbol))
-        for exchange, symbol, channel in coverage.expected_streams(config)
-        if coverage.classify_channel(exchange, channel) == coverage.CHANNEL_CATEGORY_DEPTH
-    }
+    evidence = StreamEvidence(config)
+    expected_depths = set(evidence.depth)
+    invalid_exchanges = set()
+    previous_end = {}
+    recovered_depth = set()
     buffers = {ex: convert.AssetDayBuffers(ex, BTC, convert.date_utc_from_wall_ns(start_ns)) for ex in FOLLOWERS}
     books = {ex: Book() for ex in FOLLOWERS}
     last_depth_exchange_ns = {}
@@ -199,16 +256,43 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         item[1].get("first_rx_seq") or 0, item[1]["file_name"],
     )):
         exchange = candidate["exchange"]
-        if candidate["planned_start_s"] * NS == start_ns:
-            audited = archive.check_partition(path, mf, config)
+        file_start = candidate["planned_start_s"] * NS
+        file_end = candidate.get("planned_end_s", candidate["planned_start_s"] + (end_ns - start_ns) // NS) * NS
+        discontinuous = exchange in previous_end and previous_end[exchange] < file_start
+        audited = archive.check_partition(path, mf, config)
+        structural_failure = bool(audited.get("structural_problems")) or audited.get("coverage_incomplete") is True
+        if file_start == start_ns:
             file_reports.append({"exchange": exchange, "qa_status": audited["qa_status"],
                                  "problem_count": len(audited["problems"])})
+            if structural_failure:
+                invalid_exchanges.add(exchange)
+        if discontinuous or structural_failure:
+            evidence.interrupt(exchange, previous_end.get(exchange, file_start), "ARCHIVE_DISCONTINUITY")
+            for key in expected_depths:
+                if key[0] == exchange:
+                    chains.pop(key, None)
+                    replay_warmup_chains.pop(key, None)
+                    recovered_depth.discard(key)
+                    if file_start >= start_ns or file_end == start_ns:
+                        checkpoint_applied.add(key)
+            if exchange in books:
+                books[exchange] = Book()
+                last_depth_exchange_ns.pop(exchange, None)
+        previous_end[exchange] = file_end
+        if structural_failure:
+            continue
         for wall, conn, epoch, kind, obj in rows(path):
             if not wall < end_ns:
                 continue
             in_target = wall >= start_ns
-            if kind == "META" and obj.get("event") in {"LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SWITCH"}:
+            if kind == "META" and obj.get("event") in {
+                "LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY", "SWITCH",
+            }:
                 event_name = obj["event"]
+                symbol = symbol_key(str(obj.get("symbol") or "ALL"))
+                endpoint = obj.get("endpoint")
+                reported_since = obj.get("unavailable_since_wall_ns") or obj.get("start_wall_ns") or wall
+                evidence.interrupt(exchange, min(wall, int(reported_since)), event_name, symbol, endpoint)
                 # Binance trades and public depth use independent connections.
                 if (
                     exchange == BINANCE
@@ -216,12 +300,12 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                     and event_name in {"SWITCH", "GAP_START", "LOCAL_LOSS"}
                 ):
                     continue
-                symbol = symbol_key(str(obj.get("symbol") or "ALL"))
                 if in_target:
                     boundary_events.count(exchange, symbol, event_name)
                 for ex, sym in expected_depths:
                     if ex == exchange and (symbol == "ALL" or symbol == sym):
                         key = (ex, sym)
+                        recovered_depth.discard(key)
                         if in_target:
                             checkpoint_applied.add(key)
                             reset_seen.add(key)
@@ -246,16 +330,29 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                             signal.append(quote)
                         else:
                             quotes_before = quote
+            if kind != "META":
+                for ex, sym, channel in coverage._data_streams(exchange, obj):
+                    stream = (ex, symbol_key(sym), channel)
+                    if coverage.classify_channel(exchange, channel) != coverage.CHANNEL_CATEGORY_DEPTH:
+                        evidence.observe(stream, wall)
             event = depth_event(exchange, mf["boot_id"], conn, epoch, kind, obj)
             if event is not None and (exchange, event.symbol) in expected_depths:
                 key = (exchange, event.symbol)
+                stream = evidence.depth[key]
+                # The checksum validates file identity, while this validates the
+                # levels and native sequence before publishing an availability span.
+                payload_issue = archive._validate_depth_book_sides(
+                    event.bids, event.asks, required=event.mode == "snapshot",
+                    require_non_empty=event.mode == "snapshot", require_string_size=exchange == GATE,
+                    ctx=exchange,
+                )
                 if not in_target and key in boundary_checkpoints:
                     # Preserve the verified boundary checkpoint at start_ns; only warm up BTC book for replay.
                     if event.mode == "snapshot":
                         seen_anchors.add((exchange, event.symbol, "warmup", event.connection[1], event.connection[2]))
                     if sample_end > start_ns and exchange in books and event.symbol == BTC:
                         w_chain = replay_warmup_chains.setdefault(key, Chain())
-                        if w_chain.apply(exchange, event) is None:
+                        if not payload_issue and w_chain.apply(exchange, event) is None:
                             books[exchange].apply(event)
                             last_depth_exchange_ns[exchange] = int(event.exchange_ms or 0) * 1_000_000
                         else:
@@ -263,7 +360,8 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                             last_depth_exchange_ns.pop(exchange, None)
                     continue
 
-                if in_target and key in boundary_checkpoints and key not in checkpoint_applied:
+                using_boundary = in_target and key in boundary_checkpoints and key not in checkpoint_applied
+                if using_boundary:
                     chains[key] = boundary_checkpoints[key]
                     checkpoint_applied.add(key)
 
@@ -297,9 +395,18 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         unanchored_sources.setdefault(key, event.connection[1:])
                     problem = chain.apply_unanchored_delta(exchange, event)
 
-                if not problem and exchange == GATE and not verify_gate_sizes(event):
-                    problem = "gate_quantity_not_decimal_string"
+                if payload_issue:
+                    problem = "invalid_depth_levels"
+                    if exchange == GATE and not verify_gate_sizes(event):
+                        problem = "gate_quantity_not_decimal_string"
                 if problem:
+                    recovered_depth.discard(key)
+                    chains.pop(key, None)
+                    reset_seen.add(key)
+                    if evidence.timeline.state(stream) != "known_gap":
+                        failure_status = "unverified" if problem == "missing_same_connection_anchor" else "known_gap"
+                        evidence.timeline.mark(stream, wall, failure_status, problem)
+                    evidence.last.pop(stream, None)
                     if in_target:
                         book_proofs.count(exchange, event.symbol, problem)
                         if problem == "missing_same_connection_anchor":
@@ -308,6 +415,23 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         books[exchange] = Book()
                         last_depth_exchange_ns.pop(exchange, None)
                     continue
+                if chain.anchored and chain.seq is not None:
+                    if event.mode == "snapshot":
+                        recovered_depth.add(key)
+                    state = evidence.timeline.state(stream)
+                    if event.mode != "snapshot" or (not chain.awaiting_delta and state != "known_gap"):
+                        if state != "known_gap" or key in recovered_depth:
+                            prior = checkpoint_wall.get(key)
+                            fits_boundary = (
+                                using_boundary and key not in reset_seen and event.mode != "snapshot"
+                                and prior is not None and wall - prior <= evidence.limits[stream]
+                            )
+                            evidence.observe(
+                                stream, wall, reason="verified_depth_sequence",
+                                resume_at=start_ns if fits_boundary else None,
+                            )
+                    if event.mode != "snapshot" or evidence.timeline.state(stream) == "verified_usable":
+                        recovered_depth.discard(key)
                 if chain.anchored and sample_end > start_ns and exchange in books and event.symbol == BTC:
                     book = books[exchange]
                     book.apply(event)
@@ -393,16 +517,21 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         summary["protocol_status"] = "passed"
     # Preserve structural sequence checkpoints per-market for every cleanly anchored market
     # so one failed/unanchored market never discards continuity state for healthy markets.
-    proven_failed_markets = {(e, s) for (e, s, _) in book_proofs.issues}
+    market_availability = evidence.report(start_ns, end_ns, invalid_exchanges)
+    summary["market_availability"] = market_availability
     summary["end_sequence_checkpoint"] = [
         {"exchange": ex, "symbol": sym, "connection": list(chain.connection),
-         "seq": chain.seq, "awaiting_delta": chain.awaiting_delta}
+         "seq": chain.seq, "awaiting_delta": chain.awaiting_delta,
+         "last_wall_ns": evidence.last[evidence.depth[(ex, sym)]]}
         for (ex, sym), chain in sorted(chains.items())
         if (
             (ex, sym) in expected_depths
-            and (ex, sym) not in proven_failed_markets
+            and ex not in invalid_exchanges
             and book_proofs.frames[(ex, sym)] > 0
+            and evidence.depth[(ex, sym)] in evidence.last
             and chain.anchored
+            and not chain.awaiting_delta
+            and (ex, sym) not in recovered_depth
             and chain.seq is not None
             and chain.connection is not None
         )
@@ -410,8 +539,9 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     summary["replay"] = {}
     if sample_end <= start_ns:
         return
-    # Only numeric counts, errors and statuses are exported. The converted inputs
-    # stay in the job's temporary directory and expire with the runner.
+    # A smoke replay is one independent, gap-free episode. An order resting at
+    # an outage has an unknown execution outcome. Discard that entire episode,
+    # without simulating a cancellation acknowledgement or carrying its position.
     for exchange in FOLLOWERS:
         if exchange not in coverage.enabled_exchanges(config):
             continue
@@ -421,11 +551,28 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         if any(e == exchange and s == BTC for e, s, _ in book_proofs.issues):
             summary["replay"][exchange] = {"status": "blocked", "reason": "representative_symbol_failed_protocol"}
             continue
+        required_streams = {(BINANCE, BTC, "bookTicker")} | {
+            stream for stream in evidence.by_exchange[exchange]
+            if stream[1] == BTC and coverage.classify_channel(exchange, stream[2]) in {
+                coverage.CHANNEL_CATEGORY_DEPTH, coverage.CHANNEL_CATEGORY_EVENT_TRADE,
+            }
+        }
+        # The smoke replay still uses the initial warmup period. A short unknown
+        # prefix can be trimmed only before the first replay input, never mid-episode.
+        start_replay = max(start_ns, int(buffers[exchange].hbt_rows[0][2])) if buffers[exchange].hbt_rows else start_ns
+        common = convert.common_usable_intervals(market_availability, required_streams, start_replay, sample_end)
+        summary.setdefault("common_replay_intervals", {})[exchange] = common
         if (exchange, BTC) in unanchored_sources and not buffers[exchange].seen_snapshot:
             summary["replay"][exchange] = {"status": "blocked", "reason": "anchor_not_in_lookback"}
             continue
         if len(signal) < 2 or not buffers[exchange].seen_snapshot or not buffers[exchange].hbt_rows:
             summary["replay"][exchange] = {"status": "blocked", "reason": "missing_signal_or_initial_book"}
+            continue
+        if common != [{"start_wall_ns": start_replay, "end_wall_ns": sample_end}]:
+            summary["replay"][exchange] = {
+                "status": "blocked", "reason": "required_stream_interval_unverified",
+                "resting_orders_policy": "censor_episode_if_execution_unobservable",
+            }
             continue
         try:
             summary["replay"][exchange] = run_replay(exchange, buffers[exchange], signal, specs[exchange], sample_end)
@@ -526,7 +673,7 @@ def run_replay(exchange, buffer, signal, spec, sample_end):
 
 
 def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_windows,
-                 candidates=None, checkpoint=None):
+                 candidates=None, checkpoint=None, anchor_lookback_windows=None):
     out = {"status": "retryable", "run_id": run_id, "window_id": window,
            "warmup_windows": warmup_windows, "replay_sample_seconds": replay_seconds}
     stage = "validate_window"
@@ -540,7 +687,8 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
         with tempfile.TemporaryDirectory(prefix="tokyo_archive_qa_") as directory:
             tmp = Path(directory)
             stage = "read_verified_archives"
-            items = list(selected_archives(remote, config, run_id, begin, end, tmp, warmup_windows, out, candidates))
+            lookback = warmup_windows if anchor_lookback_windows is None else anchor_lookback_windows
+            items = list(selected_archives(remote, config, run_id, begin, end, tmp, lookback, out, candidates))
             stage = "read_effective_btc_specs"
             try:
                 specs = load_btc_specs(remote, begin * NS, tmp) if replay_seconds else {}

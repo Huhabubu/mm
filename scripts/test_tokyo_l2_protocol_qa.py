@@ -476,6 +476,81 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual("missing_same_connection_anchor", s5["proven_protocol_issues"][0]["issue"])
             self.assertEqual("BTCUSDT", s5["proven_protocol_issues"][0]["symbol"])
 
+    def test_market_intervals_keep_other_streams_and_wait_for_verified_recovery(self):
+        import json
+        import zstandard as zstd
+        from unittest.mock import patch
+        import hourly_incremental_qa as archive
+        import qa_convert as convert
+        from tokyo_l2_replay_qa import NS, scan
+
+        exchange = GATE
+        start = 1_795_276_800
+        base = start * NS
+        config = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {exchange: {
+                "enabled": True, "symbols": ["BTC_USDT", "ETH_USDT", "SUI_USDT"],
+                "channels": ["futures.obu", "futures.trades"],
+            }},
+        }
+
+        def book(symbol, seq, snapshot=False):
+            return {"channel": "futures.obu", "event": "update", "result": {
+                "s": f"ob.{symbol}.50", "u": seq, "U": seq, "full": snapshot,
+                "t": 1795276800000, "b": [["100", "1"]], "a": [["101", "1"]],
+            }}
+
+        manifest = {"boot_id": "boot", "start_wall_ns": base, "first_rx_seq": 1, "file_name": "gate.tsv.zst"}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(archive, "check_partition", return_value={"qa_status": "failed", "problems": ["depth gap"]}):
+            items = []
+            for offset, records in enumerate([
+                [(1, "A", "DATA", book("BTC_USDT", 100, True)), (2, "A", "DATA", book("ETH_USDT", 200, True))],
+                [(1, "A", "DATA", book("BTC_USDT", 101)), (2, "A", "DATA", book("ETH_USDT", 201))],
+                [
+                    (11, "A", "DATA", book("BTC_USDT", 102)),
+                    (12, "A", "DATA", book("ETH_USDT", 202)),
+                    (13, "A", "DATA", book("SUI_USDT", 500)),
+                    (14, "A", "DATA", {"channel": "futures.trades", "result": [{"contract": "BTC_USDT", "id": 1}]}),
+                    (20, "B", "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT",
+                                      "unavailable_since_wall_ns": base + 1800 * NS + 19}),
+                    (23, "B", "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+                    (25, "B", "DATA", book("BTC_USDT", 300, True)),
+                    (39, "B", "DATA", book("BTC_USDT", 301)),
+                ],
+            ]):
+                path = Path(directory) / f"{offset}.tsv.zst"
+                window = start + offset * 900
+                with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as writer:
+                    for i, (ns, conn, kind, obj) in enumerate(records, 1):
+                        writer.write(f"{window * NS + ns}\t{i}\t{conn}\t1\t{i}\t{kind}\t{json.dumps(obj)}\n")
+                items.append(({"exchange": exchange, "planned_start_s": window, "planned_end_s": window + 900},
+                              manifest, path))
+            target = base + 1800 * NS
+            report = {}
+            scan(items, config, target, target + 60, target, {}, report)
+        panel = {
+            (row["symbol"], row["channel"]): row["intervals"] for row in report["market_availability"]
+        }
+        self.assertEqual(
+            [("unverified", 0, 11), ("verified_usable", 11, 19),
+             ("known_gap", 19, 39), ("verified_usable", 39, 60)],
+            [(i["status"], i["start_wall_ns"] - target, i["end_wall_ns"] - target)
+             for i in panel[("BTCUSDT", "futures.obu")]],
+        )
+        self.assertEqual(["unverified", "verified_usable"], [i["status"] for i in panel[("ETHUSDT", "futures.obu")]])
+        self.assertEqual(["unverified"], [i["status"] for i in panel[("SUIUSDT", "futures.obu")]])
+        self.assertEqual(["unverified", "verified_usable"], [i["status"] for i in panel[("BTCUSDT", "futures.trades")]])
+        self.assertEqual(
+            [(14, 19), (39, 60)],
+            [(i["start_wall_ns"] - target, i["end_wall_ns"] - target) for i in convert.common_usable_intervals(
+                report["market_availability"], {(exchange, "BTCUSDT", "futures.obu"),
+                                                (exchange, "BTCUSDT", "futures.trades")}, target, target + 60
+            )],
+        )
+        self.assertIn("BTCUSDT", {row["symbol"] for row in report["end_sequence_checkpoint"]})
+
     def test_binance_market_switch_does_not_invalidate_public_depth(self):
         """Market trades failover is independent; public depth failover still needs an anchor."""
         import json
