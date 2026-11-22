@@ -1,4 +1,4 @@
-"""Run bounded incremental protocol validation after the archive QA gate."""
+"""Run bounded protocol validation on verified archive inputs."""
 from __future__ import annotations
 
 import argparse
@@ -39,6 +39,7 @@ def _checkpoint_digest(checkpoint):
             list(r.get("connection") or []),
             r.get("seq"),
             bool(r.get("awaiting_delta")),
+            r.get("last_wall_ns"),
         )
         for r in (checkpoint or ())
     )
@@ -106,6 +107,15 @@ def _summarize_protocol_diagnostics(report):
     return out
 
 
+MAX_ANCHOR_LOOKBACK_WINDOWS = 4
+
+
+def _lookback_inputs(groups, start, step, windows):
+    return input_digests(
+        item for back in range(1, windows + 1) for item in groups.get(start - back * step, ())
+    )
+
+
 def _expected_depth_markets(config):
     from tokyo_l2_protocol_qa import symbol_key
 
@@ -122,7 +132,9 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     pm = coverage.configured_partition_minutes(config)
     step = pm * 60
-    candidates = verified_candidates(remote, config, run_id, cutover - step, state)
+    candidates = verified_candidates(
+        remote, config, run_id, cutover - MAX_ANCHOR_LOOKBACK_WINDOWS * step, state,
+    )
     groups = defaultdict(list)
     for item in candidates:
         groups[item["planned_start_s"]].append(item)
@@ -168,7 +180,9 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     def report_path(start):
         return report_dir / f"{archive._safe_window_filename(wid(start))}.json"
 
-    def archived_window_passed(start):
+    checked_windows_by_start = {}
+
+    def archived_window_checked(start):
         wd = coverage.window_descriptor(start, pm)
         window = wd["window_id"]
         span_id = wd["window_span_id"]
@@ -184,13 +198,30 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             summary = read_report(path)
             if summary:
                 break
-        return (summary.get("qa_status") == "passed" and summary.get("run_id") == run_id
+        status = summary.get("qa_status")
+        complete = status == "passed" or (
+            status in {"failed", "needs_review"} and summary.get("archive_complete_in_index") is True
+        )
+        if not (complete and summary.get("run_id") == run_id
                 and summary.get("partition_minutes") == pm
                 and summary.get("checker_commit_sha") == checker.split("/", 1)[0]
-                and set(summary.get("files") or []) == {item["source_manifest"] for item in groups[start]})
+                and set(summary.get("files") or []) == {item["source_manifest"] for item in groups[start]}):
+            return False
+        checked_windows_by_start[start] = summary
+        return True
 
-    ready = sorted(s for s in groups if cutover <= s and archived_window_passed(s))
+    ready = sorted(s for s in groups if cutover <= s and archived_window_checked(s))
     expected_depth_markets = _expected_depth_markets(config)
+
+    def restrictions(start, lookback):
+        result = {}
+        for at in range(start - lookback * step, start + step, step):
+            status = checked_windows_by_start.get(at, {})
+            bad = {loss["exchange"] for loss in status.get("attributed_late_losses", ()) if loss.get("exchange")}
+            if bad:
+                result[str(at)] = sorted(bad)
+        return result
+
     proofs = {}
     saved_reports = {}
     revisions = {}
@@ -203,9 +234,12 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         if proof.get("checker") != checker:
             continue
         saved_reports[start] = proof
+        lookback = proof.get("anchor_lookback_windows")
         if (
             proof.get("target_inputs") == inputs
             and proof.get("previous_inputs") == earlier
+            and (lookback is None or proof.get("anchor_lookback_inputs") == _lookback_inputs(groups, start, step, lookback))
+            and proof.get("source_restrictions", {}) == restrictions(start, lookback or 0)
             and (win_rev is None or proof.get("archive_revision") == win_rev)
         ):
             proofs[start] = proof
@@ -226,14 +260,29 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         covered_markets = {(row["exchange"], row["symbol"]) for row in checkpoint}
         all_markets_covered = bool(expected_depth_markets) and expected_depth_markets.issubset(covered_markets)
         warmup_windows = 1 if (replay_seconds or not all_markets_covered) else 0
+        # Check a longer continuous archive prefix only when a market's preceding
+        # checkpoint is unavailable. Missing partition files reset their own chains.
+        lookback = 1 if replay_seconds else 0
+        if not all_markets_covered:
+            lookback = max((i for i in range(1, MAX_ANCHOR_LOOKBACK_WINDOWS + 1)
+                            if groups.get(start - i * step)), default=warmup_windows)
+        blocked_sources = restrictions(start, lookback)
+        source_options = (
+            {"source_restrictions": {int(at): values for at, values in blocked_sources.items()}}
+            if blocked_sources else {}
+        )
         report = audit_window(
             remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
-            candidates=candidates, checkpoint=checkpoint or None,
+            candidates=candidates, checkpoint=checkpoint or None, anchor_lookback_windows=lookback,
+            **source_options,
         )
         report.update(
             checker=checker,
             archive_revision=revisions.get(start),
             previous_inputs=input_digests(groups[start - step]),
+            anchor_lookback_windows=lookback,
+            anchor_lookback_inputs=_lookback_inputs(groups, start, step, lookback),
+            source_restrictions=blocked_sources,
             input_checkpoint_digest=_checkpoint_digest(checkpoint),
             completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )

@@ -22,7 +22,7 @@ on:
         type: string
         default: ""
       run_id:
-        description: "Active collection batch run_id (defaults to vars.TOKYO_L2_QA_RUN_ID)"
+        description: "Collection batch ID (use legacy-60m only for an explicit replay range)"
         required: false
         type: string
         default: ""
@@ -57,7 +57,7 @@ on:
         required: false
         default: false
       replay_window:
-        description: "Run isolated real-data QA for this complete UTC window"
+        description: "Run isolated QA for a UTC window or FIRST..LAST range (inclusive, protocol only for ranges)"
         required: false
         type: string
         default: ""
@@ -373,7 +373,7 @@ jobs:
           set -euo pipefail
           rules_sha="$(sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum | cut -d ' ' -f1)"
           extra_proto=()
-          if [[ "${QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA:-false}" == "true" && -n "${QA_OBSERVED_ARCHIVE_REVISION:-}" ]]; then
+          if [[ -n "${QA_OBSERVED_ARCHIVE_REVISION:-}" && "$QA_PROTOCOL_CURRENT_WINDOW_ID" == "$QA_TARGET_WINDOW_RESOLVED" ]]; then
             extra_proto+=(--archive-revision "$QA_OBSERVED_ARCHIVE_REVISION")
           fi
           if [[ -n "${QA_TRIGGER_MODE:-}" ]]; then
@@ -492,7 +492,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - name: Check out replay audit
         uses: actions/checkout@v4
