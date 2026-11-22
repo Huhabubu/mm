@@ -4,29 +4,30 @@
   "heartbeat_status": "ok",
   "job_execution_status": "ok",
   "target_window_execution_status": "ok",
-  "historical_catchup_status": "ok",
+  "historical_catchup_status": "has_failures",
   "active_window_ready_for_protocol_qa": true,
   "trigger_mode": "archive_dispatch",
-  "started_at_utc": "2026-11-22T16:12:56Z",
-  "completed_at_utc": "2026-11-22T16:14:08Z",
-  "target_window_utc": "2026-11-22T11:45Z",
-  "expected_archive_revision": "sha256:bb3308ff48598d7d5c8ee53d7fc49c20d00e8834580af6068fb758b073c8aa6b",
-  "observed_archive_revision": "sha256:bb3308ff48598d7d5c8ee53d7fc49c20d00e8834580af6068fb758b073c8aa6b",
+  "started_at_utc": "2026-11-22T16:22:25Z",
+  "completed_at_utc": "2026-11-22T16:23:21Z",
+  "target_window_utc": "2026-11-22T15:00Z",
+  "expected_archive_revision": "sha256:e669fc2439a17223c205a38709ab4529b4961d61206edc66ddff914a04750885",
+  "observed_archive_revision": "sha256:e669fc2439a17223c205a38709ab4529b4961d61206edc66ddff914a04750885",
   "target_revision_matched": true,
   "target_validation_error": null,
-  "target_window_reused_result": false,
-  "current_window_id": "2026-11-22T11:45Z",
+  "target_window_reused_result": true,
+  "current_window_id": "2026-11-22T15:00Z",
   "current_window_completed": true,
   "current_window_verification_status": "passed",
-  "latest_due_window_id": "2026-11-22T15:45Z",
-  "latest_due_window_verification_status": "passed",
-  "latest_verified_window_id": "2026-11-22T15:45Z",
-  "latest_verified_window_status": "passed",
+  "latest_due_window_id": "2026-11-22T16:00Z",
+  "latest_due_window_verification_status": "failed",
+  "latest_verified_window_id": "2026-11-22T16:00Z",
+  "latest_verified_window_status": "failed",
   "historical_data_quality_status": "has_historical_damage",
   "historical_damaged_windows": [
     "2026-11-22T08:00Z",
     "2026-11-22T09:15Z",
-    "2026-11-22T09:45Z"
+    "2026-11-22T09:45Z",
+    "2026-11-22T16:00Z"
   ],
   "historical_overdue_windows": [],
   "historical_archived_pending_qa_windows": [],
@@ -79,6 +80,22 @@
         "recorded loss/gap events: loss=0, gap_start=3",
         "depth unavailable events recorded: 39"
       ]
+    },
+    {
+      "source_manifest": "raw/bitget_v3/2026-11-22/bitget_v3_20261122_1600_p15m_trial15_20261122_da93ae54.manifest.json",
+      "file_name": "bitget_v3_20261122_1600_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "exchange": "bitget_v3",
+      "date_utc": "2026-11-22",
+      "window_id": "2026-11-22T16:00Z",
+      "window_span_id": "2026-11-22T16:00Z__2026-11-22T16:15Z_15m",
+      "partition_minutes": 15,
+      "run_id": "trial15_20261122T0745Z",
+      "local_loss_events": 0,
+      "dropped_frames": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
     }
   ],
   "historical_loss_manifests": [],
@@ -95,19 +112,19 @@
   "discovery_mode": "archive_manifest_index",
   "discovery_warnings": [],
   "attempted": 4,
-  "ok": 4,
-  "blocked": 0,
+  "ok": 3,
+  "blocked": 1,
   "needs_review": 0,
   "retry_needed": 0,
   "target_retry_needed": 0,
   "historical_retry_needed": 0,
   "remaining_backlog": 0,
-  "unresolved_blocked": 3,
+  "unresolved_blocked": 4,
   "unresolved_review": 0,
-  "already_checked": 128,
-  "eligible_manifest_count": 132,
-  "expected_window_count": 33,
-  "window_reports_written": 33,
+  "already_checked": 132,
+  "eligible_manifest_count": 136,
+  "expected_window_count": 34,
+  "window_reports_written": 34,
   "day_reports_written": 1,
   "passed_windows": [
     "2026-11-22T07:45Z",
@@ -144,7 +161,8 @@
   "failed_windows": [
     "2026-11-22T08:00Z",
     "2026-11-22T09:15Z",
-    "2026-11-22T09:45Z"
+    "2026-11-22T09:45Z",
+    "2026-11-22T16:00Z"
   ],
   "review_windows": [],
   "archived_pending_qa_windows": [],
@@ -161,7 +179,8 @@
     "verified_failed": [
       "2026-11-22T08:00Z",
       "2026-11-22T09:15Z",
-      "2026-11-22T09:45Z"
+      "2026-11-22T09:45Z",
+      "2026-11-22T16:00Z"
     ],
     "verified_passed": [
       "2026-11-22T07:45Z",
@@ -198,10 +217,11 @@
     "verified_needs_review": []
   },
   "details": [
-    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-22T11:45Z expected_archive_revision=sha256:bb3308ff48598d7d5c8ee53d7fc49c20d00e8834580af6068fb758b073c8aa6b observed_archive_revision=sha256:bb3308ff48598d7d5c8ee53d7fc49c20d00e8834580af6068fb758b073c8aa6b checker_commit=78f7a69ac070cdb1d823e93a871b0801c4a1e3b7",
-    "TARGET PASSED raw/binance_futures/2026-11-22/binance_futures_20261122_1145_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/bitget_v3/2026-11-22/bitget_v3_20261122_1145_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/bybit_linear/2026-11-22/bybit_linear_20261122_1145_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/gate_futures/2026-11-22/gate_futures_20261122_1145_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
+    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-22T15:00Z expected_archive_revision=sha256:e669fc2439a17223c205a38709ab4529b4961d61206edc66ddff914a04750885 observed_archive_revision=sha256:e669fc2439a17223c205a38709ab4529b4961d61206edc66ddff914a04750885 checker_commit=78f7a69ac070cdb1d823e93a871b0801c4a1e3b7",
+    "REUSED_TARGET_RESULT run_id=trial15_20261122T0745Z target_window_utc=2026-11-22T15:00Z archive_revision=sha256:e669fc2439a17223c205a38709ab4529b4961d61206edc66ddff914a04750885 checker_commit=78f7a69ac070cdb1d823e93a871b0801c4a1e3b7 files=4",
+    "PASSED raw/binance_futures/2026-11-22/binance_futures_20261122_1600_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "FAILED raw/bitget_v3/2026-11-22/bitget_v3_20261122_1600_p15m_trial15_20261122_da93ae54.manifest.json: 1 issues",
+    "PASSED raw/bybit_linear/2026-11-22/bybit_linear_20261122_1600_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "PASSED raw/gate_futures/2026-11-22/gate_futures_20261122_1600_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
   ]
 }
