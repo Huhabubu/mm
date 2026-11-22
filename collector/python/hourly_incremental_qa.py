@@ -434,8 +434,9 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
     streams: dict[tuple[str, str, str], dict[str, Any]] = {}
     problems: list[str] = []
     review_items: list[str] = []
+    structural_problems: list[str] = []
     if partition_minutes != config_pm or (end_ns - start_ns) != expected_span_ns:
-        problems.append(
+        structural_problems.append(
             f"partition duration mismatch: manifest={partition_minutes}m ({window_span_id}) != config={config_pm}m"
         )
 
@@ -464,11 +465,11 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                         int(rx_seq_s),
                     )
                     if not (start_ns <= wall_ns < end_ns):
-                        problems.append(f"line {n}: timestamp outside UTC partition [{window_id}]")
+                        structural_problems.append(f"line {n}: timestamp outside UTC partition [{window_id}]")
                         if len(problems) >= 20:
                             break
                     if prev_seq is not None and rx_seq <= prev_seq:
-                        problems.append(f"line {n}: rx_seq non-monotonic")
+                        structural_problems.append(f"line {n}: rx_seq non-monotonic")
                     if kind not in {"DATA", "DATA_ESCAPED", "META"}:
                         raise ValueError(f"line {n}: unknown record kind {kind}")
                     payload = json.loads(raw)
@@ -478,7 +479,7 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                     prod_key = record_monotonic_producer_key(exchange, kind, conn, epoch_i, payload)
                     prev_mono = producer_prev_mono.get(prod_key)
                     if prev_mono is not None and mono_ns < prev_mono:
-                        problems.append(
+                        structural_problems.append(
                             f"line {n}: receive monotonic clock regressed ({prod_key[0]}:{conn}:{epoch_i})"
                         )
                     producer_prev_mono[prod_key] = mono_ns
@@ -725,20 +726,20 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
             )
 
     if first_seq is not None and manifest.get("first_rx_seq") is not None and first_seq != int(manifest["first_rx_seq"]):
-        problems.append("first_rx_seq differs from manifest")
+        structural_problems.append("first_rx_seq differs from manifest")
     if last_seq is not None and manifest.get("last_rx_seq") is not None and last_seq != int(manifest["last_rx_seq"]):
-        problems.append("last_rx_seq differs from manifest")
+        structural_problems.append("last_rx_seq differs from manifest")
     for kind, field in (("DATA", "data_lines"), ("DATA_ESCAPED", "data_escaped_lines"), ("META", "meta_lines")):
         if counts[kind] != int(manifest.get(field) or 0):
-            problems.append(f"{field} count differs from manifest")
+            structural_problems.append(f"{field} count differs from manifest")
     if loss_events != int(manifest.get("local_loss_lines") or 0):
-        problems.append("LOCAL_LOSS count differs from manifest")
+        structural_problems.append("LOCAL_LOSS count differs from manifest")
     if gap_events != int(manifest.get("gap_start_lines") or 0):
-        problems.append("GAP_START count differs from manifest")
+        structural_problems.append("GAP_START count differs from manifest")
 
     manifest_late_rej = int(manifest.get("late_frames_rejected") or 0)
     if "late_frames_rejected" in manifest and late_rejected_events != manifest_late_rej:
-        problems.append("LATE_FRAME_REJECTED count differs from manifest")
+        structural_problems.append("LATE_FRAME_REJECTED count differs from manifest")
     eff_late_rejected = max(late_rejected_events, manifest_late_rej)
     eff_late_dropped = max(late_rejected_dropped, eff_late_rejected)
     if eff_late_rejected > 0 and not late_loss_by_target_window:
@@ -817,6 +818,7 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
     head_gap_s = round(max(0, first_wall - start_ns) / 1e9, 6) if first_wall is not None else None
     tail_gap_s = round(max(0, end_ns - last_wall) / 1e9, 6) if last_wall is not None else None
 
+    problems.extend(structural_problems)
     if problems:
         qa_status = QA_STATUS_FAILED
     elif review_items:
@@ -871,6 +873,7 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
         "streams": stream_rows,
         "missing_streams": absent,
         "review_items": review_items,
+        "structural_problems": structural_problems,
         "problems": problems,
     }
 
