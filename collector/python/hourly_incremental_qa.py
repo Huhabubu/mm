@@ -145,6 +145,110 @@ def _safe_window_filename(window_id: str) -> str:
     return window_id.replace(":", "").replace("/", "_").replace(" ", "_")
 
 
+def _parse_depth_chain_frame(
+    exchange: str,
+    kind: str,
+    payload: Any,
+) -> tuple[str, bool, int, int | None, int | None] | None:
+    """Return (symbol, is_snapshot, seq, parent_seq, first_u) for sequence-bearing depth events."""
+    if not isinstance(payload, dict):
+        return None
+    if exchange == "gate_futures":
+        if kind == "META" or payload.get("channel") != "futures.obu" or payload.get("event") not in ("update", "all"):
+            return None
+        res = payload.get("result")
+        if not isinstance(res, dict) or res.get("u") is None:
+            return None
+        stream_s = str(res.get("s") or "")
+        parts = stream_s.split(".")
+        if len(parts) != 3 or parts[0] != "ob" or parts[2] != "50":
+            return None
+        sym = parts[1].upper()
+        is_snap = bool(res.get("full", False))
+        seq = int(res["u"])
+        parent = None if is_snap else (int(res["U"]) if res.get("U") is not None else None)
+        return (sym, is_snap, seq, parent, None)
+    if exchange == "bybit_linear":
+        if kind == "META":
+            return None
+        topic = str(payload.get("topic") or "")
+        if not topic.startswith("orderbook.50."):
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict) or data.get("u") is None:
+            return None
+        sym = str(data.get("s") or topic.split(".")[-1]).upper()
+        seq = int(data["u"])
+        is_snap = payload.get("type") == "snapshot" or seq == 1
+        return (sym, is_snap, seq, None, None)
+    if exchange == "bitget_v3":
+        if kind == "META":
+            return None
+        arg = payload.get("arg") or {}
+        topic = arg.get("topic") or arg.get("channel")
+        if topic != "books50":
+            return None
+        data_list = payload.get("data")
+        if not isinstance(data_list, list) or not data_list or not isinstance(data_list[0], dict):
+            return None
+        item = data_list[0]
+        if item.get("seq") is None:
+            return None
+        sym = str(arg.get("symbol") or arg.get("instId") or "").upper()
+        action = str(payload.get("action") or "")
+        if action not in ("snapshot", "update"):
+            return None
+        is_snap = action == "snapshot"
+        seq = int(item["seq"])
+        parent = None if is_snap else (int(item["pseq"]) if item.get("pseq") is not None else None)
+        return (sym, is_snap, seq, parent, None)
+    if exchange == "binance_futures":
+        if kind == "META":
+            ev = payload.get("event")
+            if ev in ("REST_SNAPSHOT_ANCHOR", "REST_SNAPSHOT"):
+                snap = payload.get("snapshot") or payload.get("raw")
+                snap_id = payload.get("lastUpdateId")
+                if snap_id is None and isinstance(snap, dict):
+                    snap_id = snap.get("lastUpdateId")
+                if snap_id is None:
+                    return None
+                sym = str(payload.get("symbol") or "").upper()
+                return (sym, True, int(snap_id), None, None)
+            if ev == "DEPTH_BRIDGED_DELTA":
+                raw_obj = payload.get("raw")
+                if isinstance(raw_obj, str):
+                    raw_obj = json.loads(raw_obj)
+                if not isinstance(raw_obj, dict):
+                    return None
+                data = raw_obj.get("data") if isinstance(raw_obj.get("data"), dict) else raw_obj
+                if data.get("u") is None or data.get("U") is None:
+                    return None
+                sym = str(payload.get("symbol") or data.get("s") or "").upper()
+                return (
+                    sym,
+                    False,
+                    int(data["u"]),
+                    int(data["pu"]) if data.get("pu") is not None else None,
+                    int(data["U"]),
+                )
+            return None
+        stream = str(payload.get("stream") or "")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not (data.get("e") == "depthUpdate" or "@depth" in stream):
+            return None
+        if data.get("u") is None or data.get("U") is None:
+            return None
+        sym = str(data.get("s") or "").upper()
+        return (
+            sym,
+            False,
+            int(data["u"]),
+            int(data["pu"]) if data.get("pu") is not None else None,
+            int(data["U"]),
+        )
+    return None
+
+
 def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Inspect one sealed partition (legacy hourly or 5/15/30/60m segment) in streaming O(1) memory."""
     norm = normalize_manifest_window(manifest, fallback_file_name=data_path.name)
@@ -191,7 +295,9 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
     producer_prev_mono: dict[tuple[str, str, int], int] = {}
     first_wall = last_wall = None
     loss_events = gap_events = depth_unavailable_events = planned_depth_refresh_events = late_rejected_events = 0
-    open_planned_depth_waits: set[str] = set()
+    open_planned_depth_waits: dict[str, dict[str, Any]] = {}
+    planned_depth_intervals: list[dict[str, Any]] = []
+    depth_anchors: dict[str, dict[str, Any]] = {}
     dropped_frames = late_rejected_dropped = 0
     late_loss_by_target_window: dict[str, int] = defaultdict(int)
 
@@ -245,21 +351,63 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                         if event == "LOCAL_LOSS":
                             loss_events += 1
                             dropped_frames += int(payload.get("dropped_frames", payload.get("dropped", 1)))
+                            depth_anchors.clear()
                         elif event == "GAP_START":
                             gap_events += 1
+                            depth_anchors.clear()
+                        elif event == "SWITCH":
+                            switch_sym = (
+                                str(payload.get("symbol") or "ALL").upper()
+                                if isinstance(payload, dict)
+                                else "ALL"
+                            )
+                            if switch_sym == "ALL":
+                                depth_anchors.clear()
+                            else:
+                                depth_anchors.pop(switch_sym, None)
                         elif event == "SNAPSHOT_BRIDGE_RETRY":
                             depth_unavailable_events += 1
+                            sym_b = (
+                                str(payload.get("symbol") or "").upper()
+                                if isinstance(payload, dict)
+                                else ""
+                            )
+                            if sym_b:
+                                depth_anchors.pop(sym_b, None)
+                            else:
+                                depth_anchors.clear()
                         elif event == "DEPTH_UNAVAILABLE":
                             sym_wait = str(payload.get("symbol") or "ALL").upper() if isinstance(payload, dict) else "ALL"
+                            if sym_wait == "ALL":
+                                depth_anchors.clear()
+                            else:
+                                depth_anchors.pop(sym_wait, None)
                             if isinstance(payload, dict) and payload.get("planned") is True and payload.get("reason") == "planned_rotation":
                                 planned_depth_refresh_events += 1
-                                open_planned_depth_waits.add(sym_wait)
+                                since_ns = int(payload.get("unavailable_since_wall_ns") or wall_ns)
+                                target_conn = str(payload.get("conn_id") or conn)
+                                target_epoch = (
+                                    int(payload["epoch"])
+                                    if payload.get("epoch") is not None
+                                    else epoch_i
+                                )
+                                open_planned_depth_waits[sym_wait] = {
+                                    "symbol": sym_wait,
+                                    "conn_id": target_conn,
+                                    "epoch": target_epoch,
+                                    "start_wall_ns": since_ns,
+                                    "end_wall_ns": None,
+                                    "snapshot_seen": False,
+                                    "delta_ok": False,
+                                    "recovered_meta_seen": False,
+                                }
                             else:
                                 depth_unavailable_events += 1
-                        elif event in ("DEPTH_RECOVERED", "REST_SNAPSHOT_ANCHOR"):
+                        elif event == "DEPTH_RECOVERED":
                             if isinstance(payload, dict):
                                 sym_done = str(payload.get("symbol") or "").upper()
-                                open_planned_depth_waits.discard(sym_done)
+                                if sym_done in open_planned_depth_waits:
+                                    open_planned_depth_waits[sym_done]["recovered_meta_seen"] = True
                         elif event == "LATE_FRAME_REJECTED":
                             late_rejected_events += 1
                             dropped = int(payload.get("dropped_frames", 1)) if isinstance(payload, dict) else 1
@@ -291,8 +439,123 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                             item["last_ns"] = max(item["last_ns"], wall_ns)
                             item["count"] += 1
 
-    if open_planned_depth_waits:
-        depth_unavailable_events += len(open_planned_depth_waits)
+                    depth_evt = _parse_depth_chain_frame(exchange, kind, payload)
+                    if depth_evt is not None:
+                        d_sym, is_snap, d_seq, d_parent, d_first_u = depth_evt
+                        if kind == "META" and isinstance(payload, dict):
+                            ev_conn = str(payload.get("conn_id") or conn)
+                            ev_epoch = (
+                                int(payload["epoch"])
+                                if payload.get("epoch") is not None
+                                else epoch_i
+                            )
+                            ev_wall = int(payload.get("snapshot_ready_wall_ns") or payload.get("ready_wall_ns") or wall_ns)
+                        else:
+                            ev_conn, ev_epoch, ev_wall = conn, epoch_i, wall_ns
+
+                        if is_snap:
+                            depth_anchors[d_sym] = {
+                                "conn_id": ev_conn,
+                                "epoch": ev_epoch,
+                                "seq": d_seq,
+                                "awaiting_delta": exchange in ("bitget_v3", "binance_futures"),
+                            }
+                            if d_sym in open_planned_depth_waits:
+                                w = open_planned_depth_waits[d_sym]
+                                if ev_conn == w["conn_id"] and ev_epoch == w["epoch"]:
+                                    w["snapshot_seen"] = True
+                                    w["end_wall_ns"] = ev_wall
+                                    w["delta_ok"] = False
+                                else:
+                                    w["snapshot_seen"] = False
+                                    w["end_wall_ns"] = None
+                                    w["delta_ok"] = False
+                        else:
+                            anchor = depth_anchors.get(d_sym)
+                            chain_ok = False
+                            if anchor is not None and anchor["conn_id"] == ev_conn and anchor["epoch"] == ev_epoch:
+                                prev_d_seq = anchor["seq"]
+                                if exchange == "gate_futures":
+                                    chain_ok = (
+                                        d_parent is not None
+                                        and d_parent == prev_d_seq + 1
+                                        and d_seq >= d_parent
+                                    )
+                                elif exchange == "bybit_linear":
+                                    chain_ok = d_seq >= prev_d_seq
+                                elif exchange == "bitget_v3":
+                                    if d_parent is not None and d_parent < d_seq:
+                                        if anchor["awaiting_delta"]:
+                                            chain_ok = d_parent <= prev_d_seq <= d_seq
+                                        else:
+                                            chain_ok = d_parent == prev_d_seq
+                                elif exchange == "binance_futures":
+                                    if anchor["awaiting_delta"]:
+                                        chain_ok = (
+                                            d_first_u is not None
+                                            and d_first_u <= prev_d_seq <= d_seq
+                                        )
+                                    else:
+                                        chain_ok = d_parent is None or d_parent == prev_d_seq
+                                if chain_ok:
+                                    anchor["seq"] = d_seq
+                                    anchor["awaiting_delta"] = False
+                                else:
+                                    depth_anchors.pop(d_sym, None)
+
+                            if d_sym in open_planned_depth_waits:
+                                w = open_planned_depth_waits[d_sym]
+                                if w["snapshot_seen"]:
+                                    if chain_ok and ev_conn == w["conn_id"] and ev_epoch == w["epoch"]:
+                                        end_w = w["end_wall_ns"] if w["end_wall_ns"] is not None else ev_wall
+                                        planned_depth_intervals.append(
+                                            {
+                                                "symbol": d_sym,
+                                                "conn_id": w["conn_id"],
+                                                "epoch": w["epoch"],
+                                                "start_wall_ns": w["start_wall_ns"],
+                                                "end_wall_ns": end_w,
+                                                "duration_seconds": round(max(0, end_w - w["start_wall_ns"]) / 1e9, 6),
+                                                "recovered": True,
+                                            }
+                                        )
+                                        del open_planned_depth_waits[d_sym]
+                                    else:
+                                        w["snapshot_seen"] = False
+                                        w["delta_ok"] = False
+                                        problems.append(
+                                            f"planned_rotation depth chain break after snapshot for {d_sym}"
+                                        )
+                                elif ev_conn == w["conn_id"] and ev_epoch == w["epoch"]:
+                                    problems.append(
+                                        f"planned_rotation unanchored delta before snapshot for {d_sym}"
+                                    )
+                            elif not chain_ok and planned_depth_refresh_events > 0 and anchor is not None:
+                                problems.append(
+                                    f"post_rotation depth chain break for {d_sym}"
+                                )
+
+    for sym_unverified, w in sorted(open_planned_depth_waits.items()):
+        depth_unavailable_events += 1
+        planned_depth_intervals.append(
+            {
+                "symbol": sym_unverified,
+                "conn_id": w["conn_id"],
+                "epoch": w["epoch"],
+                "start_wall_ns": w["start_wall_ns"],
+                "end_wall_ns": None,
+                "duration_seconds": None,
+                "recovered": False,
+            }
+        )
+        if not w["snapshot_seen"]:
+            problems.append(
+                f"planned_rotation missing new-connection snapshot for {sym_unverified} ({w['conn_id']}:{w['epoch']})"
+            )
+        else:
+            problems.append(
+                f"planned_rotation missing continuous delta after snapshot for {sym_unverified} ({w['conn_id']}:{w['epoch']})"
+            )
 
     if first_seq is not None and manifest.get("first_rx_seq") is not None and first_seq != int(manifest["first_rx_seq"]):
         problems.append("first_rx_seq differs from manifest")
@@ -435,6 +698,8 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
         "intrinsic_dropped_frames": total_dropped_frames,
         "gap_start_events": gap_events,
         "depth_unavailable_events": depth_unavailable_events,
+        "planned_depth_refresh_events": planned_depth_refresh_events,
+        "planned_depth_unavailable_intervals": planned_depth_intervals,
         "max_gap_by_category": max_gap_by_category,
         "streams": stream_rows,
         "missing_streams": absent,

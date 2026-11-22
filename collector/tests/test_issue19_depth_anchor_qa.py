@@ -628,21 +628,102 @@ def test_issue19_replay_fixture_pr18_protocol_qa_equivalence_and_hourly_qa(tmp_p
     res_clean = hqa.check_partition(dp_clean, mf_clean, qa_cfg)
     assert res_clean["qa_status"] == "passed", res_clean["problems"]
 
-    dp_plan, _, mf_plan = _write_custom_15m_partition(
+    # Fake META-only DEPTH_RECOVERED without an actual new-connection snapshot + continuous delta MUST fail QA!
+    dp_plan_meta_only, _, mf_plan_meta_only = _write_custom_15m_partition(
         tmp_path / "qa_p",
         exchange="gate_futures",
         window_start_s=w0_s,
-        boot_id="qa_p",
+        boot_id="qa_p_meta_only",
         run_id="r",
         rows=gate_base_rows([
             (10, {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation"}),
             (20, {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
         ]),
+        segment_suffix="planned_meta_only",
+    )
+    res_plan_meta_only = hqa.check_partition(dp_plan_meta_only, mf_plan_meta_only, qa_cfg)
+    assert res_plan_meta_only["qa_status"] == "failed"
+    assert res_plan_meta_only["depth_unavailable_events"] >= 1
+
+    # New-connection snapshot alone without a subsequent chained delta on (new_conn, new_epoch) MUST still fail QA!
+    dp_plan_snap_only, _, mf_plan_snap_only = _write_custom_15m_partition(
+        tmp_path / "qa_p",
+        exchange="gate_futures",
+        window_start_s=w0_s,
+        boot_id="qa_p_snap_only",
+        run_id="r",
+        rows=[
+            (t0 + 1_000_000, 100, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "1", "a": "90001.0", "A": "1"}}),
+            (t0 + 2_000_000, 200, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "1"]], "a": [["90001.0", "1"]]}}),
+            (t0 + 3_000_000, 300, "A", 1, 3, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 1, "size": "1", "price": "90000.0"}]}),
+            (t0 + 10_000_000, 1000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+            (t0 + 11_000_000, 1100, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation"}),
+            (t0 + 50_000_000, 5000, "B", 1, 6, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90000.0", "2"]], "a": [["90001.0", "2"]]}}),
+            (t0 + 51_000_000, 5100, "B", 1, 7, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+        ],
+        segment_suffix="planned_snap_only",
+    )
+    res_plan_snap_only = hqa.check_partition(dp_plan_snap_only, mf_plan_snap_only, qa_cfg)
+    assert res_plan_snap_only["qa_status"] == "failed"
+    assert res_plan_snap_only["depth_unavailable_events"] >= 1
+
+    # Broken delta after new-connection snapshot MUST fail QA!
+    dp_plan_broken_delta, _, mf_plan_broken_delta = _write_custom_15m_partition(
+        tmp_path / "qa_p",
+        exchange="gate_futures",
+        window_start_s=w0_s,
+        boot_id="qa_p_broken_delta",
+        run_id="r",
+        rows=[
+            (t0 + 1_000_000, 100, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "1", "a": "90001.0", "A": "1"}}),
+            (t0 + 2_000_000, 200, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "1"]], "a": [["90001.0", "1"]]}}),
+            (t0 + 3_000_000, 300, "A", 1, 3, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 1, "size": "1", "price": "90000.0"}]}),
+            (t0 + 10_000_000, 1000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+            (t0 + 11_000_000, 1100, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation"}),
+            (t0 + 50_000_000, 5000, "B", 1, 6, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90000.0", "2"]], "a": [["90001.0", "2"]]}}),
+            (t0 + 55_000_000, 5500, "B", 1, 7, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": False, "s": "ob.BTC_USDT.50", "U": 205, "u": 205, "b": [["90000.0", "3"]], "a": []}}),
+            (t0 + 56_000_000, 5600, "B", 1, 8, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+        ],
+        segment_suffix="planned_broken_delta",
+    )
+    res_plan_broken_delta = hqa.check_partition(dp_plan_broken_delta, mf_plan_broken_delta, qa_cfg)
+    assert res_plan_broken_delta["qa_status"] == "failed"
+    assert res_plan_broken_delta["depth_unavailable_events"] >= 1
+
+    # Genuine planned rotation with on-disk B-line snapshot AND continuous B-line delta passes while preserving depth gap interval!
+    dp_plan, _, mf_plan = _write_custom_15m_partition(
+        tmp_path / "qa_p",
+        exchange="gate_futures",
+        window_start_s=w0_s,
+        boot_id="qa_p_real",
+        run_id="r",
+        rows=[
+            (t0 + 1_000_000, 100, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "1", "a": "90001.0", "A": "1"}}),
+            (t0 + 2_000_000, 200, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "1"]], "a": [["90001.0", "1"]]}}),
+            (t0 + 3_000_000, 300, "A", 1, 3, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 1, "size": "1", "price": "90000.0"}]}),
+            (t0 + 4_000_000, 400, "A", 1, 4, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": False, "s": "ob.BTC_USDT.50", "U": 101, "u": 101, "b": [["90000.0", "1.5"]], "a": []}}),
+            (t0 + 10_000_000, 1000, "B", 1, 5, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+            (t0 + 11_000_000, 1100, "B", 1, 6, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation"}),
+            (t0 + 15_000_000, 1500, "B", 1, 7, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "1", "a": "90001.0", "A": "1"}}),
+            (t0 + 50_000_000, 5000, "B", 1, 8, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90000.0", "2"]], "a": [["90001.0", "2"]]}}),
+            (t0 + 60_000_000, 6000, "B", 1, 9, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": False, "s": "ob.BTC_USDT.50", "U": 201, "u": 201, "b": [["90000.0", "2.5"]], "a": []}}),
+            (t0 + 61_000_000, 6100, "B", 1, 10, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+            (t0 + 70_000_000, 7000, "B", 1, 11, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 2, "size": "1", "price": "90000.0"}]}),
+            (t0 + 80_000_000, 8000, "B", 1, 12, "DATA", {"channel": "futures.obu", "event": "update", "result": {"full": False, "s": "ob.BTC_USDT.50", "U": 202, "u": 202, "b": [["90000.0", "2.6"]], "a": []}}),
+        ],
         segment_suffix="planned",
     )
     res_plan = hqa.check_partition(dp_plan, mf_plan, qa_cfg)
     assert res_plan["qa_status"] == "passed", res_plan["problems"]
     assert res_plan["depth_unavailable_events"] == 0
+    assert res_plan["planned_depth_refresh_events"] == 1
+    assert len(res_plan["planned_depth_unavailable_intervals"]) == 1
+    iv = res_plan["planned_depth_unavailable_intervals"][0]
+    assert iv["symbol"] == "BTC_USDT"
+    assert iv["recovered"] is True
+    assert iv["duration_seconds"] >= 0.035
+    assert res_plan["max_gap_by_category"]["depth"] is not None
+    assert res_plan["max_gap_by_category"]["depth"] >= 0.045
 
     dp_unplan, _, mf_unplan = _write_custom_15m_partition(
         tmp_path / "qa_p",
@@ -659,3 +740,119 @@ def test_issue19_replay_fixture_pr18_protocol_qa_equivalence_and_hourly_qa(tmp_p
     res_unplan = hqa.check_partition(dp_unplan, mf_unplan, qa_cfg)
     assert res_unplan["qa_status"] == "failed"
     assert res_unplan["depth_unavailable_events"] == 1
+
+
+def test_issue19_qa_convert_same_day_restart_boot_id_isolation(tmp_path: Path):
+    """Same-UTC-day collector restart reusing (A, 1) must isolate depth anchors by boot_id:
+    - cross-boot delta without new-boot snapshot is rejected as missing_same_connection_anchor
+    - clean same-day restart with fresh new-boot snapshot remains eligible across Gate, Bybit, and Binance.
+    """
+    w0_s = int(datetime(2026, 11, 21, 14, 0, tzinfo=timezone.utc).timestamp())
+    w1_s = w0_s + 900
+    t0 = w0_s * 1_000_000_000
+    t1 = w1_s * 1_000_000_000
+
+    def write_same_day_pair(root: Path, include_boot2_snapshot: bool) -> None:
+        # 1. Gate Futures (BTC_USDT -> canonical asset BTC)
+        gate_b1 = [
+            (t0 + 1_000_000, 100, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.00", "B": "5", "a": "90001.00", "A": "5"}}),
+            (t0 + 2_000_000, 200, "A", 1, 2, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 1, "size": "1", "price": "90000.00"}]}),
+            (t0 + 3_000_000, 300, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": (t0 // 1_000_000) + 3, "full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.00", "2.0"]], "a": [["90001.00", "2.0"]]}}),
+            (t0 + 4_000_000, 400, "A", 1, 4, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": (t0 // 1_000_000) + 4, "full": False, "s": "ob.BTC_USDT.50", "U": 101, "u": 101, "b": [["90000.00", "2.5"]], "a": []}}),
+        ]
+        gate_b2: list[tuple[int, int, str, int, int, str, dict]] = [
+            (t1 + 1_000_000, 100, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.00", "B": "5", "a": "90001.00", "A": "5"}}),
+            (t1 + 2_000_000, 200, "A", 1, 2, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 2, "size": "1", "price": "90000.00"}]}),
+        ]
+        if include_boot2_snapshot:
+            gate_b2.extend([
+                (t1 + 3_000_000, 300, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": (t1 // 1_000_000) + 3, "full": True, "s": "ob.BTC_USDT.50", "u": 500, "b": [["90000.00", "3.0"]], "a": [["90001.00", "3.0"]]}}),
+                (t1 + 4_000_000, 400, "A", 1, 4, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": (t1 // 1_000_000) + 4, "full": False, "s": "ob.BTC_USDT.50", "U": 501, "u": 501, "b": [["90000.00", "3.2"]], "a": []}}),
+            ])
+        else:
+            # Reuses (A, 1) and even continues u=102 from boot_1 without a boot_2 snapshot!
+            gate_b2.append(
+                (t1 + 3_000_000, 300, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": (t1 // 1_000_000) + 3, "full": False, "s": "ob.BTC_USDT.50", "U": 102, "u": 102, "b": [["90000.00", "9.9"]], "a": []}})
+            )
+        _write_custom_15m_partition(root, exchange="gate_futures", window_start_s=w0_s, boot_id="boot_1", run_id="r1", rows=gate_b1, segment_suffix="b1")
+        _write_custom_15m_partition(root, exchange="gate_futures", window_start_s=w1_s, boot_id="boot_2", run_id="r2", rows=gate_b2, segment_suffix="b2")
+
+        # 2. Bybit Linear (ETHUSDT -> canonical asset ETH)
+        bybit_b1 = [
+            (t0 + 1_000_000, 100, "A", 1, 1, "DATA", {"topic": "orderbook.1.ETHUSDT", "type": "snapshot", "ts": (t0 // 1_000_000) + 1, "data": {"s": "ETHUSDT", "u": 10, "seq": 10, "b": [["3000.0", "2"]], "a": [["3001.0", "2"]]}}),
+            (t0 + 2_000_000, 200, "A", 1, 2, "DATA", {"topic": "publicTrade.ETHUSDT", "type": "snapshot", "ts": (t0 // 1_000_000) + 2, "data": [{"T": (t0 // 1_000_000) + 2, "s": "ETHUSDT", "S": "Buy", "v": "0.1", "p": "3000.0", "i": "e1"}]}),
+            (t0 + 3_000_000, 300, "A", 1, 3, "DATA", {"topic": "orderbook.50.ETHUSDT", "type": "snapshot", "ts": (t0 // 1_000_000) + 3, "data": {"s": "ETHUSDT", "u": 100, "seq": 1000, "b": [["3000.0", "2.0"]], "a": [["3001.0", "2.0"]]}}),
+            (t0 + 4_000_000, 400, "A", 1, 4, "DATA", {"topic": "orderbook.50.ETHUSDT", "type": "delta", "ts": (t0 // 1_000_000) + 4, "data": {"s": "ETHUSDT", "u": 101, "seq": 1010, "b": [["3000.0", "2.5"]], "a": []}}),
+        ]
+        bybit_b2: list[tuple[int, int, str, int, int, str, dict]] = [
+            (t1 + 1_000_000, 100, "A", 1, 1, "DATA", {"topic": "orderbook.1.ETHUSDT", "type": "snapshot", "ts": (t1 // 1_000_000) + 1, "data": {"s": "ETHUSDT", "u": 20, "seq": 20, "b": [["3000.0", "2"]], "a": [["3001.0", "2"]]}}),
+            (t1 + 2_000_000, 200, "A", 1, 2, "DATA", {"topic": "publicTrade.ETHUSDT", "type": "snapshot", "ts": (t1 // 1_000_000) + 2, "data": [{"T": (t1 // 1_000_000) + 2, "s": "ETHUSDT", "S": "Buy", "v": "0.1", "p": "3000.0", "i": "e2"}]}),
+        ]
+        if include_boot2_snapshot:
+            bybit_b2.extend([
+                (t1 + 3_000_000, 300, "A", 1, 3, "DATA", {"topic": "orderbook.50.ETHUSDT", "type": "snapshot", "ts": (t1 // 1_000_000) + 3, "data": {"s": "ETHUSDT", "u": 500, "seq": 5000, "b": [["3000.0", "3.0"]], "a": [["3001.0", "3.0"]]}}),
+                (t1 + 4_000_000, 400, "A", 1, 4, "DATA", {"topic": "orderbook.50.ETHUSDT", "type": "delta", "ts": (t1 // 1_000_000) + 4, "data": {"s": "ETHUSDT", "u": 501, "seq": 5010, "b": [["3000.0", "3.2"]], "a": []}}),
+            ])
+        else:
+            # Reuses (A, 1) and even continues monotonic u=102 without a boot_2 snapshot!
+            bybit_b2.append(
+                (t1 + 3_000_000, 300, "A", 1, 3, "DATA", {"topic": "orderbook.50.ETHUSDT", "type": "delta", "ts": (t1 // 1_000_000) + 3, "data": {"s": "ETHUSDT", "u": 102, "seq": 1020, "b": [["3000.0", "9.9"]], "a": []}})
+            )
+        _write_custom_15m_partition(root, exchange="bybit_linear", window_start_s=w0_s, boot_id="boot_1", run_id="r1", rows=bybit_b1, segment_suffix="b1")
+        _write_custom_15m_partition(root, exchange="bybit_linear", window_start_s=w1_s, boot_id="boot_2", run_id="r2", rows=bybit_b2, segment_suffix="b2")
+
+        # 3. Binance Futures (SOLUSDT -> canonical asset SOL)
+        bin_b1 = [
+            (t0 + 1_000_000, 100, "A", 1, 1, "DATA", {"stream": "solusdt@bookTicker", "data": {"e": "bookTicker", "u": 10, "s": "SOLUSDT", "b": "200.00", "B": "5", "a": "201.00", "A": "5"}}),
+            (t0 + 2_000_000, 200, "A", 1, 2, "META", {"event": "REST_SNAPSHOT_ANCHOR", "endpoint": "binance_public", "conn_id": "A", "epoch": 1, "symbol": "SOLUSDT", "snapshot": {"lastUpdateId": 102, "bids": [["200.00", "2.0"]], "asks": [["201.00", "2.0"]]}}),
+            (t0 + 3_000_000, 300, "A", 1, 3, "META", {"event": "DEPTH_BRIDGED_DELTA", "endpoint": "binance_public", "conn_id": "A", "epoch": 1, "symbol": "SOLUSDT", "U": 100, "u": 104, "pu": 99, "raw": json.dumps({"stream": "solusdt@depth@100ms", "data": {"e": "depthUpdate", "s": "SOLUSDT", "U": 100, "u": 104, "pu": 99, "b": [["200.00", "2.5"]], "a": []}})}),
+            (t0 + 4_000_000, 400, "A", 1, 4, "DATA", {"stream": "solusdt@depth@100ms", "data": {"e": "depthUpdate", "s": "SOLUSDT", "U": 105, "u": 106, "pu": 104, "b": [["200.00", "2.6"]], "a": []}}),
+        ]
+        bin_b2: list[tuple[int, int, str, int, int, str, dict]] = [
+            (t1 + 1_000_000, 100, "A", 1, 1, "DATA", {"stream": "solusdt@bookTicker", "data": {"e": "bookTicker", "u": 20, "s": "SOLUSDT", "b": "200.00", "B": "5", "a": "201.00", "A": "5"}}),
+        ]
+        if include_boot2_snapshot:
+            bin_b2.extend([
+                (t1 + 2_000_000, 200, "A", 1, 2, "META", {"event": "REST_SNAPSHOT_ANCHOR", "endpoint": "binance_public", "conn_id": "A", "epoch": 1, "symbol": "SOLUSDT", "snapshot": {"lastUpdateId": 502, "bids": [["200.00", "3.0"]], "asks": [["201.00", "3.0"]]}}),
+                (t1 + 3_000_000, 300, "A", 1, 3, "META", {"event": "DEPTH_BRIDGED_DELTA", "endpoint": "binance_public", "conn_id": "A", "epoch": 1, "symbol": "SOLUSDT", "U": 500, "u": 504, "pu": 499, "raw": json.dumps({"stream": "solusdt@depth@100ms", "data": {"e": "depthUpdate", "s": "SOLUSDT", "U": 500, "u": 504, "pu": 499, "b": [["200.00", "3.2"]], "a": []}})}),
+                (t1 + 4_000_000, 400, "A", 1, 4, "DATA", {"stream": "solusdt@depth@100ms", "data": {"e": "depthUpdate", "s": "SOLUSDT", "U": 505, "u": 506, "pu": 504, "b": [["200.00", "3.5"]], "a": []}}),
+            ])
+        else:
+            # Reuses (A, 1) and even continues pu=106 from boot_1 without a boot_2 REST_SNAPSHOT_ANCHOR!
+            bin_b2.append(
+                (t1 + 2_000_000, 200, "A", 1, 2, "DATA", {"stream": "solusdt@depth@100ms", "data": {"e": "depthUpdate", "s": "SOLUSDT", "U": 107, "u": 108, "pu": 106, "b": [["200.00", "9.9"]], "a": []}})
+            )
+        _write_custom_15m_partition(root, exchange="binance_futures", window_start_s=w0_s, boot_id="boot_1", run_id="r1", rows=bin_b1, segment_suffix="b1")
+        _write_custom_15m_partition(root, exchange="binance_futures", window_start_s=w1_s, boot_id="boot_2", run_id="r2", rows=bin_b2, segment_suffix="b2")
+
+    # (a) Cross-boot splice without new-boot snapshot MUST be rejected on all 3 exchanges
+    bad_root = tmp_path / "same_day_bad"
+    write_same_day_pair(bad_root, include_boot2_snapshot=False)
+    bad_summary = run_qa_convert(bad_root, tmp_path / "hbt_bad", allow_unverified_local=True)
+    assert bad_summary["status"] == "ok"
+    assert bad_summary["execution_unverified_asset_days"] == 3
+    assert len(bad_summary["unrebuildable_depth_markets"]) == 3
+    bad_cal = {r["symbol"]: r for r in json.loads(Path(bad_summary["calendar_path"]).read_text(encoding="utf-8"))}
+    for sym in ("BTC", "ETH", "SOL"):
+        row = bad_cal[sym]
+        assert row["eligibility_status"] == "execution_unverified", row
+        assert row["depth_rebuild_status"] == "unrebuildable_excluded", row
+        assert "missing_same_connection_anchor" in row["unrebuildable_depth_reasons"], row
+        assert row["excluded_unrebuildable_depth_rows"] == 1, row
+        assert "follower_l2_hbt" not in row["files"], row
+        assert "binance_depth_diag" not in row["files"], row
+
+    # (b) Clean same-day restart with fresh new-boot snapshot MUST remain eligible on all 3 exchanges
+    good_root = tmp_path / "same_day_good"
+    write_same_day_pair(good_root, include_boot2_snapshot=True)
+    good_summary = run_qa_convert(good_root, tmp_path / "hbt_good", allow_unverified_local=True)
+    assert good_summary["status"] == "ok"
+    assert good_summary["unrebuildable_depth_markets"] == []
+    assert good_summary["execution_unverified_asset_days"] == 0
+    assert good_summary["eligible_asset_days"] == 3
+    good_cal = {r["symbol"]: r for r in json.loads(Path(good_summary["calendar_path"]).read_text(encoding="utf-8"))}
+    for sym in ("BTC", "ETH", "SOL"):
+        row = good_cal[sym]
+        assert row["eligibility_status"] == "eligible", row
+        assert row["depth_rebuild_status"] == "ok", row
+

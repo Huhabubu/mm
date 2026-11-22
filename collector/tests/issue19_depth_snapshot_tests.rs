@@ -2241,3 +2241,575 @@ async fn test_issue19_live_four_exchange_depth_refresh_and_archive_rebuild() {
     assert!(*binance_audit.bbo_frames.get("BTCUSDT").unwrap_or(&0) >= 5);
     assert!(*binance_audit.trade_frames.get("BTCUSDT").unwrap_or(&0) >= 5);
 }
+
+#[test]
+fn test_issue19_standby_sequence_break_never_interrupts_healthy_primary_across_exchanges() {
+    // 1. Gate Futures
+    {
+        let mut sel = CausalSelector::new(EndpointKind::GatePublic, vec!["BTC_USDT".to_string()], 3, 5);
+        let mut archive: Vec<CanonicalRecord> = Vec::new();
+        let mut wall = 1_796_257_000_000_000_000i64;
+        let mut mono = 1_000_000u64;
+        let px = 90000.0;
+
+        for conn in [ConnId::A, ConnId::B] {
+            wall += 1_000_000;
+            mono += 1_000_000;
+            archive.extend(
+                sel.on_frame(raw_frame(
+                    ExchangeId::GateFutures,
+                    EndpointKind::GatePublic,
+                    conn,
+                    1,
+                    wall,
+                    mono,
+                    gate_snapshot_frame("BTC_USDT", 100, px),
+                ))
+                .records,
+            );
+        }
+        assert_eq!(sel.primary(), ConnId::A);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let init_a = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            gate_delta_frame("BTC_USDT", 101, 101, px, "2.1"),
+        ));
+        assert_eq!(init_a.records.len(), 1);
+        assert_eq!(init_a.records[0].kind, RecordKind::Data);
+        archive.extend(init_a.records);
+
+        // Standby B sequence break
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let brk = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            gate_delta_frame("BTC_USDT", 999, 999, px, "9.9"),
+        ));
+        assert_eq!(sel.primary(), ConnId::A);
+        assert!(!sel.in_gap());
+        assert!(brk.records.iter().any(|r| r.payload.contains("\"STANDBY_INVALID\"")));
+        assert!(!brk.records.iter().any(|r| {
+            r.payload.contains("\"SWITCH\"")
+                || r.payload.contains("\"GAP_START\"")
+                || r.payload.contains("\"DEPTH_UNAVAILABLE\"")
+        }));
+        assert!(!brk.actions.iter().any(|a| match a {
+            SelectorAction::Resubscribe { conn_id, .. }
+            | SelectorAction::FetchRestSnapshot { conn_id, .. }
+            | SelectorAction::Reconnect { conn_id, .. } => *conn_id == ConnId::A,
+            SelectorAction::Alert { .. } => false,
+        }));
+        assert!(brk.actions.iter().any(|a| matches!(
+            a,
+            SelectorAction::Resubscribe { conn_id: ConnId::B, symbols, .. } if symbols == &vec!["BTC_USDT".to_string()]
+        )));
+        archive.extend(brk.records);
+
+        sel.mark_refresh_queued(ConnId::B, 1, 50, &["BTC_USDT".to_string()]);
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok1 = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            gate_delta_frame("BTC_USDT", 102, 102, px, "2.2"),
+        ));
+        assert_eq!(a_ok1.records.len(), 1);
+        assert_eq!(a_ok1.records[0].kind, RecordKind::Data);
+        assert!(a_ok1.actions.is_empty());
+        archive.extend(a_ok1.records);
+
+        sel.on_depth_refresh_subscribed(ConnId::B, 1, 50);
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok2 = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            gate_delta_frame("BTC_USDT", 103, 103, px, "2.3"),
+        ));
+        assert_eq!(a_ok2.records.len(), 1);
+        assert_eq!(a_ok2.records[0].kind, RecordKind::Data);
+        assert!(a_ok2.actions.is_empty());
+        archive.extend(a_ok2.records);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let b_rec = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            gate_snapshot_frame("BTC_USDT", 200, px),
+        ));
+        assert!(b_rec.records.is_empty(), "standby B recovery must not leak snapshot into primary A archive");
+        assert_eq!(sel.conn_state(ConnId::B), ConnState::Live);
+        assert_eq!(sel.primary(), ConnId::A);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok3 = sel.on_frame(raw_frame(
+            ExchangeId::GateFutures,
+            EndpointKind::GatePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            gate_delta_frame("BTC_USDT", 104, 104, px, "2.4"),
+        ));
+        assert_eq!(a_ok3.records.len(), 1);
+        assert_eq!(a_ok3.records[0].kind, RecordKind::Data);
+        archive.extend(a_ok3.records);
+
+        let audit = verify_gate_records_strict(&archive, &["BTC_USDT"]);
+        assert_eq!(audit.depth_deltas.get("BTC_USDT").copied().unwrap_or(0), 4);
+    }
+
+    // 2. Bybit Linear
+    {
+        let mut sel = CausalSelector::new(EndpointKind::BybitPublic, vec!["BTCUSDT".to_string()], 3, 5);
+        let mut archive: Vec<CanonicalRecord> = Vec::new();
+        let mut wall = 1_796_257_100_000_000_000i64;
+        let mut mono = 1_000_000u64;
+        let px = 90000.0;
+
+        let bybit_snap = |u: u64| {
+            json!({
+                "topic": "orderbook.50.BTCUSDT",
+                "type": "snapshot",
+                "ts": 1796257100000i64 + u as i64,
+                "data": {"s": "BTCUSDT", "u": u, "seq": u * 10, "b": [[format!("{px:.1}"), "2.0"]], "a": [[format!("{:.1}", px + 1.0), "2.0"]]}
+            })
+            .to_string()
+        };
+        let bybit_delta = |u: u64, sz: &str| {
+            json!({
+                "topic": "orderbook.50.BTCUSDT",
+                "type": "delta",
+                "ts": 1796257100000i64 + u as i64,
+                "data": {"s": "BTCUSDT", "u": u, "seq": u * 10, "b": [[format!("{px:.1}"), sz]], "a": []}
+            })
+            .to_string()
+        };
+
+        for conn in [ConnId::A, ConnId::B] {
+            wall += 1_000_000;
+            mono += 1_000_000;
+            archive.extend(
+                sel.on_frame(raw_frame(
+                    ExchangeId::BybitLinear,
+                    EndpointKind::BybitPublic,
+                    conn,
+                    1,
+                    wall,
+                    mono,
+                    bybit_snap(100),
+                ))
+                .records,
+            );
+        }
+        assert_eq!(sel.primary(), ConnId::A);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let init_a = sel.on_frame(raw_frame(
+            ExchangeId::BybitLinear,
+            EndpointKind::BybitPublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bybit_delta(101, "2.1"),
+        ));
+        assert_eq!(init_a.records.len(), 1);
+        archive.extend(init_a.records);
+
+        // Standby B sequence regression (u=5 < 100)
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let brk = sel.on_frame(raw_frame(
+            ExchangeId::BybitLinear,
+            EndpointKind::BybitPublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            bybit_delta(5, "9.9"),
+        ));
+        assert_eq!(sel.primary(), ConnId::A);
+        assert!(!sel.in_gap());
+        assert!(brk.records.iter().any(|r| r.payload.contains("\"STANDBY_INVALID\"")));
+        assert!(!brk.records.iter().any(|r| {
+            r.payload.contains("\"SWITCH\"")
+                || r.payload.contains("\"GAP_START\"")
+                || r.payload.contains("\"DEPTH_UNAVAILABLE\"")
+        }));
+        assert!(!brk.actions.iter().any(|a| match a {
+            SelectorAction::Resubscribe { conn_id, .. }
+            | SelectorAction::FetchRestSnapshot { conn_id, .. }
+            | SelectorAction::Reconnect { conn_id, .. } => *conn_id == ConnId::A,
+            SelectorAction::Alert { .. } => false,
+        }));
+        assert!(brk.actions.iter().any(|a| matches!(
+            a,
+            SelectorAction::Resubscribe { conn_id: ConnId::B, symbols, .. } if symbols == &vec!["BTCUSDT".to_string()]
+        )));
+        archive.extend(brk.records);
+
+        sel.mark_refresh_queued(ConnId::B, 1, 50, &["BTCUSDT".to_string()]);
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok1 = sel.on_frame(raw_frame(
+            ExchangeId::BybitLinear,
+            EndpointKind::BybitPublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bybit_delta(102, "2.2"),
+        ));
+        assert_eq!(a_ok1.records.len(), 1);
+        assert!(a_ok1.actions.is_empty());
+        archive.extend(a_ok1.records);
+
+        sel.on_depth_refresh_subscribed(ConnId::B, 1, 50);
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let b_rec = sel.on_frame(raw_frame(
+            ExchangeId::BybitLinear,
+            EndpointKind::BybitPublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            bybit_snap(200),
+        ));
+        assert!(b_rec.records.is_empty());
+        assert_eq!(sel.conn_state(ConnId::B), ConnState::Live);
+        assert_eq!(sel.primary(), ConnId::A);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok2 = sel.on_frame(raw_frame(
+            ExchangeId::BybitLinear,
+            EndpointKind::BybitPublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bybit_delta(103, "2.3"),
+        ));
+        assert_eq!(a_ok2.records.len(), 1);
+        archive.extend(a_ok2.records);
+
+        let audit = verify_bybit_records_strict(&archive, &["BTCUSDT"]);
+        assert_eq!(audit.depth_deltas.get("BTCUSDT").copied().unwrap_or(0), 3);
+    }
+
+    // 3. Bitget V3
+    {
+        let mut sel = CausalSelector::new(EndpointKind::BitgetPublic, vec!["BTCUSDT".to_string()], 3, 5);
+        let mut archive: Vec<CanonicalRecord> = Vec::new();
+        let mut wall = 1_796_257_200_000_000_000i64;
+        let mut mono = 1_000_000u64;
+        let px = 90000.0;
+
+        let bg_snap = |seq: u64| {
+            json!({
+                "action": "snapshot",
+                "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"},
+                "data": [{"seq": seq, "pseq": 0, "b": [[format!("{px:.1}"), "2.0"]], "a": [[format!("{:.1}", px + 1.0), "2.0"]]}]
+            })
+            .to_string()
+        };
+        let bg_update = |pseq: u64, seq: u64, sz: &str| {
+            json!({
+                "action": "update",
+                "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"},
+                "data": [{"seq": seq, "pseq": pseq, "b": [[format!("{px:.1}"), sz]], "a": []}]
+            })
+            .to_string()
+        };
+
+        for conn in [ConnId::A, ConnId::B] {
+            wall += 1_000_000;
+            mono += 1_000_000;
+            archive.extend(
+                sel.on_frame(raw_frame(
+                    ExchangeId::BitgetV3,
+                    EndpointKind::BitgetPublic,
+                    conn,
+                    1,
+                    wall,
+                    mono,
+                    bg_snap(100),
+                ))
+                .records,
+            );
+            wall += 1_000_000;
+            mono += 1_000_000;
+            archive.extend(
+                sel.on_frame(raw_frame(
+                    ExchangeId::BitgetV3,
+                    EndpointKind::BitgetPublic,
+                    conn,
+                    1,
+                    wall,
+                    mono,
+                    bg_update(100, 105, "2.1"),
+                ))
+                .records,
+            );
+        }
+        assert_eq!(sel.primary(), ConnId::A);
+
+        // Standby B sequence break (pseq=105 >= seq=105)
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let brk = sel.on_frame(raw_frame(
+            ExchangeId::BitgetV3,
+            EndpointKind::BitgetPublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            bg_update(105, 105, "9.9"),
+        ));
+        assert_eq!(sel.primary(), ConnId::A);
+        assert!(!sel.in_gap());
+        assert!(brk.records.iter().any(|r| r.payload.contains("\"STANDBY_INVALID\"")));
+        assert!(!brk.records.iter().any(|r| {
+            r.payload.contains("\"SWITCH\"")
+                || r.payload.contains("\"GAP_START\"")
+                || r.payload.contains("\"DEPTH_UNAVAILABLE\"")
+        }));
+        assert!(!brk.actions.iter().any(|a| match a {
+            SelectorAction::Resubscribe { conn_id, .. }
+            | SelectorAction::FetchRestSnapshot { conn_id, .. }
+            | SelectorAction::Reconnect { conn_id, .. } => *conn_id == ConnId::A,
+            SelectorAction::Alert { .. } => false,
+        }));
+        assert!(brk.actions.iter().any(|a| matches!(
+            a,
+            SelectorAction::Resubscribe { conn_id: ConnId::B, symbols, .. } if symbols == &vec!["BTCUSDT".to_string()]
+        )));
+        archive.extend(brk.records);
+
+        sel.mark_refresh_queued(ConnId::B, 1, 50, &["BTCUSDT".to_string()]);
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok1 = sel.on_frame(raw_frame(
+            ExchangeId::BitgetV3,
+            EndpointKind::BitgetPublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bg_update(105, 110, "2.2"),
+        ));
+        assert_eq!(a_ok1.records.len(), 1);
+        assert!(a_ok1.actions.is_empty());
+        archive.extend(a_ok1.records);
+
+        sel.on_depth_refresh_subscribed(ConnId::B, 1, 50);
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let b_rec = sel.on_frame(raw_frame(
+            ExchangeId::BitgetV3,
+            EndpointKind::BitgetPublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            bg_snap(200),
+        ));
+        assert!(b_rec.records.is_empty());
+        assert_eq!(sel.conn_state(ConnId::B), ConnState::Live);
+        assert_eq!(sel.primary(), ConnId::A);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok2 = sel.on_frame(raw_frame(
+            ExchangeId::BitgetV3,
+            EndpointKind::BitgetPublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bg_update(110, 115, "2.3"),
+        ));
+        assert_eq!(a_ok2.records.len(), 1);
+        archive.extend(a_ok2.records);
+
+        let audit = verify_bitget_records_strict(&archive, &["BTCUSDT"], true);
+        assert_eq!(audit.depth_deltas.get("BTCUSDT").copied().unwrap_or(0), 3);
+    }
+
+    // 4. Binance Futures
+    {
+        let mut sel = CausalSelector::new(EndpointKind::BinancePublic, vec!["BTCUSDT".to_string()], 3, 5);
+        let mut archive: Vec<CanonicalRecord> = Vec::new();
+        let mut wall = 1_796_257_300_000_000_000i64;
+        let mut mono = 1_000_000u64;
+        let px = 90000.0;
+
+        let bin_delta = |fu: u64, lu: u64, pu: u64, sz: &str| {
+            json!({
+                "stream": "btcusdt@depth@100ms",
+                "data": {"e": "depthUpdate", "s": "BTCUSDT", "U": fu, "u": lu, "pu": pu, "b": [[format!("{px:.2}"), sz]], "a": []}
+            })
+            .to_string()
+        };
+        let bin_rest = |last_u: u64| {
+            json!({
+                "lastUpdateId": last_u,
+                "bids": [[format!("{px:.2}"), "5.0"]],
+                "asks": [[format!("{:.2}", px + 1.0), "5.0"]]
+            })
+            .to_string()
+        };
+
+        for conn in [ConnId::A, ConnId::B] {
+            wall += 1_000_000;
+            mono += 1_000_000;
+            sel.on_frame(raw_frame(
+                ExchangeId::BinanceFutures,
+                EndpointKind::BinancePublic,
+                conn,
+                1,
+                wall,
+                mono,
+                bin_delta(100, 104, 99, "6.0"),
+            ));
+            wall += 1_000_000;
+            mono += 1_000_000;
+            archive.extend(
+                sel.on_rest_snapshot(conn, "BTCUSDT", 102, &bin_rest(102), wall, mono)
+                    .records,
+            );
+        }
+        assert_eq!(sel.primary(), ConnId::A);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let init_a = sel.on_frame(raw_frame(
+            ExchangeId::BinanceFutures,
+            EndpointKind::BinancePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bin_delta(105, 106, 104, "6.1"),
+        ));
+        assert_eq!(init_a.records.len(), 1);
+        archive.extend(init_a.records);
+
+        // Standby B sequence break (pu=999 != 104)
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let brk = sel.on_frame(raw_frame(
+            ExchangeId::BinanceFutures,
+            EndpointKind::BinancePublic,
+            ConnId::B,
+            1,
+            wall,
+            mono,
+            bin_delta(120, 121, 999, "9.9"),
+        ));
+        assert_eq!(sel.primary(), ConnId::A);
+        assert!(!sel.in_gap());
+        assert!(brk.records.iter().any(|r| r.payload.contains("\"STANDBY_INVALID\"")));
+        assert!(!brk.records.iter().any(|r| {
+            r.payload.contains("\"SWITCH\"")
+                || r.payload.contains("\"GAP_START\"")
+                || r.payload.contains("\"DEPTH_UNAVAILABLE\"")
+        }));
+        assert!(!brk.actions.iter().any(|a| match a {
+            SelectorAction::Resubscribe { conn_id, .. }
+            | SelectorAction::FetchRestSnapshot { conn_id, .. }
+            | SelectorAction::Reconnect { conn_id, .. } => *conn_id == ConnId::A,
+            SelectorAction::Alert { .. } => false,
+        }));
+        assert!(brk.actions.iter().any(|a| matches!(
+            a,
+            SelectorAction::FetchRestSnapshot { conn_id: ConnId::B, symbol } if symbol == "BTCUSDT"
+        )));
+        archive.extend(brk.records);
+
+        // Healthy A continues uninterrupted while standby B awaits REST snapshot
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok1 = sel.on_frame(raw_frame(
+            ExchangeId::BinanceFutures,
+            EndpointKind::BinancePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bin_delta(107, 108, 106, "6.2"),
+        ));
+        assert_eq!(a_ok1.records.len(), 1);
+        assert!(a_ok1.actions.is_empty());
+        archive.extend(a_ok1.records);
+
+        // Recover standby B cleanly via REST snapshot
+        wall += 1_000_000;
+        mono += 1_000_000;
+        assert!(sel
+            .on_frame(raw_frame(
+                ExchangeId::BinanceFutures,
+                EndpointKind::BinancePublic,
+                ConnId::B,
+                1,
+                wall,
+                mono,
+                bin_delta(200, 202, 199, "5.5"),
+            ))
+            .records
+            .is_empty());
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let b_rec = sel.on_rest_snapshot(ConnId::B, "BTCUSDT", 201, &bin_rest(201), wall, mono);
+        assert!(b_rec.records.is_empty());
+        assert_eq!(sel.conn_state(ConnId::B), ConnState::Live);
+        assert_eq!(sel.primary(), ConnId::A);
+
+        wall += 1_000_000;
+        mono += 1_000_000;
+        let a_ok2 = sel.on_frame(raw_frame(
+            ExchangeId::BinanceFutures,
+            EndpointKind::BinancePublic,
+            ConnId::A,
+            1,
+            wall,
+            mono,
+            bin_delta(109, 110, 108, "6.3"),
+        ));
+        assert_eq!(a_ok2.records.len(), 1);
+        archive.extend(a_ok2.records);
+
+        let audit = verify_binance_records_strict(&archive, &["BTCUSDT"]);
+        assert_eq!(audit.depth_deltas.get("BTCUSDT").copied().unwrap_or(0), 4);
+    }
+}
+

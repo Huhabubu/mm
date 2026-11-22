@@ -468,7 +468,9 @@ def _ingest_binance_record(
             if buf.depth_unavailable_intervals and buf.depth_unavailable_intervals[-1].get("end_wall_ns") is None:
                 buf.depth_unavailable_intervals[-1]["end_wall_ns"] = ready_local_ts
             last_uid = int(obj.get("lastUpdateId") or raw.get("lastUpdateId") or 0)
+            rec_boot = str(obj.get("boot_id") or rec.get("boot_id") or "")
             buf.binance_depth_anchor = {
+                "boot_id": rec_boot,
                 "conn_id": str(obj.get("conn_id") or rec.get("conn_id") or ""),
                 "epoch": int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0)),
                 "last_update_id": last_uid,
@@ -482,14 +484,24 @@ def _ingest_binance_record(
                 ("binance_futures", sym, date_utc),
                 AssetDayBuffers("binance_futures", sym, date_utc),
             )
+            rec_boot = str(obj.get("boot_id") or rec.get("boot_id") or "")
             conn_id = str(obj.get("conn_id") or rec.get("conn_id") or "")
             epoch = int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0))
             anchor = buf.binance_depth_anchor
-            if anchor is None or anchor["conn_id"] != conn_id or anchor["epoch"] != epoch:
-                raise ValueError(
-                    f"Binance DEPTH_BRIDGED_DELTA conn/epoch mismatch for {sym}: "
-                    f"delta=({conn_id},{epoch}) anchor={anchor}"
+            if (
+                anchor is None
+                or anchor.get("boot_id", "") != rec_boot
+                or anchor["conn_id"] != conn_id
+                or anchor["epoch"] != epoch
+            ):
+                buf.record_unrebuildable_depth(
+                    reason="missing_same_connection_anchor",
+                    wall_ns=local_ts,
+                    conn_id=conn_id,
+                    epoch=epoch,
                 )
+                buf.binance_depth_anchor = None
+                return
             raw_ws = obj.get("raw")
             raw_obj = json.loads(raw_ws) if isinstance(raw_ws, str) else raw_ws
             if not isinstance(raw_obj, dict):
@@ -596,22 +608,24 @@ def _ingest_binance_record(
             AssetDayBuffers("binance_futures", sym, date_utc),
         )
         anchor = buf.binance_depth_anchor
+        rec_boot = str(rec.get("boot_id") or "")
         rec_conn = str(rec.get("conn_id") or "")
         rec_epoch = int(rec.get("epoch", 0))
-        if anchor is None:
+        if (
+            anchor is None
+            or anchor.get("boot_id", "") != rec_boot
+            or anchor["conn_id"] != rec_conn
+            or anchor["epoch"] != rec_epoch
+        ):
             buf.record_unrebuildable_depth(
                 reason="missing_same_connection_anchor",
                 wall_ns=local_ts,
                 conn_id=rec_conn,
                 epoch=rec_epoch,
             )
+            buf.binance_depth_anchor = None
             return
         if "U" in data and "u" in data:
-            if anchor["conn_id"] != rec_conn or anchor["epoch"] != rec_epoch:
-                raise ValueError(
-                    f"Binance live depthUpdate cross-connection splice for {sym}: "
-                    f"delta=({rec_conn},{rec_epoch}) anchor=({anchor['conn_id']},{anchor['epoch']})"
-                )
             first_u = int(data["U"])
             last_u = int(data["u"])
             prev_u = int(data["pu"]) if "pu" in data else None
@@ -620,15 +634,24 @@ def _ingest_binance_record(
                 if last_u < snap_uid:
                     return
                 if not (first_u <= snap_uid <= last_u):
-                    raise ValueError(
-                        f"Binance first live delta violates U<=S<=u for {sym}: "
-                        f"U={first_u}, S={snap_uid}, u={last_u}"
+                    buf.record_unrebuildable_depth(
+                        reason="exchange_update_chain_break",
+                        wall_ns=local_ts,
+                        conn_id=rec_conn,
+                        epoch=rec_epoch,
                     )
+                    buf.binance_depth_anchor = None
+                    return
                 anchor["awaiting_first_delta"] = False
             elif anchor["last_u"] is not None and prev_u is not None and prev_u != anchor["last_u"]:
-                raise ValueError(
-                    f"Binance live depthUpdate pu break for {sym}: pu={prev_u} != prev_u={anchor['last_u']}"
+                buf.record_unrebuildable_depth(
+                    reason="exchange_update_chain_break",
+                    wall_ns=local_ts,
+                    conn_id=rec_conn,
+                    epoch=rec_epoch,
                 )
+                buf.binance_depth_anchor = None
+                return
             anchor["last_u"] = last_u
         _emit_depth_batch(buf, False, exch_ts, local_ts, bids, asks)
     elif ev == "aggTrade" or stream.endswith("@aggTrade"):
@@ -705,6 +728,7 @@ def reconstruct_binance_depth_book(
                 snap = obj.get("snapshot") if ev_name == "REST_SNAPSHOT_ANCHOR" else obj.get("raw")
                 if not isinstance(snap, dict):
                     raise ValueError(f"Malformed {ev_name} for {raw_sym}")
+                rec_boot = str(obj.get("boot_id") or rec.get("boot_id") or "")
                 conn_id = str(obj.get("conn_id") or rec.get("conn_id") or "")
                 epoch = int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0))
                 last_uid = int(obj.get("lastUpdateId") or snap.get("lastUpdateId") or 0)
@@ -712,6 +736,7 @@ def reconstruct_binance_depth_book(
                 if unavailable_intervals and unavailable_intervals[-1]["end_wall_ns"] is None:
                     unavailable_intervals[-1]["end_wall_ns"] = ready_ns
                 anchor = {
+                    "boot_id": rec_boot,
                     "conn_id": conn_id,
                     "epoch": epoch,
                     "last_update_id": last_uid,
@@ -729,12 +754,18 @@ def reconstruct_binance_depth_book(
                 raw_sym = str(obj.get("symbol") or "")
                 if not _matches(raw_sym):
                     continue
+                rec_boot = str(obj.get("boot_id") or rec.get("boot_id") or "")
                 conn_id = str(obj.get("conn_id") or rec.get("conn_id") or "")
                 epoch = int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0))
-                if anchor is None or anchor["conn_id"] != conn_id or anchor["epoch"] != epoch:
+                if (
+                    anchor is None
+                    or anchor.get("boot_id", "") != rec_boot
+                    or anchor["conn_id"] != conn_id
+                    or anchor["epoch"] != epoch
+                ):
                     raise ValueError(
                         f"DEPTH_BRIDGED_DELTA without matching same-connection anchor for {raw_sym}: "
-                        f"delta=({conn_id},{epoch}) anchor={anchor}"
+                        f"delta=({rec_boot},{conn_id},{epoch}) anchor={anchor}"
                     )
                 raw_ws = obj.get("raw")
                 raw_obj = json.loads(raw_ws) if isinstance(raw_ws, str) else raw_ws
@@ -807,14 +838,19 @@ def reconstruct_binance_depth_book(
             raw_sym = str(data.get("s") or "")
             if not _matches(raw_sym):
                 continue
+            rec_boot = str(rec.get("boot_id") or "")
             rec_conn = str(rec.get("conn_id") or "")
             rec_epoch = int(rec.get("epoch", 0))
             if anchor is None:
                 raise ValueError(f"Unanchored live Binance depthUpdate for {raw_sym} at wall_ns={wall_ns}")
-            if anchor["conn_id"] != rec_conn or anchor["epoch"] != rec_epoch:
+            if (
+                anchor.get("boot_id", "") != rec_boot
+                or anchor["conn_id"] != rec_conn
+                or anchor["epoch"] != rec_epoch
+            ):
                 raise ValueError(
                     f"Cross-connection Binance depthUpdate for {raw_sym}: "
-                    f"delta=({rec_conn},{rec_epoch}) anchor=({anchor['conn_id']},{anchor['epoch']})"
+                    f"delta=({rec_boot},{rec_conn},{rec_epoch}) anchor=({anchor.get('boot_id', '')},{anchor['conn_id']},{anchor['epoch']})"
                 )
             first_u = int(data["U"])
             last_u = int(data["u"])
@@ -930,12 +966,14 @@ def _validate_and_apply_follower_depth(
     bids: list[tuple[float, float]],
     asks: list[tuple[float, float]],
 ) -> None:
+    rec_boot = str(rec.get("boot_id") or "")
     rec_conn = str(rec.get("conn_id") or "")
     rec_epoch = int(rec.get("epoch", 0))
     if is_snap:
         if buf.depth_unavailable_intervals and buf.depth_unavailable_intervals[-1].get("end_wall_ns") is None:
             buf.depth_unavailable_intervals[-1]["end_wall_ns"] = local_ts
         buf.follower_depth_anchor = {
+            "boot_id": rec_boot,
             "conn_id": rec_conn,
             "epoch": rec_epoch,
             "seq": seq,
@@ -945,7 +983,12 @@ def _validate_and_apply_follower_depth(
         return
 
     anchor = buf.follower_depth_anchor
-    if anchor is None or anchor["conn_id"] != rec_conn or anchor["epoch"] != rec_epoch:
+    if (
+        anchor is None
+        or anchor.get("boot_id", "") != rec_boot
+        or anchor["conn_id"] != rec_conn
+        or anchor["epoch"] != rec_epoch
+    ):
         buf.record_unrebuildable_depth(
             reason="missing_same_connection_anchor",
             wall_ns=local_ts,
@@ -1601,6 +1644,7 @@ def run_qa_convert(
                 file_prev_rx_seq: int | None = None
                 file_first_rx_seq: int | None = None
                 for rec in records:
+                    rec["boot_id"] = boot_id
                     if coverage is not None:
                         coverage.observe_record(exchange, rec)
                     total_records += 1

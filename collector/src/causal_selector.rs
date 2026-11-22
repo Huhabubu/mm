@@ -412,11 +412,15 @@ impl CausalSelector {
             return;
         }
 
+        let is_primary = conn_id == self.primary;
         let epoch = self.runtime(conn_id).epoch;
         for sym in &target_syms {
             self.runtime_mut(conn_id)
                 .validator
                 .prepare_symbol_depth_refresh(sym);
+            if !is_primary {
+                continue;
+            }
             let entry = self
                 .archive_depth
                 .entry(sym.clone())
@@ -836,8 +840,26 @@ impl CausalSelector {
                 needs_resubscribe,
                 needs_snapshot_refetch,
             } => {
+                if conn_id == self.primary {
+                    self.handle_primary_fault(wall_ns, mono_ns, &reason, &mut out);
+                } else {
+                    out.records.push(self.emit_meta(
+                        wall_ns,
+                        mono_ns,
+                        conn_id,
+                        json!({
+                            "event": "STANDBY_INVALID",
+                            "endpoint": self.endpoint.as_str(),
+                            "conn": conn_id.as_str(),
+                            "reason": reason
+                        }),
+                    ));
+                }
                 if needs_snapshot_refetch {
                     if let Some(sym) = symbol.clone() {
+                        let emit_unavail = self.endpoint == EndpointKind::BinancePublic
+                            && conn_id == self.primary
+                            && !self.in_gap;
                         self.enter_depth_wait(
                             conn_id,
                             &[sym],
@@ -845,7 +867,7 @@ impl CausalSelector {
                             mono_ns,
                             &reason,
                             false,
-                            self.endpoint == EndpointKind::BinancePublic,
+                            emit_unavail,
                             true,
                             &mut out,
                         );
@@ -867,21 +889,6 @@ impl CausalSelector {
                         true,
                         &mut out,
                     );
-                }
-                if conn_id == self.primary {
-                    self.handle_primary_fault(wall_ns, mono_ns, &reason, &mut out);
-                } else {
-                    out.records.push(self.emit_meta(
-                        wall_ns,
-                        mono_ns,
-                        conn_id,
-                        json!({
-                            "event": "STANDBY_INVALID",
-                            "endpoint": self.endpoint.as_str(),
-                            "conn": conn_id.as_str(),
-                            "reason": reason
-                        }),
-                    ));
                 }
             }
         }
