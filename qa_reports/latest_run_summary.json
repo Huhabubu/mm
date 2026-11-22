@@ -1,35 +1,54 @@
 {
-  "status": "ok",
-  "qa_status": "passed",
-  "heartbeat_status": "ok",
+  "status": "blocked",
+  "qa_status": "failed",
+  "heartbeat_status": "failed",
   "job_execution_status": "ok",
   "target_window_execution_status": "ok",
   "historical_catchup_status": "ok",
-  "active_window_ready_for_protocol_qa": true,
+  "active_window_ready_for_protocol_qa": false,
   "trigger_mode": "archive_dispatch",
-  "started_at_utc": "2026-11-22T08:04:33Z",
-  "completed_at_utc": "2026-11-22T08:05:33Z",
-  "target_window_utc": "2026-11-22T07:45Z",
-  "expected_archive_revision": "sha256:3b436aa27bc848716e6f211803e978f6aacd2539695be5aba38ecb0483a8fedc",
-  "observed_archive_revision": "sha256:3b436aa27bc848716e6f211803e978f6aacd2539695be5aba38ecb0483a8fedc",
+  "started_at_utc": "2026-11-22T08:19:37Z",
+  "completed_at_utc": "2026-11-22T08:20:41Z",
+  "target_window_utc": "2026-11-22T08:00Z",
+  "expected_archive_revision": "sha256:ef878d582ae23d85044fd41d65741723376c035fbca2e2490698a8609d0162b9",
+  "observed_archive_revision": "sha256:ef878d582ae23d85044fd41d65741723376c035fbca2e2490698a8609d0162b9",
   "target_revision_matched": true,
   "target_validation_error": null,
   "target_window_reused_result": false,
-  "current_window_id": "2026-11-22T07:45Z",
+  "current_window_id": "2026-11-22T08:00Z",
   "current_window_completed": true,
-  "current_window_verification_status": "passed",
-  "latest_due_window_id": "2026-11-22T07:45Z",
-  "latest_due_window_verification_status": "passed",
-  "latest_verified_window_id": "2026-11-22T07:45Z",
-  "latest_verified_window_status": "passed",
+  "current_window_verification_status": "failed",
+  "latest_due_window_id": "2026-11-22T08:00Z",
+  "latest_due_window_verification_status": "failed",
+  "latest_verified_window_id": "2026-11-22T08:00Z",
+  "latest_verified_window_status": "failed",
   "historical_data_quality_status": "clean",
   "historical_damaged_windows": [],
   "historical_overdue_windows": [],
   "historical_archived_pending_qa_windows": [],
   "historical_damaged_partitions": [],
   "historical_loss_manifests": [],
-  "current_damaged_windows": [],
-  "current_damaged_partitions": [],
+  "current_damaged_windows": [
+    "2026-11-22T08:00Z"
+  ],
+  "current_damaged_partitions": [
+    {
+      "source_manifest": "raw/binance_futures/2026-11-22/binance_futures_20261122_0800_p15m_trial15_20261122_da93ae54.manifest.json",
+      "file_name": "binance_futures_20261122_0800_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "exchange": "binance_futures",
+      "date_utc": "2026-11-22",
+      "window_id": "2026-11-22T08:00Z",
+      "window_span_id": "2026-11-22T08:00Z__2026-11-22T08:15Z_15m",
+      "partition_minutes": 15,
+      "run_id": "trial15_20261122T0745Z",
+      "local_loss_events": 0,
+      "dropped_frames": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    }
+  ],
   "qa_version": 2,
   "checker_commit_sha": "dfd1e51b3e3d929611cbe39947bb73f770ec5d8e",
   "effective_config_sha256": "b266588d4021978dbe1dcfe0ca29dade8584ef60a7f5de51cdba25401b0c669a",
@@ -41,24 +60,26 @@
   "discovery_mode": "archive_manifest_index",
   "discovery_warnings": [],
   "attempted": 4,
-  "ok": 4,
-  "blocked": 0,
+  "ok": 3,
+  "blocked": 1,
   "needs_review": 0,
   "retry_needed": 0,
   "target_retry_needed": 0,
   "historical_retry_needed": 0,
   "remaining_backlog": 0,
-  "unresolved_blocked": 0,
+  "unresolved_blocked": 1,
   "unresolved_review": 0,
-  "already_checked": 0,
-  "eligible_manifest_count": 4,
-  "expected_window_count": 1,
-  "window_reports_written": 1,
+  "already_checked": 4,
+  "eligible_manifest_count": 8,
+  "expected_window_count": 2,
+  "window_reports_written": 2,
   "day_reports_written": 1,
   "passed_windows": [
     "2026-11-22T07:45Z"
   ],
-  "failed_windows": [],
+  "failed_windows": [
+    "2026-11-22T08:00Z"
+  ],
   "review_windows": [],
   "archived_pending_qa_windows": [],
   "not_archived_windows": [],
@@ -71,17 +92,19 @@
     "not_archived_overdue": [],
     "not_archived_pending_grace": [],
     "archived_pending_qa": [],
-    "verified_failed": [],
+    "verified_failed": [
+      "2026-11-22T08:00Z"
+    ],
     "verified_passed": [
       "2026-11-22T07:45Z"
     ],
     "verified_needs_review": []
   },
   "details": [
-    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-22T07:45Z expected_archive_revision=sha256:3b436aa27bc848716e6f211803e978f6aacd2539695be5aba38ecb0483a8fedc observed_archive_revision=sha256:3b436aa27bc848716e6f211803e978f6aacd2539695be5aba38ecb0483a8fedc checker_commit=dfd1e51b3e3d929611cbe39947bb73f770ec5d8e",
-    "TARGET PASSED raw/binance_futures/2026-11-22/binance_futures_20261122_0745_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/bitget_v3/2026-11-22/bitget_v3_20261122_0745_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/bybit_linear/2026-11-22/bybit_linear_20261122_0745_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/gate_futures/2026-11-22/gate_futures_20261122_0745_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
+    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-22T08:00Z expected_archive_revision=sha256:ef878d582ae23d85044fd41d65741723376c035fbca2e2490698a8609d0162b9 observed_archive_revision=sha256:ef878d582ae23d85044fd41d65741723376c035fbca2e2490698a8609d0162b9 checker_commit=dfd1e51b3e3d929611cbe39947bb73f770ec5d8e",
+    "TARGET FAILED raw/binance_futures/2026-11-22/binance_futures_20261122_0800_p15m_trial15_20261122_da93ae54.manifest.json: 1 issues",
+    "TARGET PASSED raw/bitget_v3/2026-11-22/bitget_v3_20261122_0800_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/bybit_linear/2026-11-22/bybit_linear_20261122_0800_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/gate_futures/2026-11-22/gate_futures_20261122_0800_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
   ]
 }
