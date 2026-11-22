@@ -43,12 +43,18 @@ def _summarize_protocol_diagnostics(report):
     if not isinstance(report, dict):
         return {
             "protocol_issues": [],
+            "proven_protocol_issues": [],
             "failed_markets": [],
             "missing_anchor_sources": [],
+            "unanchored_lookback_markets": [],
             "boundary_events": [],
             "archive_file_checks": [],
         }
-    issues = list((report.get("protocol") or {}).get("issues") or [])
+    issues = list(
+        report.get("proven_protocol_issues")
+        if report.get("proven_protocol_issues") is not None
+        else ((report.get("protocol") or {}).get("issues") or [])
+    )
     failed_markets = sorted(
         {
             f"{item.get('exchange')}:{item.get('symbol')}"
@@ -58,8 +64,10 @@ def _summarize_protocol_diagnostics(report):
     )
     out = {
         "protocol_issues": issues,
+        "proven_protocol_issues": issues,
         "failed_markets": failed_markets,
         "missing_anchor_sources": list(report.get("missing_anchor_sources") or []),
+        "unanchored_lookback_markets": list(report.get("unanchored_lookback_markets") or []),
         "boundary_events": list(report.get("boundary_events") or []),
         "archive_file_checks": list(report.get("archive_file_checks") or []),
     }
@@ -70,6 +78,18 @@ def _summarize_protocol_diagnostics(report):
     if report.get("spec_error_type"):
         out["spec_error_type"] = report.get("spec_error_type")
     return out
+
+
+def _expected_depth_markets(config):
+    from tokyo_l2_protocol_qa import symbol_key
+
+    if not isinstance(config, dict) or not config.get("exchanges"):
+        return set()
+    return {
+        (exchange, symbol_key(symbol))
+        for exchange, symbol, channel in coverage.expected_streams(config)
+        if coverage.classify_channel(exchange, channel) == coverage.CHANNEL_CATEGORY_DEPTH
+    }
 
 
 def run(remote, config, run_id, cutover, current, state, checker, *, archive_revision=None, trigger_mode=None, max_catchup=None):
@@ -94,18 +114,24 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             "run_id": run_id,
             "trigger_mode": trigger_mode or "unknown",
             "current_window": wid(current),
+            "current_window_ready": False,
             "expected_archive_revision": expected_rev,
             "archive_revision": observed_current_rev,
             "reused_current_result": False,
             "protocol_status": "revision_mismatch",
             "protocol_issues": [],
+            "proven_protocol_issues": [],
             "failed_markets": [],
             "missing_anchor_sources": [],
+            "unanchored_lookback_markets": [],
             "boundary_events": [],
             "archive_file_checks": [],
             "hourly_replay_window": wid(current - current % 3600),
             "hourly_btc_replay": {},
             "checked_windows": [],
+            "historical_checked_windows": [],
+            "historical_passed_windows": [],
+            "historical_anchor_unverified_windows": [],
             "historical_failed_windows": [],
             "pending_ready_windows": 0,
             "started_at_utc": started_at_utc,
@@ -116,18 +142,31 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         return report_dir / f"{archive._safe_window_filename(wid(start))}.json"
 
     def archived_window_passed(start):
-        window = wid(start)
-        path = (state / "qa_reports" / "windows" / window[:10] /
-                f"{archive._safe_window_filename(window)}.window.qa.json")
-        summary = read_report(path)
+        wd = coverage.window_descriptor(start, pm)
+        window = wd["window_id"]
+        span_id = wd["window_span_id"]
+        batch_folder = archive._safe_window_filename(run_id or "default")
+        candidate_paths = (
+            state / "qa_reports" / "windows" / batch_folder / window[:10]
+            / f"{archive._safe_window_filename(span_id)}.window.qa.json",
+            state / "qa_reports" / "windows" / window[:10]
+            / f"{archive._safe_window_filename(window)}.window.qa.json",
+        )
+        summary = {}
+        for path in candidate_paths:
+            summary = read_report(path)
+            if summary:
+                break
         return (summary.get("qa_status") == "passed" and summary.get("run_id") == run_id
                 and summary.get("partition_minutes") == pm
                 and summary.get("checker_commit_sha") == checker.split("/", 1)[0]
                 and set(summary.get("files") or []) == {item["source_manifest"] for item in groups[start]})
 
     ready = [s for s in groups if cutover <= s and archived_window_passed(s)]
+    expected_depth_markets = _expected_depth_markets(config)
     current_report = {}
     reports = {}
+    checkpoints_by_start = {}
     revisions = {}
     for start in ready:
         inputs = input_digests(groups[start])
@@ -135,10 +174,16 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         win_rev = _window_archive_revision(groups[start], run_id, wid(start), pm)
         revisions[start] = win_rev
         proof = read_report(report_path(start))
-        rev_ok = (proof.get("archive_revision") in (None, win_rev)) if win_rev is not None else True
-        if (proof.get("checker") == checker and proof.get("target_inputs") == inputs
-                and proof.get("previous_inputs") == earlier and rev_ok
-                and proof.get("status") in {"passed", "data_failed"}):
+        rev_ok = (proof.get("archive_revision") == win_rev) if win_rev is not None else True
+        identity_ok = (
+            proof.get("checker") == checker
+            and proof.get("target_inputs") == inputs
+            and proof.get("previous_inputs") == earlier
+            and rev_ok
+        )
+        if identity_ok and proof.get("end_sequence_checkpoint"):
+            checkpoints_by_start[start] = list(proof["end_sequence_checkpoint"])
+        if identity_ok and proof.get("status") in {"passed", "data_failed"}:
             reports[start] = proof
 
     reused_current_result = current in reports
@@ -151,10 +196,14 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     for start in plan_windows(ready, reports, current, max_catchup=eff_max_catchup):
         replay_seconds = 660 if start % 3600 == 0 else 0
         previous = reports.get(start - step, {})
-        checkpoint = previous.get("end_sequence_checkpoint") if previous.get("protocol_status") == "passed" else None
-        warmup_windows = 1 if replay_seconds or not checkpoint else 0
-        report = audit_window(remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
-                              candidates=candidates, checkpoint=checkpoint if not warmup_windows else None)
+        checkpoint = list(previous.get("end_sequence_checkpoint") or checkpoints_by_start.get(start - step) or [])
+        covered_markets = {(row["exchange"], row["symbol"]) for row in checkpoint}
+        all_markets_covered = bool(expected_depth_markets) and expected_depth_markets.issubset(covered_markets)
+        warmup_windows = 1 if (replay_seconds or not all_markets_covered) else 0
+        report = audit_window(
+            remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
+            candidates=candidates, checkpoint=checkpoint or None,
+        )
         report.update(
             checker=checker,
             archive_revision=revisions.get(start),
@@ -162,6 +211,8 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         archive._atomic_write_json(report_path(start), report)
+        if report.get("end_sequence_checkpoint"):
+            checkpoints_by_start[start] = list(report["end_sequence_checkpoint"])
         reports[start] = report
         checked_windows.append(wid(start))
 
@@ -170,24 +221,33 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     # Use the most recent due hourly sample for visibility even on intervening windows.
     latest_hour = current - current % 3600
     hourly = reports.get(latest_hour, {})
+    historical_passed = [wid(start) for start, report in sorted(reports.items())
+                         if start != current and report.get("status") == "passed"]
+    historical_unverified = [wid(start) for start, report in sorted(reports.items())
+                             if start != current and report.get("status") == "anchor_unverified"]
     historical = [wid(start) for start, report in sorted(reports.items())
-                  if start != current and report["status"] == "data_failed"]
+                  if start != current and report.get("status") == "data_failed"]
     completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     out = {
         "status": current_report.get("status", "pending"),
         "run_id": run_id,
         "trigger_mode": trigger_mode or "unknown",
         "current_window": wid(current),
+        "current_window_ready": current in ready,
         "expected_archive_revision": expected_rev,
         "archive_revision": observed_current_rev,
         "reused_current_result": reused_current_result,
         "protocol_status": current_report.get("protocol_status", "pending"),
         **diag,
+        "end_sequence_checkpoint_markets": len(current_report.get("end_sequence_checkpoint") or []),
         "hourly_replay_window": wid(latest_hour),
         "hourly_btc_replay": {ex: v["status"] for ex, v in hourly.get("replay", {}).items()},
         "checked_windows": checked_windows,
+        "historical_checked_windows": [w for w in checked_windows if w != wid(current)],
+        "historical_passed_windows": historical_passed,
+        "historical_anchor_unverified_windows": historical_unverified,
         "historical_failed_windows": historical,
-        "pending_ready_windows": len(set(ready) - reports.keys()),
+        "pending_ready_windows": len(set(ready) - {s for s, r in reports.items() if r.get("status") in {"passed", "data_failed"}}),
         "started_at_utc": started_at_utc,
         "completed_at_utc": completed_at_utc,
     }
@@ -217,15 +277,23 @@ def main():
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as dest:
             dest.write("\n## Archive protocol QA and hourly BTC replay\n\n")
-            if data.get("protocol_issues"):
+            if data.get("proven_protocol_issues"):
                 issue_str = "; ".join(
                     f"{x.get('exchange')}:{x.get('symbol')}={x.get('issue')}({x.get('count')})"
-                    for x in data["protocol_issues"]
+                    for x in data["proven_protocol_issues"]
                 )
-                dest.write(f"- **Failed markets**: `{data.get('failed_markets')}`\n")
-                dest.write(f"- **Protocol issues**: `{issue_str}`\n")
+                dest.write(f"- **Proven failed markets**: `{data.get('failed_markets')}`\n")
+                dest.write(f"- **Proven protocol issues**: `{issue_str}`\n")
+            if data.get("unanchored_lookback_markets"):
+                un_str = "; ".join(
+                    f"{x.get('exchange')}:{x.get('symbol')}(conn={x.get('connection')}/e{x.get('epoch')}, deltas_checked={x.get('delta_frames_continuity_checked')}, breaks={x.get('proven_chain_breaks')})"
+                    for x in data["unanchored_lookback_markets"]
+                )
+                dest.write(f"- **Unanchored in lookback (no snapshot in warmup)**: `{un_str}`\n")
             if data.get("missing_anchor_sources"):
-                dest.write(f"- **Missing anchor sources**: `{data['missing_anchor_sources']}`\n")
+                dest.write(f"- **Proven missing anchor sources (post-reset / reconnection)**: `{data['missing_anchor_sources']}`\n")
+            if data.get("historical_checked_windows"):
+                dest.write(f"- **Historical catch-up windows checked**: `{data['historical_checked_windows']}`\n")
             if data.get("error_type"):
                 dest.write(f"- **Execution error**: `{data.get('error_type')}` at `{data.get('error_stage')}`\n")
             dest.write("\n```json\n" + body + "\n```\n")

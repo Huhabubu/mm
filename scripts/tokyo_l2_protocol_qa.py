@@ -102,11 +102,13 @@ class Chain:
     connection: tuple[str, str, int] | None = None
     seq: int | None = None
     awaiting_delta: bool = False
+    anchored: bool = True
 
     def apply(self, exchange: str, event: Depth) -> str | None:
         if event.mode == "snapshot":
             self.connection, self.seq = event.connection, event.seq
             self.awaiting_delta = exchange in {BINANCE, BITGET}
+            self.anchored = True
             return None
         if event.mode not in {"delta", "update"}:
             return "invalid_depth_action"
@@ -128,6 +130,42 @@ class Chain:
             self.seq = None
             return "exchange_update_chain_break"
         self.seq, self.awaiting_delta = event.seq, False
+        return None
+
+    def apply_unanchored_delta(self, exchange: str, event: Depth) -> str | None:
+        """Validate delta-to-delta continuity on a pre-existing connection whose initial snapshot
+        predates the bounded lookback window. A mid-stream connection/epoch change still triggers
+        proven `missing_same_connection_anchor`, and any sequence discontinuity triggers proven
+        `exchange_update_chain_break`.
+        """
+        if event.mode not in {"delta", "update"}:
+            return "invalid_depth_action"
+        if self.connection is None:
+            self.connection = event.connection
+            self.seq = event.seq
+            self.awaiting_delta = False
+            self.anchored = False
+            return None
+        if self.connection != event.connection:
+            self.seq = None
+            self.anchored = True
+            return "missing_same_connection_anchor"
+        if self.seq is None:
+            self.seq = event.seq
+            return None
+        if exchange == BINANCE:
+            first = event.exchange_ms[1]
+            valid = event.parent == self.seq and first <= event.seq and event.seq >= self.seq
+        elif exchange == GATE:
+            valid = event.parent == self.seq + 1 and event.seq >= event.parent
+        elif exchange == BITGET:
+            valid = event.parent == self.seq and event.parent < event.seq
+        else:
+            valid = event.seq >= self.seq
+        if not valid:
+            self.seq = None
+            return "exchange_update_chain_break"
+        self.seq = event.seq
         return None
 
 

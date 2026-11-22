@@ -272,6 +272,7 @@ jobs:
                   env_out.write("QA_TARGET_WINDOW_EXECUTION_STATUS=failed\n")
                   env_out.write("QA_HISTORICAL_CATCHUP_STATUS=failed\n")
                   env_out.write("QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA=false\n")
+                  env_out.write("QA_READY_WINDOWS_FOR_PROTOCOL_QA=false\n")
                   env_out.write("QA_CURRENT_WINDOW_COMPLETED=false\n")
                   env_out.write("QA_CURRENT_WINDOW_VERIFICATION_STATUS=parse_error\n")
               sys.exit(0)
@@ -301,6 +302,8 @@ jobs:
           verified_failed = wc.get("verified_failed", data.get("failed_windows") or [])
           verified_passed = wc.get("verified_passed", data.get("passed_windows") or [])
           verified_review = wc.get("verified_needs_review", data.get("review_windows") or [])
+          any_ready_for_proto = "true" if (ready_for_proto == "true" or len(verified_passed) > 0) else "false"
+          proto_current_wid = cur_wid or (str(verified_passed[-1]) if verified_passed else "")
 
           target_wid = str(data.get("target_window_utc") or "")
           obs_rev = str(data.get("observed_archive_revision") or "")
@@ -317,6 +320,8 @@ jobs:
               env_out.write(f"QA_TARGET_RETRY_NEEDED={target_retry}\n")
               env_out.write(f"QA_HISTORICAL_RETRY_NEEDED={hist_retry}\n")
               env_out.write(f"QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA={ready_for_proto}\n")
+              env_out.write(f"QA_READY_WINDOWS_FOR_PROTOCOL_QA={any_ready_for_proto}\n")
+              env_out.write(f"QA_PROTOCOL_CURRENT_WINDOW_ID={proto_current_wid}\n")
               env_out.write(f"QA_CURRENT_WINDOW_ID={cur_wid}\n")
               env_out.write(f"QA_CURRENT_WINDOW_COMPLETED={cur_done}\n")
               env_out.write(f"QA_CURRENT_WINDOW_VERIFICATION_STATUS={cur_vstatus}\n")
@@ -340,7 +345,7 @@ jobs:
               "## Tokyo L2 Incremental QA Summary",
               f"- **Trigger & Traceability**: mode=`{data.get('trigger_mode')}` | run_id=`{data.get('effective_run_id') or data.get('run_id')}` | target_window_utc=`{target_wid or 'none'}` | expected_revision=`{exp_rev or 'none'}` | observed_revision=`{obs_rev or 'none'}` | revision_matched=`{data.get('target_revision_matched')}` | reused_result=`{reused}`",
               f"- **Timestamps (UTC)**: index_ready=`{os.environ.get('QA_INDEX_MODTIME_UTC', '') or 'unavailable'}` | job_started=`{os.environ.get('QA_JOB_STARTED_AT_UTC', '')}` | inspect_started=`{data.get('started_at_utc')}` | inspect_completed=`{data.get('completed_at_utc')}`",
-              f"- **1. Job Execution Status**: job=`{job_status}` | target_window=`{target_exec_status}` (target_retry=`{target_retry}`) | historical_catchup=`{hist_catchup_status}` (historical_retry=`{hist_retry}`) | ready_for_protocol_qa=`{ready_for_proto}` | discovery=`{data.get('discovery_mode')}`",
+              f"- **1. Job Execution Status**: job=`{job_status}` | target_window=`{target_exec_status}` (target_retry=`{target_retry}`) | historical_catchup=`{hist_catchup_status}` (historical_retry=`{hist_retry}`) | ready_for_protocol_qa=`{ready_for_proto}` | any_ready_windows=`{any_ready_for_proto}` | discovery=`{data.get('discovery_mode')}`",
               f"- **2. Active Window**: `{cur_wid}` | completed=`{cur_done}` | verification_status=`{cur_vstatus}` | heartbeat_status=`{hb_status}` | latest_verified=`{latest_ver_wid or 'none'}` (`{latest_ver_status or 'none'}`)",
               f"- **3. 4-Way Window Classification**: not_archived=`{len(not_archived)}` | archived_pending_qa=`{len(archived_pending_qa)}` | verified_failed=`{len(verified_failed)}` | verified_passed=`{len(verified_passed)}` | needs_review=`{len(verified_review)}`",
               f"- **4. Historical Data Quality**: `{hist_status}` | damaged_windows=`{hist_wins}` | historical_overdue_windows=`{hist_overdue}` | damaged_partitions_count=`{len(hist_parts)}` | historical_loss_manifests_count=`{len(hist_loss_mfs)}`",
@@ -360,7 +365,7 @@ jobs:
 
       - name: Validate current archive protocols and hourly representative replay
         id: protocols
-        if: ${{ !cancelled() && env.QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA == 'true' && env.QA_CURRENT_WINDOW_ID != '' }}
+        if: ${{ !cancelled() && (env.QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA == 'true' || env.QA_READY_WINDOWS_FOR_PROTOCOL_QA == 'true') && env.QA_PROTOCOL_CURRENT_WINDOW_ID != '' }}
         env:
           PYTHONPATH: source/collector/python
         shell: bash
@@ -368,7 +373,7 @@ jobs:
           set -euo pipefail
           rules_sha="$(sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum | cut -d ' ' -f1)"
           extra_proto=()
-          if [[ -n "${QA_OBSERVED_ARCHIVE_REVISION:-}" ]]; then
+          if [[ "${QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA:-false}" == "true" && -n "${QA_OBSERVED_ARCHIVE_REVISION:-}" ]]; then
             extra_proto+=(--archive-revision "$QA_OBSERVED_ARCHIVE_REVISION")
           fi
           if [[ -n "${QA_TRIGGER_MODE:-}" ]]; then
@@ -377,7 +382,7 @@ jobs:
           python workflow_code/scripts/tokyo_l2_recurring_qa.py \
             --remote qa: --state-dir state --config "source/$QA_BOUND_CONFIG_PATH" \
             --run-id "$QA_BOUND_RUN_ID" --cutover "$QA_BOUND_SINCE_WINDOW" \
-            --current "$QA_CURRENT_WINDOW_ID" --checker "$TOKYO_L2_QA_CHECKER_COMMIT/$rules_sha" \
+            --current "$QA_PROTOCOL_CURRENT_WINDOW_ID" --checker "$TOKYO_L2_QA_CHECKER_COMMIT/$rules_sha" \
             "${extra_proto[@]}"
 
       - name: Persist QA summary reports to tokyo-l2-qa-state

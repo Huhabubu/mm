@@ -231,6 +231,251 @@ class ProtocolTest(unittest.TestCase):
         book.apply(event)
         self.assertFalse(book.crossed())
 
+    def test_recurring_runs_historical_catchup_when_current_window_missing_or_failed_and_propagates_partial_checkpoint(self):
+        import json
+        from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
+        import tokyo_l2_recurring_qa as recurring
+
+        w0 = 1_795_276_800  # 2026-11-21T16:00Z (historical ready)
+        w1 = w0 + 900       # 2026-11-21T16:15Z (historical ready, builds on w0 per-market checkpoint)
+        w2 = w1 + 900       # 2026-11-21T16:30Z (latest current window: NOT archived / failed file QA!)
+        run_id = "trial15_run"
+        checker_sha = "abc123def456"
+        checker = f"{checker_sha}/rules123"
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {
+                "gate_futures": {
+                    "enabled": True,
+                    "symbols": ["BTC_USDT", "ETH_USDT"],
+                    "channels": ["futures.obu"],
+                }
+            },
+        }
+
+        def make_cand(start):
+            wid = coverage.window_descriptor(start, 15)["window_id"]
+            mf = f"raw/gate_futures/{wid[:10]}/gate_{start}.manifest.json"
+            return {
+                "exchange": "gate_futures",
+                "source_manifest": mf,
+                "source_data": mf.replace(".manifest.json", ".tsv.zst"),
+                "manifest_sha256": f"{start:064x}",
+                "data_sha256": f"{start + 1:064x}",
+                "manifest_bytes": 100,
+                "data_bytes": 200,
+                "planned_start_s": start,
+            }
+
+        cands = [make_cand(w0), make_cand(w1)]
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            for c in cands:
+                wid = coverage.window_descriptor(c["planned_start_s"], 15)["window_id"]
+                wpath = (
+                    state / "qa_reports" / "windows" / wid[:10]
+                    / f"{archive._safe_window_filename(wid)}.window.qa.json"
+                )
+                wpath.parent.mkdir(parents=True, exist_ok=True)
+                wpath.write_text(
+                    json.dumps(
+                        {
+                            "qa_status": "passed",
+                            "run_id": run_id,
+                            "partition_minutes": 15,
+                            "checker_commit_sha": checker_sha,
+                            "files": [c["source_manifest"]],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            calls = []
+
+            def fake_audit(_remote, _cfg, _rid, start, window, _replay_s, warmup, **kw):
+                calls.append((start, warmup, kw.get("checkpoint")))
+                if start == w0:
+                    # One market (ETHUSDT) failed, but BTCUSDT checkpoint MUST survive for w1!
+                    return {
+                        "status": "data_failed",
+                        "run_id": run_id,
+                        "window_id": window,
+                        "protocol_status": "failed",
+                        "target_inputs": recurring.input_digests([cands[0]]),
+                        "protocol": {
+                            "frames": [],
+                            "issues": [{"exchange": "gate_futures", "symbol": "ETHUSDT", "issue": "exchange_update_chain_break", "count": 1}],
+                        },
+                        "end_sequence_checkpoint": [
+                            {"exchange": "gate_futures", "symbol": "BTCUSDT", "connection": ["boot", "B", 1], "seq": 102, "awaiting_delta": False}
+                        ],
+                        "replay": {},
+                    }
+                return {
+                    "status": "passed",
+                    "run_id": run_id,
+                    "window_id": window,
+                    "protocol_status": "passed",
+                    "target_inputs": recurring.input_digests([cands[1]]),
+                    "protocol": {"frames": [], "issues": []},
+                    "end_sequence_checkpoint": [
+                        {"exchange": "gate_futures", "symbol": "BTCUSDT", "connection": ["boot", "B", 1], "seq": 150, "awaiting_delta": False},
+                        {"exchange": "gate_futures", "symbol": "ETHUSDT", "connection": ["boot", "B", 1], "seq": 320, "awaiting_delta": False},
+                    ],
+                    "replay": {},
+                }
+
+            with patch.object(recurring, "verified_candidates", return_value=cands), \
+                 patch.object(recurring, "audit_window", side_effect=fake_audit):
+                res = recurring.run(
+                    "qa:", cfg, run_id, w0, w2, state, checker,
+                    trigger_mode="schedule_catchup",
+                )
+
+            # Even though current window w2 is missing/unready, BOTH ready historical windows w0 & w1 were audited!
+            self.assertFalse(res["current_window_ready"])
+            self.assertEqual("pending", res["status"])
+            self.assertEqual([w0, w1], [c[0] for c in calls])
+            self.assertEqual(2, len(res["historical_checked_windows"]))
+            # w1 received w0's partial per-market BTCUSDT checkpoint EVEN THOUGH w0 failed on ETHUSDT,
+            # and also requested warmup_windows=1 so uncovered ETHUSDT could warm up!
+            self.assertEqual(1, calls[1][1])
+            self.assertEqual(1, len(calls[1][2]))
+            self.assertEqual("BTCUSDT", calls[1][2][0]["symbol"])
+
+    def test_scan_preserves_per_market_checkpoints_and_distinguishes_unanchored_lookback_vs_proven_break(self):
+        import json
+        import zstandard as zstd
+        from unittest.mock import patch
+        import hourly_incremental_qa as archive
+        from tokyo_l2_replay_qa import NS, scan
+
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {
+                "gate_futures": {
+                    "enabled": True,
+                    "symbols": ["BTC_USDT", "ETH_USDT"],
+                    "channels": ["futures.obu"],
+                }
+            },
+        }
+        start_s = 1_795_276_800
+        start_ns = start_s * NS
+        end_ns = (start_s + 900) * NS
+
+        def write_gate_zst(path: Path, lines: list[tuple[int, str, int, str, dict]]):
+            with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as w:
+                for idx, (wall, conn, epoch, kind, obj) in enumerate(lines, start=1):
+                    w.write(f"{wall}\t{idx}\t{conn}\t{epoch}\t{idx}\t{kind}\t{json.dumps(obj)}\n")
+
+        def gate_msg(sym: str, u: int, U: int | None = None, full: bool = False):
+            res = {"s": f"ob.{sym}.50", "t": 1795276801000, "u": u, "b": [["100.0", "1.0"]], "a": [["101.0", "1.0"]]}
+            if full:
+                res["full"] = True
+            else:
+                res["U"] = U
+            return {"channel": "futures.obu", "event": "update", "result": res}
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(archive, "check_partition", return_value={"qa_status": "passed", "problems": []}):
+            tmp = Path(temp)
+            mf_base = {"boot_id": "boot1", "start_wall_ns": start_ns, "first_rx_seq": 1, "file_name": "gate.tsv.zst"}
+
+            # 1) Window 1: BTCUSDT anchored & clean (100->101->102); ETHUSDT has proven sequence break (200->205, U=203).
+            p1 = tmp / "w1.tsv.zst"
+            write_gate_zst(p1, [
+                (start_ns + 1, "B", 1, "DATA", gate_msg("BTC_USDT", 100, full=True)),
+                (start_ns + 2, "B", 1, "DATA", gate_msg("BTC_USDT", 101, U=101)),
+                (start_ns + 3, "B", 1, "DATA", gate_msg("BTC_USDT", 102, U=102)),
+                (start_ns + 4, "B", 1, "DATA", gate_msg("ETH_USDT", 200, full=True)),
+                (start_ns + 5, "B", 1, "DATA", gate_msg("ETH_USDT", 205, U=203)),
+            ])
+            cand1 = {"exchange": GATE, "planned_start_s": start_s}
+            s1 = {}
+            scan([(cand1, mf_base, p1)], cfg, start_ns, end_ns, start_ns, {}, s1)
+            self.assertEqual("failed", s1["protocol_status"])
+            self.assertEqual(1, len(s1["proven_protocol_issues"]))
+            self.assertEqual("ETHUSDT", s1["proven_protocol_issues"][0]["symbol"])
+            self.assertEqual("exchange_update_chain_break", s1["proven_protocol_issues"][0]["issue"])
+            # BTCUSDT checkpoint is PRESERVED despite ETHUSDT failing!
+            self.assertEqual(1, len(s1["end_sequence_checkpoint"]))
+            self.assertEqual("BTCUSDT", s1["end_sequence_checkpoint"][0]["symbol"])
+            self.assertEqual(102, s1["end_sequence_checkpoint"][0]["seq"])
+
+            # 2) Window 2: mixed boundary checkpoint (BTCUSDT deltas only, no snapshot!) + warmup (w1 included) + ETHUSDT fresh snapshot!
+            w2_start_s = start_s + 900
+            w2_start_ns = w2_start_s * NS
+            w2_end_ns = (w2_start_s + 900) * NS
+            p2 = tmp / "w2.tsv.zst"
+            write_gate_zst(p2, [
+                (w2_start_ns + 1, "B", 1, "DATA", gate_msg("BTC_USDT", 103, U=103)),
+                (w2_start_ns + 2, "B", 1, "DATA", gate_msg("BTC_USDT", 104, U=104)),
+                (w2_start_ns + 3, "B", 1, "DATA", gate_msg("ETH_USDT", 300, full=True)),
+                (w2_start_ns + 4, "B", 1, "DATA", gate_msg("ETH_USDT", 301, U=301)),
+            ])
+            cand2 = {"exchange": GATE, "planned_start_s": w2_start_s}
+            mf2 = dict(mf_base, start_wall_ns=w2_start_ns, file_name="gate2.tsv.zst")
+            s2 = {}
+            scan(
+                [(cand1, mf_base, p1), (cand2, mf2, p2)],
+                cfg, w2_start_ns, w2_end_ns, w2_start_ns, {}, s2,
+                checkpoint=s1["end_sequence_checkpoint"],
+            )
+            self.assertEqual("passed", s2["protocol_status"])
+            self.assertEqual([], s2["proven_protocol_issues"])
+            self.assertEqual([], s2["unanchored_lookback_markets"])
+            self.assertEqual(2, len(s2["end_sequence_checkpoint"]))
+
+            # 3) Pre-existing long-lived connection without snapshot in lookback:
+            #    continuous deltas -> anchor_unverified (NOT proven chain break!)
+            p3 = tmp / "w3_unanchored.tsv.zst"
+            write_gate_zst(p3, [
+                (start_ns + 1, "B", 1, "DATA", gate_msg("BTC_USDT", 500, U=500)),
+                (start_ns + 2, "B", 1, "DATA", gate_msg("BTC_USDT", 501, U=501)),
+                (start_ns + 3, "B", 1, "DATA", gate_msg("BTC_USDT", 502, U=502)),
+                (start_ns + 4, "B", 1, "DATA", gate_msg("ETH_USDT", 600, full=True)),
+                (start_ns + 5, "B", 1, "DATA", gate_msg("ETH_USDT", 601, U=601)),
+            ])
+            s3 = {}
+            scan([(cand1, mf_base, p3)], cfg, start_ns, end_ns, start_ns, {}, s3)
+            self.assertEqual("anchor_unverified", s3["protocol_status"])
+            self.assertEqual([], s3["proven_protocol_issues"])
+            self.assertEqual(1, len(s3["unanchored_lookback_markets"]))
+            self.assertEqual("BTCUSDT", s3["unanchored_lookback_markets"][0]["symbol"])
+            self.assertEqual(3, s3["unanchored_lookback_markets"][0]["delta_frames_continuity_checked"])
+            self.assertEqual(0, s3["unanchored_lookback_markets"][0]["proven_chain_breaks"])
+            # ETHUSDT was anchored and clean -> still saved in end_sequence_checkpoint; unanchored BTCUSDT is excluded!
+            self.assertEqual(["ETHUSDT"], [c["symbol"] for c in s3["end_sequence_checkpoint"]])
+
+            # 4) Unanchored pre-existing stream WITH a real delta sequence break -> PROVEN exchange_update_chain_break!
+            p4 = tmp / "w4_unanchored_break.tsv.zst"
+            write_gate_zst(p4, [
+                (start_ns + 1, "B", 1, "DATA", gate_msg("BTC_USDT", 500, U=500)),
+                (start_ns + 2, "B", 1, "DATA", gate_msg("BTC_USDT", 505, U=503)),  # gap: expected U=501!
+                (start_ns + 3, "B", 1, "DATA", gate_msg("ETH_USDT", 600, full=True)),
+            ])
+            s4 = {}
+            scan([(cand1, mf_base, p4)], cfg, start_ns, end_ns, start_ns, {}, s4)
+            self.assertEqual("failed", s4["protocol_status"])
+            self.assertEqual("exchange_update_chain_break", s4["proven_protocol_issues"][0]["issue"])
+            self.assertEqual("BTCUSDT", s4["proven_protocol_issues"][0]["symbol"])
+
+            # 5) Mid-stream reconnection (epoch 1 -> epoch 2) without fresh snapshot -> PROVEN missing_same_connection_anchor!
+            p5 = tmp / "w5_reconn.tsv.zst"
+            write_gate_zst(p5, [
+                (start_ns + 1, "B", 1, "DATA", gate_msg("BTC_USDT", 500, U=500)),
+                (start_ns + 2, "B", 2, "DATA", gate_msg("BTC_USDT", 501, U=501)),  # epoch changed without snapshot!
+                (start_ns + 3, "B", 1, "DATA", gate_msg("ETH_USDT", 600, full=True)),
+            ])
+            s5 = {}
+            scan([(cand1, mf_base, p5)], cfg, start_ns, end_ns, start_ns, {}, s5)
+            self.assertEqual("failed", s5["protocol_status"])
+            self.assertEqual("missing_same_connection_anchor", s5["proven_protocol_issues"][0]["issue"])
+            self.assertEqual("BTCUSDT", s5["proven_protocol_issues"][0]["symbol"])
+
 
 if __name__ == "__main__":
     unittest.main()

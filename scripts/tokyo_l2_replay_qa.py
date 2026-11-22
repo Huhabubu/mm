@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -163,12 +164,19 @@ def on_grid(value, step, *, allow_zero=False):
 
 
 def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint=None):
-    chains = {}
-    for row in checkpoint or ():
-        chains[(row["exchange"], row["symbol"])] = Chain(
-            tuple(row["connection"]), row["seq"], row["awaiting_delta"]
+    boundary_checkpoints = {
+        (row["exchange"], row["symbol"]): Chain(
+            tuple(row["connection"]), row["seq"], row["awaiting_delta"], anchored=True
         )
-    summary["boundary_checkpoint_markets"] = len(chains)
+        for row in checkpoint or ()
+    }
+    chains = {}
+    replay_warmup_chains = {}
+    checkpoint_applied = set()
+    reset_seen = set()
+    unanchored_delta_counts = Counter()
+    unanchored_sources = {}
+    summary["boundary_checkpoint_markets"] = len(boundary_checkpoints)
     book_proofs = ProtocolReport()
     expected_depths = {
         (exchange, symbol_key(symbol))
@@ -204,10 +212,17 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                 symbol = symbol_key(str(obj.get("symbol") or "ALL"))
                 if in_target:
                     boundary_events.count(exchange, symbol, event_name)
-                for key in list(chains):
-                    ex, sym = key
+                for ex, sym in expected_depths:
                     if ex == exchange and (symbol == "ALL" or symbol == sym):
-                        del chains[key]
+                        key = (ex, sym)
+                        if in_target:
+                            checkpoint_applied.add(key)
+                            reset_seen.add(key)
+                            chains.pop(key, None)
+                        elif key not in boundary_checkpoints:
+                            reset_seen.add(key)
+                            chains.pop(key, None)
+                        replay_warmup_chains.pop(key, None)
                         if ex in books and sym == BTC:
                             books[ex] = Book()
                             last_depth_exchange_ns.pop(ex, None)
@@ -226,12 +241,31 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                             quotes_before = quote
             event = depth_event(exchange, mf["boot_id"], conn, epoch, kind, obj)
             if event is not None and (exchange, event.symbol) in expected_depths:
-                chain = chains.setdefault((exchange, event.symbol), Chain())
+                key = (exchange, event.symbol)
+                if not in_target and key in boundary_checkpoints:
+                    # Preserve the verified boundary checkpoint at start_ns; only warm up BTC book for replay.
+                    if event.mode == "snapshot":
+                        seen_anchors.add((exchange, event.symbol, "warmup", event.connection[1], event.connection[2]))
+                    if sample_end > start_ns and exchange in books and event.symbol == BTC:
+                        w_chain = replay_warmup_chains.setdefault(key, Chain())
+                        if w_chain.apply(exchange, event) is None:
+                            books[exchange].apply(event)
+                            last_depth_exchange_ns[exchange] = int(event.exchange_ms or 0) * 1_000_000
+                        else:
+                            books[exchange] = Book()
+                            last_depth_exchange_ns.pop(exchange, None)
+                    continue
+
+                if in_target and key in boundary_checkpoints and key not in checkpoint_applied:
+                    chains[key] = boundary_checkpoints[key]
+                    checkpoint_applied.add(key)
+
+                chain = chains.setdefault(key, Chain(anchored=False))
                 if in_target:
-                    book_proofs.frames[(exchange, event.symbol)] += 1
+                    book_proofs.frames[key] += 1
                 if sample_end > start_ns and exchange in FOLLOWERS and event.symbol == BTC and in_target and exchange not in seeded:
                     seeded.add(exchange)
-                    if chain.seq is not None and chain.connection == event.connection and event.mode != "snapshot":
+                    if chain.anchored and chain.seq is not None and chain.connection == event.connection and event.mode != "snapshot":
                         book = books[exchange]
                         previous_exchange_ns = last_depth_exchange_ns.get(exchange)
                         target_exchange_ns = int(event.exchange_ms or 0) * 1_000_000
@@ -244,19 +278,30 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                 if event.mode == "snapshot":
                     seen_anchors.add((exchange, event.symbol, "target" if in_target else "warmup",
                                       event.connection[1], event.connection[2]))
-                problem = chain.apply(exchange, event)
+                    reset_seen.discard(key)
+                    problem = chain.apply(exchange, event)
+                elif chain.anchored or key in reset_seen:
+                    problem = chain.apply(exchange, event)
+                else:
+                    # Pre-existing long-lived connection whose initial snapshot predates bounded lookback.
+                    # Still verify delta-to-delta sequence continuity so any real break is proven immediately.
+                    if in_target:
+                        unanchored_delta_counts[key] += 1
+                        unanchored_sources.setdefault(key, event.connection[1:])
+                    problem = chain.apply_unanchored_delta(exchange, event)
+
                 if not problem and exchange == GATE and not verify_gate_sizes(event):
                     problem = "gate_quantity_not_decimal_string"
                 if problem:
                     if in_target:
                         book_proofs.count(exchange, event.symbol, problem)
                         if problem == "missing_same_connection_anchor":
-                            missing_anchor_sources.setdefault((exchange, event.symbol), event.connection[1:])
+                            missing_anchor_sources.setdefault(key, event.connection[1:])
                     if sample_end > start_ns and exchange in books and event.symbol == BTC:
                         books[exchange] = Book()
                         last_depth_exchange_ns.pop(exchange, None)
                     continue
-                if sample_end > start_ns and exchange in books and event.symbol == BTC:
+                if chain.anchored and sample_end > start_ns and exchange in books and event.symbol == BTC:
                     book = books[exchange]
                     book.apply(event)
                     ms = int(event.exchange_ms or 0)
@@ -318,17 +363,43 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         {"exchange": ex, "symbol": sym, "connection": conn, "epoch": epoch}
         for (ex, sym), (conn, epoch) in sorted(missing_anchor_sources.items())
     ]
+    summary["unanchored_lookback_markets"] = [
+        {
+            "exchange": ex,
+            "symbol": sym,
+            "connection": conn,
+            "epoch": epoch,
+            "delta_frames_continuity_checked": unanchored_delta_counts[(ex, sym)],
+            "proven_chain_breaks": book_proofs.issues.get((ex, sym, "exchange_update_chain_break"), 0),
+        }
+        for (ex, sym), (conn, epoch) in sorted(unanchored_sources.items())
+    ]
     summary["boundary_events"] = boundary_events.json()["issues"]
     summary["archive_file_checks"] = file_reports
     summary["protocol"] = book_proofs.json()
-    summary["protocol_status"] = "failed" if book_proofs.issues else "passed"
-    # Structural sequence markers support the next partition. No price/size is retained.
+    summary["proven_protocol_issues"] = summary["protocol"]["issues"]
+    if book_proofs.issues:
+        summary["protocol_status"] = "failed"
+    elif summary["unanchored_lookback_markets"]:
+        summary["protocol_status"] = "anchor_unverified"
+    else:
+        summary["protocol_status"] = "passed"
+    # Preserve structural sequence checkpoints per-market for every cleanly anchored market
+    # so one failed/unanchored market never discards continuity state for healthy markets.
+    proven_failed_markets = {(e, s) for (e, s, _) in book_proofs.issues}
     summary["end_sequence_checkpoint"] = [
         {"exchange": ex, "symbol": sym, "connection": list(chain.connection),
          "seq": chain.seq, "awaiting_delta": chain.awaiting_delta}
         for (ex, sym), chain in sorted(chains.items())
-        if (ex, sym) in expected_depths and chain.seq is not None and chain.connection is not None
-    ] if summary["protocol_status"] == "passed" else []
+        if (
+            (ex, sym) in expected_depths
+            and (ex, sym) not in proven_failed_markets
+            and book_proofs.frames[(ex, sym)] > 0
+            and chain.anchored
+            and chain.seq is not None
+            and chain.connection is not None
+        )
+    ]
     summary["replay"] = {}
     if sample_end <= start_ns:
         return
@@ -342,6 +413,9 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             continue
         if any(e == exchange and s == BTC for e, s, _ in book_proofs.issues):
             summary["replay"][exchange] = {"status": "blocked", "reason": "representative_symbol_failed_protocol"}
+            continue
+        if (exchange, BTC) in unanchored_sources and not buffers[exchange].seen_snapshot:
+            summary["replay"][exchange] = {"status": "blocked", "reason": "anchor_not_in_lookback"}
             continue
         if len(signal) < 2 or not buffers[exchange].seen_snapshot or not buffers[exchange].hbt_rows:
             summary["replay"][exchange] = {"status": "blocked", "reason": "missing_signal_or_initial_book"}
@@ -469,10 +543,19 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
             stage = "validate_archived_events"
             scan(items, config, begin * NS, end * NS, min(end, begin + replay_seconds) * NS,
                  specs, out, checkpoint=checkpoint)
-        passed = out["protocol_status"] == "passed" and all(
-            x["qa_status"] == "passed" for x in out["archive_file_checks"]
-        ) and all(x["status"] == "passed" for x in out["replay"].values())
-        out["status"] = "passed" if passed else "data_failed"
+        files_ok = all(x["qa_status"] == "passed" for x in out["archive_file_checks"])
+        replay_vals = list(out["replay"].values())
+        replay_ok = all(x["status"] == "passed" for x in replay_vals)
+        replay_only_unanchored = bool(replay_vals) and all(
+            x["status"] == "passed" or x.get("reason") == "anchor_not_in_lookback"
+            for x in replay_vals
+        )
+        if out["protocol_status"] == "passed" and files_ok and replay_ok:
+            out["status"] = "passed"
+        elif out["protocol_status"] == "anchor_unverified" and files_ok and (replay_ok or replay_only_unanchored):
+            out["status"] = "anchor_unverified"
+        else:
+            out["status"] = "data_failed"
         if out.get("spec_error_type") or any(x["reason"] == "converter_or_engine_error"
                                              for x in out["replay"].values() if "reason" in x):
             out["status"] = "retryable"
