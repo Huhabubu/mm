@@ -1,0 +1,362 @@
+"""Run bounded incremental protocol validation after the archive QA gate."""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from datetime import datetime, timezone
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+
+import data_coverage as coverage
+import hourly_incremental_qa as archive
+from tokyo_l2_replay_qa import audit_window, input_digests, verified_candidates
+
+
+def read_report(path):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def plan_windows(ready, recorded, current, *, max_catchup=1, deferred=None):
+    # Prioritize the notified target / latest due window, then bounded oldest-first catch-up.
+    # Windows in `deferred` (e.g. anchor_unverified awaiting a new predecessor checkpoint) are
+    # skipped so they never starve subsequent ready windows.
+    skip = set(recorded) | set(deferred or ())
+    backlog = sorted(set(ready) - skip - {current})
+    budget = max(0, int(max_catchup))
+    return ([current] if current in ready and current not in skip else []) + backlog[:budget]
+
+
+def _checkpoint_digest(checkpoint):
+    norm = sorted(
+        (
+            str(r.get("exchange") or ""),
+            str(r.get("symbol") or ""),
+            list(r.get("connection") or []),
+            r.get("seq"),
+            bool(r.get("awaiting_delta")),
+        )
+        for r in (checkpoint or ())
+    )
+    return sha256(json.dumps(norm, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _reports_with_current_checkpoints(proofs, step):
+    validated = {}
+    for start, proof in sorted(proofs.items()):
+        previous = validated.get(start - step, {})
+        if proof.get("input_checkpoint_digest") == _checkpoint_digest(previous.get("end_sequence_checkpoint")):
+            validated[start] = proof
+    return validated
+
+
+def _window_archive_revision(items, run_id, window_id, pm):
+    if not items:
+        return None
+    if hasattr(coverage, "compute_window_archive_revision"):
+        return coverage.compute_window_archive_revision(
+            items, run_id=run_id, window_id=window_id, partition_minutes=pm
+        )
+    return None
+
+
+def _summarize_protocol_diagnostics(report):
+    """Extract structural per-market failure reasons (zero raw prices/sizes/payloads)."""
+    if not isinstance(report, dict):
+        return {
+            "protocol_issues": [],
+            "proven_protocol_issues": [],
+            "failed_markets": [],
+            "missing_anchor_sources": [],
+            "unanchored_lookback_markets": [],
+            "boundary_events": [],
+            "archive_file_checks": [],
+        }
+    issues = list(
+        report.get("proven_protocol_issues")
+        if report.get("proven_protocol_issues") is not None
+        else ((report.get("protocol") or {}).get("issues") or [])
+    )
+    failed_markets = sorted(
+        {
+            f"{item.get('exchange')}:{item.get('symbol')}"
+            for item in issues
+            if isinstance(item, dict) and item.get("exchange") and item.get("symbol")
+        }
+    )
+    out = {
+        "protocol_issues": issues,
+        "proven_protocol_issues": issues,
+        "failed_markets": failed_markets,
+        "missing_anchor_sources": list(report.get("missing_anchor_sources") or []),
+        "unanchored_lookback_markets": list(report.get("unanchored_lookback_markets") or []),
+        "boundary_events": list(report.get("boundary_events") or []),
+        "archive_file_checks": list(report.get("archive_file_checks") or []),
+    }
+    if report.get("error_type"):
+        out["error_type"] = report.get("error_type")
+    if report.get("error_stage"):
+        out["error_stage"] = report.get("error_stage")
+    if report.get("spec_error_type"):
+        out["spec_error_type"] = report.get("spec_error_type")
+    return out
+
+
+def _expected_depth_markets(config):
+    from tokyo_l2_protocol_qa import symbol_key
+
+    if not isinstance(config, dict) or not config.get("exchanges"):
+        return set()
+    return {
+        (exchange, symbol_key(symbol))
+        for exchange, symbol, channel in coverage.expected_streams(config)
+        if coverage.classify_channel(exchange, channel) == coverage.CHANNEL_CATEGORY_DEPTH
+    }
+
+
+def run(remote, config, run_id, cutover, current, state, checker, *, archive_revision=None, trigger_mode=None, max_catchup=None):
+    started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    pm = coverage.configured_partition_minutes(config)
+    step = pm * 60
+    candidates = verified_candidates(remote, config, run_id, cutover - step, state)
+    groups = defaultdict(list)
+    for item in candidates:
+        groups[item["planned_start_s"]].append(item)
+
+    report_dir = state / "qa_reports" / "protocol" / sha256(run_id.encode()).hexdigest()[:24] / f"{pm}m"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    wid = lambda start: coverage.window_descriptor(start, pm)["window_id"]
+
+    observed_current_rev = _window_archive_revision(groups.get(current, []), run_id, wid(current), pm)
+    expected_rev = str(archive_revision or "").strip() or None
+    if expected_rev is not None and observed_current_rev is not None and observed_current_rev != expected_rev:
+        completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "status": "revision_mismatch",
+            "run_id": run_id,
+            "trigger_mode": trigger_mode or "unknown",
+            "current_window": wid(current),
+            "current_window_ready": False,
+            "expected_archive_revision": expected_rev,
+            "archive_revision": observed_current_rev,
+            "reused_current_result": False,
+            "protocol_status": "revision_mismatch",
+            "protocol_issues": [],
+            "proven_protocol_issues": [],
+            "failed_markets": [],
+            "missing_anchor_sources": [],
+            "unanchored_lookback_markets": [],
+            "boundary_events": [],
+            "archive_file_checks": [],
+            "hourly_replay_window": wid(current - current % 3600),
+            "hourly_btc_replay": {},
+            "checked_windows": [],
+            "historical_checked_windows": [],
+            "historical_passed_windows": [],
+            "historical_anchor_unverified_windows": [],
+            "deferred_anchor_unverified_windows": [],
+            "historical_failed_windows": [],
+            "pending_ready_windows": 0,
+            "started_at_utc": started_at_utc,
+            "completed_at_utc": completed_at_utc,
+        }
+
+    def report_path(start):
+        return report_dir / f"{archive._safe_window_filename(wid(start))}.json"
+
+    def archived_window_passed(start):
+        wd = coverage.window_descriptor(start, pm)
+        window = wd["window_id"]
+        span_id = wd["window_span_id"]
+        batch_folder = archive._safe_window_filename(run_id or "default")
+        candidate_paths = (
+            state / "qa_reports" / "windows" / batch_folder / window[:10]
+            / f"{archive._safe_window_filename(span_id)}.window.qa.json",
+            state / "qa_reports" / "windows" / window[:10]
+            / f"{archive._safe_window_filename(window)}.window.qa.json",
+        )
+        summary = {}
+        for path in candidate_paths:
+            summary = read_report(path)
+            if summary:
+                break
+        return (summary.get("qa_status") == "passed" and summary.get("run_id") == run_id
+                and summary.get("partition_minutes") == pm
+                and summary.get("checker_commit_sha") == checker.split("/", 1)[0]
+                and set(summary.get("files") or []) == {item["source_manifest"] for item in groups[start]})
+
+    ready = sorted(s for s in groups if cutover <= s and archived_window_passed(s))
+    expected_depth_markets = _expected_depth_markets(config)
+    proofs = {}
+    saved_reports = {}
+    revisions = {}
+    for start in ready:
+        inputs = input_digests(groups[start])
+        earlier = input_digests(groups[start - step])
+        win_rev = _window_archive_revision(groups[start], run_id, wid(start), pm)
+        revisions[start] = win_rev
+        proof = read_report(report_path(start))
+        if proof.get("checker") != checker:
+            continue
+        saved_reports[start] = proof
+        if (
+            proof.get("target_inputs") == inputs
+            and proof.get("previous_inputs") == earlier
+            and (win_rev is None or proof.get("archive_revision") == win_rev)
+        ):
+            proofs[start] = proof
+
+    validated = _reports_with_current_checkpoints(proofs, step)
+    recorded = {s for s, proof in validated.items() if proof.get("status") in {"passed", "data_failed"}}
+    deferred = {s for s, proof in validated.items() if proof.get("status") == "anchor_unverified"}
+    eff_max_catchup = (
+        int(max_catchup)
+        if max_catchup is not None
+        else (4 if trigger_mode == "schedule_catchup" else 1)
+    )
+    checked = set()
+    checked_windows = []
+    for start in plan_windows(ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred):
+        replay_seconds = 660 if start % 3600 == 0 else 0
+        checkpoint = validated.get(start - step, {}).get("end_sequence_checkpoint") or []
+        covered_markets = {(row["exchange"], row["symbol"]) for row in checkpoint}
+        all_markets_covered = bool(expected_depth_markets) and expected_depth_markets.issubset(covered_markets)
+        warmup_windows = 1 if (replay_seconds or not all_markets_covered) else 0
+        report = audit_window(
+            remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
+            candidates=candidates, checkpoint=checkpoint or None,
+        )
+        report.update(
+            checker=checker,
+            archive_revision=revisions.get(start),
+            previous_inputs=input_digests(groups[start - step]),
+            input_checkpoint_digest=_checkpoint_digest(checkpoint),
+            completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        proofs[start] = report
+        # The target runs first. A subsequent catch-up can change the checkpoint the target used.
+        validated = _reports_with_current_checkpoints(proofs, step)
+        checked.add(start)
+        checked_windows.append(wid(start))
+
+    for start in sorted(saved_reports.keys() | checked):
+        if start in validated:
+            if start in checked:
+                archive._atomic_write_json(report_path(start), validated[start])
+        elif start in checked or saved_reports[start].get("status") != "pending":
+            # Reconciliation reads these reports directly, so revoke stale terminal results on disk.
+            archive._atomic_write_json(report_path(start), {
+                "status": "pending",
+                "protocol_status": "pending",
+                "reason": "protocol_inputs_changed",
+                "run_id": run_id,
+                "window_id": wid(start),
+                "archive_revision": revisions[start],
+                "checker": checker,
+            })
+
+    all_known = {
+        start: proof for start, proof in validated.items()
+        if start in checked or proof.get("status") in {"passed", "data_failed", "anchor_unverified"}
+    }
+    current_report = all_known.get(current, {})
+    reused_current_result = current in all_known and current not in checked
+    diag = _summarize_protocol_diagnostics(current_report)
+    # Use the most recent due hourly sample for visibility even on intervening windows.
+    latest_hour = current - current % 3600
+    hourly = all_known.get(latest_hour, {})
+    historical_passed = [wid(start) for start, report in sorted(all_known.items())
+                         if start != current and report.get("status") == "passed"]
+    historical_unverified = [wid(start) for start, report in sorted(all_known.items())
+                             if start != current and report.get("status") == "anchor_unverified"]
+    historical = [wid(start) for start, report in sorted(all_known.items())
+                  if start != current and report.get("status") == "data_failed"]
+    deferred_windows = [wid(start) for start, report in sorted(all_known.items())
+                        if report.get("status") == "anchor_unverified"]
+    completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = {
+        "status": current_report.get("status", "pending"),
+        "run_id": run_id,
+        "trigger_mode": trigger_mode or "unknown",
+        "current_window": wid(current),
+        "current_window_ready": current in ready,
+        "expected_archive_revision": expected_rev,
+        "archive_revision": observed_current_rev,
+        "reused_current_result": reused_current_result,
+        "protocol_status": current_report.get("protocol_status", "pending"),
+        **diag,
+        "end_sequence_checkpoint_markets": len(current_report.get("end_sequence_checkpoint") or []),
+        "hourly_replay_window": wid(latest_hour),
+        "hourly_btc_replay": {ex: v["status"] for ex, v in hourly.get("replay", {}).items()},
+        "checked_windows": checked_windows,
+        "historical_checked_windows": [w for w in checked_windows if w != wid(current)],
+        "historical_passed_windows": historical_passed,
+        "historical_anchor_unverified_windows": historical_unverified,
+        "deferred_anchor_unverified_windows": deferred_windows,
+        "historical_failed_windows": historical,
+        "pending_ready_windows": len(set(ready) - set(all_known)),
+        "started_at_utc": started_at_utc,
+        "completed_at_utc": completed_at_utc,
+    }
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--remote", required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--cutover", required=True)
+    parser.add_argument("--current", required=True)
+    parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--checker", required=True)
+    parser.add_argument("--archive-revision", default=None)
+    parser.add_argument("--trigger-mode", default=None)
+    parser.add_argument("--max-catchup", type=int, default=None)
+    args = parser.parse_args()
+    data = run(args.remote, json.loads(args.config.read_text()), args.run_id,
+               coverage.parse_window_start_s(args.cutover), coverage.parse_window_start_s(args.current),
+               args.state_dir, args.checker,
+               archive_revision=args.archive_revision, trigger_mode=args.trigger_mode,
+               max_catchup=args.max_catchup)
+    body = json.dumps(data, indent=2)
+    print(body)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as dest:
+            dest.write("\n## Archive protocol QA and hourly BTC replay\n\n")
+            if data.get("proven_protocol_issues"):
+                issue_str = "; ".join(
+                    f"{x.get('exchange')}:{x.get('symbol')}={x.get('issue')}({x.get('count')})"
+                    for x in data["proven_protocol_issues"]
+                )
+                dest.write(f"- **Proven failed markets**: `{data.get('failed_markets')}`\n")
+                dest.write(f"- **Proven protocol issues**: `{issue_str}`\n")
+            if data.get("unanchored_lookback_markets"):
+                un_str = "; ".join(
+                    f"{x.get('exchange')}:{x.get('symbol')}(conn={x.get('connection')}/e{x.get('epoch')}, deltas_checked={x.get('delta_frames_continuity_checked')}, breaks={x.get('proven_chain_breaks')})"
+                    for x in data["unanchored_lookback_markets"]
+                )
+                dest.write(f"- **Unanchored in lookback (no snapshot in warmup)**: `{un_str}`\n")
+            if data.get("missing_anchor_sources"):
+                dest.write(f"- **Proven missing anchor sources (post-reset / reconnection)**: `{data['missing_anchor_sources']}`\n")
+            if data.get("historical_checked_windows"):
+                dest.write(f"- **Historical catch-up windows checked**: `{data['historical_checked_windows']}`\n")
+            if data.get("error_type"):
+                dest.write(f"- **Execution error**: `{data.get('error_type')}` at `{data.get('error_stage')}`\n")
+            dest.write("\n```json\n" + body + "\n```\n")
+    if os.environ.get("GITHUB_ENV"):
+        with open(os.environ["GITHUB_ENV"], "a") as dest:
+            dest.write(f"QA_PROTOCOL_STATUS={data['protocol_status']}\n")
+            dest.write(f"QA_PROTOCOL_REUSED={'true' if data.get('reused_current_result') else 'false'}\n")
+            dest.write(f"QA_PROTOCOL_COMPLETED_AT_UTC={data.get('completed_at_utc', '')}\n")
+            replay = ",".join(f"{e}={s}" for e, s in data["hourly_btc_replay"].items()) or "pending"
+            dest.write(f"QA_HOURLY_BTC_REPLAY={replay}\n")
+    return 0 if data["status"] == "passed" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
