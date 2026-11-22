@@ -1,23 +1,23 @@
 {
-  "status": "blocked",
-  "qa_status": "failed",
-  "heartbeat_status": "failed",
+  "status": "ok",
+  "qa_status": "passed",
+  "heartbeat_status": "ok",
   "job_execution_status": "ok",
   "target_window_execution_status": "ok",
   "historical_catchup_status": "ok",
-  "active_window_ready_for_protocol_qa": false,
+  "active_window_ready_for_protocol_qa": true,
   "trigger_mode": "archive_dispatch",
-  "started_at_utc": "2026-11-22T10:04:10Z",
-  "completed_at_utc": "2026-11-22T10:05:37Z",
-  "target_window_utc": "2026-11-22T09:45Z",
-  "expected_archive_revision": "sha256:8f9f30f1b6ab185e73f6836e9f1353db46ed9ff4bdb03fe60d8953060a7c7988",
-  "observed_archive_revision": "sha256:8f9f30f1b6ab185e73f6836e9f1353db46ed9ff4bdb03fe60d8953060a7c7988",
+  "started_at_utc": "2026-11-22T10:06:31Z",
+  "completed_at_utc": "2026-11-22T10:07:40Z",
+  "target_window_utc": "2026-11-22T08:45Z",
+  "expected_archive_revision": "sha256:fcbd00a0e3af04b8b07ca9d3cbb941e4e14f9b1116771e612ff33bd3381600bc",
+  "observed_archive_revision": "sha256:fcbd00a0e3af04b8b07ca9d3cbb941e4e14f9b1116771e612ff33bd3381600bc",
   "target_revision_matched": true,
   "target_validation_error": null,
   "target_window_reused_result": false,
-  "current_window_id": "2026-11-22T09:45Z",
+  "current_window_id": "2026-11-22T08:45Z",
   "current_window_completed": true,
-  "current_window_verification_status": "failed",
+  "current_window_verification_status": "passed",
   "latest_due_window_id": "2026-11-22T09:45Z",
   "latest_due_window_verification_status": "failed",
   "latest_verified_window_id": "2026-11-22T09:45Z",
@@ -25,7 +25,8 @@
   "historical_data_quality_status": "has_historical_damage",
   "historical_damaged_windows": [
     "2026-11-22T08:00Z",
-    "2026-11-22T09:15Z"
+    "2026-11-22T09:15Z",
+    "2026-11-22T09:45Z"
   ],
   "historical_overdue_windows": [],
   "historical_archived_pending_qa_windows": [],
@@ -61,13 +62,7 @@
       "problems": [
         "depth unavailable events recorded: 6"
       ]
-    }
-  ],
-  "historical_loss_manifests": [],
-  "current_damaged_windows": [
-    "2026-11-22T09:45Z"
-  ],
-  "current_damaged_partitions": [
+    },
     {
       "source_manifest": "raw/bitget_v3/2026-11-22/bitget_v3_20261122_0945_p15m_trial15_20261122_da93ae54.manifest.json",
       "file_name": "bitget_v3_20261122_0945_p15m_trial15_20261122_da93ae54.tsv.zst",
@@ -86,6 +81,9 @@
       ]
     }
   ],
+  "historical_loss_manifests": [],
+  "current_damaged_windows": [],
+  "current_damaged_partitions": [],
   "qa_version": 2,
   "checker_commit_sha": "ed7646637ee23e8aa9257a8307edc3b16e7f51f1",
   "effective_config_sha256": "b266588d4021978dbe1dcfe0ca29dade8584ef60a7f5de51cdba25401b0c669a",
@@ -97,8 +95,8 @@
   "discovery_mode": "archive_manifest_index",
   "discovery_warnings": [],
   "attempted": 4,
-  "ok": 3,
-  "blocked": 1,
+  "ok": 4,
+  "blocked": 0,
   "needs_review": 0,
   "retry_needed": 0,
   "target_retry_needed": 0,
@@ -152,10 +150,10 @@
     "verified_needs_review": []
   },
   "details": [
-    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-22T09:45Z expected_archive_revision=sha256:8f9f30f1b6ab185e73f6836e9f1353db46ed9ff4bdb03fe60d8953060a7c7988 observed_archive_revision=sha256:8f9f30f1b6ab185e73f6836e9f1353db46ed9ff4bdb03fe60d8953060a7c7988 checker_commit=ed7646637ee23e8aa9257a8307edc3b16e7f51f1",
-    "TARGET PASSED raw/binance_futures/2026-11-22/binance_futures_20261122_0945_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET FAILED raw/bitget_v3/2026-11-22/bitget_v3_20261122_0945_p15m_trial15_20261122_da93ae54.manifest.json: 2 issues",
-    "TARGET PASSED raw/bybit_linear/2026-11-22/bybit_linear_20261122_0945_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/gate_futures/2026-11-22/gate_futures_20261122_0945_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
+    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-22T08:45Z expected_archive_revision=sha256:fcbd00a0e3af04b8b07ca9d3cbb941e4e14f9b1116771e612ff33bd3381600bc observed_archive_revision=sha256:fcbd00a0e3af04b8b07ca9d3cbb941e4e14f9b1116771e612ff33bd3381600bc checker_commit=ed7646637ee23e8aa9257a8307edc3b16e7f51f1",
+    "TARGET PASSED raw/binance_futures/2026-11-22/binance_futures_20261122_0845_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/bitget_v3/2026-11-22/bitget_v3_20261122_0845_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/bybit_linear/2026-11-22/bybit_linear_20261122_0845_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/gate_futures/2026-11-22/gate_futures_20261122_0845_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
   ]
 }
