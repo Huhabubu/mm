@@ -39,6 +39,9 @@ def _checkpoint_digest(checkpoint):
             list(r.get("connection") or []),
             r.get("seq"),
             bool(r.get("awaiting_delta")),
+            # A downstream result is stale if the predecessor's book changes,
+            # even when its connection and last sequence remain unchanged.
+            json.dumps(r.get("book"), sort_keys=True, separators=(",", ":")),
         )
         for r in (checkpoint or ())
     )
