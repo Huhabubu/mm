@@ -589,7 +589,9 @@ jobs:
                 f"warmup_markets={len(first.get('observed_snapshot_markets', []))} "
                 f"warmup_files={len(first.get('warmup_inputs', []))}")
           assert first["status"] == "passed", first["status"]
-          assert len(markets) == 24 and all(has(row, "verified_usable") for row in markets), markets
+          missing = [f"{row['exchange']}:{row['symbol']}" for row in markets if not has(row, "verified_usable")]
+          print(f"First-window depth frames by mode={first.get('depth_frames_by_mode')}")
+          assert len(markets) == 24 and not missing, missing
           incidents = {
               "2026-11-22T08:00Z": "binance_futures",
               "2026-11-22T09:15Z": "bitget_v3",
@@ -603,8 +605,14 @@ jobs:
               preserved = [row for row in markets if row["exchange"] != exchange and has(row, "verified_usable")]
               assert affected and len(preserved) == 18, (window, len(affected), len(preserved))
               example = next((row for row in affected if row["symbol"] == "BTCUSDT"), affected[0])
+              spans = example["intervals"]
+              gaps = [span for span in spans if span["status"] == "known_gap"]
+              resumed = any(span["status"] == "verified_usable" and span["start_wall_ns"] >= gaps[0]["end_wall_ns"]
+                            for span in spans)
+              if window != "2026-11-22T09:45Z":
+                  assert resumed, (window, example["symbol"], spans)
               print(f"{window} affected_depth={len(affected)} preserved_depth={len(preserved)} "
-                    f"gap_example={json.dumps([span for span in example['intervals'] if span['status'] == 'known_gap'])}")
+                    f"resumed={resumed} gap_example={json.dumps(gaps)}")
           later = windows["2026-11-22T08:15Z"]
           assert len(later["end_sequence_checkpoint"]) >= 18, later["end_sequence_checkpoint"]
           print(f"Accepted 10 windows, first-window verified depth markets={len(first['end_sequence_checkpoint'])}, "

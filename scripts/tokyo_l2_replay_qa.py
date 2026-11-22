@@ -278,6 +278,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     previous_end = {}
     legacy_ends = {}
     recovered_depth = set()
+    depth_frames_by_mode = Counter()
     buffers = {ex: convert.AssetDayBuffers(ex, BTC, convert.date_utc_from_wall_ns(start_ns)) for ex in FOLLOWERS}
     books = {ex: Book() for ex in FOLLOWERS}
     last_depth_exchange_ns = {}
@@ -416,6 +417,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                 chain = chains.setdefault(key, Chain(anchored=False))
                 if in_target:
                     book_proofs.frames[key] += 1
+                    depth_frames_by_mode[(exchange, event.mode)] += 1
                 if sample_end > start_ns and exchange in FOLLOWERS and event.symbol == BTC and in_target and exchange not in seeded:
                     seeded.add(exchange)
                     if chain.anchored and chain.seq is not None and chain.connection == event.connection and event.mode != "snapshot":
@@ -428,6 +430,10 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                             else:
                                 convert._emit_depth_batch(buffers[exchange], True, previous_exchange_ns, start_ns - 1,
                                                           list(book.bids.items()), list(book.asks.items()))
+                consecutive_full_books = (
+                    exchange == BITGET and event.mode == "snapshot" and key in recovered_depth
+                    and chain.connection == event.connection and chain.seq is not None and event.seq > chain.seq
+                )
                 if event.mode == "snapshot":
                     seen_anchors.add((exchange, event.symbol, "target" if in_target else "warmup",
                                       event.connection[1], event.connection[2]))
@@ -467,17 +473,21 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                     if event.mode == "snapshot":
                         recovered_depth.add(key)
                     state = evidence.timeline.state(stream)
-                    if event.mode != "snapshot" or (not chain.awaiting_delta and state != "known_gap"):
-                        if state != "known_gap" or key in recovered_depth:
-                            prior = checkpoint_wall.get(key)
-                            fits_boundary = (
-                                using_boundary and key not in reset_seen and event.mode != "snapshot"
-                                and prior is not None and wall - prior <= evidence.limits[stream]
-                            )
-                            evidence.observe(
-                                stream, wall, reason="verified_depth_sequence",
-                                resume_at=start_ns if fits_boundary else None,
-                            )
+                    # After a recorded interruption, a checked delta or a newer
+                    # independent Bitget book on the same connection proves recovery.
+                    proved = event.mode != "snapshot" or (
+                        (not chain.awaiting_delta or exchange == BITGET) and state != "known_gap"
+                    ) or consecutive_full_books
+                    if proved and (state != "known_gap" or key in recovered_depth):
+                        prior = checkpoint_wall.get(key)
+                        fits_boundary = (
+                            using_boundary and key not in reset_seen and event.mode != "snapshot"
+                            and prior is not None and wall - prior <= evidence.limits[stream]
+                        )
+                        evidence.observe(
+                            stream, wall, reason="verified_depth_sequence",
+                            resume_at=start_ns if fits_boundary else None,
+                        )
                     if event.mode != "snapshot" or evidence.timeline.state(stream) == "verified_usable":
                         recovered_depth.discard(key)
                 if chain.anchored and sample_end > start_ns and exchange in books and event.symbol == BTC:
@@ -555,6 +565,10 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     ]
     summary["boundary_events"] = boundary_events.json()["issues"]
     summary["archive_file_checks"] = file_reports
+    summary["depth_frames_by_mode"] = [
+        {"exchange": exchange, "mode": mode, "count": count}
+        for (exchange, mode), count in sorted(depth_frames_by_mode.items())
+    ]
     summary["protocol"] = book_proofs.json()
     summary["proven_protocol_issues"] = summary["protocol"]["issues"]
     if book_proofs.issues:
@@ -587,7 +601,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             and book_proofs.frames[(ex, sym)] > 0
             and evidence.depth[(ex, sym)] in evidence.last
             and chain.anchored
-            and not chain.awaiting_delta
+            and (not chain.awaiting_delta or ex == BITGET)
             and (ex, sym) not in recovered_depth
             and chain.seq is not None
             and chain.connection is not None

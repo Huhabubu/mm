@@ -476,6 +476,52 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual("missing_same_connection_anchor", s5["proven_protocol_issues"][0]["issue"])
             self.assertEqual("BTCUSDT", s5["proven_protocol_issues"][0]["symbol"])
 
+    def test_bitget_full_book_stream_recovers_on_newer_same_connection_snapshot(self):
+        import json
+        import zstandard as zstd
+        from unittest.mock import patch
+        import hourly_incremental_qa as archive
+        from tokyo_l2_replay_qa import NS, scan
+
+        start = 1_795_276_800
+        wall = start * NS
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {BITGET: {"enabled": True, "symbols": ["BTCUSDT"], "channels": ["books50"]}},
+        }
+
+        def full_book(seq):
+            return {"arg": {"topic": "books50", "symbol": "BTCUSDT"}, "action": "snapshot",
+                    "data": [{"seq": seq, "bids": [["100", "1"]], "asks": [["101", "1"]]}]}
+
+        records = [
+            (1, "A", "DATA", full_book(10)),
+            (2, "B", "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTCUSDT"}),
+            (3, "B", "DATA", full_book(20)),
+            (4, "B", "DATA", full_book(20)),
+            (5, "B", "DATA", full_book(21)),
+        ]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(archive, "check_partition", return_value={"qa_status": "failed", "problems": ["depth gap"]}):
+            path = Path(directory) / "bitget.tsv.zst"
+            with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as writer:
+                for stamp, conn, kind, obj in records:
+                    writer.write(f"{wall + stamp}\t{stamp}\t{conn}\t1\t{stamp}\t{kind}\t{json.dumps(obj)}\n")
+            report = {}
+            scan(
+                [({"exchange": BITGET, "planned_start_s": start},
+                  {"boot_id": "boot", "file_name": path.name}, path)],
+                cfg, wall, wall + 10, wall, {}, report,
+            )
+        spans = report["market_availability"][0]["intervals"]
+        self.assertEqual(
+            [("unverified", 0, 1), ("verified_usable", 1, 2),
+             ("known_gap", 2, 5), ("verified_usable", 5, 10)],
+            [(iv["status"], iv["start_wall_ns"] - wall, iv["end_wall_ns"] - wall) for iv in spans],
+        )
+        self.assertEqual(21, report["end_sequence_checkpoint"][0]["seq"])
+        self.assertTrue(report["end_sequence_checkpoint"][0]["awaiting_delta"])
+
     def test_range_starts_with_verified_predecessor_then_carries_checkpoint(self):
         from unittest.mock import patch
         import tokyo_l2_replay_qa as replay
