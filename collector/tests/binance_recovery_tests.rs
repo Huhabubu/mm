@@ -185,7 +185,8 @@ fn rebuild_binance_book(records: &[CanonicalRecord], symbol: &str) -> Result<Reb
                         b.epoch = None;
                     }
                 }
-                "SWITCH" => {
+                "SWITCH" if obj.get("endpoint").and_then(Value::as_str) != Some("binance_market") => {
+                    // /market/stream trades failover is independent of /public/stream depth.
                     let to_conn = obj.get("to").and_then(Value::as_str).unwrap_or("");
                     if b.conn_id.as_deref() != Some(to_conn) {
                         b.conn_id = None;
