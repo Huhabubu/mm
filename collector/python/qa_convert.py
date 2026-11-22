@@ -428,40 +428,32 @@ def _order_and_validate_hbt_events(
     clean = raw_arr.copy()
     clean["ev"] = clean["ev"] & _EVENT_SEMANTIC_MASK
 
+    local_order = np.argsort(clean["local_ts"], kind="mergesort")
     ordered = correct_event_order(
         clean,
         np.argsort(clean["exch_ts"], kind="mergesort"),
-        np.argsort(clean["local_ts"], kind="mergesort"),
+        local_order,
     )
-    clears = list(local_book_clears or ())
+    clears = sorted(local_book_clears or ())
     if clears:
-        merged_rows: list[tuple[Any, ...]] = []
-        ci = 0
-        local_seen = 0
-        prev_local_ts = -1
-        for row in ordered:
-            is_local = (int(row["ev"]) & int(LOCAL_EVENT)) != 0
-            row_lts = int(row["local_ts"])
-            if is_local:
-                while ci < len(clears) and local_seen >= clears[ci][1]:
-                    emit_lts = max(prev_local_ts, min(clears[ci][0], row_lts))
-                    merged_rows.append(
-                        (int(LOCAL_EVENT | DEPTH_CLEAR_EVENT), 0, emit_lts, 0.0, 0.0, 0, 0, 0.0)
-                    )
-                    prev_local_ts = emit_lts
-                    ci += 1
-            merged_rows.append(tuple(row))
-            if is_local:
-                local_seen += 1
-                prev_local_ts = max(prev_local_ts, row_lts)
-        while ci < len(clears):
-            emit_lts = max(prev_local_ts, clears[ci][0])
-            merged_rows.append(
-                (int(LOCAL_EVENT | DEPTH_CLEAR_EVENT), 0, emit_lts, 0.0, 0.0, 0, 0, 0.0)
+        local_positions = np.flatnonzero((ordered["ev"] & LOCAL_EVENT) != 0)
+        local_times = ordered["local_ts"][local_positions]
+        merged = np.empty(len(ordered) + len(clears), dtype=event_dtype)
+        begin = 0
+        for offset, (local_ts, raw_boundary) in enumerate(clears):
+            first = int(np.searchsorted(local_times, local_ts, side="left"))
+            last = int(np.searchsorted(local_times, local_ts, side="right"))
+            # Only break timestamp ties by archive order. Sorting by receive time can move
+            # a trade across the cutover, so its original index cannot determine the time.
+            local_index = first + int(np.searchsorted(local_order[first:last], raw_boundary))
+            end = int(local_positions[local_index]) if local_index < len(local_positions) else len(ordered)
+            merged[begin + offset:end + offset] = ordered[begin:end]
+            merged[end + offset] = (
+                int(LOCAL_EVENT | DEPTH_CLEAR_EVENT), 0, local_ts, 0.0, 0.0, 0, 0, 0.0
             )
-            prev_local_ts = emit_lts
-            ci += 1
-        ordered = np.array(merged_rows, dtype=event_dtype)
+            begin = end
+        merged[begin + len(clears):] = ordered[begin:]
+        ordered = merged
     try:
         validate_event_order(ordered)
     except ValueError as exc:
@@ -1672,7 +1664,7 @@ def evaluate_50_level_coverage(
 
 def audit_fills_against_depth_unavailable_intervals(
     fills: list[dict[str, Any]],
-    depth_unavailable_intervals: list[dict[str, Any]],
+    depth_unavailable_intervals: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
     """Explicitly account for simulated fills (including pre-switch resting orders triggered by
     public trades) occurring inside `depth_unavailable_intervals`.
@@ -1682,7 +1674,7 @@ def audit_fills_against_depth_unavailable_intervals(
     - Any fill whose execution or local-observation timestamp falls within an unavailable depth
       interval `[start_wall_ns, end_wall_ns)` (or `>= start_wall_ns` if unrecovered) is explicitly
       tagged `execution_status="depth_unavailable_unverified"` and `queue_assumption="UNOBSERVABLE_DEPTH_GAP"`.
-    - Whenever `unverified_gap_fills > 0`, the overall audit status is `"execution_unverified"`.
+    - A gap fill or missing interval metadata makes the overall audit `"execution_unverified"`.
     """
     labeled: list[dict[str, Any]] = []
     verified_cnt = 0
@@ -1698,7 +1690,7 @@ def audit_fills_against_depth_unavailable_intervals(
             if val is not None and int(val) > 0:
                 cand_ts.append(int(val))
         matched_iv: dict[str, Any] | None = None
-        for iv in depth_unavailable_intervals:
+        for iv in depth_unavailable_intervals or ():
             start_ns = int(iv.get("start_wall_ns") or 0)
             end_raw = iv.get("end_wall_ns")
             end_ns = int(end_raw) if end_raw is not None else None
@@ -1727,6 +1719,12 @@ def audit_fills_against_depth_unavailable_intervals(
                     "matched_interval": matched_iv,
                 }
             )
+        elif depth_unavailable_intervals is None:
+            labeled.append({
+                **fill,
+                "execution_status": "depth_availability_unknown",
+                "queue_assumption": "UNKNOWN_DEPTH_AVAILABILITY",
+            })
         else:
             verified_cnt += 1
             labeled.append(
@@ -1737,11 +1735,14 @@ def audit_fills_against_depth_unavailable_intervals(
                 }
             )
 
+    intervals_available = depth_unavailable_intervals is not None
     return {
-        "status": "execution_unverified" if unverified_cnt > 0 else "verified",
+        "status": "execution_unverified" if unverified_cnt or not intervals_available else "verified",
         "policy": "retain_raw_fill_and_flag_unverified",
+        "depth_intervals_available": intervals_available,
         "total_fills": len(labeled),
         "verified_fills": verified_cnt,
+        "unassessed_fills": len(labeled) - verified_cnt - unverified_cnt,
         "unverified_gap_fills": unverified_cnt,
         "unverified_gap_fill_qty": unverified_qty,
         "unverified_intervals_hit": hit_intervals,
@@ -2445,6 +2446,42 @@ def run_qa_convert(
     return summary
 
 
+def _load_replay_depth_intervals(
+    follower_path: Path, follower_sha256: str,
+) -> list[dict[str, Any]] | None:
+    """Read interval metadata from the calendar for this exact conversion artifact."""
+    calendar = follower_path.with_name("eligibility_calendar.json")
+    try:
+        rows = json.loads(calendar.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        files, hashes = row.get("files"), row.get("sha256")
+        if not isinstance(files, dict) or not isinstance(hashes, dict):
+            continue
+        recorded_path = files.get("follower_l2_hbt")
+        if (not isinstance(recorded_path, str) or Path(recorded_path).name != follower_path.name
+                or hashes.get("follower_l2_hbt") != follower_sha256):
+            continue
+        intervals = row.get("depth_unavailable_intervals")
+        if not isinstance(intervals, list):
+            return None
+        for interval in intervals:
+            if not isinstance(interval, dict) or "end_wall_ns" not in interval:
+                return None
+            start, end = interval.get("start_wall_ns"), interval["end_wall_ns"]
+            if type(start) is not int or start <= 0:
+                return None
+            if end is not None and (type(end) is not int or end < start):
+                return None
+        return intervals
+    return None
+
+
 def run_offline_e2e_hbt_replay(
     follower_l2_npz: Path,
     binance_bbo_npz: Path,
@@ -2469,8 +2506,9 @@ def run_offline_e2e_hbt_replay(
     """Run Huhabubu/mm's official `scripts/core_glft_engine.py::run_core_glft` on converted .npz files.
 
     Returns exact deterministic fingerprints (input SHA-256, fills, ledger, decisions) for P1
-    repeatability and anti-lookahead verification, plus explicit `gap_execution_audit` classifying
-    any fills occurring inside `depth_unavailable_intervals` as `depth_unavailable_unverified`.
+    repeatability and anti-lookahead verification. Unless explicitly supplied, depth intervals
+    are read from the eligibility calendar beside the follower L2 artifact. Missing or unmatched
+    metadata leaves execution unverified while preserving raw engine accounting.
     """
     from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
 
@@ -2622,14 +2660,18 @@ def run_offline_e2e_hbt_replay(
         }
         for i in range(len(fill_ts_ns))
     ]
+    follower_sha256 = _sha256_file(follower_l2_npz)
+    if depth_unavailable_intervals is None:
+        depth_unavailable_intervals = _load_replay_depth_intervals(follower_l2_npz, follower_sha256)
     gap_execution_audit = audit_fills_against_depth_unavailable_intervals(
         fill_records,
-        list(depth_unavailable_intervals or ()),
+        depth_unavailable_intervals,
     )
 
     return {
         "status": "ok",
-        "follower_l2_sha256": _sha256_file(follower_l2_npz),
+        "execution_status": gap_execution_audit["status"],
+        "follower_l2_sha256": follower_sha256,
         "binance_bbo_sha256": _sha256_file(binance_bbo_npz),
         "ledger_sha256": ledger_sha256,
         "t0_ns": int(t0),

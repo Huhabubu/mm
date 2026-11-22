@@ -968,7 +968,11 @@ def test_issue19_qa_convert_unrecovered_planned_rotation_blocks_and_gap_clears_s
     #     local view clears during gap & recovers cleanly WITHOUT fabricating an EXCH_EVENT clear that
     #     could sort after a higher-latency B-line snapshot and wipe the simulated matching exchange! ---
     from hftbacktest import DEPTH_CLEAR_EVENT, EXCH_EVENT, LOCAL_EVENT
-    from qa_convert import audit_fills_against_depth_unavailable_intervals, evaluate_50_level_coverage
+    from qa_convert import (
+        _load_replay_depth_intervals,
+        audit_fills_against_depth_unavailable_intervals,
+        evaluate_50_level_coverage,
+    )
 
     ms = 1_000_000
     for lat_name, a_exch_ms, a_loc_ms, b_exch_ms, b_loc_ms in [
@@ -1136,10 +1140,11 @@ def test_issue19_qa_convert_unrecovered_planned_rotation_blocks_and_gap_clears_s
     }
 
     # Explicit backtest fill accounting: raw fills retained (total=2), gap fill flagged unverified!
-    audit = audit_fills_against_depth_unavailable_intervals(
-        [gap_fill_rec, post_fill_rec],
-        tg_row["depth_unavailable_intervals"],
+    intervals = _load_replay_depth_intervals(
+        Path(tg_row["files"]["follower_l2_hbt"]), tg_row["sha256"]["follower_l2_hbt"]
     )
+    assert intervals == tg_row["depth_unavailable_intervals"]
+    audit = audit_fills_against_depth_unavailable_intervals([gap_fill_rec, post_fill_rec], intervals)
     assert audit["status"] == "execution_unverified", audit
     assert audit["policy"] == "retain_raw_fill_and_flag_unverified"
     assert audit["total_fills"] == 2
@@ -1179,4 +1184,50 @@ def test_issue19_qa_convert_unrecovered_planned_rotation_blocks_and_gap_clears_s
     assert cov["items"][1]["depth_coverage"] == "VISIBLE_WITHIN_50"
 
 
+def test_local_clear_uses_receive_time_when_archive_order_reverses():
+    import numpy as np
+    from hftbacktest import (
+        BUY_EVENT, DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT, EXCH_EVENT,
+        LOCAL_EVENT, SELL_EVENT, TRADE_EVENT, event_dtype,
+    )
 
+    from qa_convert import _order_and_validate_hbt_events
+
+    ms = 1_000_000
+    base = 1_700_000_100_000_000_000
+
+    def event(kind, exch_ms, local_ms, price=0.0, qty=0.0):
+        return (kind, base + exch_ms * ms, base + local_ms * ms, price, qty, 0, 0, 0.0)
+
+    for snapshot_ms in (2000, 2050):
+        old = [
+            event(DEPTH_CLEAR_EVENT, 950, 1100),
+            event(DEPTH_SNAPSHOT_EVENT | BUY_EVENT, 950, 1100, 90000.0, 1.0),
+            event(DEPTH_SNAPSHOT_EVENT | SELL_EVENT, 950, 1100, 90001.0, 1.0),
+            event(TRADE_EVENT | SELL_EVENT, 1980, 2000, 90000.0, 1.0),
+            *[event(TRADE_EVENT | SELL_EVENT, 1990 + i, 2090 + i, 90000.0, 1.0) for i in range(5)],
+        ]
+        new = [
+            event(DEPTH_CLEAR_EVENT, 1950, snapshot_ms),
+            event(DEPTH_SNAPSHOT_EVENT | BUY_EVENT, 1950, snapshot_ms, 90050.0, 1.0),
+            event(DEPTH_SNAPSHOT_EVENT | SELL_EVENT, 1950, snapshot_ms, 90051.0, 1.0),
+        ]
+        raw = np.array(old + new, dtype=event_dtype)
+        ordered, diag = _order_and_validate_hbt_events(
+            raw, exchange="gate_futures", symbol="BTC", date_utc="2023-11-14",
+            stream_kind="follower_l2_hbt", local_book_clears=[(base + 2000 * ms, len(old))],
+        )
+        assert diag["raw_local_ts_reversals"] == 1
+        assert diag["local_only_book_clears"] == 1
+        assert np.count_nonzero(ordered["ev"] & EXCH_EVENT) == len(raw)
+        local = ordered[(ordered["ev"] & LOCAL_EVENT) != 0]
+        boundary = np.flatnonzero(
+            (local["ev"] == int(LOCAL_EVENT | DEPTH_CLEAR_EVENT)) & (local["exch_ts"] == 0)
+        )
+        assert len(boundary) == 1
+        i = int(boundary[0])
+        assert local[i]["local_ts"] == base + 2000 * ms
+        assert (int(local[i - 1]["ev"]) & 0xFF) == int(TRADE_EVENT)
+        assert (int(local[i + 1]["ev"]) & 0xFF) == int(DEPTH_CLEAR_EVENT)
+        assert local[i + 1]["local_ts"] == base + snapshot_ms * ms
+        assert local[i + 3]["px"] == 90051.0
