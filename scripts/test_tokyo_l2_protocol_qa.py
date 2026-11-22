@@ -620,5 +620,124 @@ class ProtocolTest(unittest.TestCase):
                 self.assertEqual([coverage.window_descriptor(w0, 15)["window_id"]], r4["deferred_anchor_unverified_windows"])
 
 
+    def test_recurring_revokes_downstream_reports_when_predecessor_checkpoint_changes(self):
+        import json
+        from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
+        import tokyo_l2_recurring_qa as recurring
+
+        w0 = 1_795_276_800
+        w1 = w0 + 900
+        w2 = w1 + 900
+        run_id = "checkpoint_revision_test"
+        checker_sha = "abc123def456"
+        checker = f"{checker_sha}/rules"
+        config = {"deployment": {"partition_minutes": 15}}
+        candidates = {}
+        for start in (w0, w1, w2):
+            manifest = f"raw/gate_futures/gate_{start}.manifest.json"
+            candidates[start] = {
+                "exchange": "gate_futures",
+                "source_manifest": manifest,
+                "source_data": manifest.replace(".manifest.json", ".tsv.zst"),
+                "manifest_sha256": f"{start:064x}",
+                "data_sha256": f"{start + 1:064x}",
+                "manifest_bytes": 100,
+                "data_bytes": 200,
+                "planned_start_s": start,
+            }
+
+        calls = []
+        revised = False
+
+        def audit(_remote, _config, batch, start, window, _seconds, _warmup, *, candidates, checkpoint):
+            calls.append((start, checkpoint))
+            if revised and start == w0:
+                status, protocol_status = "data_failed", "failed"
+            elif not checkpoint and (start == w2 or (revised and start == w1)):
+                status = protocol_status = "anchor_unverified"
+            else:
+                status = protocol_status = "passed"
+            return {
+                "status": status,
+                "protocol_status": protocol_status,
+                "run_id": batch,
+                "window_id": window,
+                "target_inputs": recurring.input_digests(
+                    [item for item in candidates if item["planned_start_s"] == start]
+                ),
+                "end_sequence_checkpoint": [
+                    {"exchange": "gate_futures", "symbol": "BTCUSDT",
+                     "connection": ["boot", "A", 1], "seq": start, "awaiting_delta": False}
+                ] if status == "passed" else [],
+            }
+
+        def window_id(start):
+            return coverage.window_descriptor(start, 15)["window_id"]
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            for start, item in candidates.items():
+                window = window_id(start)
+                path = (
+                    state / "qa_reports" / "windows" / window[:10]
+                    / f"{archive._safe_window_filename(window)}.window.qa.json"
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "qa_status": "passed",
+                    "run_id": run_id,
+                    "partition_minutes": 15,
+                    "checker_commit_sha": checker_sha,
+                    "files": [item["source_manifest"]],
+                }), encoding="utf-8")
+
+            def run(current, max_catchup=0):
+                return recurring.run(
+                    "qa:", config, run_id, w0, current, state, checker, max_catchup=max_catchup
+                )
+
+            def saved(start):
+                name = f"{archive._safe_window_filename(window_id(start))}.json"
+                path = next((state / "qa_reports" / "protocol").rglob(name))
+                return json.loads(path.read_text(encoding="utf-8"))
+
+            with patch.object(recurring, "verified_candidates", return_value=list(candidates.values())), \
+                 patch.object(recurring, "audit_window", side_effect=audit):
+                # W1 can independently anchor, so W2 can pass before W0 has been audited.
+                self.assertEqual("passed", run(w1)["status"])
+                self.assertEqual("passed", run(w2)["status"])
+                self.assertTrue(run(w2)["reused_current_result"])
+
+                # When catch-up adds W0's checkpoint, invalidate W1 and W2 in the same run.
+                calls.clear()
+                caught_up = run(w2, max_catchup=1)
+                self.assertEqual([(w0, None)], calls)
+                self.assertEqual("pending", caught_up["status"])
+                self.assertFalse(caught_up["reused_current_result"])
+                for start in (w1, w2):
+                    proof = saved(start)
+                    self.assertEqual("pending", proof["status"])
+                    self.assertNotIn("end_sequence_checkpoint", proof)
+
+                # Recheck against the new chain and verify unchanged results can still be reused.
+                self.assertEqual("passed", run(w1)["status"])
+                self.assertEqual("passed", run(w2)["status"])
+                self.assertTrue(run(w2)["reused_current_result"])
+
+                # Revision affects W0 alone. W2's inputs still match, but its transitive checkpoint does not.
+                revised = True
+                candidates[w0]["manifest_sha256"] = "f" * 64
+                calls.clear()
+                result = run(w2, max_catchup=2)
+                self.assertEqual([(w2, None), (w0, None), (w1, None)], calls)
+                self.assertFalse(result["reused_current_result"])
+                self.assertEqual("anchor_unverified", result["status"])
+                self.assertEqual([window_id(w0)], result["historical_failed_windows"])
+                self.assertEqual([window_id(w1)], result["historical_anchor_unverified_windows"])
+                self.assertEqual("anchor_unverified", saved(w2)["status"])
+
+
 if __name__ == "__main__":
     unittest.main()

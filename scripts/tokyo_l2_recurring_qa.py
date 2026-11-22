@@ -45,6 +45,15 @@ def _checkpoint_digest(checkpoint):
     return sha256(json.dumps(norm, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _reports_with_current_checkpoints(proofs, step):
+    validated = {}
+    for start, proof in sorted(proofs.items()):
+        previous = validated.get(start - step, {})
+        if proof.get("input_checkpoint_digest") == _checkpoint_digest(previous.get("end_sequence_checkpoint")):
+            validated[start] = proof
+    return validated
+
+
 def _window_archive_revision(items, run_id, window_id, pm):
     if not items:
         return None
@@ -182,10 +191,8 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
 
     ready = sorted(s for s in groups if cutover <= s and archived_window_passed(s))
     expected_depth_markets = _expected_depth_markets(config)
-    current_report = {}
-    reports = {}
-    deferred_unverified = {}
-    checkpoints_by_start = {}
+    proofs = {}
+    saved_reports = {}
     revisions = {}
     for start in ready:
         inputs = input_digests(groups[start])
@@ -193,34 +200,29 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         win_rev = _window_archive_revision(groups[start], run_id, wid(start), pm)
         revisions[start] = win_rev
         proof = read_report(report_path(start))
-        rev_ok = (proof.get("archive_revision") == win_rev) if win_rev is not None else True
-        identity_ok = (
-            proof.get("checker") == checker
-            and proof.get("target_inputs") == inputs
+        if proof.get("checker") != checker:
+            continue
+        saved_reports[start] = proof
+        if (
+            proof.get("target_inputs") == inputs
             and proof.get("previous_inputs") == earlier
-            and rev_ok
-        )
-        if identity_ok and proof.get("end_sequence_checkpoint"):
-            checkpoints_by_start[start] = list(proof["end_sequence_checkpoint"])
-        if identity_ok and proof.get("status") in {"passed", "data_failed"}:
-            reports[start] = proof
-        elif identity_ok and proof.get("status") == "anchor_unverified":
-            available_prev_digest = _checkpoint_digest(checkpoints_by_start.get(start - step))
-            if proof.get("input_checkpoint_digest") == available_prev_digest:
-                # Same inputs and same predecessor checkpoint -> defer so later ready windows are not starved.
-                deferred_unverified[start] = proof
+            and (win_rev is None or proof.get("archive_revision") == win_rev)
+        ):
+            proofs[start] = proof
 
+    validated = _reports_with_current_checkpoints(proofs, step)
+    recorded = {s for s, proof in validated.items() if proof.get("status") in {"passed", "data_failed"}}
+    deferred = {s for s, proof in validated.items() if proof.get("status") == "anchor_unverified"}
     eff_max_catchup = (
         int(max_catchup)
         if max_catchup is not None
         else (4 if trigger_mode == "schedule_catchup" else 1)
     )
+    checked = set()
     checked_windows = []
-    for start in plan_windows(ready, reports, current, max_catchup=eff_max_catchup, deferred=deferred_unverified):
+    for start in plan_windows(ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred):
         replay_seconds = 660 if start % 3600 == 0 else 0
-        previous = reports.get(start - step) or deferred_unverified.get(start - step) or {}
-        checkpoint = list(previous.get("end_sequence_checkpoint") or checkpoints_by_start.get(start - step) or [])
-        input_ckpt_digest = _checkpoint_digest(checkpoint)
+        checkpoint = validated.get(start - step, {}).get("end_sequence_checkpoint") or []
         covered_markets = {(row["exchange"], row["symbol"]) for row in checkpoint}
         all_markets_covered = bool(expected_depth_markets) and expected_depth_markets.issubset(covered_markets)
         warmup_windows = 1 if (replay_seconds or not all_markets_covered) else 0
@@ -232,23 +234,37 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             checker=checker,
             archive_revision=revisions.get(start),
             previous_inputs=input_digests(groups[start - step]),
-            input_checkpoint_digest=input_ckpt_digest,
+            input_checkpoint_digest=_checkpoint_digest(checkpoint),
             completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
-        archive._atomic_write_json(report_path(start), report)
-        if report.get("end_sequence_checkpoint"):
-            checkpoints_by_start[start] = list(report["end_sequence_checkpoint"])
-        if report.get("status") == "anchor_unverified":
-            deferred_unverified[start] = report
-            reports.pop(start, None)
-        else:
-            reports[start] = report
-            deferred_unverified.pop(start, None)
+        proofs[start] = report
+        # The target runs first. A subsequent catch-up can change the checkpoint the target used.
+        validated = _reports_with_current_checkpoints(proofs, step)
+        checked.add(start)
         checked_windows.append(wid(start))
 
-    all_known = {**deferred_unverified, **reports}
+    for start in sorted(saved_reports.keys() | checked):
+        if start in validated:
+            if start in checked:
+                archive._atomic_write_json(report_path(start), validated[start])
+        elif start in checked or saved_reports[start].get("status") != "pending":
+            # Reconciliation reads these reports directly, so revoke stale terminal results on disk.
+            archive._atomic_write_json(report_path(start), {
+                "status": "pending",
+                "protocol_status": "pending",
+                "reason": "protocol_inputs_changed",
+                "run_id": run_id,
+                "window_id": wid(start),
+                "archive_revision": revisions[start],
+                "checker": checker,
+            })
+
+    all_known = {
+        start: proof for start, proof in validated.items()
+        if start in checked or proof.get("status") in {"passed", "data_failed", "anchor_unverified"}
+    }
     current_report = all_known.get(current, {})
-    reused_current_result = current in all_known and wid(current) not in checked_windows
+    reused_current_result = current in all_known and current not in checked
     diag = _summarize_protocol_diagnostics(current_report)
     # Use the most recent due hourly sample for visibility even on intervening windows.
     latest_hour = current - current % 3600
@@ -259,7 +275,8 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
                              if start != current and report.get("status") == "anchor_unverified"]
     historical = [wid(start) for start, report in sorted(all_known.items())
                   if start != current and report.get("status") == "data_failed"]
-    deferred_windows = [wid(start) for start in sorted(deferred_unverified)]
+    deferred_windows = [wid(start) for start, report in sorted(all_known.items())
+                        if report.get("status") == "anchor_unverified"]
     completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     out = {
         "status": current_report.get("status", "pending"),
@@ -281,7 +298,7 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         "historical_anchor_unverified_windows": historical_unverified,
         "deferred_anchor_unverified_windows": deferred_windows,
         "historical_failed_windows": historical,
-        "pending_ready_windows": len(set(ready) - set(reports) - set(deferred_unverified)),
+        "pending_ready_windows": len(set(ready) - set(all_known)),
         "started_at_utc": started_at_utc,
         "completed_at_utc": completed_at_utc,
     }
