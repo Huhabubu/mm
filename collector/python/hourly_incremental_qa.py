@@ -496,14 +496,23 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
 
                     if kind == "META":
                         event = payload.get("event", "") if isinstance(payload, dict) else ""
+                        # Binance public depth and market trades use independent connections.
+                        # A market-only switch/gap cannot invalidate a public depth anchor.
+                        market_only = (
+                            exchange == "binance_futures"
+                            and isinstance(payload, dict)
+                            and payload.get("endpoint") == "binance_market"
+                        )
                         if event == "LOCAL_LOSS":
                             loss_events += 1
                             dropped_frames += int(payload.get("dropped_frames", payload.get("dropped", 1)))
-                            depth_anchors.clear()
+                            if not market_only:
+                                depth_anchors.clear()
                         elif event == "GAP_START":
                             gap_events += 1
-                            depth_anchors.clear()
-                        elif event == "SWITCH":
+                            if not market_only:
+                                depth_anchors.clear()
+                        elif event == "SWITCH" and not market_only:
                             switch_sym = (
                                 str(payload.get("symbol") or "ALL").upper()
                                 if isinstance(payload, dict)

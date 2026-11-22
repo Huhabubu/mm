@@ -1231,3 +1231,58 @@ def test_local_clear_uses_receive_time_when_archive_order_reverses():
         assert (int(local[i + 1]["ev"]) & 0xFF) == int(DEPTH_CLEAR_EVENT)
         assert local[i + 1]["local_ts"] == base + snapshot_ms * ms
         assert local[i + 3]["px"] == 90051.0
+
+
+def test_binance_market_only_switch_preserves_depth_anchor_in_file_qa(tmp_path: Path):
+    """A Binance trades-only failover cannot invalidate an independent public-depth snapshot."""
+    start_s = int(datetime(2026, 11, 22, 8, tzinfo=timezone.utc).timestamp())
+    start_ns = start_s * 1_000_000_000
+    config = {
+        "deployment": {"partition_minutes": 15},
+        "meta_daemon": {"collector_stale_seconds": 1800, "depth_stale_seconds": 1800},
+        "exchanges": {"binance_futures": {
+            "enabled": True, "symbols": ["BTCUSDT"],
+            "public_channels": ["depth@100ms"], "market_channels": [],
+        }},
+    }
+    snapshot = {
+        "event": "REST_SNAPSHOT_ANCHOR", "endpoint": "binance_public", "symbol": "BTCUSDT",
+        "snapshot": {"lastUpdateId": 100, "bids": [["100", "2"]], "asks": [["101", "3"]]},
+    }
+    market_switch = {"event": "SWITCH", "endpoint": "binance_market", "symbol": "ALL"}
+    update = {
+        "stream": "btcusdt@depth@100ms",
+        "data": {
+            "e": "depthUpdate", "s": "BTCUSDT", "U": 100, "u": 101, "pu": 100,
+            "b": [["100", "4"]], "a": [], "T": 1795350000000,
+        },
+    }
+    records = [
+        (start_ns + 1_000_000, 1, "A", 1, 1, "META", snapshot),
+        (start_ns + 2_000_000, 2, "B", 1, 2, "META", market_switch),
+        (start_ns + 3_000_000, 3, "A", 1, 3, "DATA", update),
+    ]
+    path, _, manifest = _write_custom_15m_partition(
+        tmp_path, exchange="binance_futures", window_start_s=start_s,
+        boot_id="boot", run_id="market_switch", rows=records,
+    )
+    report = hqa.check_partition(path, manifest, config)
+    assert report["qa_status"] == "passed", report["problems"]
+
+    # Genuine depth-unavailability metadata still fails QA; the fix does not hide it.
+    unavailable = {
+        "event": "DEPTH_UNAVAILABLE", "endpoint": "binance_public",
+        "symbol": "BTCUSDT", "reason": "test_real_unavailable",
+    }
+    records.insert(2, (start_ns + 2_500_000, 2, "A", 1, 4, "META", unavailable))
+    # Keep archive-local receive sequence strictly increasing after the added marker.
+    records = [(wall, mono, conn, epoch, idx + 1, kind, obj)
+               for idx, (wall, mono, conn, epoch, _, kind, obj)
+               in enumerate(records)]
+    path2, _, manifest2 = _write_custom_15m_partition(
+        tmp_path, exchange="binance_futures", window_start_s=start_s,
+        boot_id="boot", run_id="depth_unavailable", rows=records,
+    )
+    report2 = hqa.check_partition(path2, manifest2, config)
+    assert report2["qa_status"] == "failed"
+    assert report2["depth_unavailable_events"] == 1
