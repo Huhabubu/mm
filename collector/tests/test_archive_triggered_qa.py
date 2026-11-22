@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+from http.client import IncompleteRead
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import shutil
@@ -1343,6 +1345,121 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
         assert verdict["qa_completed_at_utc"] == "2026-11-21T14:35:00Z"
         assert any(auth for _, auth in get_calls)
         assert any(not auth for _, auth in get_calls)
+
+
+@pytest.mark.parametrize("report_recovers", [False, True])
+def test_stale_accepted_fetch_error_requeues_with_backoff(tmp_path, report_recovers):
+    now_s = datetime(2026, 11, 21, 15, tzinfo=timezone.utc).timestamp()
+    now_iso = qd._iso_utc(now_s)
+    key = {
+        "run_id": "trial-fetch-retry",
+        "target_window_utc": "2026-11-21T14:30Z",
+        "archive_revision": "a" * 64,
+    }
+    token = "pat_test"
+    ledger_path = tmp_path / arch.LEDGER_DB_FILENAME
+    with arch.ArchiveLedger(ledger_path) as ledger:
+        _, row = ledger.enqueue_qa_dispatch(
+            **key, partition_minutes=15, window_span_id=None, index_sha256="b" * 64,
+            index_synced_at_utc=now_iso, manifests=[], now_iso=now_iso,
+        )
+        ledger.mark_qa_dispatch_accepted(row["id"], accepted_at_utc=now_iso, now_iso=now_iso)
+
+    sent_windows = []
+
+    def sender(_url, _headers, body, _connect_timeout, _total_timeout):
+        sent_windows.append(json.loads(body)["inputs"]["target_window_utc"])
+        return qd.HttpDispatchResponse(204, {}, "")
+
+    def unavailable(_row):
+        raise TimeoutError(f"Result read timed out with token {token}")
+
+    def tick(at, fetcher=unavailable):
+        return qd.dispatch_pending_qa(
+            tmp_path, token=token, now_epoch_s=at, http_sender=sender,
+            result_fetcher=fetcher, recover_from_index=False, accepted_stale_timeout_s=1800,
+            base_backoff_s=45, max_backoff_s=60,
+        )
+
+    early = tick(now_s + 1799)
+    assert early["reconciliation"]["error_count"] == 1
+    assert early["reconciliation"]["requeued_stale_count"] == 0
+    assert early["outbox_counts"]["ACCEPTED"] == 1
+
+    overdue = tick(now_s + 1800)
+    assert overdue["reconciliation"]["error_count"] == 1
+    assert overdue["reconciliation"]["requeued_stale_count"] == 1
+    assert overdue["outbox_counts"]["PENDING"] == 1
+    assert overdue["attempted_count"] == 0
+    assert token not in json.dumps(overdue)
+    with arch.ArchiveLedger(ledger_path) as ledger:
+        pending = ledger.get_qa_dispatch(**key)
+        assert pending["last_error_code"] == "accepted_result_fetch_failed"
+        assert "TimeoutError" in pending["last_error_message"]
+        assert token not in pending["last_error_message"]
+        assert pending["next_attempt_at_epoch_s"] == now_s + 1845
+
+    assert tick(now_s + 1844)["attempted_count"] == 0
+
+    if report_recovers:
+        due = tick(now_s + 1845, lambda _row: {"qa_result_status": "passed"})
+        assert due["outbox_counts"]["QA_COMPLETED"] == 1
+        assert due["attempted_count"] == 0
+        assert sent_windows == []
+    else:
+        due = tick(now_s + 1845)
+        assert due["outbox_counts"]["ACCEPTED"] == 1
+        assert due["accepted_count"] == 1
+        assert sent_windows == [key["target_window_utc"]]
+
+
+@pytest.mark.parametrize(
+    "body_size, chunked, extra_declared_bytes, expected_error",
+    [
+        (300_000, False, 0, None),
+        (1024 * 1024, False, 0, None),
+        (1024 * 1024 + 1, False, 0, RuntimeError),
+        (1024 * 1024 + 1, True, 0, RuntimeError),
+        (100, False, 1, IncompleteRead),
+    ],
+)
+def test_http_get_reads_complete_bounded_body(body_size, chunked, extra_declared_bytes, expected_error):
+    payload = b'"' + b'x' * (body_size - 2) + b'"'
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            if chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", str(len(payload) + extra_declared_bytes))
+            self.end_headers()
+            if chunked:
+                self.wfile.write(f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n")
+            else:
+                self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/qa-report.json"
+            if expected_error is None:
+                response = qd.default_http_get(url, {}, 2, 5)
+                assert response.status_code == 200
+                assert response.body.encode("utf-8") == payload
+            elif expected_error is RuntimeError:
+                with pytest.raises(RuntimeError, match="response exceeds 1048576 bytes"):
+                    qd.default_http_get(url, {}, 2, 5)
+            else:
+                with pytest.raises(IncompleteRead):
+                    qd.default_http_get(url, {}, 2, 5)
+        finally:
+            server.shutdown()
+            worker.join()
 
 
 def test_checker_resolution_rejects_a_truncated_full_commit_response():

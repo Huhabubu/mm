@@ -55,6 +55,7 @@ DEFAULT_MAX_BACKOFF_S = 900.0
 DEFAULT_AUTH_BACKOFF_S = 300.0
 DEFAULT_ACCEPTED_STALE_TIMEOUT_S = 1800.0
 DEFAULT_MAX_DISPATCHES_PER_RUN = 2
+MAX_GITHUB_GET_BODY_BYTES = 1024 * 1024
 
 _PROTOCOL_RULE_SCRIPT_PATHS = (
     "scripts/tokyo_l2_protocol_qa.py",
@@ -244,7 +245,14 @@ def default_http_get(
             raise TimeoutError(f"Total timeout ({total_t}s) exceeded before body read")
         if conn.sock is not None:
             conn.sock.settimeout(remaining)
-        raw_body = resp.read(262144)
+        declared_length = resp.length
+        raw_body = resp.read(MAX_GITHUB_GET_BODY_BYTES + 1)
+        if len(raw_body) > MAX_GITHUB_GET_BODY_BYTES:
+            raise RuntimeError(
+                f"GitHub GET response exceeds {MAX_GITHUB_GET_BODY_BYTES} bytes (HTTP {resp.status})"
+            )
+        if declared_length is not None and len(raw_body) < declared_length:
+            raise http.client.IncompleteRead(raw_body, declared_length - len(raw_body))
         hdrs = {k.lower(): v for k, v in resp.getheaders()}
         return HttpDispatchResponse(
             status_code=int(resp.status),
@@ -609,6 +617,8 @@ def reconcile_accepted_dispatches(
     result_fetcher: QaResultFetcherFn,
     run_id_filter: str | None = None,
     accepted_stale_timeout_s: float = DEFAULT_ACCEPTED_STALE_TIMEOUT_S,
+    base_backoff_s: float = DEFAULT_BASE_BACKOFF_S,
+    max_backoff_s: float = DEFAULT_MAX_BACKOFF_S,
     now_epoch_s: float | None = None,
     token: str | None = None,
 ) -> dict[str, Any]:
@@ -618,6 +628,7 @@ def reconcile_accepted_dispatches(
       with `qa_completed_at_utc` recorded separately from `api_accepted_at_utc`.
     - ACCEPTED entry older than `accepted_stale_timeout_s` with no matching final report (e.g. run
       replaced in GitHub's concurrency queue) -> requeued to `PENDING` with explicit visibility.
+    - A failed lookup also requeues an overdue ACCEPTED entry, with backoff before redispatch.
     """
     now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
     now_iso = _iso_utc(now_s)
@@ -643,19 +654,21 @@ def reconcile_accepted_dispatches(
     errors: list[dict[str, Any]] = []
 
     for row in accepted_rows + retried_pending_rows:
+        fetch_error = None
         try:
             verdict = result_fetcher(row)
         except Exception as exc:
+            verdict = None
+            fetch_error = _sanitize_error(f"{type(exc).__name__}: {exc}", token=token)
             errors.append(
                 {
                     "id": row["id"],
                     "run_id": row["run_id"],
                     "target_window_utc": row["target_window_utc"],
                     "archive_revision": row["archive_revision"],
-                    "error": _sanitize_error(f"{type(exc).__name__}: {exc}", token=token),
+                    "error": fetch_error,
                 }
             )
-            continue
 
         if verdict is not None:
             completed_ts = str(verdict.get("qa_completed_at_utc") or now_iso)
@@ -702,25 +715,40 @@ def reconcile_accepted_dispatches(
         accepted_epoch = _parse_iso_utc(row.get("api_accepted_at_utc"))
         age_s = (now_s - accepted_epoch) if accepted_epoch is not None else 0.0
         if accepted_stale_timeout_s > 0 and accepted_epoch is not None and age_s >= float(accepted_stale_timeout_s):
-            err_msg = (
-                f"No matching final QA report for ({row['run_id']}, {row['target_window_utc']}, "
-                f"{row['archive_revision']}) after {int(age_s)}s (possibly replaced in concurrency queue)"
-            )
+            if fetch_error is None:
+                error_code = "accepted_result_missing_or_replaced"
+                event_type = "QA_DISPATCH_REQUEUED_MISSING_RESULT"
+                err_msg = (
+                    f"No matching final QA report for ({row['run_id']}, {row['target_window_utc']}, "
+                    f"{row['archive_revision']}) after {int(age_s)}s (possibly replaced in concurrency queue)"
+                )
+                next_attempt_s = now_s
+            else:
+                error_code = "accepted_result_fetch_failed"
+                event_type = "QA_DISPATCH_REQUEUED_FETCH_ERROR"
+                err_msg = fetch_error
+                next_attempt_s = now_s + _compute_retry_delay_s(
+                    attempt_index=int(row["attempt_count"]) - 1,
+                    base_backoff_s=base_backoff_s,
+                    max_backoff_s=max_backoff_s,
+                    now_s=now_s,
+                )
             ledger.mark_qa_dispatch_requeue(
                 int(row["id"]),
-                next_attempt_at_epoch_s=now_s,
-                error_code="accepted_result_missing_or_replaced",
+                next_attempt_at_epoch_s=next_attempt_s,
+                error_code=error_code,
                 error_message=err_msg,
                 now_iso=now_iso,
             )
             ledger.record_event(
                 ts_utc=now_iso,
                 run_id=str(row["run_id"] or "qa_dispatch"),
-                event_type="QA_DISPATCH_REQUEUED_MISSING_RESULT",
+                event_type=event_type,
                 detail={
                     "target_window_utc": row["target_window_utc"],
                     "archive_revision": row["archive_revision"],
                     "accepted_age_seconds": int(age_s),
+                    "next_attempt_at_utc": _iso_utc(next_attempt_s),
                 },
             )
             requeued_items.append(
@@ -731,10 +759,11 @@ def reconcile_accepted_dispatches(
                     "archive_revision": row["archive_revision"],
                     "api_accepted_at_utc": row.get("api_accepted_at_utc"),
                     "accepted_age_seconds": int(age_s),
-                    "error_code": "accepted_result_missing_or_replaced",
+                    "error_code": error_code,
+                    "next_attempt_at_utc": _iso_utc(next_attempt_s),
                 }
             )
-        else:
+        elif fetch_error is None:
             in_flight_items.append(
                 {
                     "id": row["id"],
@@ -999,6 +1028,8 @@ def dispatch_pending_qa(
                         result_fetcher=eff_fetcher,
                         run_id_filter=run_id_filter,
                         accepted_stale_timeout_s=eff_stale_timeout_s,
+                        base_backoff_s=base_backoff_s,
+                        max_backoff_s=max_backoff_s,
                         now_epoch_s=now_s,
                         token=eff_token or None,
                     )
