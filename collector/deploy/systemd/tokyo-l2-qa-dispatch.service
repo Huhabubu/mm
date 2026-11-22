@@ -1,0 +1,17 @@
+[Unit]
+Description=AWS Tokyo L2 Independent GitHub Actions QA Workflow Dispatcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/mm
+EnvironmentFile=-/etc/tokyo-l2/live.env
+# Least-privilege fine-grained GitHub PAT (`Actions: write` on this repo only).
+# Loaded EXCLUSIVELY by this unit; collector and archive units must NEVER read it.
+EnvironmentFile=-/etc/tokyo-l2/github_qa_dispatch.env
+ExecStart=/opt/mm/collector/bin/qa-dispatch --dir /data/tokyo_l2 --config /etc/tokyo-l2/config.json --run-id ${TOKYO_L2_RUN_ID} --max-dispatches 1 --connect-timeout 5 --total-timeout 15 --require-token
+StandardOutput=journal
+StandardError=journal
