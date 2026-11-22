@@ -535,7 +535,7 @@ class ProtocolTest(unittest.TestCase):
                         ({"exchange": "binance_futures", "planned_start_s": begin // NS}, m1, p1),
                     ], cfg, begin, begin + 900 * NS, begin, {}, report)
                     self.assertEqual(expected, report["protocol_status"])
-                    if endpoint == "binance_market":
+                    if expected == "passed":
                         proof, = report["end_sequence_checkpoint"]
                         self.assertEqual(["boot", "A", 1], proof["connection"])
                         self.assertEqual(101, proof["seq"])
