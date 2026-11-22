@@ -171,22 +171,6 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         for row in checkpoint or ()
     }
     chains = {}
-    # Reconstruct each market's *complete* book only after a trusted snapshot / full predecessor book.
-    # Sequence-only checkpoints remain valid for continuity checks but never synthesize missing levels.
-    state_books = {}
-    for row in checkpoint or ():
-        saved_book = row.get("book")
-        if saved_book is not None:
-            if not isinstance(saved_book, dict) or not {"bids", "asks"} <= saved_book.keys():
-                raise ValueError("invalid book checkpoint")
-            restored = Book()
-            restored.apply(Depth(
-                row["symbol"], tuple(row["connection"]), "snapshot", int(row["seq"]), None,
-                saved_book["bids"], saved_book["asks"],
-            ))
-            if not restored.bids or not restored.asks or restored.crossed():
-                raise ValueError("invalid book checkpoint levels")
-            state_books[(row["exchange"], row["symbol"])] = restored
     replay_warmup_chains = {}
     checkpoint_applied = set()
     reset_seen = set()
@@ -223,11 +207,15 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             if not wall < end_ns:
                 continue
             in_target = wall >= start_ns
-            if (kind == "META"
-                and obj.get("event") in {"LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SWITCH"}
-                and not (exchange == BINANCE and obj.get("endpoint") == "binance_market")
-            ):
+            if kind == "META" and obj.get("event") in {"LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SWITCH"}:
                 event_name = obj["event"]
+                # Binance trades and public depth use independent connections.
+                if (
+                    exchange == BINANCE
+                    and obj.get("endpoint") == "binance_market"
+                    and event_name in {"SWITCH", "GAP_START", "LOCAL_LOSS"}
+                ):
+                    continue
                 symbol = symbol_key(str(obj.get("symbol") or "ALL"))
                 if in_target:
                     boundary_events.count(exchange, symbol, event_name)
@@ -241,8 +229,6 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         elif key not in boundary_checkpoints:
                             reset_seen.add(key)
                             chains.pop(key, None)
-                        if in_target or key not in boundary_checkpoints:
-                            state_books.pop(key, None)
                         replay_warmup_chains.pop(key, None)
                         if ex in books and sym == BTC:
                             books[ex] = Book()
@@ -290,13 +276,6 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         book = books[exchange]
                         previous_exchange_ns = last_depth_exchange_ns.get(exchange)
                         target_exchange_ns = int(event.exchange_ms or 0) * 1_000_000
-                        # A previous-window book checkpoint can seed HBT even when no snapshot
-                        # appeared in the single 15-minute warmup file.
-                        if (not book.bids or not book.asks) and key in state_books:
-                            prior = state_books[key]
-                            book.bids, book.asks = dict(prior.bids), dict(prior.asks)
-                            if previous_exchange_ns is None:
-                                previous_exchange_ns = target_exchange_ns
                         if book.bids and book.asks and not book.crossed() and previous_exchange_ns is not None:
                             if previous_exchange_ns > target_exchange_ns:
                                 book_proofs.count(exchange, BTC, "depth_timestamp_reversal_at_boundary")
@@ -325,16 +304,10 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         book_proofs.count(exchange, event.symbol, problem)
                         if problem == "missing_same_connection_anchor":
                             missing_anchor_sources.setdefault(key, event.connection[1:])
-                    state_books.pop(key, None)
                     if sample_end > start_ns and exchange in books and event.symbol == BTC:
                         books[exchange] = Book()
                         last_depth_exchange_ns.pop(exchange, None)
                     continue
-                if event.mode == "snapshot":
-                    state_books[key] = Book()
-                    state_books[key].apply(event)
-                elif chain.anchored and key in state_books:
-                    state_books[key].apply(event)
                 if chain.anchored and sample_end > start_ns and exchange in books and event.symbol == BTC:
                     book = books[exchange]
                     book.apply(event)
@@ -422,17 +395,8 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     # so one failed/unanchored market never discards continuity state for healthy markets.
     proven_failed_markets = {(e, s) for (e, s, _) in book_proofs.issues}
     summary["end_sequence_checkpoint"] = [
-        {
-            "exchange": ex, "symbol": sym, "connection": list(chain.connection),
-            "seq": chain.seq, "awaiting_delta": chain.awaiting_delta,
-            **({
-                "book": {
-                    "bids": [[str(px), str(qty)] for px, qty in sorted(state_books[(ex, sym)].bids.items(), reverse=True)],
-                    "asks": [[str(px), str(qty)] for px, qty in sorted(state_books[(ex, sym)].asks.items())],
-                }
-            } if (ex, sym) in state_books and state_books[(ex, sym)].bids
-                 and state_books[(ex, sym)].asks and not state_books[(ex, sym)].crossed() else {}),
-        }
+        {"exchange": ex, "symbol": sym, "connection": list(chain.connection),
+         "seq": chain.seq, "awaiting_delta": chain.awaiting_delta}
         for (ex, sym), chain in sorted(chains.items())
         if (
             (ex, sym) in expected_depths

@@ -476,78 +476,6 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual("missing_same_connection_anchor", s5["proven_protocol_issues"][0]["issue"])
             self.assertEqual("BTCUSDT", s5["proven_protocol_issues"][0]["symbol"])
 
-
-    def test_full_book_checkpoint_rebuilds_next_window_without_snapshot(self):
-        """A partition boundary can be delta-only; carry every verified price level."""
-        import json
-        import zstandard as zstd
-        from unittest.mock import patch
-        import hourly_incremental_qa as archive
-        from tokyo_l2_replay_qa import NS, scan
-
-        cfg = {
-            "deployment": {"partition_minutes": 15},
-            "exchanges": {"gate_futures": {
-                "enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu.50"],
-            }},
-        }
-        start = 1_795_276_800 * NS
-
-        def row(wall, update_id, *, full=False, bid_qty="3"):
-            payload = {
-                "channel": "futures.obu", "event": "update",
-                "result": {
-                    "s": "ob.BTC_USDT.50", "t": 1795276801000, "u": update_id,
-                    "b": [["100", bid_qty]], "a": [["101", "4"]],
-                },
-            }
-            if full:
-                payload["result"]["full"] = True
-            else:
-                payload["result"]["U"] = update_id
-            return wall, "B", 1, "DATA", payload
-
-        def write(path, records):
-            with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as out:
-                for idx, (wall, conn, epoch, kind, obj) in enumerate(records, 1):
-                    out.write(f"{wall}\t{idx}\t{conn}\t{epoch}\t{idx}\t{kind}\t{json.dumps(obj)}\n")
-
-        with tempfile.TemporaryDirectory() as tmp, patch.object(
-            archive, "check_partition", return_value={"qa_status": "passed", "problems": []},
-        ):
-            p1, p2 = Path(tmp) / "first.tsv.zst", Path(tmp) / "next.tsv.zst"
-            write(p1, [
-                row(start + 1, 100, full=True),
-                row(start + 2, 101, bid_qty="5"),
-            ])
-            write(p2, [row(start + 900 * NS + 1, 102, bid_qty="6")])
-            meta = {"boot_id": "boot", "start_wall_ns": start, "first_rx_seq": 1, "file_name": "first.tsv.zst"}
-            summary1 = {}
-            scan([({"exchange": GATE, "planned_start_s": start // NS}, meta, p1)],
-                 cfg, start, start + 900 * NS, start, {}, summary1)
-            self.assertEqual("passed", summary1["protocol_status"])
-            prior = summary1["end_sequence_checkpoint"]
-            self.assertEqual(1, len(prior))
-            self.assertEqual([["100.0", "5.0"]], prior[0]["book"]["bids"])
-            self.assertEqual([["101.0", "4.0"]], prior[0]["book"]["asks"])
-
-            summary2 = {}
-            meta2 = dict(meta, start_wall_ns=start + 900 * NS, file_name="next.tsv.zst")
-            scan([({"exchange": GATE, "planned_start_s": start // NS + 900}, meta2, p2)],
-                 cfg, start + 900 * NS, start + 1800 * NS, start + 900 * NS, {}, summary2,
-                 checkpoint=prior)
-            self.assertEqual("passed", summary2["protocol_status"])
-            self.assertEqual([["100.0", "6.0"]], summary2["end_sequence_checkpoint"][0]["book"]["bids"])
-
-            # Sequence-only legacy checkpoints must NOT invent a complete book.
-            legacy = [{k: v for k, v in prior[0].items() if k != "book"}]
-            legacy_summary = {}
-            scan([({"exchange": GATE, "planned_start_s": start // NS + 900}, meta2, p2)],
-                 cfg, start + 900 * NS, start + 1800 * NS, start + 900 * NS, {}, legacy_summary,
-                 checkpoint=legacy)
-            self.assertEqual("passed", legacy_summary["protocol_status"])
-            self.assertNotIn("book", legacy_summary["end_sequence_checkpoint"][0])
-
     def test_binance_market_switch_does_not_invalidate_public_depth(self):
         """Market trades failover is independent; public depth failover still needs an anchor."""
         import json
@@ -586,11 +514,20 @@ class ProtocolTest(unittest.TestCase):
             m0 = {"boot_id": "boot", "start_wall_ns": begin - 900 * NS,
                   "first_rx_seq": 1, "file_name": "warmup.tsv.zst"}
             m1 = dict(m0, start_wall_ns=begin, file_name="target.tsv.zst")
-            for endpoint, expected in (("binance_market", "passed"), ("binance_public", "failed")):
-                with self.subTest(endpoint=endpoint):
+            cases = (
+                ("binance_market", "SWITCH", "passed"),
+                ("binance_market", "GAP_START", "passed"),
+                ("binance_market", "LOCAL_LOSS", "passed"),
+                ("binance_public", "SWITCH", "failed"),
+                ("binance_public", "DEPTH_UNAVAILABLE", "failed"),
+                ("binance_market", "DEPTH_UNAVAILABLE", "failed"),
+                (None, "SWITCH", "failed"),
+            )
+            for endpoint, marker, expected in cases:
+                with self.subTest(endpoint=endpoint, event=marker):
                     write(p0, [
                         (begin - 3, "A", 1, "META", snap),
-                        (begin - 2, "B", 1, "META", {"event": "SWITCH", "endpoint": endpoint, "symbol": "ALL"}),
+                        (begin - 2, "B", 1, "META", {"event": marker, "endpoint": endpoint, "symbol": "ALL"}),
                     ])
                     report = {}
                     scan([
@@ -599,7 +536,9 @@ class ProtocolTest(unittest.TestCase):
                     ], cfg, begin, begin + 900 * NS, begin, {}, report)
                     self.assertEqual(expected, report["protocol_status"])
                     if endpoint == "binance_market":
-                        self.assertEqual([["100.0", "4.0"]], report["end_sequence_checkpoint"][0]["book"]["bids"])
+                        proof, = report["end_sequence_checkpoint"]
+                        self.assertEqual(["boot", "A", 1], proof["connection"])
+                        self.assertEqual(101, proof["seq"])
                     else:
                         self.assertEqual("missing_same_connection_anchor",
                                          report["proven_protocol_issues"][0]["issue"])
