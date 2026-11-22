@@ -470,13 +470,13 @@ def resolve_expected_checker_from_github(
         return resp
 
     commit_url = f"{api_base.rstrip('/')}/repos/{repo}/commits/{quote(source_ref, safe='')}"
-    c_resp = _get(commit_url, "application/vnd.github+json")
+    # Request just the SHA so large commit diffs cannot exceed the GET body limit.
+    c_resp = _get(commit_url, "application/vnd.github.sha")
     if not (200 <= c_resp.status_code < 300):
         raise RuntimeError(f"Failed to resolve checker commit for {repo}@{source_ref}: HTTP {c_resp.status_code}")
-    c_obj = json.loads(c_resp.body)
-    checker_commit = str((c_obj or {}).get("sha") or "").strip()
-    if not checker_commit:
-        raise RuntimeError(f"Empty checker commit SHA returned for {repo}@{source_ref}")
+    checker_commit = c_resp.body.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", checker_commit):
+        raise RuntimeError(f"Invalid checker commit SHA returned for {repo}@{source_ref}")
 
     if not include_protocol_rules:
         return checker_commit, None

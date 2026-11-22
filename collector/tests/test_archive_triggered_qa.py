@@ -1273,6 +1273,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
             "scripts/tokyo_l2_replay_qa.py": b"# replay rules v2\n",
             "scripts/tokyo_l2_recurring_qa.py": b"# recurring rules v2\n",
         }
+        live_checker_sha = "c" * 40
         expected_rules_sha = qd.compute_protocol_rules_sha(script_bodies)
         get_calls: list[tuple[str, bool]] = []
         serve_stale_pair = {"flag": True}
@@ -1283,12 +1284,13 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
             if has_auth:
                 return qd.HttpDispatchResponse(403, {}, '{"message":"Resource not accessible by personal access token"}')
             if "/commits/" in url:
-                return qd.HttpDispatchResponse(200, {}, json.dumps({"sha": "commit_p2"}))
+                assert hdrs["Accept"] == "application/vnd.github.sha"
+                return qd.HttpDispatchResponse(200, {}, live_checker_sha)
             for rel, raw in script_bodies.items():
                 if f"/contents/{rel}?ref=main" in url:
                     return qd.HttpDispatchResponse(200, {}, raw.decode("utf-8"))
             if url.endswith(".window.qa.json?ref=tokyo-l2-qa-state"):
-                chk = "commit_old" if serve_stale_pair["flag"] else "commit_p2"
+                chk = "commit_old" if serve_stale_pair["flag"] else live_checker_sha
                 return qd.HttpDispatchResponse(
                     200,
                     {},
@@ -1303,7 +1305,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
                     ),
                 )
             if "/qa_reports/protocol/" in url:
-                chk = "commit_old/old_rules" if serve_stale_pair["flag"] else f"commit_p2/{expected_rules_sha}"
+                chk = "commit_old/old_rules" if serve_stale_pair["flag"] else f"{live_checker_sha}/{expected_rules_sha}"
                 return qd.HttpDispatchResponse(
                     200,
                     {},
@@ -1332,15 +1334,31 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
         # live checker binding MUST reject them!
         assert gh_fetcher(by_wid[wid1]) is None
 
-        # Once reports match the live resolved commit_p2 + expected_rules_sha, reconciliation accepts!
+        # Once reports match the live resolved commit and rules digest, reconciliation accepts!
         serve_stale_pair["flag"] = False
         verdict = gh_fetcher(by_wid[wid1])
         assert verdict is not None
         assert verdict["qa_result_status"] == "protocol_failed"
-        assert verdict["protocol_checker"] == f"commit_p2/{expected_rules_sha}"
+        assert verdict["protocol_checker"] == f"{live_checker_sha}/{expected_rules_sha}"
         assert verdict["qa_completed_at_utc"] == "2026-11-21T14:35:00Z"
         assert any(auth for _, auth in get_calls)
         assert any(not auth for _, auth in get_calls)
+
+
+def test_checker_resolution_rejects_a_truncated_full_commit_response():
+    # Simulate the former 256 KiB read limit on a commit with a large diff.
+    full_commit = json.dumps({"sha": "a" * 40, "files": [{"patch": "x" * 300_000}]})
+    truncated = full_commit[:262_144]
+
+    def fake_get(url, headers, _connect_timeout, _total_timeout):
+        assert url.endswith("/commits/feat%2Ftokyo-l2-reliability-fixes")
+        assert headers["Accept"] == "application/vnd.github.sha"
+        return qd.HttpDispatchResponse(200, {}, truncated)
+
+    with pytest.raises(RuntimeError, match="Invalid checker commit SHA"):
+        qd.resolve_expected_checker_from_github(
+            repo="Huhabubu/mm", http_get=fake_get, include_protocol_rules=False
+        )
 
 
 def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_reports():
