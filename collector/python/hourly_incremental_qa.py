@@ -190,7 +190,8 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
     first_seq = last_seq = prev_seq = None
     producer_prev_mono: dict[tuple[str, str, int], int] = {}
     first_wall = last_wall = None
-    loss_events = gap_events = depth_unavailable_events = late_rejected_events = 0
+    loss_events = gap_events = depth_unavailable_events = planned_depth_refresh_events = late_rejected_events = 0
+    open_planned_depth_waits: set[str] = set()
     dropped_frames = late_rejected_dropped = 0
     late_loss_by_target_window: dict[str, int] = defaultdict(int)
 
@@ -246,8 +247,19 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                             dropped_frames += int(payload.get("dropped_frames", payload.get("dropped", 1)))
                         elif event == "GAP_START":
                             gap_events += 1
-                        elif event in ("DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"):
+                        elif event == "SNAPSHOT_BRIDGE_RETRY":
                             depth_unavailable_events += 1
+                        elif event == "DEPTH_UNAVAILABLE":
+                            sym_wait = str(payload.get("symbol") or "ALL").upper() if isinstance(payload, dict) else "ALL"
+                            if isinstance(payload, dict) and payload.get("planned") is True and payload.get("reason") == "planned_rotation":
+                                planned_depth_refresh_events += 1
+                                open_planned_depth_waits.add(sym_wait)
+                            else:
+                                depth_unavailable_events += 1
+                        elif event in ("DEPTH_RECOVERED", "REST_SNAPSHOT_ANCHOR"):
+                            if isinstance(payload, dict):
+                                sym_done = str(payload.get("symbol") or "").upper()
+                                open_planned_depth_waits.discard(sym_done)
                         elif event == "LATE_FRAME_REJECTED":
                             late_rejected_events += 1
                             dropped = int(payload.get("dropped_frames", 1)) if isinstance(payload, dict) else 1
@@ -278,6 +290,9 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                             )
                             item["last_ns"] = max(item["last_ns"], wall_ns)
                             item["count"] += 1
+
+    if open_planned_depth_waits:
+        depth_unavailable_events += len(open_planned_depth_waits)
 
     if first_seq is not None and manifest.get("first_rx_seq") is not None and first_seq != int(manifest["first_rx_seq"]):
         problems.append("first_rx_seq differs from manifest")

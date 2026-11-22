@@ -1,17 +1,21 @@
-use crate::protocol::{make_validator, FrameVerdict, ProtocolValidator};
+use crate::protocol::{is_depth_channel, make_validator, FrameVerdict, ProtocolValidator};
 use crate::types::{
     CanonicalRecord, ConnId, ConnState, EndpointKind, ExchangeId, RawFrame, RecordKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectorAction {
     /// Request REST snapshot refresh (Binance) for (conn_id, symbol).
     FetchRestSnapshot { conn_id: ConnId, symbol: String },
     /// Request channel resubscription on a connection to get a clean full snapshot anchor.
-    Resubscribe { conn_id: ConnId, reason: String },
+    Resubscribe {
+        conn_id: ConnId,
+        symbols: Vec<String>,
+        reason: String,
+    },
     /// Reconnect the specified connection (e.g. planned rotation or fatal error).
     Reconnect { conn_id: ConnId, reason: String },
     /// Trigger an alert (e.g. dual outage > 5s or LOCAL_LOSS).
@@ -29,7 +33,7 @@ pub struct SelectorOutput {
     pub written_streams: Vec<(String, String)>,
     /// Explicit `(symbol, channel)` subscription ACKs observed on control frames.
     pub subscription_acks: Vec<(String, String)>,
-    /// Buffered Binance depth frame waiting for REST snapshot anchor.
+    /// Buffered depth frame waiting for snapshot anchor.
     pub buffered_wait_anchor: Option<(String, String)>,
     /// Detailed outcome when a Binance REST snapshot succeeded (`(conn_id, epoch, symbol, bridged_count, live_now)`).
     pub snapshot_bridge_ok: Option<(ConnId, u64, String, usize, bool)>,
@@ -53,6 +57,17 @@ impl SelectorOutput {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchiveSymbolDepthState {
+    Anchored {
+        conn_id: ConnId,
+        epoch: u64,
+    },
+    WaitSnapshot {
+        unavailable_since_wall_ns: Option<i64>,
+    },
+}
+
 struct ConnRuntime {
     validator: Box<dyn ProtocolValidator>,
     epoch: u64,
@@ -61,6 +76,8 @@ struct ConnRuntime {
     last_pong_mono_ns: u64,
     last_symbol_mono_ns: HashMap<String, u64>,
     resync_requested: bool,
+    pending_refresh_id: Option<u64>,
+    pending_refresh_symbols: HashSet<String>,
 }
 
 impl ConnRuntime {
@@ -73,6 +90,8 @@ impl ConnRuntime {
             last_pong_mono_ns: 0,
             last_symbol_mono_ns: HashMap::new(),
             resync_requested: false,
+            pending_refresh_id: None,
+            pending_refresh_symbols: HashSet::new(),
         }
     }
 
@@ -81,6 +100,17 @@ impl ConnRuntime {
             return ConnState::Invalid;
         }
         self.validator.state()
+    }
+
+    fn blocks_depth_symbol(&self, symbol: &str) -> bool {
+        self.pending_refresh_id.is_some()
+            && (self.pending_refresh_symbols.is_empty()
+                || self.pending_refresh_symbols.contains(&symbol.to_uppercase()))
+    }
+
+    fn clear_pending_refresh(&mut self) {
+        self.pending_refresh_id = None;
+        self.pending_refresh_symbols.clear();
     }
 }
 
@@ -93,6 +123,8 @@ impl ConnRuntime {
 /// 4. Planned rotations switch ONLY when standby is LIVE (0 ms gap).
 /// 5. Faults switch immediately to a LIVE standby (with SWITCH + fresh anchor trigger),
 ///    or emit explicit GAP_START / GAP_END if neither connection is LIVE.
+/// 6. Archive depth increments NEVER emit on `(conn_id, epoch)` without an archive-written
+///    snapshot on that same `(conn_id, epoch)` after the latest switch, gap, or refresh.
 pub struct CausalSelector {
     exchange: ExchangeId,
     endpoint: EndpointKind,
@@ -105,6 +137,8 @@ pub struct CausalSelector {
     silence_threshold_ns: u64,
     dual_outage_alert_ns: u64,
     dual_outage_alerted: bool,
+    archive_depth: HashMap<String, ArchiveSymbolDepthState>,
+    initial_promotion_done: bool,
     /// Counters for audit/manifest diagnostics.
     pub switch_count: u64,
     pub gap_count: u64,
@@ -118,6 +152,15 @@ impl CausalSelector {
         silence_watchdog_seconds: u64,
         dual_outage_alert_seconds: u64,
     ) -> Self {
+        let mut archive_depth = HashMap::new();
+        for s in &symbols {
+            archive_depth.insert(
+                s.to_uppercase(),
+                ArchiveSymbolDepthState::WaitSnapshot {
+                    unavailable_since_wall_ns: None,
+                },
+            );
+        }
         Self {
             exchange: endpoint.exchange(),
             endpoint,
@@ -130,6 +173,8 @@ impl CausalSelector {
             silence_threshold_ns: silence_watchdog_seconds.saturating_mul(1_000_000_000),
             dual_outage_alert_ns: dual_outage_alert_seconds.saturating_mul(1_000_000_000),
             dual_outage_alerted: false,
+            archive_depth,
+            initial_promotion_done: false,
             switch_count: 0,
             gap_count: 0,
             local_loss_count: 0,
@@ -280,25 +325,230 @@ impl CausalSelector {
         }
     }
 
-    fn queue_post_switch_anchor_actions(&mut self, standby: ConnId, reason: &str, out: &mut SelectorOutput) {
-        if self.endpoint == EndpointKind::BinancePublic {
-            // Binance /public/stream uses URL-based combined streams where WS Resubscribe is a no-op.
-            // Refresh standby's REST anchors so the canonical archive always has same-connection
-            // REST_SNAPSHOT_ANCHOR + DEPTH_BRIDGED_DELTA records after SWITCH without splicing A & B.
-            self.runtime_mut(standby).validator.prepare_depth_refresh();
-            let symbols = self.runtime(standby).validator.expected_symbols();
-            for sym in symbols {
-                out.actions.push(SelectorAction::FetchRestSnapshot {
-                    conn_id: standby,
-                    symbol: sym,
+    fn depth_channel_name(&self) -> &'static str {
+        match self.endpoint {
+            EndpointKind::BinancePublic => "depth@100ms",
+            EndpointKind::GatePublic => "futures.obu",
+            EndpointKind::BybitPublic => "orderbook.50",
+            EndpointKind::BitgetPublic => "books50",
+            EndpointKind::BinanceMarket => "aggTrade",
+        }
+    }
+
+    fn has_depth_stream(&self) -> bool {
+        self.endpoint != EndpointKind::BinanceMarket
+    }
+
+    fn reset_archive_depth_wait(&mut self) {
+        for st in self.archive_depth.values_mut() {
+            *st = ArchiveSymbolDepthState::WaitSnapshot {
+                unavailable_since_wall_ns: None,
+            };
+        }
+    }
+
+    fn unanchored_symbols(
+        &self,
+        conn_id: ConnId,
+        epoch: u64,
+        except_symbol: Option<&str>,
+    ) -> Vec<String> {
+        let except_upper = except_symbol.map(|s| s.to_uppercase());
+        self.expected_symbols()
+            .into_iter()
+            .filter(|sym| {
+                let sym_u = sym.to_uppercase();
+                if except_upper.as_deref() == Some(sym_u.as_str()) {
+                    return false;
+                }
+                !matches!(
+                    self.archive_depth.get(&sym_u),
+                    Some(ArchiveSymbolDepthState::Anchored {
+                        conn_id: c,
+                        epoch: e,
+                    }) if *c == conn_id && *e == epoch
+                )
+            })
+            .collect()
+    }
+
+    fn anchored_symbols(&self, conn_id: ConnId, epoch: u64) -> Vec<String> {
+        self.expected_symbols()
+            .into_iter()
+            .filter(|sym| {
+                matches!(
+                    self.archive_depth.get(&sym.to_uppercase()),
+                    Some(ArchiveSymbolDepthState::Anchored {
+                        conn_id: c,
+                        epoch: e,
+                    }) if *c == conn_id && *e == epoch
+                )
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enter_depth_wait(
+        &mut self,
+        conn_id: ConnId,
+        symbols: &[String],
+        wall_ns: i64,
+        mono_ns: u64,
+        reason: &str,
+        planned: bool,
+        emit_unavailable_meta: bool,
+        queue_action: bool,
+        out: &mut SelectorOutput,
+    ) {
+        if !self.has_depth_stream() {
+            return;
+        }
+        let target_syms: Vec<String> = if symbols.is_empty() {
+            self.expected_symbols()
+        } else {
+            symbols.iter().map(|s| s.to_uppercase()).collect()
+        };
+        if target_syms.is_empty() {
+            return;
+        }
+
+        let epoch = self.runtime(conn_id).epoch;
+        for sym in &target_syms {
+            self.runtime_mut(conn_id)
+                .validator
+                .prepare_symbol_depth_refresh(sym);
+            let entry = self
+                .archive_depth
+                .entry(sym.clone())
+                .or_insert(ArchiveSymbolDepthState::WaitSnapshot {
+                    unavailable_since_wall_ns: None,
+                });
+            let should_emit = emit_unavailable_meta
+                && !matches!(
+                    entry,
+                    ArchiveSymbolDepthState::WaitSnapshot {
+                        unavailable_since_wall_ns: Some(_),
+                    }
+                );
+            if emit_unavailable_meta {
+                if !matches!(
+                    entry,
+                    ArchiveSymbolDepthState::WaitSnapshot {
+                        unavailable_since_wall_ns: Some(_),
+                    }
+                ) {
+                    *entry = ArchiveSymbolDepthState::WaitSnapshot {
+                        unavailable_since_wall_ns: Some(wall_ns),
+                    };
+                }
+            } else {
+                *entry = ArchiveSymbolDepthState::WaitSnapshot {
+                    unavailable_since_wall_ns: None,
+                };
+            }
+
+            if should_emit {
+                let mut payload = json!({
+                    "event": "DEPTH_UNAVAILABLE",
+                    "endpoint": self.endpoint.as_str(),
+                    "conn_id": conn_id.as_str(),
+                    "epoch": epoch,
+                    "symbol": sym,
+                    "unavailable_since_wall_ns": wall_ns,
+                    "reason": reason
+                });
+                if planned {
+                    payload["planned"] = json!(true);
+                }
+                out.records.push(self.emit_meta(wall_ns, mono_ns, conn_id, payload));
+            }
+        }
+
+        if queue_action {
+            if self.endpoint == EndpointKind::BinancePublic {
+                for sym in target_syms {
+                    out.actions.push(SelectorAction::FetchRestSnapshot {
+                        conn_id,
+                        symbol: sym,
+                    });
+                }
+            } else {
+                out.actions.push(SelectorAction::Resubscribe {
+                    conn_id,
+                    symbols: target_syms,
+                    reason: reason.to_string(),
                 });
             }
+        }
+    }
+
+    pub fn mark_refresh_queued(
+        &mut self,
+        conn_id: ConnId,
+        epoch: u64,
+        refresh_id: u64,
+        symbols: &[String],
+    ) {
+        let rt = self.runtime_mut(conn_id);
+        if rt.connected && rt.epoch == epoch {
+            rt.pending_refresh_id = Some(refresh_id);
+            rt.pending_refresh_symbols = symbols.iter().map(|s| s.to_uppercase()).collect();
+        }
+    }
+
+    pub fn on_depth_refresh_subscribed(
+        &mut self,
+        conn_id: ConnId,
+        epoch: u64,
+        refresh_id: u64,
+    ) {
+        let rt = self.runtime_mut(conn_id);
+        if rt.epoch == epoch && rt.pending_refresh_id == Some(refresh_id) {
+            rt.clear_pending_refresh();
+        }
+    }
+
+    pub fn on_depth_refresh_queue_failed(
+        &mut self,
+        conn_id: ConnId,
+        epoch: u64,
+        symbols: &[String],
+        wall_ns: i64,
+        mono_ns: u64,
+        reason: &str,
+    ) -> SelectorOutput {
+        let mut out = SelectorOutput::empty();
+        if self.runtime(conn_id).epoch != epoch {
+            return out;
+        }
+        self.runtime_mut(conn_id).clear_pending_refresh();
+        let target_syms: Vec<String> = if symbols.is_empty() {
+            self.expected_symbols()
         } else {
-            out.actions.push(SelectorAction::Resubscribe {
-                conn_id: standby,
+            symbols.iter().map(|s| s.to_uppercase()).collect()
+        };
+        self.enter_depth_wait(
+            conn_id,
+            &target_syms,
+            wall_ns,
+            mono_ns,
+            reason,
+            false,
+            true,
+            false,
+            &mut out,
+        );
+        if !self.runtime(conn_id).resync_requested && self.runtime(conn_id).connected {
+            self.runtime_mut(conn_id).resync_requested = true;
+            out.actions.push(SelectorAction::Reconnect {
+                conn_id,
                 reason: reason.to_string(),
             });
         }
+        if conn_id == self.primary && !self.in_gap {
+            self.handle_primary_fault(wall_ns, mono_ns, reason, &mut out);
+        }
+        out
     }
 
     /// Process a single raw frame stamped before JSON parsing.
@@ -337,17 +587,26 @@ impl CausalSelector {
                 }
             }
             FrameVerdict::BufferedWaitAnchor { symbol } => {
-                // Buffered inside this connection's independent validator waiting for REST snapshot.
-                if self.endpoint == EndpointKind::BinancePublic {
-                    out.buffered_wait_anchor = Some((symbol, "depth@100ms".to_string()));
-                }
+                // Buffered or waiting inside this connection's independent validator.
+                out.buffered_wait_anchor = Some((symbol, self.depth_channel_name().to_string()));
             }
             FrameVerdict::AcceptData {
                 symbol,
                 channel,
-                is_anchor_reset: _,
+                is_anchor_reset,
                 diagnostic: _,
             } => {
+                if is_depth_channel(self.endpoint, &channel)
+                    && self.runtime(conn_id).blocks_depth_symbol(&symbol)
+                {
+                    // Drop any stale pre-subscribe snapshot/delta belonging to an invalidated subscription.
+                    self.runtime_mut(conn_id)
+                        .validator
+                        .prepare_symbol_depth_refresh(&symbol);
+                    out.buffered_wait_anchor = Some((symbol, channel));
+                    return out;
+                }
+
                 self.runtime_mut(conn_id)
                     .last_symbol_mono_ns
                     .insert(symbol.clone(), mono_ns);
@@ -358,6 +617,9 @@ impl CausalSelector {
                 out.received_streams = accepted_streams.clone();
 
                 let conn_is_live = self.runtime(conn_id).state() == ConnState::Live;
+                if conn_id == self.primary && conn_is_live {
+                    self.initial_promotion_done = true;
+                }
 
                 // If we were in a gap and this connection just became LIVE, recover causally now.
                 if self.in_gap && conn_is_live {
@@ -366,6 +628,7 @@ impl CausalSelector {
                     self.in_gap = false;
                     self.gap_start_mono_ns = None;
                     self.dual_outage_alerted = false;
+                    self.initial_promotion_done = true;
                     out.records.push(self.emit_meta(
                         wall_ns,
                         mono_ns,
@@ -377,31 +640,65 @@ impl CausalSelector {
                             "previous_primary": prev_primary.as_str()
                         }),
                     ));
-                    if self.endpoint == EndpointKind::BinancePublic && conn_id != prev_primary {
-                        self.queue_post_switch_anchor_actions(
+                    self.reset_archive_depth_wait();
+
+                    if !self.has_depth_stream() {
+                        out.records.push(self.emit_data(&frame));
+                        out.market_data = Some((symbol, channel));
+                        out.written_streams = accepted_streams;
+                        return out;
+                    }
+
+                    let is_depth_snapshot =
+                        is_depth_channel(self.endpoint, &channel) && is_anchor_reset;
+                    let unanchored = if is_depth_snapshot {
+                        self.archive_depth.insert(
+                            symbol.to_uppercase(),
+                            ArchiveSymbolDepthState::Anchored {
+                                conn_id,
+                                epoch: frame.epoch,
+                            },
+                        );
+                        out.records.push(self.emit_data(&frame));
+                        out.market_data = Some((symbol.clone(), channel));
+                        out.written_streams = accepted_streams;
+                        self.unanchored_symbols(conn_id, frame.epoch, Some(&symbol))
+                    } else {
+                        if !is_depth_channel(self.endpoint, &channel) {
+                            out.records.push(self.emit_data(&frame));
+                            out.market_data = Some((symbol, channel));
+                            out.written_streams = accepted_streams;
+                        }
+                        self.unanchored_symbols(conn_id, frame.epoch, None)
+                    };
+
+                    if !unanchored.is_empty() {
+                        self.enter_depth_wait(
                             conn_id,
+                            &unanchored,
+                            wall_ns,
+                            mono_ns,
                             "post_gap_recovery_fresh_anchor",
+                            false,
+                            true,
+                            true,
                             &mut out,
                         );
-                        if channel == "depth@100ms" {
-                            return out;
-                        }
                     }
-                    out.records.push(self.emit_data(&frame));
-                    out.market_data = Some((symbol, channel));
-                    out.written_streams = accepted_streams;
                     return out;
                 }
 
-                // If primary is not LIVE (e.g. startup WaitAnchor) and standby became LIVE first, promote standby.
+                // If primary has not yet become LIVE on initial startup and standby became LIVE first, promote standby.
                 if conn_id != self.primary
                     && conn_is_live
+                    && !self.initial_promotion_done
                     && self.runtime(self.primary).state() != ConnState::Live
                     && !self.in_gap
                 {
                     let old_primary = self.primary;
                     self.primary = conn_id;
                     self.switch_count += 1;
+                    self.initial_promotion_done = true;
                     out.records.push(self.emit_meta(
                         wall_ns,
                         mono_ns,
@@ -412,30 +709,125 @@ impl CausalSelector {
                             "from": old_primary.as_str(),
                             "to": conn_id.as_str(),
                             "reason": "initial_or_standby_ready_first",
-                            "symbol": "ALL"
+                            "symbol": "ALL",
+                            "trigger_fresh_anchor": true
                         }),
                     ));
-                    if self.endpoint == EndpointKind::BinancePublic {
-                        self.queue_post_switch_anchor_actions(
+                    self.reset_archive_depth_wait();
+
+                    if !self.has_depth_stream() {
+                        out.records.push(self.emit_data(&frame));
+                        out.market_data = Some((symbol, channel));
+                        out.written_streams = accepted_streams;
+                        return out;
+                    }
+
+                    let is_depth_snapshot =
+                        is_depth_channel(self.endpoint, &channel) && is_anchor_reset;
+                    let unanchored = if is_depth_snapshot {
+                        self.archive_depth.insert(
+                            symbol.to_uppercase(),
+                            ArchiveSymbolDepthState::Anchored {
+                                conn_id,
+                                epoch: frame.epoch,
+                            },
+                        );
+                        out.records.push(self.emit_data(&frame));
+                        out.market_data = Some((symbol.clone(), channel));
+                        out.written_streams = accepted_streams;
+                        self.unanchored_symbols(conn_id, frame.epoch, Some(&symbol))
+                    } else {
+                        if !is_depth_channel(self.endpoint, &channel) {
+                            out.records.push(self.emit_data(&frame));
+                            out.market_data = Some((symbol, channel));
+                            out.written_streams = accepted_streams;
+                        }
+                        self.unanchored_symbols(conn_id, frame.epoch, None)
+                    };
+
+                    if !unanchored.is_empty() {
+                        self.enter_depth_wait(
                             conn_id,
+                            &unanchored,
+                            wall_ns,
+                            mono_ns,
                             "standby_promoted_fresh_anchor",
+                            false,
+                            true,
+                            true,
                             &mut out,
                         );
-                        if channel == "depth@100ms" {
-                            return out;
-                        }
                     }
-                    out.records.push(self.emit_data(&frame));
-                    out.market_data = Some((symbol, channel));
-                    out.written_streams = accepted_streams;
                     return out;
                 }
 
                 // Normal single-stream emission: ONLY write active primary to disk.
                 if conn_id == self.primary && !self.in_gap {
-                    out.records.push(self.emit_data(&frame));
-                    out.market_data = Some((symbol, channel));
-                    out.written_streams = accepted_streams;
+                    if !is_depth_channel(self.endpoint, &channel) {
+                        out.records.push(self.emit_data(&frame));
+                        out.market_data = Some((symbol, channel));
+                        out.written_streams = accepted_streams;
+                    } else if is_anchor_reset {
+                        let sym_u = symbol.to_uppercase();
+                        if let Some(ArchiveSymbolDepthState::WaitSnapshot {
+                            unavailable_since_wall_ns: Some(since_ns),
+                        }) = self.archive_depth.get(&sym_u).cloned()
+                        {
+                            out.records.push(self.emit_meta(
+                                wall_ns,
+                                mono_ns,
+                                conn_id,
+                                json!({
+                                    "event": "DEPTH_RECOVERED",
+                                    "endpoint": self.endpoint.as_str(),
+                                    "conn_id": conn_id.as_str(),
+                                    "epoch": frame.epoch,
+                                    "symbol": sym_u,
+                                    "unavailable_since_wall_ns": since_ns,
+                                    "recovered_wall_ns": wall_ns,
+                                    "recovered_mono_ns": mono_ns,
+                                    "duration_ns": wall_ns.saturating_sub(since_ns)
+                                }),
+                            ));
+                        }
+                        self.archive_depth.insert(
+                            sym_u,
+                            ArchiveSymbolDepthState::Anchored {
+                                conn_id,
+                                epoch: frame.epoch,
+                            },
+                        );
+                        out.records.push(self.emit_data(&frame));
+                        out.market_data = Some((symbol, channel));
+                        out.written_streams = accepted_streams;
+                    } else {
+                        let sym_u = symbol.to_uppercase();
+                        let anchored = matches!(
+                            self.archive_depth.get(&sym_u),
+                            Some(ArchiveSymbolDepthState::Anchored {
+                                conn_id: c,
+                                epoch: e,
+                            }) if *c == conn_id && *e == frame.epoch
+                        );
+                        if anchored {
+                            out.records.push(self.emit_data(&frame));
+                            out.market_data = Some((symbol, channel));
+                            out.written_streams = accepted_streams;
+                        } else {
+                            self.enter_depth_wait(
+                                conn_id,
+                                &[sym_u],
+                                wall_ns,
+                                mono_ns,
+                                "missing_same_connection_archive_anchor",
+                                false,
+                                true,
+                                true,
+                                &mut out,
+                            );
+                            out.buffered_wait_anchor = Some((symbol, channel));
+                        }
+                    }
                 }
             }
             FrameVerdict::Violation {
@@ -446,34 +838,35 @@ impl CausalSelector {
             } => {
                 if needs_snapshot_refetch {
                     if let Some(sym) = symbol.clone() {
-                        out.actions.push(SelectorAction::FetchRestSnapshot {
+                        self.enter_depth_wait(
                             conn_id,
-                            symbol: sym.clone(),
-                        });
-                        if self.endpoint == EndpointKind::BinancePublic {
-                            let epoch = self.runtime(conn_id).epoch;
-                            out.records.push(self.emit_meta(
-                                wall_ns,
-                                mono_ns,
-                                conn_id,
-                                json!({
-                                    "event": "DEPTH_UNAVAILABLE",
-                                    "endpoint": self.endpoint.as_str(),
-                                    "conn_id": conn_id.as_str(),
-                                    "epoch": epoch,
-                                    "symbol": sym,
-                                    "unavailable_since_wall_ns": wall_ns,
-                                    "reason": reason
-                                }),
-                            ));
-                        }
+                            &[sym],
+                            wall_ns,
+                            mono_ns,
+                            &reason,
+                            false,
+                            self.endpoint == EndpointKind::BinancePublic,
+                            true,
+                            &mut out,
+                        );
                     }
                 }
                 if needs_resubscribe {
-                    out.actions.push(SelectorAction::Resubscribe {
+                    let target_syms = symbol
+                        .clone()
+                        .map(|s| vec![s])
+                        .unwrap_or_else(|| self.expected_symbols());
+                    self.enter_depth_wait(
                         conn_id,
-                        reason: reason.clone(),
-                    });
+                        &target_syms,
+                        wall_ns,
+                        mono_ns,
+                        &reason,
+                        false,
+                        false,
+                        true,
+                        &mut out,
+                    );
                 }
                 if conn_id == self.primary {
                     self.handle_primary_fault(wall_ns, mono_ns, &reason, &mut out);
@@ -528,16 +921,17 @@ impl CausalSelector {
                 ));
 
                 let conn_live = self.runtime(conn_id).state() == ConnState::Live;
-                let mut promoted_standby = false;
+                if conn_id == self.primary && conn_live {
+                    self.initial_promotion_done = true;
+                }
+                let mut refresh_others_reason: Option<&'static str> = None;
                 if self.in_gap && conn_live {
                     let prev_primary = self.primary;
                     self.primary = conn_id;
                     self.in_gap = false;
                     self.gap_start_mono_ns = None;
                     self.dual_outage_alerted = false;
-                    if conn_id != prev_primary {
-                        promoted_standby = true;
-                    }
+                    self.initial_promotion_done = true;
                     out.records.push(self.emit_meta(
                         wall_ns,
                         mono_ns,
@@ -549,15 +943,19 @@ impl CausalSelector {
                             "previous_primary": prev_primary.as_str()
                         }),
                     ));
+                    self.reset_archive_depth_wait();
+                    refresh_others_reason = Some("post_gap_recovery_fresh_anchor");
                 } else if conn_id != self.primary
                     && conn_live
+                    && !self.initial_promotion_done
                     && self.runtime(self.primary).state() != ConnState::Live
                     && !self.in_gap
                 {
                     let old_primary = self.primary;
                     self.primary = conn_id;
                     self.switch_count += 1;
-                    promoted_standby = true;
+                    self.initial_promotion_done = true;
+                    refresh_others_reason = Some("standby_promoted_fresh_anchor");
                     out.records.push(self.emit_meta(
                         wall_ns,
                         mono_ns,
@@ -568,14 +966,22 @@ impl CausalSelector {
                             "from": old_primary.as_str(),
                             "to": conn_id.as_str(),
                             "reason": "standby_depth_ready_first",
-                            "symbol": "ALL"
+                            "symbol": "ALL",
+                            "trigger_fresh_anchor": true
                         }),
                     ));
+                    self.reset_archive_depth_wait();
                 }
 
-                if conn_id == self.primary {
+                if conn_id == self.primary && !self.in_gap {
                     // Emit raw REST snapshot anchor into canonical stream at true snapshot-ready clock.
                     let rx_seq = self.next_seq();
+                    let unavailable_since = match self.archive_depth.get(&sym_upper) {
+                        Some(ArchiveSymbolDepthState::WaitSnapshot {
+                            unavailable_since_wall_ns: Some(since_ns),
+                        }) => Some(*since_ns),
+                        _ => bridge.unavailable_since_wall_ns,
+                    };
                     let wrapper = json!({
                         "event": "REST_SNAPSHOT_ANCHOR",
                         "endpoint": self.endpoint.as_str(),
@@ -588,7 +994,7 @@ impl CausalSelector {
                         "awaiting_first_ws_delta": bridge.awaiting_first_ws_delta,
                         "bridged_buffered_deltas": bridged_count,
                         "dropped_stale_buffered_deltas": bridge.dropped_before_snapshot,
-                        "unavailable_since_wall_ns": bridge.unavailable_since_wall_ns,
+                        "unavailable_since_wall_ns": unavailable_since,
                         "snapshot": serde_json::from_str::<serde_json::Value>(raw_snapshot_json)
                             .unwrap_or_else(|_| json!({"raw_parse_error": true}))
                     });
@@ -636,25 +1042,28 @@ impl CausalSelector {
                         });
                     }
 
-                    // If standby was just promoted to primary, refresh anchors for the other symbols
-                    // on this newly promoted primary so the archive has same-connection anchors for all 6 symbols
-                    // without emitting unanchored deltas beforehand.
-                    if promoted_standby && self.endpoint == EndpointKind::BinancePublic {
-                        let others: Vec<String> = self
-                            .runtime(conn_id)
-                            .validator
-                            .expected_symbols()
-                            .into_iter()
-                            .filter(|s| s != &sym_upper)
-                            .collect();
-                        for other_sym in others {
-                            self.runtime_mut(conn_id)
-                                .validator
-                                .prepare_symbol_depth_refresh(&other_sym);
-                            out.actions.push(SelectorAction::FetchRestSnapshot {
+                    self.archive_depth.insert(
+                        sym_upper.clone(),
+                        ArchiveSymbolDepthState::Anchored { conn_id, epoch },
+                    );
+
+                    // If standby was just promoted to primary or we recovered from dual gap,
+                    // refresh anchors for any unanchored symbols on this newly active primary
+                    // so the archive has same-connection anchors for all symbols without splicing.
+                    if let Some(reason) = refresh_others_reason {
+                        let others = self.unanchored_symbols(conn_id, epoch, Some(&sym_upper));
+                        if !others.is_empty() {
+                            self.enter_depth_wait(
                                 conn_id,
-                                symbol: other_sym,
-                            });
+                                &others,
+                                wall_ns,
+                                mono_ns,
+                                reason,
+                                false,
+                                true,
+                                true,
+                                &mut out,
+                            );
                         }
                     }
                 }
@@ -697,6 +1106,7 @@ impl CausalSelector {
         {
             let rt = self.runtime_mut(conn_id);
             rt.connected = false;
+            rt.clear_pending_refresh();
             rt.validator.reset();
         }
         if conn_id == self.primary {
@@ -723,13 +1133,19 @@ impl CausalSelector {
 
     /// Notify selector that a connection reconnected cleanly with a new epoch.
     pub fn on_reconnect(&mut self, conn_id: ConnId, new_epoch: u64, mono_ns: u64) {
-        let rt = self.runtime_mut(conn_id);
-        rt.epoch = new_epoch;
-        rt.connected = true;
-        rt.last_msg_mono_ns = mono_ns;
-        rt.last_pong_mono_ns = mono_ns;
-        rt.resync_requested = false;
-        rt.validator.reset();
+        {
+            let rt = self.runtime_mut(conn_id);
+            rt.epoch = new_epoch;
+            rt.connected = true;
+            rt.last_msg_mono_ns = mono_ns;
+            rt.last_pong_mono_ns = mono_ns;
+            rt.resync_requested = false;
+            rt.clear_pending_refresh();
+            rt.validator.reset();
+        }
+        if conn_id == self.primary {
+            self.reset_archive_depth_wait();
+        }
     }
 
     /// Trigger staggered planned rotation (00:00 UTC for A, 12:00 UTC for B).
@@ -750,6 +1166,7 @@ impl CausalSelector {
             if self.runtime(standby).state() == ConnState::Live {
                 self.primary = standby;
                 self.switch_count += 1;
+                self.initial_promotion_done = true;
                 out.records.push(self.emit_meta(
                     wall_ns,
                     mono_ns,
@@ -764,10 +1181,17 @@ impl CausalSelector {
                         "trigger_fresh_anchor": true
                     }),
                 ));
-                // Trigger fresh anchor on new primary for seamless offline replay without backdating.
-                self.queue_post_switch_anchor_actions(
+                self.reset_archive_depth_wait();
+                let all_syms = self.expected_symbols();
+                self.enter_depth_wait(
                     standby,
-                    "post_switch_fresh_anchor",
+                    &all_syms,
+                    wall_ns,
+                    mono_ns,
+                    "planned_rotation",
+                    true,
+                    true,
+                    true,
                     &mut out,
                 );
                 out.actions.push(SelectorAction::Reconnect {
@@ -923,6 +1347,22 @@ impl CausalSelector {
                 reason
             ),
         }];
+        let primary = self.primary;
+        let primary_epoch = self.runtime(primary).epoch;
+        let anchored = self.anchored_symbols(primary, primary_epoch);
+        if !anchored.is_empty() && !self.in_gap && self.runtime(primary).connected {
+            self.enter_depth_wait(
+                primary,
+                &anchored,
+                wall_ns,
+                mono_ns,
+                reason,
+                false,
+                false,
+                true,
+                &mut out,
+            );
+        }
         out
     }
 
@@ -938,6 +1378,7 @@ impl CausalSelector {
         if self.runtime(standby).state() == ConnState::Live {
             self.primary = standby;
             self.switch_count += 1;
+            self.initial_promotion_done = true;
             out.records.push(self.emit_meta(
                 wall_ns,
                 mono_ns,
@@ -952,12 +1393,24 @@ impl CausalSelector {
                     "trigger_fresh_anchor": true
                 }),
             ));
-            // Request fresh anchor on new primary so offline book rebuilds cleanly without splicing A & B.
-            self.queue_post_switch_anchor_actions(standby, "post_failover_fresh_anchor", out);
+            self.reset_archive_depth_wait();
+            let all_syms = self.expected_symbols();
+            self.enter_depth_wait(
+                standby,
+                &all_syms,
+                wall_ns,
+                mono_ns,
+                "post_failover_fresh_anchor",
+                false,
+                true,
+                true,
+                out,
+            );
         } else if !self.in_gap {
             self.in_gap = true;
             self.gap_start_mono_ns = Some(mono_ns);
             self.gap_count += 1;
+            self.initial_promotion_done = true;
             out.records.push(self.emit_meta(
                 wall_ns,
                 mono_ns,
@@ -970,6 +1423,7 @@ impl CausalSelector {
                     "reason": reason
                 }),
             ));
+            self.reset_archive_depth_wait();
         }
     }
 }

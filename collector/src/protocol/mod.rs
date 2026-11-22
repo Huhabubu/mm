@@ -117,6 +117,16 @@ pub trait ProtocolValidator: Send {
     fn expected_symbol_count(&self) -> usize;
 }
 
+pub fn is_depth_channel(endpoint: EndpointKind, channel: &str) -> bool {
+    matches!(
+        (endpoint, channel),
+        (EndpointKind::BinancePublic, "depth@100ms")
+            | (EndpointKind::GatePublic, "futures.obu")
+            | (EndpointKind::BybitPublic, "orderbook.50")
+            | (EndpointKind::BitgetPublic, "books50")
+    )
+}
+
 pub fn make_validator(endpoint: EndpointKind, symbols: Vec<String>) -> Box<dyn ProtocolValidator> {
     match endpoint {
         EndpointKind::BinancePublic => Box::new(binance::BinanceValidator::new_public(symbols)),

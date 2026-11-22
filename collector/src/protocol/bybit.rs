@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 struct BybitBookState {
     state: ConnState,
     prev_u: Option<u64>,
+    refreshing: bool,
 }
 
 impl BybitBookState {
@@ -14,6 +15,7 @@ impl BybitBookState {
         Self {
             state: ConnState::WaitAnchor,
             prev_u: None,
+            refreshing: false,
         }
     }
 }
@@ -26,6 +28,7 @@ pub struct BybitValidator {
     seen_trade_set: HashMap<String, HashSet<String>>,
     pending_sub_acks: Vec<(String, String)>,
     overall_invalid: bool,
+    fatal_invalid: bool,
 }
 
 impl BybitValidator {
@@ -45,7 +48,16 @@ impl BybitValidator {
             seen_trade_set: HashMap::new(),
             pending_sub_acks: Vec::new(),
             overall_invalid: false,
+            fatal_invalid: false,
         }
+    }
+
+    pub fn build_depth_message(symbols: &[String], op: &str, req_id: &str) -> Value {
+        let args: Vec<String> = symbols
+            .iter()
+            .map(|s| format!("orderbook.50.{}", s.to_uppercase()))
+            .collect();
+        json!({"req_id": req_id, "op": op, "args": args})
     }
 
     pub fn build_subscribe_message(symbols: &[String]) -> Value {
@@ -136,6 +148,16 @@ impl BybitValidator {
             };
             st.prev_u = Some(u);
             st.state = ConnState::Live;
+            st.refreshing = false;
+            if !is_l1
+                && !self.fatal_invalid
+                && self
+                    .book50_states
+                    .values()
+                    .all(|s| s.state != ConnState::Invalid)
+            {
+                self.overall_invalid = false;
+            }
             return FrameVerdict::AcceptData {
                 symbol: sym,
                 channel,
@@ -145,6 +167,9 @@ impl BybitValidator {
         }
 
         if msg_type == "delta" {
+            if !is_l1 && st.refreshing {
+                return FrameVerdict::BufferedWaitAnchor { symbol: sym };
+            }
             if st.state != ConnState::Live {
                 return FrameVerdict::Violation {
                     symbol: Some(sym),
@@ -261,6 +286,20 @@ impl ProtocolValidator for BybitValidator {
                     needs_snapshot_refetch: false,
                 };
             }
+            if op == "unsubscribe" {
+                if v.get("success").and_then(Value::as_bool) == Some(true) {
+                    return FrameVerdict::Control {
+                        note: "bybit unsubscribe ack".to_string(),
+                    };
+                }
+                self.overall_invalid = true;
+                return FrameVerdict::Violation {
+                    symbol: None,
+                    reason: format!("bybit unsubscribe failed: {}", raw),
+                    needs_resubscribe: false,
+                    needs_snapshot_refetch: false,
+                };
+            }
         }
 
         let topic = match v.get("topic").and_then(Value::as_str) {
@@ -333,8 +372,54 @@ impl ProtocolValidator for BybitValidator {
         self.expected_symbols.clone()
     }
 
+    fn symbol_depth_state(&self, symbol: &str) -> Option<ConnState> {
+        self.book50_states
+            .get(&symbol.to_uppercase())
+            .map(|st| if st.refreshing { ConnState::Resync } else { st.state })
+    }
+
+    fn prepare_depth_refresh(&mut self) {
+        self.overall_invalid = false;
+        self.fatal_invalid = false;
+        self.pending_sub_acks.clear();
+        for st in self.book50_states.values_mut() {
+            *st = BybitBookState {
+                state: ConnState::WaitAnchor,
+                prev_u: None,
+                refreshing: true,
+            };
+        }
+    }
+
+    fn prepare_symbol_depth_refresh(&mut self, symbol: &str) {
+        if self.overall_invalid
+            && self
+                .book50_states
+                .values()
+                .all(|s| s.state != ConnState::Invalid)
+        {
+            self.fatal_invalid = true;
+        }
+        let sym = symbol.to_uppercase();
+        let st = self
+            .book50_states
+            .entry(sym)
+            .or_insert_with(BybitBookState::new);
+        if st.state != ConnState::Invalid {
+            st.state = ConnState::WaitAnchor;
+        }
+        st.prev_u = None;
+        st.refreshing = true;
+        self.overall_invalid = self.overall_invalid
+            || self
+                .book50_states
+                .values()
+                .any(|s| s.state == ConnState::Invalid);
+    }
+
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.fatal_invalid = false;
         self.pending_sub_acks.clear();
         for st in self.book50_states.values_mut() {
             *st = BybitBookState::new();

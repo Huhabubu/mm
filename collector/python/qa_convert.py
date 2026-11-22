@@ -220,8 +220,46 @@ class AssetDayBuffers:
     edge_samples: list[tuple[int, float, float, float, float, int, int]] = field(default_factory=list)
     last_book_local_ts: int = -1
     binance_depth_anchor: dict[str, Any] | None = None
+    follower_depth_anchor: dict[str, Any] | None = None
     depth_unavailable_intervals: list[dict[str, Any]] = field(default_factory=list)
     bridged_delta_records: list[dict[str, Any]] = field(default_factory=list)
+    unrebuildable_depth_reasons: list[str] = field(default_factory=list)
+    unrebuildable_depth_intervals: list[dict[str, Any]] = field(default_factory=list)
+    excluded_unrebuildable_depth_rows: int = 0
+    depth_recovered_count: int = 0
+
+    def record_unrebuildable_depth(
+        self,
+        *,
+        reason: str,
+        wall_ns: int,
+        conn_id: str,
+        epoch: int,
+    ) -> None:
+        if reason not in self.unrebuildable_depth_reasons:
+            self.unrebuildable_depth_reasons.append(reason)
+        if (
+            self.unrebuildable_depth_intervals
+            and self.unrebuildable_depth_intervals[-1]["reason"] == reason
+            and self.unrebuildable_depth_intervals[-1]["conn_id"] == conn_id
+            and self.unrebuildable_depth_intervals[-1]["epoch"] == epoch
+        ):
+            self.unrebuildable_depth_intervals[-1]["end_wall_ns"] = wall_ns
+            self.unrebuildable_depth_intervals[-1]["excluded_frames"] += 1
+        else:
+            self.unrebuildable_depth_intervals.append(
+                {
+                    "exchange": self.exchange,
+                    "symbol": self.symbol,
+                    "reason": reason,
+                    "start_wall_ns": wall_ns,
+                    "end_wall_ns": wall_ns,
+                    "conn_id": conn_id,
+                    "epoch": epoch,
+                    "excluded_frames": 1,
+                }
+            )
+        self.excluded_unrebuildable_depth_rows += 1
 
     def apply_levels(self, is_snapshot: bool, bid_levels: list[tuple[float, float]], ask_levels: list[tuple[float, float]], local_ts: int) -> None:
         if is_snapshot:
@@ -558,9 +596,17 @@ def _ingest_binance_record(
             AssetDayBuffers("binance_futures", sym, date_utc),
         )
         anchor = buf.binance_depth_anchor
-        if anchor is not None and "U" in data and "u" in data:
-            rec_conn = str(rec.get("conn_id") or "")
-            rec_epoch = int(rec.get("epoch", 0))
+        rec_conn = str(rec.get("conn_id") or "")
+        rec_epoch = int(rec.get("epoch", 0))
+        if anchor is None:
+            buf.record_unrebuildable_depth(
+                reason="missing_same_connection_anchor",
+                wall_ns=local_ts,
+                conn_id=rec_conn,
+                epoch=rec_epoch,
+            )
+            return
+        if "U" in data and "u" in data:
             if anchor["conn_id"] != rec_conn or anchor["epoch"] != rec_epoch:
                 raise ValueError(
                     f"Binance live depthUpdate cross-connection splice for {sym}: "
@@ -812,12 +858,138 @@ def reconstruct_binance_depth_book(
     }
 
 
+def _ingest_follower_meta(
+    exchange: str,
+    rec: dict[str, Any],
+    date_utc: str,
+    buffers: dict[tuple[str, str, str], AssetDayBuffers],
+) -> None:
+    local_ts = rec["recv_wall_ns"]
+    obj = json.loads(rec["payload"])
+    if not isinstance(obj, dict):
+        return
+    ev_name = str(obj.get("event") or "")
+    raw_sym = str(obj.get("symbol") or "ALL").strip()
+    is_all = not raw_sym or raw_sym.upper() == "ALL"
+
+    def _target_buffers() -> list[AssetDayBuffers]:
+        if is_all:
+            return [
+                b
+                for (ex, _sym, d_utc), b in buffers.items()
+                if ex == exchange and d_utc == date_utc
+            ]
+        sym = canonical_asset(exchange, raw_sym)
+        return [
+            buffers.setdefault(
+                (exchange, sym, date_utc),
+                AssetDayBuffers(exchange, sym, date_utc),
+            )
+        ]
+
+    if ev_name in ("SWITCH", "GAP_START", "LOCAL_LOSS"):
+        for buf in _target_buffers():
+            buf.follower_depth_anchor = None
+    elif ev_name == "DEPTH_UNAVAILABLE":
+        since_ns = int(obj.get("unavailable_since_wall_ns") or local_ts)
+        for buf in _target_buffers():
+            buf.follower_depth_anchor = None
+            if not buf.depth_unavailable_intervals or buf.depth_unavailable_intervals[-1].get("end_wall_ns") is not None:
+                buf.depth_unavailable_intervals.append(
+                    {
+                        "start_wall_ns": since_ns,
+                        "end_wall_ns": None,
+                        "reason": str(obj.get("reason") or ev_name),
+                        "planned": bool(obj.get("planned")),
+                        "conn_id": str(obj.get("conn_id") or rec.get("conn_id") or ""),
+                        "epoch": int(obj["epoch"]) if obj.get("epoch") is not None else int(rec.get("epoch", 0)),
+                    }
+                )
+    elif ev_name == "DEPTH_RECOVERED" and not is_all:
+        sym = canonical_asset(exchange, raw_sym)
+        buf = buffers.setdefault(
+            (exchange, sym, date_utc),
+            AssetDayBuffers(exchange, sym, date_utc),
+        )
+        recovered_ns = int(obj.get("recovered_wall_ns") or local_ts)
+        if buf.depth_unavailable_intervals and buf.depth_unavailable_intervals[-1].get("end_wall_ns") is None:
+            buf.depth_unavailable_intervals[-1]["end_wall_ns"] = recovered_ns
+        buf.depth_recovered_count += 1
+
+
+def _validate_and_apply_follower_depth(
+    *,
+    buf: AssetDayBuffers,
+    exchange: str,
+    rec: dict[str, Any],
+    is_snap: bool,
+    seq: int | None,
+    parent: int | None,
+    exch_ts: int,
+    local_ts: int,
+    bids: list[tuple[float, float]],
+    asks: list[tuple[float, float]],
+) -> None:
+    rec_conn = str(rec.get("conn_id") or "")
+    rec_epoch = int(rec.get("epoch", 0))
+    if is_snap:
+        if buf.depth_unavailable_intervals and buf.depth_unavailable_intervals[-1].get("end_wall_ns") is None:
+            buf.depth_unavailable_intervals[-1]["end_wall_ns"] = local_ts
+        buf.follower_depth_anchor = {
+            "conn_id": rec_conn,
+            "epoch": rec_epoch,
+            "seq": seq,
+            "awaiting_delta": exchange == "bitget_v3",
+        }
+        _emit_depth_batch(buf, True, exch_ts, local_ts, bids, asks)
+        return
+
+    anchor = buf.follower_depth_anchor
+    if anchor is None or anchor["conn_id"] != rec_conn or anchor["epoch"] != rec_epoch:
+        buf.record_unrebuildable_depth(
+            reason="missing_same_connection_anchor",
+            wall_ns=local_ts,
+            conn_id=rec_conn,
+            epoch=rec_epoch,
+        )
+        buf.follower_depth_anchor = None
+        return
+
+    prev_seq = anchor.get("seq")
+    if prev_seq is not None and seq is not None:
+        if exchange == "gate_futures":
+            valid = parent is not None and parent == prev_seq + 1 and seq >= parent
+        elif exchange == "bitget_v3":
+            if parent is None or parent >= seq:
+                valid = False
+            elif anchor.get("awaiting_delta"):
+                valid = parent <= prev_seq <= seq
+            else:
+                valid = parent == prev_seq
+        else:
+            valid = seq >= prev_seq
+        if not valid:
+            buf.record_unrebuildable_depth(
+                reason="exchange_update_chain_break",
+                wall_ns=local_ts,
+                conn_id=rec_conn,
+                epoch=rec_epoch,
+            )
+            buf.follower_depth_anchor = None
+            return
+
+    anchor["seq"] = seq
+    anchor["awaiting_delta"] = False
+    _emit_depth_batch(buf, False, exch_ts, local_ts, bids, asks)
+
+
 def _ingest_gate_record(
     rec: dict[str, Any],
     date_utc: str,
     buffers: dict[tuple[str, str, str], AssetDayBuffers],
 ) -> None:
     if rec["kind"] == "META":
+        _ingest_follower_meta("gate_futures", rec, date_utc, buffers)
         return
     local_ts = rec["recv_wall_ns"]
     obj = json.loads(rec["payload"])
@@ -834,6 +1006,8 @@ def _ingest_gate_record(
         exch_ms = int(result.get("t") or obj.get("time_ms") or (local_ts // 1_000_000))
         exch_ts = exch_ms * 1_000_000
         is_full = bool(result.get("full", False))
+        seq = int(result["u"]) if result.get("u") is not None else None
+        parent = int(result["U"]) if result.get("U") is not None else None
         # Decimal strings (X-Gate-Size-Decimal: 1) parsed as float, NEVER int!
         bids = _parse_price_qty_pairs(result.get("b") or [])
         asks = _parse_price_qty_pairs(result.get("a") or [])
@@ -841,7 +1015,18 @@ def _ingest_gate_record(
             ("gate_futures", sym, date_utc),
             AssetDayBuffers("gate_futures", sym, date_utc),
         )
-        _emit_depth_batch(buf, is_full, exch_ts, local_ts, bids, asks)
+        _validate_and_apply_follower_depth(
+            buf=buf,
+            exchange="gate_futures",
+            rec=rec,
+            is_snap=is_full,
+            seq=seq,
+            parent=parent,
+            exch_ts=exch_ts,
+            local_ts=local_ts,
+            bids=bids,
+            asks=asks,
+        )
 
     elif channel == "futures.trades":
         trades = result if isinstance(result, list) else [result]
@@ -900,6 +1085,7 @@ def _ingest_bybit_record(
     buffers: dict[tuple[str, str, str], AssetDayBuffers],
 ) -> None:
     if rec["kind"] == "META":
+        _ingest_follower_meta("bybit_linear", rec, date_utc, buffers)
         return
     local_ts = rec["recv_wall_ns"]
     obj = json.loads(rec["payload"])
@@ -912,14 +1098,26 @@ def _ingest_bybit_record(
         sym = canonical_asset("bybit_linear", str(data.get("s") or topic.split(".")[-1]))
         exch_ms = int(obj.get("cts") or obj.get("ts") or (local_ts // 1_000_000))
         exch_ts = exch_ms * 1_000_000
-        is_snap = obj.get("type") == "snapshot"
+        seq = int(data["u"]) if data.get("u") is not None else None
+        is_snap = obj.get("type") == "snapshot" or seq == 1
         bids = _parse_price_qty_pairs(data.get("b") or [])
         asks = _parse_price_qty_pairs(data.get("a") or [])
         buf = buffers.setdefault(
             ("bybit_linear", sym, date_utc),
             AssetDayBuffers("bybit_linear", sym, date_utc),
         )
-        _emit_depth_batch(buf, is_snap, exch_ts, local_ts, bids, asks)
+        _validate_and_apply_follower_depth(
+            buf=buf,
+            exchange="bybit_linear",
+            rec=rec,
+            is_snap=is_snap,
+            seq=seq,
+            parent=None,
+            exch_ts=exch_ts,
+            local_ts=local_ts,
+            bids=bids,
+            asks=asks,
+        )
 
     elif topic.startswith("orderbook.1."):
         # Strictly separate independent L1 BBO (NEVER merged into 50-level L2 book!)
@@ -982,6 +1180,7 @@ def _ingest_bitget_record(
     buffers: dict[tuple[str, str, str], AssetDayBuffers],
 ) -> None:
     if rec["kind"] == "META":
+        _ingest_follower_meta("bitget_v3", rec, date_utc, buffers)
         return
     local_ts = rec["recv_wall_ns"]
     obj = json.loads(rec["payload"])
@@ -1003,13 +1202,26 @@ def _ingest_bitget_record(
                 continue
             exch_ms = int(item.get("ts") or obj.get("ts") or (local_ts // 1_000_000))
             exch_ts = exch_ms * 1_000_000
+            seq = int(item["seq"]) if item.get("seq") is not None else None
+            parent = int(item["pseq"]) if item.get("pseq") is not None else None
             bids = _parse_price_qty_pairs(item.get("b") or item.get("bids") or [])
             asks = _parse_price_qty_pairs(item.get("a") or item.get("asks") or [])
             buf = buffers.setdefault(
                 ("bitget_v3", sym, date_utc),
                 AssetDayBuffers("bitget_v3", sym, date_utc),
             )
-            _emit_depth_batch(buf, is_snap, exch_ts, local_ts, bids, asks)
+            _validate_and_apply_follower_depth(
+                buf=buf,
+                exchange="bitget_v3",
+                rec=rec,
+                is_snap=is_snap,
+                seq=seq,
+                parent=parent,
+                exch_ts=exch_ts,
+                local_ts=local_ts,
+                bids=bids,
+                asks=asks,
+            )
 
     elif channel == "books1":
         # Strictly separate independent L1 BBO (NEVER merged into 50-level L2 book!)
@@ -1578,7 +1790,16 @@ def run_qa_convert(
                 day_sha256["binance_bbo"] = _sha256_file(bbo_path)
                 artifacts.append({"kind": "binance_bbo", "exchange": exchange, "symbol": sym, "date_utc": date_utc, "path": str(bbo_path), "sha256": day_sha256["binance_bbo"], "rows": int(len(bbo_arr))})
 
-            if buf.hbt_rows:
+            for r_code in buf.unrebuildable_depth_reasons:
+                if r_code not in reasons:
+                    reasons.append(r_code)
+            unrecovered_unavail = [
+                iv for iv in buf.depth_unavailable_intervals if iv.get("end_wall_ns") is None and not iv.get("planned")
+            ]
+            if unrecovered_unavail and "depth_unavailable_unrecovered" not in reasons:
+                reasons.append("depth_unavailable_unrecovered")
+
+            if buf.hbt_rows and not buf.unrebuildable_depth_reasons:
                 raw_arr = np.array(buf.hbt_rows, dtype=event_dtype)
                 ordered, order_diag = _order_and_validate_hbt_events(
                     raw_arr,
@@ -1625,7 +1846,17 @@ def run_qa_convert(
             # Follower exchange: strictly separate 50-level HBT L2+trades vs independent L1 BBO
             if not buf.seen_snapshot:
                 reasons.append("missing_l2_snapshot_anchor")
-            if buf.hbt_rows:
+            for r_code in buf.unrebuildable_depth_reasons:
+                if r_code not in reasons:
+                    reasons.append(r_code)
+            unrecovered_unavail = [
+                iv for iv in buf.depth_unavailable_intervals if iv.get("end_wall_ns") is None and not iv.get("planned")
+            ]
+            if unrecovered_unavail and "depth_unavailable_unrecovered" not in reasons:
+                reasons.append("depth_unavailable_unrecovered")
+
+            depth_rebuildable = buf.seen_snapshot and not buf.unrebuildable_depth_reasons
+            if buf.hbt_rows and depth_rebuildable:
                 raw_arr = np.array(buf.hbt_rows, dtype=event_dtype)
                 ordered, order_diag = _order_and_validate_hbt_events(
                     raw_arr,
@@ -1651,7 +1882,7 @@ def run_qa_convert(
                     }
                 )
 
-            if buf.edge_samples:
+            if buf.edge_samples and depth_rebuildable:
                 edge_path = out_dir / f"{exchange}_l2_edges_{sym}_{ymd}.npz"
                 np.savez_compressed(
                     edge_path,
@@ -1686,20 +1917,30 @@ def run_qa_convert(
                 artifacts.append({"kind": "follower_l1_bbo", "exchange": exchange, "symbol": sym, "date_utc": date_utc, "path": str(l1_path), "sha256": day_sha256["follower_l1_bbo"], "rows": int(len(l1_arr))})
 
         status = "execution_unverified" if reasons else "eligible"
+        depth_rebuild_status = (
+            "unrebuildable_excluded"
+            if buf.unrebuildable_depth_reasons
+            else ("ok" if (exchange == "binance_futures" or buf.seen_snapshot) else "missing_anchor")
+        )
         calendar_rows.append(
             {
                 "exchange": exchange,
                 "symbol": sym,
                 "date_utc": date_utc,
                 "eligibility_status": status,
+                "depth_rebuild_status": depth_rebuild_status,
                 "unverified_reasons": reasons,
+                "unrebuildable_depth_reasons": buf.unrebuildable_depth_reasons,
+                "unrebuildable_depth_intervals": buf.unrebuildable_depth_intervals,
+                "excluded_unrebuildable_depth_rows": buf.excluded_unrebuildable_depth_rows,
+                "depth_unavailable_intervals": buf.depth_unavailable_intervals,
                 "gap_count": len(gaps),
                 "gap_intervals": gaps,
                 "local_loss_count": sum(x["dropped"] for x in losses),
                 "switch_count": day_switches.get((exchange, date_utc), 0),
                 "clock_uncertified_samples": len(clock_issues),
                 "spec_change_isolations": len(spec_issues),
-                "hbt_event_count": len(buf.hbt_rows),
+                "hbt_event_count": len(buf.hbt_rows) if not buf.unrebuildable_depth_reasons else 0,
                 "bbo_row_count": len(buf.bbo_rows),
                 "agg_trade_row_count": len(buf.agg_trade_rows),
                 "dedup_trades_dropped": buf.dedup_trades_dropped,
@@ -1753,6 +1994,18 @@ def run_qa_convert(
                 ]
             )
 
+    unrebuildable_depth_markets = [
+        {
+            "exchange": r["exchange"],
+            "symbol": r["symbol"],
+            "date_utc": r["date_utc"],
+            "reasons": r["unrebuildable_depth_reasons"],
+            "intervals": r["unrebuildable_depth_intervals"],
+            "excluded_rows": r["excluded_unrebuildable_depth_rows"],
+        }
+        for r in calendar_rows
+        if r["depth_rebuild_status"] == "unrebuildable_excluded"
+    ]
     summary = {
         "status": "ok",
         "phase": "qa_convert",
@@ -1762,6 +2015,7 @@ def run_qa_convert(
         "calendar_csv_path": str(cal_csv),
         "coverage": coverage_report,
         "local_loss_partitions": local_loss_partitions,
+        "unrebuildable_depth_markets": unrebuildable_depth_markets,
         "eligible_asset_days": sum(1 for r in calendar_rows if r["eligibility_status"] == "eligible"),
         "execution_unverified_asset_days": sum(
             1 for r in calendar_rows if r["eligibility_status"] == "execution_unverified"

@@ -28,6 +28,7 @@ pub struct GateValidator {
     pending_sub_acks: Vec<(String, String)>,
     extra_accepted_streams: Vec<(String, String)>,
     overall_invalid: bool,
+    fatal_invalid: bool,
 }
 
 impl GateValidator {
@@ -45,6 +46,7 @@ impl GateValidator {
             pending_sub_acks: Vec::new(),
             extra_accepted_streams: Vec::new(),
             overall_invalid: false,
+            fatal_invalid: false,
         }
     }
 
@@ -198,6 +200,9 @@ impl GateValidator {
             st.prev_u = Some(u);
             st.state = ConnState::Live;
             st.refreshing = false;
+            if !self.fatal_invalid && self.obu_states.values().all(|s| s.state != ConnState::Invalid) {
+                self.overall_invalid = false;
+            }
             return FrameVerdict::AcceptData {
                 symbol: sym,
                 channel: "futures.obu".to_string(),
@@ -503,6 +508,12 @@ impl ProtocolValidator for GateValidator {
         self.expected_symbols.clone()
     }
 
+    fn symbol_depth_state(&self, symbol: &str) -> Option<ConnState> {
+        self.obu_states
+            .get(&symbol.to_uppercase())
+            .map(|st| if st.refreshing { ConnState::Resync } else { st.state })
+    }
+
     fn prepare_depth_refresh(&mut self) {
         self.reset();
         for state in self.obu_states.values_mut() {
@@ -510,8 +521,27 @@ impl ProtocolValidator for GateValidator {
         }
     }
 
+    fn prepare_symbol_depth_refresh(&mut self, symbol: &str) {
+        if self.overall_invalid && self.obu_states.values().all(|s| s.state != ConnState::Invalid) {
+            self.fatal_invalid = true;
+        }
+        let sym = symbol.to_uppercase();
+        let st = self
+            .obu_states
+            .entry(sym)
+            .or_insert_with(GateObuState::new);
+        if st.state != ConnState::Invalid {
+            st.state = ConnState::WaitAnchor;
+        }
+        st.prev_u = None;
+        st.refreshing = true;
+        self.overall_invalid =
+            self.overall_invalid || self.obu_states.values().any(|s| s.state == ConnState::Invalid);
+    }
+
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.fatal_invalid = false;
         self.pending_sub_acks.clear();
         self.extra_accepted_streams.clear();
         for st in self.obu_states.values_mut() {
