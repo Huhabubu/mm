@@ -510,7 +510,7 @@ class ProtocolTest(unittest.TestCase):
         def write(path, records):
             with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as out:
                 for idx, (wall, conn, epoch, kind, obj) in enumerate(records, 1):
-                    out.write(f"{wall}\\t{idx}\\t{conn}\\t{epoch}\\t{idx}\\t{kind}\\t{json.dumps(obj)}\\n")
+                    out.write(f"{wall}\t{idx}\t{conn}\t{epoch}\t{idx}\t{kind}\t{json.dumps(obj)}\n")
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             archive, "check_partition", return_value={"qa_status": "passed", "problems": []},
@@ -576,7 +576,7 @@ class ProtocolTest(unittest.TestCase):
         def write(path, recs):
             with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as out:
                 for idx, (wall, conn, epoch, kind, obj) in enumerate(recs, 1):
-                    out.write(f"{wall}\\t{idx}\\t{conn}\\t{epoch}\\t{idx}\\t{kind}\\t{json.dumps(obj)}\\n")
+                    out.write(f"{wall}\t{idx}\t{conn}\t{epoch}\t{idx}\t{kind}\t{json.dumps(obj)}\n")
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             archive, "check_partition", return_value={"qa_status": "passed", "problems": []},
