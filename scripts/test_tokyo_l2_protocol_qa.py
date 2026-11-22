@@ -476,6 +476,149 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual("missing_same_connection_anchor", s5["proven_protocol_issues"][0]["issue"])
             self.assertEqual("BTCUSDT", s5["proven_protocol_issues"][0]["symbol"])
 
+    def test_anchor_unverified_window_does_not_starve_subsequent_windows_and_wakes_on_predecessor_checkpoint(self):
+        """Review Round 4 P1:
+        Reproduce 3+ consecutive catch-up runs when the earliest ready window W0 returns
+        anchor_unverified: W0 must be deferred while its predecessor checkpoint is unchanged so
+        subsequent ready windows W1, W2 advance every run instead of starving; and as soon as a
+        predecessor produces a new checkpoint, the deferred window wakes up and promotes to passed.
+        """
+        import json
+        from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
+        import tokyo_l2_recurring_qa as recurring
+
+        w0 = 1_795_276_800  # 16:00Z (anchor_unverified, no predecessor)
+        w1 = w0 + 900       # 16:15Z (passes & writes full checkpoint)
+        w2 = w1 + 900       # 16:30Z (passes using w1 checkpoint)
+        w3 = w2 + 900       # 16:45Z (current: initially anchor_unverified, then wakes up once w2 passes!)
+        run_id = "trial15_run"
+        checker_sha = "abc123def456"
+        checker = f"{checker_sha}/rules123"
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {
+                "gate_futures": {
+                    "enabled": True,
+                    "symbols": ["BTC_USDT"],
+                    "channels": ["futures.obu"],
+                }
+            },
+        }
+
+        def make_cand(start):
+            wid = coverage.window_descriptor(start, 15)["window_id"]
+            mf = f"raw/gate_futures/{wid[:10]}/gate_{start}.manifest.json"
+            return {
+                "exchange": "gate_futures",
+                "source_manifest": mf,
+                "source_data": mf.replace(".manifest.json", ".tsv.zst"),
+                "manifest_sha256": f"{start:064x}",
+                "data_sha256": f"{start + 1:064x}",
+                "manifest_bytes": 100,
+                "data_bytes": 200,
+                "planned_start_s": start,
+            }
+
+        cands = [make_cand(w0), make_cand(w1), make_cand(w2), make_cand(w3)]
+        cands_by_start = {c["planned_start_s"]: [c] for c in cands}
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            for c in cands:
+                wid = coverage.window_descriptor(c["planned_start_s"], 15)["window_id"]
+                wpath = (
+                    state / "qa_reports" / "windows" / wid[:10]
+                    / f"{archive._safe_window_filename(wid)}.window.qa.json"
+                )
+                wpath.parent.mkdir(parents=True, exist_ok=True)
+                wpath.write_text(
+                    json.dumps(
+                        {
+                            "qa_status": "passed",
+                            "run_id": run_id,
+                            "partition_minutes": 15,
+                            "checker_commit_sha": checker_sha,
+                            "files": [c["source_manifest"]],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            round_calls: list[list[int]] = []
+
+            def fake_audit(_remote, _cfg, _rid, start, window, _replay_s, _warmup, **kw):
+                round_calls[-1].append(start)
+                ckpt = kw.get("checkpoint") or []
+                if start == w0:
+                    return {
+                        "status": "anchor_unverified",
+                        "run_id": run_id,
+                        "window_id": window,
+                        "protocol_status": "anchor_unverified",
+                        "target_inputs": recurring.input_digests(cands_by_start[start]),
+                        "protocol": {"frames": [], "issues": []},
+                        "unanchored_lookback_markets": [{"exchange": "gate_futures", "symbol": "BTCUSDT"}],
+                        "end_sequence_checkpoint": [],
+                        "replay": {},
+                    }
+                if start == w3 and not ckpt:
+                    return {
+                        "status": "anchor_unverified",
+                        "run_id": run_id,
+                        "window_id": window,
+                        "protocol_status": "anchor_unverified",
+                        "target_inputs": recurring.input_digests(cands_by_start[start]),
+                        "protocol": {"frames": [], "issues": []},
+                        "unanchored_lookback_markets": [{"exchange": "gate_futures", "symbol": "BTCUSDT"}],
+                        "end_sequence_checkpoint": [],
+                        "replay": {},
+                    }
+                return {
+                    "status": "passed",
+                    "run_id": run_id,
+                    "window_id": window,
+                    "protocol_status": "passed",
+                    "target_inputs": recurring.input_digests(cands_by_start[start]),
+                    "protocol": {"frames": [], "issues": []},
+                    "unanchored_lookback_markets": [],
+                    "end_sequence_checkpoint": [
+                        {"exchange": "gate_futures", "symbol": "BTCUSDT", "connection": ["boot", "B", 1], "seq": start, "awaiting_delta": False}
+                    ],
+                    "replay": {},
+                }
+
+            with patch.object(recurring, "verified_candidates", return_value=cands), \
+                 patch.object(recurring, "audit_window", side_effect=fake_audit):
+                # Round 1 (max_catchup=1): checks current W3 (anchor_unverified) and earliest W0 (anchor_unverified).
+                round_calls.append([])
+                r1 = recurring.run("qa:", cfg, run_id, w0, w3, state, checker, max_catchup=1)
+                self.assertEqual([w3, w0], round_calls[-1])
+                self.assertEqual("anchor_unverified", r1["status"])
+
+                # Round 2: W0 & W3 are deferred -> MUST advance to W1 instead of re-picking W0!
+                round_calls.append([])
+                r2 = recurring.run("qa:", cfg, run_id, w0, w3, state, checker, max_catchup=1)
+                self.assertEqual([w1], round_calls[-1])
+                self.assertIn(coverage.window_descriptor(w1, 15)["window_id"], r2["historical_passed_windows"])
+                self.assertEqual("anchor_unverified", r2["status"])
+
+                # Round 3: W0 still deferred, W1 passed -> MUST advance to W2!
+                round_calls.append([])
+                r3 = recurring.run("qa:", cfg, run_id, w0, w3, state, checker, max_catchup=1)
+                self.assertEqual([w2], round_calls[-1])
+                self.assertIn(coverage.window_descriptor(w2, 15)["window_id"], r3["historical_passed_windows"])
+
+                # Round 4: W2 now produced a new checkpoint -> W3 AUTOMATICALLY wakes up and promotes to passed!
+                round_calls.append([])
+                r4 = recurring.run("qa:", cfg, run_id, w0, w3, state, checker, max_catchup=1)
+                self.assertEqual([w3], round_calls[-1])
+                self.assertEqual("passed", r4["status"])
+                self.assertEqual("passed", r4["protocol_status"])
+                self.assertEqual(0, r4["pending_ready_windows"])
+                self.assertEqual([coverage.window_descriptor(w0, 15)["window_id"]], r4["deferred_anchor_unverified_windows"])
+
 
 if __name__ == "__main__":
     unittest.main()

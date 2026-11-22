@@ -21,11 +21,28 @@ def read_report(path):
         return {}
 
 
-def plan_windows(ready, recorded, current, *, max_catchup=1):
+def plan_windows(ready, recorded, current, *, max_catchup=1, deferred=None):
     # Prioritize the notified target / latest due window, then bounded oldest-first catch-up.
-    backlog = sorted(set(ready) - set(recorded) - {current})
+    # Windows in `deferred` (e.g. anchor_unverified awaiting a new predecessor checkpoint) are
+    # skipped so they never starve subsequent ready windows.
+    skip = set(recorded) | set(deferred or ())
+    backlog = sorted(set(ready) - skip - {current})
     budget = max(0, int(max_catchup))
-    return ([current] if current in ready and current not in recorded else []) + backlog[:budget]
+    return ([current] if current in ready and current not in skip else []) + backlog[:budget]
+
+
+def _checkpoint_digest(checkpoint):
+    norm = sorted(
+        (
+            str(r.get("exchange") or ""),
+            str(r.get("symbol") or ""),
+            list(r.get("connection") or []),
+            r.get("seq"),
+            bool(r.get("awaiting_delta")),
+        )
+        for r in (checkpoint or ())
+    )
+    return sha256(json.dumps(norm, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def _window_archive_revision(items, run_id, window_id, pm):
@@ -132,6 +149,7 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             "historical_checked_windows": [],
             "historical_passed_windows": [],
             "historical_anchor_unverified_windows": [],
+            "deferred_anchor_unverified_windows": [],
             "historical_failed_windows": [],
             "pending_ready_windows": 0,
             "started_at_utc": started_at_utc,
@@ -162,10 +180,11 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
                 and summary.get("checker_commit_sha") == checker.split("/", 1)[0]
                 and set(summary.get("files") or []) == {item["source_manifest"] for item in groups[start]})
 
-    ready = [s for s in groups if cutover <= s and archived_window_passed(s)]
+    ready = sorted(s for s in groups if cutover <= s and archived_window_passed(s))
     expected_depth_markets = _expected_depth_markets(config)
     current_report = {}
     reports = {}
+    deferred_unverified = {}
     checkpoints_by_start = {}
     revisions = {}
     for start in ready:
@@ -185,18 +204,23 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             checkpoints_by_start[start] = list(proof["end_sequence_checkpoint"])
         if identity_ok and proof.get("status") in {"passed", "data_failed"}:
             reports[start] = proof
+        elif identity_ok and proof.get("status") == "anchor_unverified":
+            available_prev_digest = _checkpoint_digest(checkpoints_by_start.get(start - step))
+            if proof.get("input_checkpoint_digest") == available_prev_digest:
+                # Same inputs and same predecessor checkpoint -> defer so later ready windows are not starved.
+                deferred_unverified[start] = proof
 
-    reused_current_result = current in reports
     eff_max_catchup = (
         int(max_catchup)
         if max_catchup is not None
         else (4 if trigger_mode == "schedule_catchup" else 1)
     )
     checked_windows = []
-    for start in plan_windows(ready, reports, current, max_catchup=eff_max_catchup):
+    for start in plan_windows(ready, reports, current, max_catchup=eff_max_catchup, deferred=deferred_unverified):
         replay_seconds = 660 if start % 3600 == 0 else 0
-        previous = reports.get(start - step, {})
+        previous = reports.get(start - step) or deferred_unverified.get(start - step) or {}
         checkpoint = list(previous.get("end_sequence_checkpoint") or checkpoints_by_start.get(start - step) or [])
+        input_ckpt_digest = _checkpoint_digest(checkpoint)
         covered_markets = {(row["exchange"], row["symbol"]) for row in checkpoint}
         all_markets_covered = bool(expected_depth_markets) and expected_depth_markets.issubset(covered_markets)
         warmup_windows = 1 if (replay_seconds or not all_markets_covered) else 0
@@ -208,25 +232,34 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             checker=checker,
             archive_revision=revisions.get(start),
             previous_inputs=input_digests(groups[start - step]),
+            input_checkpoint_digest=input_ckpt_digest,
             completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         archive._atomic_write_json(report_path(start), report)
         if report.get("end_sequence_checkpoint"):
             checkpoints_by_start[start] = list(report["end_sequence_checkpoint"])
-        reports[start] = report
+        if report.get("status") == "anchor_unverified":
+            deferred_unverified[start] = report
+            reports.pop(start, None)
+        else:
+            reports[start] = report
+            deferred_unverified.pop(start, None)
         checked_windows.append(wid(start))
 
-    current_report = reports.get(current, {})
+    all_known = {**deferred_unverified, **reports}
+    current_report = all_known.get(current, {})
+    reused_current_result = current in all_known and wid(current) not in checked_windows
     diag = _summarize_protocol_diagnostics(current_report)
     # Use the most recent due hourly sample for visibility even on intervening windows.
     latest_hour = current - current % 3600
-    hourly = reports.get(latest_hour, {})
-    historical_passed = [wid(start) for start, report in sorted(reports.items())
+    hourly = all_known.get(latest_hour, {})
+    historical_passed = [wid(start) for start, report in sorted(all_known.items())
                          if start != current and report.get("status") == "passed"]
-    historical_unverified = [wid(start) for start, report in sorted(reports.items())
+    historical_unverified = [wid(start) for start, report in sorted(all_known.items())
                              if start != current and report.get("status") == "anchor_unverified"]
-    historical = [wid(start) for start, report in sorted(reports.items())
+    historical = [wid(start) for start, report in sorted(all_known.items())
                   if start != current and report.get("status") == "data_failed"]
+    deferred_windows = [wid(start) for start in sorted(deferred_unverified)]
     completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     out = {
         "status": current_report.get("status", "pending"),
@@ -246,8 +279,9 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         "historical_checked_windows": [w for w in checked_windows if w != wid(current)],
         "historical_passed_windows": historical_passed,
         "historical_anchor_unverified_windows": historical_unverified,
+        "deferred_anchor_unverified_windows": deferred_windows,
         "historical_failed_windows": historical,
-        "pending_ready_windows": len(set(ready) - {s for s, r in reports.items() if r.get("status") in {"passed", "data_failed"}}),
+        "pending_ready_windows": len(set(ready) - set(reports) - set(deferred_unverified)),
         "started_at_utc": started_at_utc,
         "completed_at_utc": completed_at_utc,
     }
