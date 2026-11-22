@@ -45,6 +45,7 @@ DEFAULT_GITHUB_API_BASE = "https://api.github.com"
 DEFAULT_GITHUB_REPO = "Huhabubu/mm"
 DEFAULT_WORKFLOW_FILE = "tokyo-l2-incremental-qa.yml"
 DEFAULT_WORKFLOW_REF = "main"
+DEFAULT_QA_SOURCE_REF = "feat/tokyo-l2-reliability-fixes"
 DEFAULT_QA_STATE_BRANCH = "tokyo-l2-qa-state"
 DEFAULT_TOKEN_ENV = "TOKYO_L2_GITHUB_QA_DISPATCH_TOKEN"
 DEFAULT_CONNECT_TIMEOUT_S = 5.0
@@ -55,6 +56,11 @@ DEFAULT_AUTH_BACKOFF_S = 300.0
 DEFAULT_ACCEPTED_STALE_TIMEOUT_S = 1800.0
 DEFAULT_MAX_DISPATCHES_PER_RUN = 2
 
+_PROTOCOL_RULE_SCRIPT_PATHS = (
+    "scripts/tokyo_l2_protocol_qa.py",
+    "scripts/tokyo_l2_replay_qa.py",
+    "scripts/tokyo_l2_recurring_qa.py",
+)
 _TERMINAL_ARCHIVE_QA_STATUSES = frozenset({"passed", "failed", "needs_review"})
 _TERMINAL_PROTOCOL_QA_STATUSES = frozenset({"passed", "data_failed"})
 
@@ -275,6 +281,20 @@ def _protocol_report_rel_path(record: dict[str, Any]) -> str:
     return f"qa_reports/protocol/{run_hash}/{pm}m/{_safe_report_name(wid)}.json"
 
 
+def compute_protocol_rules_sha(script_bytes_by_rel_path: dict[str, bytes]) -> str:
+    """Compute the exact `rules_sha` produced by `.github/workflows/tokyo-l2-incremental-qa.yml`:
+    `sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum`.
+    """
+    lines: list[str] = []
+    for rel in _PROTOCOL_RULE_SCRIPT_PATHS:
+        raw = script_bytes_by_rel_path.get(rel)
+        if raw is None:
+            raise KeyError(f"Missing protocol rule script bytes for {rel}")
+        digest = hashlib.sha256(raw).hexdigest()
+        lines.append(f"{digest}  workflow_code/{rel}\n")
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+
+
 def evaluate_qa_reports_for_record(
     record: dict[str, Any],
     *,
@@ -286,10 +306,10 @@ def evaluate_qa_reports_for_record(
 ) -> dict[str, Any] | None:
     """Verify whether persisted QA reports satisfy `(run_id, target_window_utc, archive_revision, checker)`.
 
-    Returns a completion dict (`qa_result_status`, `qa_completed_at_utc`, etc.) only when a
-    matching terminal result is proven across batch, window, archive revision, and checker version;
-    returns `None` if results are missing, non-terminal, lack required identity fields, or belong
-    to an older/mismatched checker or revision.
+    Fail-closed by default: refuses to mark a dispatch completed unless the expected checker
+    commit (and full `<checker_commit>/<rules_sha>` when `require_protocol_report=True`) is
+    explicitly bound and strictly matched by both persisted reports. Two mutually consistent
+    reports from an older checker or older protocol rules can never close the record.
     """
     if not isinstance(window_report, dict):
         return None
@@ -297,6 +317,22 @@ def evaluate_qa_reports_for_record(
     exp_wid = str(record.get("target_window_utc") or "").strip()
     exp_rev = str(record.get("archive_revision") or "").strip()
     if not exp_wid or not exp_rev:
+        return None
+
+    exp_commit_arg = str(expected_checker_commit or "").strip()
+    exp_proto_checker = str(expected_protocol_checker or "").strip()
+    exp_proto_commit, exp_proto_sep, exp_proto_rules = exp_proto_checker.partition("/")
+    exp_proto_commit = exp_proto_commit.strip()
+    exp_proto_rules = exp_proto_rules.strip()
+
+    if exp_commit_arg and exp_proto_commit and exp_commit_arg != exp_proto_commit:
+        return None
+    eff_expected_commit = exp_commit_arg or exp_proto_commit
+    if not eff_expected_commit:
+        # Fail closed: never accept reports without an explicitly bound expected checker commit.
+        return None
+    if require_protocol_report and not (exp_proto_commit and exp_proto_sep and exp_proto_rules):
+        # Fail closed: when protocol QA is required, BOTH checker commit and rules_sha must be bound.
         return None
 
     rep_run_id = str(window_report.get("run_id") or "").strip()
@@ -307,17 +343,8 @@ def evaluate_qa_reports_for_record(
 
     if rep_run_id != exp_run_id or rep_wid != exp_wid or not rep_rev or rep_rev != exp_rev:
         return None
-    if not win_checker:
+    if not win_checker or win_checker != eff_expected_commit:
         return None
-
-    exp_commit = str(expected_checker_commit or "").strip()
-    exp_proto_checker = str(expected_protocol_checker or "").strip()
-    if exp_commit and win_checker != exp_commit:
-        return None
-    if exp_proto_checker:
-        exp_proto_commit = exp_proto_checker.split("/", 1)[0].strip()
-        if exp_proto_commit and win_checker != exp_proto_commit:
-            return None
 
     if win_status not in _TERMINAL_ARCHIVE_QA_STATUSES:
         return None
@@ -330,7 +357,7 @@ def evaluate_qa_reports_for_record(
             "checker_commit_sha": win_checker,
         }
 
-    # Archive window QA passed; strictly verify protocol QA report identity and checker version.
+    # Archive window QA passed; strictly verify protocol QA report identity and checker/rules version.
     proto_ok = False
     proto_status: str | None = None
     if isinstance(protocol_report, dict):
@@ -341,14 +368,10 @@ def evaluate_qa_reports_for_record(
         p_checker_full = str(protocol_report.get("checker") or "").strip()
         p_checker_commit = p_checker_full.split("/", 1)[0].strip()
 
-        checker_matches = bool(p_checker_full) and p_checker_commit == win_checker
-        if checker_matches and exp_commit:
-            checker_matches = p_checker_commit == exp_commit
-        if checker_matches and exp_proto_checker:
-            if "/" in exp_proto_checker:
-                checker_matches = p_checker_full == exp_proto_checker
-            else:
-                checker_matches = p_checker_commit == exp_proto_checker
+        if exp_proto_sep and exp_proto_rules:
+            checker_matches = p_checker_full == f"{eff_expected_commit}/{exp_proto_rules}"
+        else:
+            checker_matches = bool(p_checker_full) and p_checker_commit == eff_expected_commit
 
         if (
             p_status in _TERMINAL_PROTOCOL_QA_STATUSES
@@ -417,10 +440,69 @@ def make_state_dir_result_fetcher(
     return _fetch
 
 
+def resolve_expected_checker_from_github(
+    *,
+    repo: str,
+    source_ref: str = DEFAULT_QA_SOURCE_REF,
+    workflow_ref: str = DEFAULT_WORKFLOW_REF,
+    api_base: str = DEFAULT_GITHUB_API_BASE,
+    token: str | None = None,
+    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
+    total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
+    http_get: HttpGetFn | None = None,
+    include_protocol_rules: bool = True,
+) -> tuple[str, str | None]:
+    """Resolve current `(checker_commit_sha, '<checker_commit_sha>/<rules_sha>' | None)` from GitHub."""
+    getter = http_get or default_http_get
+
+    def _get(url: str, accept: str) -> HttpDispatchResponse:
+        base_hdrs = {
+            "Accept": accept,
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "tokyo-l2-qa-dispatcher/1.0",
+        }
+        hdrs = dict(base_hdrs)
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
+        resp = getter(url, hdrs, connect_timeout_s, total_timeout_s)
+        if resp.status_code == 403 and token:
+            resp = getter(url, dict(base_hdrs), connect_timeout_s, total_timeout_s)
+        return resp
+
+    commit_url = f"{api_base.rstrip('/')}/repos/{repo}/commits/{quote(source_ref, safe='')}"
+    c_resp = _get(commit_url, "application/vnd.github+json")
+    if not (200 <= c_resp.status_code < 300):
+        raise RuntimeError(f"Failed to resolve checker commit for {repo}@{source_ref}: HTTP {c_resp.status_code}")
+    c_obj = json.loads(c_resp.body)
+    checker_commit = str((c_obj or {}).get("sha") or "").strip()
+    if not checker_commit:
+        raise RuntimeError(f"Empty checker commit SHA returned for {repo}@{source_ref}")
+
+    if not include_protocol_rules:
+        return checker_commit, None
+
+    scripts_bytes: dict[str, bytes] = {}
+    for rel in _PROTOCOL_RULE_SCRIPT_PATHS:
+        s_url = (
+            f"{api_base.rstrip('/')}/repos/{repo}/contents/{quote(rel, safe='/')}"
+            f"?ref={quote(workflow_ref, safe='')}"
+        )
+        s_resp = _get(s_url, "application/vnd.github.raw+json")
+        if not (200 <= s_resp.status_code < 300):
+            raise RuntimeError(
+                f"Failed to resolve protocol rule script {rel}@{workflow_ref}: HTTP {s_resp.status_code}"
+            )
+        scripts_bytes[rel] = s_resp.body.encode("utf-8")
+    rules_sha = compute_protocol_rules_sha(scripts_bytes)
+    return checker_commit, f"{checker_commit}/{rules_sha}"
+
+
 def make_github_result_fetcher(
     *,
     repo: str,
     state_branch: str = DEFAULT_QA_STATE_BRANCH,
+    source_ref: str = DEFAULT_QA_SOURCE_REF,
+    workflow_ref: str = DEFAULT_WORKFLOW_REF,
     api_base: str = DEFAULT_GITHUB_API_BASE,
     token: str | None = None,
     connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
@@ -432,6 +514,9 @@ def make_github_result_fetcher(
 ) -> QaResultFetcherFn:
     """Fetch persisted window/protocol QA JSON reports from GitHub's state branch via Contents API.
 
+    If `expected_checker_commit` / `expected_protocol_checker` are not explicitly pinned, lazily
+    resolves the current `(checker_commit_sha, '<commit>/<rules_sha>')` from `source_ref` and
+    `workflow_ref` on GitHub so stale reports from older checkers/rules can never close an entry.
     On public repos where the notifier's fine-grained PAT is strictly scoped to `Actions: write`
     (without `Contents: read`), automatically falls back from authenticated GET (403) to
     unauthenticated GET.
@@ -442,6 +527,41 @@ def make_github_result_fetcher(
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "tokyo-l2-qa-dispatcher/1.0",
     }
+    resolved_cache: dict[str, str | None] = {
+        "initialized": None,
+        "commit": str(expected_checker_commit or "").strip() or None,
+        "protocol_checker": str(expected_protocol_checker or "").strip() or None,
+    }
+
+    def _ensure_expected_checker() -> tuple[str | None, str | None]:
+        if resolved_cache["initialized"] is not None:
+            return resolved_cache["commit"], resolved_cache["protocol_checker"]
+        commit = resolved_cache["commit"]
+        proto_chk = resolved_cache["protocol_checker"]
+        needs_proto = require_protocol_report and not (
+            proto_chk and "/" in proto_chk and all(part.strip() for part in proto_chk.split("/", 1))
+        )
+        needs_commit = not commit and not (proto_chk and proto_chk.split("/", 1)[0].strip())
+        if needs_commit or needs_proto:
+            r_commit, r_proto = resolve_expected_checker_from_github(
+                repo=repo,
+                source_ref=source_ref,
+                workflow_ref=workflow_ref,
+                api_base=api_base,
+                token=token,
+                connect_timeout_s=connect_timeout_s,
+                total_timeout_s=total_timeout_s,
+                http_get=getter,
+                include_protocol_rules=require_protocol_report,
+            )
+            if needs_commit:
+                commit = r_commit
+            if needs_proto:
+                proto_chk = r_proto
+        resolved_cache["commit"] = commit
+        resolved_cache["protocol_checker"] = proto_chk
+        resolved_cache["initialized"] = "1"
+        return commit, proto_chk
 
     def _get_json(rel_path: str) -> dict[str, Any] | None:
         encoded_path = quote(rel_path, safe="/")
@@ -460,6 +580,7 @@ def make_github_result_fetcher(
         raise RuntimeError(f"GitHub state read failed for {rel_path}: HTTP {resp.status_code}")
 
     def _fetch(record: dict[str, Any]) -> dict[str, Any] | None:
+        exp_commit, exp_proto = _ensure_expected_checker()
         win_rep: dict[str, Any] | None = None
         for rel in _window_report_rel_paths(record):
             win_rep = _get_json(rel)
@@ -475,8 +596,8 @@ def make_github_result_fetcher(
             window_report=win_rep,
             protocol_report=proto_rep,
             require_protocol_report=require_protocol_report,
-            expected_checker_commit=expected_checker_commit,
-            expected_protocol_checker=expected_protocol_checker,
+            expected_checker_commit=exp_commit,
+            expected_protocol_checker=exp_proto,
         )
 
     return _fetch
@@ -749,6 +870,7 @@ def dispatch_pending_qa(
     http_get: HttpGetFn | None = None,
     qa_state_dir: Path | None = None,
     qa_state_branch: str | None = None,
+    qa_source_ref: str | None = None,
     accepted_stale_timeout_s: float | None = None,
     require_protocol_report: bool | None = None,
     expected_checker_commit: str | None = None,
@@ -764,6 +886,9 @@ def dispatch_pending_qa(
     eff_repo = (repo or os.environ.get("TOKYO_L2_GITHUB_REPO") or DEFAULT_GITHUB_REPO).strip()
     eff_workflow = (workflow_file or os.environ.get("TOKYO_L2_GITHUB_QA_WORKFLOW") or DEFAULT_WORKFLOW_FILE).strip()
     eff_ref = (ref or os.environ.get("TOKYO_L2_GITHUB_QA_REF") or DEFAULT_WORKFLOW_REF).strip()
+    eff_source_ref = (
+        qa_source_ref or os.environ.get("TOKYO_L2_GITHUB_QA_SOURCE_REF") or DEFAULT_QA_SOURCE_REF
+    ).strip()
     eff_state_branch = (
         qa_state_branch or os.environ.get("TOKYO_L2_GITHUB_QA_STATE_BRANCH") or DEFAULT_QA_STATE_BRANCH
     ).strip()
@@ -856,6 +981,8 @@ def dispatch_pending_qa(
                     eff_fetcher = make_github_result_fetcher(
                         repo=eff_repo,
                         state_branch=eff_state_branch,
+                        source_ref=eff_source_ref,
+                        workflow_ref=eff_ref,
                         api_base=api_base,
                         token=eff_token or None,
                         connect_timeout_s=connect_timeout_s,
@@ -878,6 +1005,10 @@ def dispatch_pending_qa(
                     reconciliation = {
                         "enabled": True,
                         "source": reconcile_source,
+                        "source_ref": eff_source_ref,
+                        "workflow_ref": eff_ref,
+                        "expected_checker_commit": eff_expected_checker_commit,
+                        "expected_protocol_checker": eff_expected_protocol_checker,
                         "require_protocol_report": eff_require_protocol,
                         "accepted_stale_timeout_s": eff_stale_timeout_s,
                         **reconcile_res,
@@ -1290,10 +1421,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-backoff", type=float, default=DEFAULT_MAX_BACKOFF_S)
     parser.add_argument("--qa-state-dir", type=Path, default=None, help="Optional local QA state checkout for result reconciliation")
     parser.add_argument("--qa-state-branch", default=None, help="GitHub QA state branch for result reconciliation (default: tokyo-l2-qa-state)")
+    parser.add_argument("--qa-source-ref", default=None, help="GitHub collector source ref used to resolve current checker commit SHA (default: feat/tokyo-l2-reliability-fixes)")
     parser.add_argument("--accepted-stale-timeout", type=float, default=None, help="Requeue ACCEPTED entries missing final QA reports after N seconds (default: 1800)")
     parser.add_argument("--require-protocol-report", action="store_true", default=None, help="Require persisted protocol QA report in addition to window QA report before marking QA_COMPLETED")
-    parser.add_argument("--expected-checker-commit", default=None, help="Optional required checker_commit_sha for reconciliation")
-    parser.add_argument("--expected-protocol-checker", default=None, help="Optional required full protocol checker (<commit>/<rules_sha>) for reconciliation")
+    parser.add_argument("--expected-checker-commit", default=None, help="Optional pinned checker_commit_sha for reconciliation (auto-resolved from GitHub --qa-source-ref when omitted)")
+    parser.add_argument("--expected-protocol-checker", default=None, help="Optional pinned full protocol checker (<commit>/<rules_sha>) for reconciliation (auto-resolved from GitHub when omitted)")
     parser.add_argument("--no-reconcile", action="store_true", help="Skip reconciling ACCEPTED entries against persisted QA reports")
     parser.add_argument("--require-token", action="store_true", help="Exit non-zero if dispatch token is unset")
     parser.add_argument("--status-only", action="store_true", help="Print outbox status JSON without sending requests")
@@ -1329,6 +1461,7 @@ def main(argv: list[str] | None = None) -> int:
         max_backoff_s=args.max_backoff,
         qa_state_dir=args.qa_state_dir,
         qa_state_branch=args.qa_state_branch,
+        qa_source_ref=args.qa_source_ref,
         accepted_stale_timeout_s=args.accepted_stale_timeout,
         require_protocol_report=args.require_protocol_report,
         expected_checker_commit=args.expected_checker_commit,

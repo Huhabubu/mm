@@ -1187,6 +1187,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
             qa_state_dir=state_dir,
             accepted_stale_timeout_s=1800,
             require_protocol_report=True,
+            expected_protocol_checker="commit_p2/rules_v1",
             recover_from_index=False,
         )
         assert r_rec["reconciliation"]["completed_count"] == 1
@@ -1253,6 +1254,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
             qa_state_dir=state_dir,
             accepted_stale_timeout_s=1800,
             require_protocol_report=True,
+            expected_protocol_checker="commit_p2/rules_v1",
             recover_from_index=False,
         )
         assert r_final["reconciliation"]["completed_count"] == 1
@@ -1262,15 +1264,31 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
         assert sent_windows == []
         assert r_final["outbox_counts"] == {"PENDING": 0, "ACCEPTED": 0, "QA_COMPLETED": 2}
 
-        # Verify GitHub Contents API fetcher handles Actions-only PAT HTTP 403 -> unauthenticated fallback -> 200.
+        # Verify GitHub Contents API fetcher:
+        # - Automatically resolves live (checker_commit_sha, rules_sha) from source_ref + workflow_ref
+        # - Handles Actions-only PAT HTTP 403 -> unauthenticated fallback -> 200
+        # - Rejects two mutually consistent reports from an OLDER checker/rules version!
+        script_bodies = {
+            "scripts/tokyo_l2_protocol_qa.py": b"# protocol rules v2\n",
+            "scripts/tokyo_l2_replay_qa.py": b"# replay rules v2\n",
+            "scripts/tokyo_l2_recurring_qa.py": b"# recurring rules v2\n",
+        }
+        expected_rules_sha = qd.compute_protocol_rules_sha(script_bodies)
         get_calls: list[tuple[str, bool]] = []
+        serve_stale_pair = {"flag": True}
 
         def fake_github_get(url: str, hdrs: dict[str, str], _ct: float, _tt: float):
             has_auth = "Authorization" in hdrs
             get_calls.append((url, has_auth))
             if has_auth:
                 return qd.HttpDispatchResponse(403, {}, '{"message":"Resource not accessible by personal access token"}')
+            if "/commits/" in url:
+                return qd.HttpDispatchResponse(200, {}, json.dumps({"sha": "commit_p2"}))
+            for rel, raw in script_bodies.items():
+                if f"/contents/{rel}?ref=main" in url:
+                    return qd.HttpDispatchResponse(200, {}, raw.decode("utf-8"))
             if url.endswith(".window.qa.json?ref=tokyo-l2-qa-state"):
+                chk = "commit_old" if serve_stale_pair["flag"] else "commit_p2"
                 return qd.HttpDispatchResponse(
                     200,
                     {},
@@ -1280,22 +1298,23 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
                             "window_id": wid1,
                             "archive_revision": rev1,
                             "qa_status": "passed",
-                            "checker_commit_sha": "commit_p2",
+                            "checker_commit_sha": chk,
                         }
                     ),
                 )
             if "/qa_reports/protocol/" in url:
+                chk = "commit_old/old_rules" if serve_stale_pair["flag"] else f"commit_p2/{expected_rules_sha}"
                 return qd.HttpDispatchResponse(
                     200,
                     {},
                     json.dumps(
                         {
-                            "status": "data_failed",
-                            "protocol_status": "failed",
+                            "status": "passed" if serve_stale_pair["flag"] else "data_failed",
+                            "protocol_status": "passed" if serve_stale_pair["flag"] else "failed",
                             "run_id": run_id,
                             "window_id": wid1,
                             "archive_revision": rev1,
-                            "checker": "commit_p2/rules_v1",
+                            "checker": chk,
                             "completed_at_utc": "2026-11-21T14:35:00Z",
                         }
                     ),
@@ -1309,17 +1328,25 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
             http_get=fake_github_get,
             require_protocol_report=True,
         )
+        # Even though both old window + old protocol reports agree on commit_old, auto-resolved
+        # live checker binding MUST reject them!
+        assert gh_fetcher(by_wid[wid1]) is None
+
+        # Once reports match the live resolved commit_p2 + expected_rules_sha, reconciliation accepts!
+        serve_stale_pair["flag"] = False
         verdict = gh_fetcher(by_wid[wid1])
         assert verdict is not None
         assert verdict["qa_result_status"] == "protocol_failed"
+        assert verdict["protocol_checker"] == f"commit_p2/{expected_rules_sha}"
         assert verdict["qa_completed_at_utc"] == "2026-11-21T14:35:00Z"
         assert any(auth for _, auth in get_calls)
         assert any(not auth for _, auth in get_calls)
 
 
 def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_reports():
-    """Review Round 3 #1:
-    Reconciliation MUST NOT prematurely mark a record completed when:
+    """Review Round 3 #1 & Round 4 P2:
+    Reconciliation MUST fail closed and MUST NOT prematurely mark a record completed when:
+      0. Expected checker commit / protocol rules version is left unbound (even if both reports match each other!),
       1. Protocol report omits archive_revision (None or ''),
       2. Protocol report omits checker or comes from an older checker commit than window_report,
       3. Window/protocol reports come from an older checker commit or rules_sha than expected,
@@ -1337,20 +1364,7 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
         "checker_commit_sha": "commit_new",
         "qa_status": "passed",
     }
-
-    # 1. Missing archive_revision in protocol report -> MUST return None even with require_protocol_report=True!
-    proto_no_rev = {
-        "status": "passed",
-        "protocol_status": "passed",
-        "run_id": rec["run_id"],
-        "window_id": rec["target_window_utc"],
-        "checker": "commit_new/rules_v2",
-    }
-    assert qd.evaluate_qa_reports_for_record(
-        rec, window_report=good_win, protocol_report=proto_no_rev, require_protocol_report=True
-    ) is None
-
-    # 2. Older checker commit in protocol report than window_report -> MUST return None!
+    old_win = dict(good_win, checker_commit_sha="commit_old")
     proto_old_checker = {
         "status": "passed",
         "protocol_status": "passed",
@@ -1359,8 +1373,53 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
         "archive_revision": rec["archive_revision"],
         "checker": "commit_old/rules_v1",
     }
+
+    # 0. Review Round 4 P2: two mutually consistent OLD reports with default empty expected checker -> MUST return None!
     assert qd.evaluate_qa_reports_for_record(
-        rec, window_report=good_win, protocol_report=proto_old_checker, require_protocol_report=True
+        rec, window_report=old_win, protocol_report=proto_old_checker, require_protocol_report=True
+    ) is None
+    assert qd.evaluate_qa_reports_for_record(
+        rec, window_report=old_win, protocol_report=proto_old_checker, require_protocol_report=False
+    ) is None
+    # With require_protocol_report=True, binding ONLY commit without rules_sha -> MUST also return None!
+    assert qd.evaluate_qa_reports_for_record(
+        rec,
+        window_report=good_win,
+        protocol_report={
+            "status": "passed",
+            "protocol_status": "passed",
+            "run_id": rec["run_id"],
+            "window_id": rec["target_window_utc"],
+            "archive_revision": rec["archive_revision"],
+            "checker": "commit_new/rules_v1",
+        },
+        require_protocol_report=True,
+        expected_checker_commit="commit_new",
+    ) is None
+
+    # 1. Missing archive_revision in protocol report -> MUST return None even with bound expected_protocol_checker!
+    proto_no_rev = {
+        "status": "passed",
+        "protocol_status": "passed",
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "checker": "commit_new/rules_v2",
+    }
+    assert qd.evaluate_qa_reports_for_record(
+        rec,
+        window_report=good_win,
+        protocol_report=proto_no_rev,
+        require_protocol_report=True,
+        expected_protocol_checker="commit_new/rules_v2",
+    ) is None
+
+    # 2. Older checker commit in protocol report than window_report -> MUST return None!
+    assert qd.evaluate_qa_reports_for_record(
+        rec,
+        window_report=good_win,
+        protocol_report=proto_old_checker,
+        require_protocol_report=True,
+        expected_protocol_checker="commit_new/rules_v2",
     ) is None
 
     # 3. Missing checker in protocol report -> MUST return None!
@@ -1372,17 +1431,21 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
         "archive_revision": rec["archive_revision"],
     }
     assert qd.evaluate_qa_reports_for_record(
-        rec, window_report=good_win, protocol_report=proto_no_checker, require_protocol_report=True
+        rec,
+        window_report=good_win,
+        protocol_report=proto_no_checker,
+        require_protocol_report=True,
+        expected_protocol_checker="commit_new/rules_v2",
     ) is None
 
-    # 4. Both reports on old checker when expected_checker_commit or expected_protocol_checker is newer -> MUST return None!
-    old_win = dict(good_win, checker_commit_sha="commit_old")
+    # 4. Both reports on old checker/rules when expected is newer -> MUST return None!
     assert qd.evaluate_qa_reports_for_record(
         rec,
         window_report=old_win,
         protocol_report=proto_old_checker,
         require_protocol_report=True,
         expected_checker_commit="commit_new",
+        expected_protocol_checker="commit_new/rules_v2",
     ) is None
     proto_old_rules = {
         "status": "passed",
@@ -1404,7 +1467,11 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
     win_no_checker = dict(good_win)
     win_no_checker.pop("checker_commit_sha")
     assert qd.evaluate_qa_reports_for_record(
-        rec, window_report=win_no_checker, protocol_report=proto_old_rules, require_protocol_report=False
+        rec,
+        window_report=win_no_checker,
+        protocol_report=proto_old_rules,
+        require_protocol_report=False,
+        expected_checker_commit="commit_new",
     ) is None
 
     # 6. Non-terminal anchor_unverified protocol report -> MUST return None!
@@ -1417,10 +1484,14 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
         "checker": "commit_new/rules_v2",
     }
     assert qd.evaluate_qa_reports_for_record(
-        rec, window_report=good_win, protocol_report=proto_unverified, require_protocol_report=True
+        rec,
+        window_report=good_win,
+        protocol_report=proto_unverified,
+        require_protocol_report=True,
+        expected_protocol_checker="commit_new/rules_v2",
     ) is None
 
-    # 7. All four dimensions (run_id, window_id, archive_revision, checker) match -> completes!
+    # 7. All four dimensions (run_id, window_id, archive_revision, bound checker+rules) match -> completes!
     proto_ok = {
         "status": "passed",
         "protocol_status": "passed",

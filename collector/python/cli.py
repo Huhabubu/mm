@@ -708,6 +708,7 @@ def cmd_qa_dispatch(args: argparse.Namespace) -> int:
         max_backoff_s=args.max_backoff,
         qa_state_dir=args.qa_state_dir,
         qa_state_branch=args.qa_state_branch,
+        qa_source_ref=args.qa_source_ref,
         accepted_stale_timeout_s=args.accepted_stale_timeout,
         require_protocol_report=args.require_protocol_report,
         expected_checker_commit=args.expected_checker_commit,
@@ -786,6 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_disp.add_argument("--max-backoff", type=float, default=900.0)
     p_disp.add_argument("--qa-state-dir", type=Path, default=None)
     p_disp.add_argument("--qa-state-branch", default=None)
+    p_disp.add_argument("--qa-source-ref", default=None)
     p_disp.add_argument("--accepted-stale-timeout", type=float, default=None)
     p_disp.add_argument("--require-protocol-report", action="store_true", default=None)
     p_disp.add_argument("--expected-checker-commit", default=None)
