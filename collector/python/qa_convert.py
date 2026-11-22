@@ -224,6 +224,7 @@ class AssetDayBuffers:
     binance_depth_anchor: dict[str, Any] | None = None
     follower_depth_anchor: dict[str, Any] | None = None
     depth_unavailable_intervals: list[dict[str, Any]] = field(default_factory=list)
+    local_book_clears: list[tuple[int, int]] = field(default_factory=list)
     bridged_delta_records: list[dict[str, Any]] = field(default_factory=list)
     unrebuildable_depth_reasons: list[str] = field(default_factory=list)
     unrebuildable_depth_intervals: list[dict[str, Any]] = field(default_factory=list)
@@ -231,17 +232,20 @@ class AssetDayBuffers:
     depth_recovered_count: int = 0
 
     def emit_book_clear_if_active(self, local_ts: int) -> None:
-        """Emit DEPTH_CLEAR_EVENT when an active book is invalidated so replay never matches stale pre-switch depth."""
+        """Record a LOCAL_EVENT-only DEPTH_CLEAR_EVENT when local depth continuity breaks.
+
+        A local disconnect/switch/rotation did NOT happen on the exchange matching engine, so
+        we must never fabricate an EXCH_EVENT clear with an estimated exchange timestamp (which
+        could sort after a higher-latency new-connection snapshot and wipe the matching book).
+        Instead, only the local view is cleared at exact `local_ts` and edge_samples records an
+        empty-book sentinel so gap-interval quotes/fills are explicitly flagged unverified.
+        """
         if not self.bids and not self.asks:
             return
-        if self.last_exch_ts > 0 and self.last_local_ts > 0:
-            clear_exch_ts = self.last_exch_ts + max(0, local_ts - self.last_local_ts)
-        else:
-            clear_exch_ts = local_ts
-        self.hbt_rows.append((DEPTH_CLEAR_EVENT, clear_exch_ts, local_ts, 0.0, 0.0, 0, 0, 0.0))
+        self.local_book_clears.append((local_ts, len(self.hbt_rows)))
+        self.edge_samples.append((local_ts, float("nan"), float("nan"), float("nan"), float("nan"), 0, 0))
         self.bids.clear()
         self.asks.clear()
-        self.last_exch_ts = max(self.last_exch_ts, clear_exch_ts)
         self.last_local_ts = max(self.last_local_ts, local_ts)
 
     def close_unavailable_interval_on_snapshot(
@@ -404,13 +408,19 @@ def _order_and_validate_hbt_events(
     symbol: str,
     date_utc: str,
     stream_kind: str,
+    local_book_clears: list[tuple[int, int]] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Strip direction flags, run HBT correct_event_order(), and strictly run validate_event_order().
+    """Strip direction flags, run HBT correct_event_order(), merge LOCAL_EVENT-only clears, and validate_event_order().
 
     `hftbacktest.data.validation.correct_event_order()` assigns `EXCH_EVENT` and `LOCAL_EVENT`
     via bitwise OR when splitting out-of-order rows. Any pre-set `EXCH_EVENT | LOCAL_EVENT` bits
     on input rows must be cleared beforehand (while preserving event type and buy/sell side bits)
     so split rows do not erroneously retain both direction flags.
+
+    Local-only clears (recorded on local WS switch/rotation/outage) are merged strictly with
+    `LOCAL_EVENT | DEPTH_CLEAR_EVENT` (never `EXCH_EVENT`) after exchange-event ordering so a
+    local disconnect never synthesizes an exchange-side clear that could invert against a
+    higher-latency snapshot on the new connection.
     """
     first_raw_exch = _find_first_raw_reversal(raw_arr, "exch_ts")
     first_raw_local = _find_first_raw_reversal(raw_arr, "local_ts")
@@ -423,6 +433,35 @@ def _order_and_validate_hbt_events(
         np.argsort(clean["exch_ts"], kind="mergesort"),
         np.argsort(clean["local_ts"], kind="mergesort"),
     )
+    clears = list(local_book_clears or ())
+    if clears:
+        merged_rows: list[tuple[Any, ...]] = []
+        ci = 0
+        local_seen = 0
+        prev_local_ts = -1
+        for row in ordered:
+            is_local = (int(row["ev"]) & int(LOCAL_EVENT)) != 0
+            row_lts = int(row["local_ts"])
+            if is_local:
+                while ci < len(clears) and local_seen >= clears[ci][1]:
+                    emit_lts = max(prev_local_ts, min(clears[ci][0], row_lts))
+                    merged_rows.append(
+                        (int(LOCAL_EVENT | DEPTH_CLEAR_EVENT), 0, emit_lts, 0.0, 0.0, 0, 0, 0.0)
+                    )
+                    prev_local_ts = emit_lts
+                    ci += 1
+            merged_rows.append(tuple(row))
+            if is_local:
+                local_seen += 1
+                prev_local_ts = max(prev_local_ts, row_lts)
+        while ci < len(clears):
+            emit_lts = max(prev_local_ts, clears[ci][0])
+            merged_rows.append(
+                (int(LOCAL_EVENT | DEPTH_CLEAR_EVENT), 0, emit_lts, 0.0, 0.0, 0, 0, 0.0)
+            )
+            prev_local_ts = emit_lts
+            ci += 1
+        ordered = np.array(merged_rows, dtype=event_dtype)
     try:
         validate_event_order(ordered)
     except ValueError as exc:
@@ -435,7 +474,8 @@ def _order_and_validate_hbt_events(
     diag = {
         "input_rows": int(len(raw_arr)),
         "ordered_rows": int(len(ordered)),
-        "split_extra_rows": int(len(ordered) - len(raw_arr)),
+        "split_extra_rows": int(len(ordered) - len(raw_arr) - len(clears)),
+        "local_only_book_clears": int(len(clears)),
         "raw_exch_ts_reversals": int(first_raw_exch["total_reversals"]) if first_raw_exch else 0,
         "raw_local_ts_reversals": int(first_raw_local["total_reversals"]) if first_raw_local else 0,
         "first_raw_exch_reversal": first_raw_exch,
@@ -1570,18 +1610,29 @@ def evaluate_50_level_coverage(
     labeled: list[dict[str, Any]] = []
     visible_cnt = 0
     unknown_cnt = 0
+    depth_unavail_cnt = 0
 
     for q in quotes:
         ts = int(q["ts_ns"])
         side = str(q["side"]).lower()
         px = float(q["price"])
         idx = int(np.searchsorted(edge_ts, ts, side="right")) - 1
+        extra: dict[str, Any] = {}
         if idx < 0:
             cov = "QUEUE_UNKNOWN"
             reason = "before_first_book_snapshot"
         else:
             _, best_bid, edge_bid, best_ask, edge_ask, n_b, n_a = edge_samples[idx]
-            if side == "buy":
+            if (
+                int(n_b) <= 0
+                or int(n_a) <= 0
+                or not math.isfinite(float(best_bid))
+                or not math.isfinite(float(best_ask))
+            ):
+                cov = "DEPTH_UNAVAILABLE"
+                reason = "depth_unavailable_gap"
+                extra["queue_assumption"] = "UNOBSERVABLE_DEPTH_GAP"
+            elif side == "buy":
                 if n_b >= 50 and px < edge_bid - 1e-12:
                     cov = "QUEUE_UNKNOWN"
                     reason = "beyond_50th_bid_level"
@@ -1605,15 +1656,98 @@ def evaluate_50_level_coverage(
             visible_cnt += 1
         else:
             unknown_cnt += 1
-        labeled.append({**q, "depth_coverage": cov, "coverage_reason": reason})
+            if cov == "DEPTH_UNAVAILABLE":
+                depth_unavail_cnt += 1
+        labeled.append({**q, "depth_coverage": cov, "coverage_reason": reason, **extra})
 
     return {
         "total": len(labeled),
         "visible_within_50": visible_cnt,
         "queue_unknown": unknown_cnt,
+        "depth_unavailable": depth_unavail_cnt,
         "queue_unknown_ratio": (unknown_cnt / len(labeled)) if labeled else 0.0,
         "items": labeled,
     }
+
+
+def audit_fills_against_depth_unavailable_intervals(
+    fills: list[dict[str, Any]],
+    depth_unavailable_intervals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Explicitly account for simulated fills (including pre-switch resting orders triggered by
+    public trades) occurring inside `depth_unavailable_intervals`.
+
+    Policy (`retain_raw_fill_and_flag_unverified`, matching SPEC_v1.4):
+    - Never silently drop or selectively filter out fills from raw engine PnL / position accounting.
+    - Any fill whose execution or local-observation timestamp falls within an unavailable depth
+      interval `[start_wall_ns, end_wall_ns)` (or `>= start_wall_ns` if unrecovered) is explicitly
+      tagged `execution_status="depth_unavailable_unverified"` and `queue_assumption="UNOBSERVABLE_DEPTH_GAP"`.
+    - Whenever `unverified_gap_fills > 0`, the overall audit status is `"execution_unverified"`.
+    """
+    labeled: list[dict[str, Any]] = []
+    verified_cnt = 0
+    unverified_cnt = 0
+    unverified_qty = 0.0
+    hit_intervals: list[dict[str, Any]] = []
+    seen_iv_keys: set[tuple[int, int | None]] = set()
+
+    for fill in fills:
+        cand_ts: list[int] = []
+        for k in ("ts_ns", "exch_ts_ns", "local_ts_ns", "observed_ts_ns"):
+            val = fill.get(k)
+            if val is not None and int(val) > 0:
+                cand_ts.append(int(val))
+        matched_iv: dict[str, Any] | None = None
+        for iv in depth_unavailable_intervals:
+            start_ns = int(iv.get("start_wall_ns") or 0)
+            end_raw = iv.get("end_wall_ns")
+            end_ns = int(end_raw) if end_raw is not None else None
+            for t in cand_ts:
+                if t >= start_ns and (end_ns is None or t < end_ns):
+                    matched_iv = iv
+                    break
+            if matched_iv is not None:
+                break
+
+        if matched_iv is not None:
+            unverified_cnt += 1
+            unverified_qty += abs(float(fill.get("qty") or fill.get("exec_qty") or 0.0))
+            iv_key = (
+                int(matched_iv.get("start_wall_ns") or 0),
+                int(matched_iv["end_wall_ns"]) if matched_iv.get("end_wall_ns") is not None else None,
+            )
+            if iv_key not in seen_iv_keys:
+                seen_iv_keys.add(iv_key)
+                hit_intervals.append(matched_iv)
+            labeled.append(
+                {
+                    **fill,
+                    "execution_status": "depth_unavailable_unverified",
+                    "queue_assumption": "UNOBSERVABLE_DEPTH_GAP",
+                    "matched_interval": matched_iv,
+                }
+            )
+        else:
+            verified_cnt += 1
+            labeled.append(
+                {
+                    **fill,
+                    "execution_status": "verified",
+                    "queue_assumption": "OBSERVABLE_BOOK",
+                }
+            )
+
+    return {
+        "status": "execution_unverified" if unverified_cnt > 0 else "verified",
+        "policy": "retain_raw_fill_and_flag_unverified",
+        "total_fills": len(labeled),
+        "verified_fills": verified_cnt,
+        "unverified_gap_fills": unverified_cnt,
+        "unverified_gap_fill_qty": unverified_qty,
+        "unverified_intervals_hit": hit_intervals,
+        "items": labeled,
+    }
+
 
 
 def _resolve_manifest_inputs(
@@ -2083,6 +2217,7 @@ def run_qa_convert(
                     symbol=sym,
                     date_utc=date_utc,
                     stream_kind="binance_depth_diag",
+                    local_book_clears=buf.local_book_clears,
                 )
                 dep_path = out_dir / f"binance_depth_diag_{sym}_{ymd}.npz"
                 np.savez_compressed(dep_path, data=ordered)
@@ -2145,6 +2280,7 @@ def run_qa_convert(
                     symbol=sym,
                     date_utc=date_utc,
                     stream_kind="follower_l2_hbt",
+                    local_book_clears=buf.local_book_clears,
                 )
                 l2_path = out_dir / f"{exchange}_l2_{sym}_{ymd}.npz"
                 np.savez_compressed(l2_path, data=ordered)
@@ -2215,6 +2351,7 @@ def run_qa_convert(
                 "unrebuildable_depth_intervals": buf.unrebuildable_depth_intervals,
                 "excluded_unrebuildable_depth_rows": buf.excluded_unrebuildable_depth_rows,
                 "depth_unavailable_intervals": buf.depth_unavailable_intervals,
+                "gap_execution_policy": "local_clear_only_retain_gap_fills_as_unverified",
                 "gap_count": len(gaps),
                 "gap_intervals": gaps,
                 "local_loss_count": sum(x["dropped"] for x in losses),
@@ -2327,11 +2464,13 @@ def run_offline_e2e_hbt_replay(
     cross_timestamp_tie_mode: str = "microsecond",
     stop_at_ns: int = 0,
     probe_ns: np.ndarray | None = None,
+    depth_unavailable_intervals: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run Huhabubu/mm's official `scripts/core_glft_engine.py::run_core_glft` on converted .npz files.
 
     Returns exact deterministic fingerprints (input SHA-256, fills, ledger, decisions) for P1
-    repeatability and anti-lookahead verification.
+    repeatability and anti-lookahead verification, plus explicit `gap_execution_audit` classifying
+    any fills occurring inside `depth_unavailable_intervals` as `depth_unavailable_unverified`.
     """
     from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
 
@@ -2473,6 +2612,21 @@ def run_offline_e2e_hbt_replay(
         json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
+    fill_records = [
+        {
+            "exch_ts_ns": int(fill_ts_ns[i]),
+            "observed_ts_ns": int(fill_observed_ns[i]),
+            "side": "buy" if int(fill_sides[i]) == 1 else "sell",
+            "price": float(fill_exec_price[i]),
+            "qty": float(fill_exec_qty[i]),
+        }
+        for i in range(len(fill_ts_ns))
+    ]
+    gap_execution_audit = audit_fills_against_depth_unavailable_intervals(
+        fill_records,
+        list(depth_unavailable_intervals or ()),
+    )
+
     return {
         "status": "ok",
         "follower_l2_sha256": _sha256_file(follower_l2_npz),
@@ -2482,6 +2636,7 @@ def run_offline_e2e_hbt_replay(
         "t_end_ns": int(now_end),
         "diagnostics": [float(x) for x in diagnostics],
         "probe_rows": probe_rows.tolist() if probe_ns is not None else [],
+        "gap_execution_audit": gap_execution_audit,
         "metrics": fingerprint_payload,
     }
 

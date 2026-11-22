@@ -964,36 +964,126 @@ def test_issue19_qa_convert_unrecovered_planned_rotation_blocks_and_gap_clears_s
     assert "depth_unavailable_unrecovered" in bin_row["unverified_reasons"]
     assert "binance_depth_diag" not in bin_row["files"]
 
-    # --- 2. Recovered planned rotation MUST clear stale A-line book during gap in HFTBacktest 2.4.4 replay ---
-    rec_root = tmp_path / "rec_planned_replay"
-    rec_rows = [
-        (t0 + 1_000_000_000, 1000, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "5", "a": "90001.0", "A": "5"}}),
-        (t0 + 1_000_000_000, 1001, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 1000, "full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "10.0"]], "a": [["90001.0", "10.0"]]}}),
-        (t0 + 1_100_000_000, 1100, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 1100, "full": False, "s": "ob.BTC_USDT.50", "U": 101, "u": 101, "b": [["90000.0", "12.0"]], "a": []}}),
-        # Planned rotation cutover at t0 + 2.0s: stale A-line book (90000 / 90001) MUST be cleared!
-        (t0 + 2_000_000_000, 2000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
-        (t0 + 2_000_000_000, 2001, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation", "conn_id": "B", "epoch": 1}),
-        # Fresh B-line snapshot arrives at t0 + 4.0s at shifted prices (90050 / 90051) + continuous delta
-        (t0 + 4_000_000_000, 4000, "B", 1, 6, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 4000, "full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90050.0", "10.0"]], "a": [["90051.0", "10.0"]]}}),
-        (t0 + 4_001_000_000, 4001, "B", 1, 7, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
-        (t0 + 4_100_000_000, 4100, "B", 1, 8, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 4100, "full": False, "s": "ob.BTC_USDT.50", "U": 201, "u": 201, "b": [["90050.0", "11.0"]], "a": []}}),
-    ]
-    _write_custom_15m_partition(rec_root, exchange="gate_futures", window_start_s=w0_s, boot_id="boot_rec_replay", run_id="r", rows=rec_rows, segment_suffix="rec")
-    rec_summary = run_qa_convert(rec_root, tmp_path / "out_rec_replay", allow_unverified_local=True)
-    assert rec_summary["status"] == "ok"
-    assert rec_summary["eligible_asset_days"] == 1, rec_summary
-    rec_row = json.loads(Path(rec_summary["calendar_path"]).read_text(encoding="utf-8"))[0]
-    assert rec_row["eligibility_status"] == "eligible", rec_row
-    assert rec_row["depth_rebuild_status"] == "ok", rec_row
-    l2_path = Path(rec_row["files"]["follower_l2_hbt"])
-    assert l2_path.is_file()
+    # --- 2. Recovered planned rotation across snapshot receive latencies (high / equal / low B latency):
+    #     local view clears during gap & recovers cleanly WITHOUT fabricating an EXCH_EVENT clear that
+    #     could sort after a higher-latency B-line snapshot and wipe the simulated matching exchange! ---
+    from hftbacktest import DEPTH_CLEAR_EVENT, EXCH_EVENT, LOCAL_EVENT
+    from qa_convert import audit_fills_against_depth_unavailable_intervals, evaluate_50_level_coverage
 
-    data = np.load(l2_path)["data"]
-    asset = (
+    ms = 1_000_000
+    for lat_name, a_exch_ms, a_loc_ms, b_exch_ms, b_loc_ms in [
+        # Exact reviewer repro: A has 10ms latency (1090/1100), switch at 2000ms, B snapshot has 100ms latency (1950/2050)!
+        ("high_lat_b_snapshot", 1090, 1100, 1950, 2050),
+        # Equal latency: A has 10ms latency, B has 10ms latency after 2s gap
+        ("equal_lat_b_snapshot", 1090, 1100, 3990, 4000),
+        # Lower latency on B: A has 100ms latency, B has 5ms latency
+        ("low_lat_b_snapshot", 1000, 1100, 3995, 4000),
+    ]:
+        rec_root = tmp_path / f"rec_planned_{lat_name}"
+        rec_rows = [
+            (t0 + a_loc_ms * ms, 1000, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "5", "a": "90001.0", "A": "5"}}),
+            (t0 + a_loc_ms * ms, 1001, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + a_exch_ms, "full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "10.0"]], "a": [["90001.0", "10.0"]]}}),
+            (t0 + (a_loc_ms + 50) * ms, 1100, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + a_exch_ms + 50, "full": False, "s": "ob.BTC_USDT.50", "U": 101, "u": 101, "b": [["90000.0", "12.0"]], "a": []}}),
+            # Planned rotation cutover at t0 + 2000ms -> emits strictly LOCAL_EVENT | DEPTH_CLEAR_EVENT
+            (t0 + 2000 * ms, 2000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+            (t0 + 2000 * ms, 2001, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation", "conn_id": "B", "epoch": 1}),
+            # Fresh B-line snapshot at shifted prices (90050 / 90051) + continuous deltas
+            (t0 + b_loc_ms * ms, 4000, "B", 1, 6, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + b_exch_ms, "full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90050.0", "10.0"]], "a": [["90051.0", "10.0"]]}}),
+            (t0 + (b_loc_ms + 1) * ms, 4001, "B", 1, 7, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+            (t0 + (b_loc_ms + 50) * ms, 4100, "B", 1, 8, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + b_exch_ms + 50, "full": False, "s": "ob.BTC_USDT.50", "U": 201, "u": 201, "b": [["90050.0", "11.0"]], "a": []}}),
+            (t0 + (b_loc_ms + 500) * ms, 4500, "B", 1, 9, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + b_exch_ms + 500, "full": False, "s": "ob.BTC_USDT.50", "U": 202, "u": 202, "b": [["90050.0", "12.0"]], "a": []}}),
+        ]
+        _write_custom_15m_partition(rec_root, exchange="gate_futures", window_start_s=w0_s, boot_id=f"boot_{lat_name}", run_id="r", rows=rec_rows, segment_suffix=lat_name)
+        rec_summary = run_qa_convert(rec_root, tmp_path / f"out_{lat_name}", allow_unverified_local=True)
+        assert rec_summary["status"] == "ok"
+        assert rec_summary["eligible_asset_days"] == 1, (lat_name, rec_summary)
+        rec_row = json.loads(Path(rec_summary["calendar_path"]).read_text(encoding="utf-8"))[0]
+        assert rec_row["eligibility_status"] == "eligible", (lat_name, rec_row)
+        assert rec_row["depth_rebuild_status"] == "ok", (lat_name, rec_row)
+        assert rec_row["gap_execution_policy"] == "local_clear_only_retain_gap_fills_as_unverified"
+        l2_path = Path(rec_row["files"]["follower_l2_hbt"])
+        assert l2_path.is_file()
+
+        data = np.load(l2_path)["data"]
+        # Verify cutover clear is strictly LOCAL_EVENT-only (NEVER EXCH_EVENT)!
+        exch_clears = [r for r in data if (int(r["ev"]) & int(EXCH_EVENT)) and (int(r["ev"]) & 0xFF) == int(DEPTH_CLEAR_EVENT)]
+        local_only_clears = [
+            r for r in data
+            if (int(r["ev"]) & int(LOCAL_EVENT))
+            and not (int(r["ev"]) & int(EXCH_EVENT))
+            and (int(r["ev"]) & 0xFF) == int(DEPTH_CLEAR_EVENT)
+        ]
+        assert len(exch_clears) == 2, (lat_name, "expected only genuine A & B snapshot clears on exchange side")
+        assert len(local_only_clears) == 1, (lat_name, "expected exactly 1 LOCAL_EVENT-only clear at cutover")
+        assert int(local_only_clears[0]["local_ts"]) == t0 + 2000 * ms
+
+        asset = (
+            BacktestAsset()
+            .data([data])
+            .linear_asset(1.0)
+            .constant_order_latency(1 * ms, 1 * ms)
+            .risk_adverse_queue_model()
+            .no_partial_fill_exchange()
+            .trading_value_fee_model(0.0, 0.0)
+            .tick_size(0.1)
+            .lot_size(1.0)
+            .roi_lb(89900.0)
+            .roi_ub(90200.0)
+        )
+        hbt = ROIVectorMarketDepthBacktest([asset])
+        assert hbt.elapse(1) == 0
+        # Pre-rotation (t0 + 1500ms): A-line book active
+        assert hbt.elapse((t0 + 1500 * ms) - hbt.current_timestamp) == 0
+        assert hbt.depth(0).best_bid == 90000.0, lat_name
+        assert hbt.depth(0).best_ask == 90001.0, lat_name
+
+        # Inside gap (t0 + 2020ms): local book MUST be empty (nan, nan)
+        assert hbt.elapse((t0 + 2020 * ms) - hbt.current_timestamp) == 0
+        assert math.isnan(hbt.depth(0).best_bid), (lat_name, hbt.depth(0).best_bid)
+        assert math.isnan(hbt.depth(0).best_ask), (lat_name, hbt.depth(0).best_ask)
+
+        # Post-recovery (t0 + b_loc_ms + 200ms): BOTH local book AND simulated exchange matching engine
+        # MUST hold B-line's fresh snapshot (90050 / 90051) — exchange side must NOT have been wiped!
+        post_ms = b_loc_ms + 200
+        assert hbt.elapse((t0 + post_ms * ms) - hbt.current_timestamp) == 0
+        assert hbt.depth(0).best_bid == 90050.0, lat_name
+        assert hbt.depth(0).best_ask == 90051.0, lat_name
+        hbt.submit_buy_order(0, 2, 90051.0, 1.0, GTC, LIMIT, False)
+        assert hbt.elapse(50 * ms) == 0
+        assert hbt.position(0) == 1.0, f"{lat_name}: exchange matching book was wiped after B snapshot recovery!"
+
+    # --- 3. Pre-switch resting passive order + public trade inside rotation gap:
+    #     HftBacktest retains pre-existing resting orders after clear and fills them on trade-through;
+    #     explicit gap-fill audit MUST retain the fill in raw accounting AND flag it unverified! ---
+    trade_gap_root = tmp_path / "rec_planned_resting_trade_gap"
+    trade_gap_rows = [
+        (t0 + 1000 * ms, 1000, "A", 1, 1, "DATA", {"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "5", "a": "90001.0", "A": "5"}}),
+        (t0 + 1000 * ms, 1001, "A", 1, 2, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 995, "full": True, "s": "ob.BTC_USDT.50", "u": 100, "b": [["90000.0", "10.0"]], "a": [["90001.0", "10.0"]]}}),
+        (t0 + 1100 * ms, 1100, "A", 1, 3, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 1095, "full": False, "s": "ob.BTC_USDT.50", "U": 101, "u": 101, "b": [["90000.0", "10.0"]], "a": []}}),
+        # Planned rotation cutover at t0 + 2000ms
+        (t0 + 2000 * ms, 2000, "B", 1, 4, "META", {"event": "SWITCH", "symbol": "ALL", "from": "A", "to": "B", "reason": "planned_rotation"}),
+        (t0 + 2000 * ms, 2001, "B", 1, 5, "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT", "planned": True, "reason": "planned_rotation", "conn_id": "B", "epoch": 1}),
+        # Public sell trade at 90000.0 (size=-20.0) arrives INSIDE the gap at t0 + 2500ms!
+        (t0 + 2500 * ms, 2500, "B", 1, 6, "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 9001, "size": "-20.0", "price": "90000.0", "create_time_ms": t0_ms + 2495}]}),
+        # Fresh B-line snapshot arrives at t0 + 4000ms + continuous deltas through t0 + 5000ms
+        (t0 + 4000 * ms, 4000, "B", 1, 7, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 3995, "full": True, "s": "ob.BTC_USDT.50", "u": 200, "b": [["90050.0", "10.0"]], "a": [["90051.0", "10.0"]]}}),
+        (t0 + 4001 * ms, 4001, "B", 1, 8, "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
+        (t0 + 4100 * ms, 4100, "B", 1, 9, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 4095, "full": False, "s": "ob.BTC_USDT.50", "U": 201, "u": 201, "b": [["90050.0", "11.0"]], "a": []}}),
+        (t0 + 5000 * ms, 5000, "B", 1, 10, "DATA", {"channel": "futures.obu", "event": "update", "result": {"t": t0_ms + 4995, "full": False, "s": "ob.BTC_USDT.50", "U": 202, "u": 202, "b": [["90050.0", "12.0"]], "a": []}}),
+    ]
+    _write_custom_15m_partition(trade_gap_root, exchange="gate_futures", window_start_s=w0_s, boot_id="boot_rest_gap_trade", run_id="r", rows=trade_gap_rows, segment_suffix="gap_trade")
+    tg_summary = run_qa_convert(trade_gap_root, tmp_path / "out_gap_trade", allow_unverified_local=True)
+    assert tg_summary["status"] == "ok"
+    tg_row = json.loads(Path(tg_summary["calendar_path"]).read_text(encoding="utf-8"))[0]
+    assert tg_row["depth_rebuild_status"] == "ok"
+    assert len(tg_row["depth_unavailable_intervals"]) == 1
+
+    tg_data = np.load(tg_row["files"]["follower_l2_hbt"])["data"]
+    tg_asset = (
         BacktestAsset()
-        .data([data])
+        .data([tg_data])
         .linear_asset(1.0)
-        .constant_order_latency(1_000_000, 1_000_000)
+        .constant_order_latency(1 * ms, 1 * ms)
         .risk_adverse_queue_model()
         .no_partial_fill_exchange()
         .trading_value_fee_model(0.0, 0.0)
@@ -1002,30 +1092,91 @@ def test_issue19_qa_convert_unrecovered_planned_rotation_blocks_and_gap_clears_s
         .roi_lb(89900.0)
         .roi_ub(90200.0)
     )
-    hbt = ROIVectorMarketDepthBacktest([asset])
+    hbt_tg = ROIVectorMarketDepthBacktest([tg_asset])
+    hbt_tg.elapse(1)
+    # Pre-rotation (t0 + 1500ms): place passive resting buy at best bid 90000.0
+    hbt_tg.elapse((t0 + 1500 * ms) - hbt_tg.current_timestamp)
+    hbt_tg.submit_buy_order(0, 10, 90000.0, 1.0, GTC, LIMIT, False)
+    # Inside gap BEFORE public trade (t0 + 2200ms): local book cleared, resting order still open (pos=0)
+    hbt_tg.elapse((t0 + 2200 * ms) - hbt_tg.current_timestamp)
+    assert math.isnan(hbt_tg.depth(0).best_bid)
+    assert math.isnan(hbt_tg.depth(0).best_ask)
+    assert hbt_tg.position(0) == 0.0
+    # Inside gap AFTER public sell trade at 90000.0 (t0 + 2600ms): resting order fills in NoPartialFillExchange!
+    hbt_tg.elapse((t0 + 2600 * ms) - hbt_tg.current_timestamp)
+    assert hbt_tg.position(0) == 1.0
+    ord_gap = hbt_tg.orders(0).get(10)
+    assert ord_gap is not None and ord_gap.exec_qty == 1.0 and ord_gap.exec_price == 90000.0
+    assert int(ord_gap.exch_timestamp) == t0 + 2495 * ms
+    gap_fill_rec = {
+        "order_id": 10,
+        "exch_ts_ns": int(ord_gap.exch_timestamp),
+        "observed_ts_ns": int(hbt_tg.current_timestamp),
+        "side": "buy",
+        "price": float(ord_gap.exec_price),
+        "qty": float(ord_gap.exec_qty),
+    }
 
-    # Pre-rotation (t0 + 1.5s): A-line book is active
-    hbt.elapse(500_000_000)
-    assert hbt.depth(0).best_bid == 90000.0
-    assert hbt.depth(0).best_ask == 90001.0
+    # Post-recovery (t0 + 4500ms): submit & fill a normal verified order on B-line's fresh book (90050/90051)
+    assert hbt_tg.elapse((t0 + 4500 * ms) - hbt_tg.current_timestamp) == 0
+    assert hbt_tg.depth(0).best_bid == 90050.0 and hbt_tg.depth(0).best_ask == 90051.0
+    hbt_tg.submit_buy_order(0, 20, 90051.0, 1.0, GTC, LIMIT, False)
+    assert hbt_tg.elapse(100 * ms) == 0
+    assert hbt_tg.position(0) == 2.0
+    ord_ok = hbt_tg.orders(0).get(20)
+    assert ord_ok is not None and ord_ok.exec_qty == 1.0 and ord_ok.exec_price == 90051.0
+    assert int(ord_ok.exch_timestamp) >= t0 + 4500 * ms
+    post_fill_rec = {
+        "order_id": 20,
+        "exch_ts_ns": int(ord_ok.exch_timestamp),
+        "observed_ts_ns": int(hbt_tg.current_timestamp),
+        "side": "buy",
+        "price": float(ord_ok.exec_price),
+        "qty": float(ord_ok.exec_qty),
+    }
 
-    # Inside planned rotation gap (t0 + 2.5s): book MUST be empty (cleared), NOT stale 90000/90001!
-    hbt.elapse(1_000_000_000)
-    assert math.isnan(hbt.depth(0).best_bid), f"stale pre-switch bid leaked into gap: {hbt.depth(0).best_bid}"
-    assert math.isnan(hbt.depth(0).best_ask), f"stale pre-switch ask leaked into gap: {hbt.depth(0).best_ask}"
+    # Explicit backtest fill accounting: raw fills retained (total=2), gap fill flagged unverified!
+    audit = audit_fills_against_depth_unavailable_intervals(
+        [gap_fill_rec, post_fill_rec],
+        tg_row["depth_unavailable_intervals"],
+    )
+    assert audit["status"] == "execution_unverified", audit
+    assert audit["policy"] == "retain_raw_fill_and_flag_unverified"
+    assert audit["total_fills"] == 2
+    assert audit["unverified_gap_fills"] == 1
+    assert audit["verified_fills"] == 1
+    assert audit["unverified_gap_fill_qty"] == 1.0
+    assert audit["items"][0]["execution_status"] == "depth_unavailable_unverified"
+    assert audit["items"][0]["queue_assumption"] == "UNOBSERVABLE_DEPTH_GAP"
+    assert audit["items"][1]["execution_status"] == "verified"
+    assert audit["items"][1]["queue_assumption"] == "OBSERVABLE_BOOK"
 
-    # Aggressive buy at stale A-line ask (90001.0) during gap MUST NOT fill!
-    hbt.submit_buy_order(0, 1, 90001.0, 1.0, GTC, LIMIT, False)
-    hbt.elapse(500_000_000)  # t0 + 3.0s
-    assert hbt.position(0) == 0.0, f"order filled against stale pre-switch book during gap: pos={hbt.position(0)}"
-    hbt.cancel(0, 1, False)
+    # Edge-sample coverage also labels the gap fill DEPTH_UNAVAILABLE and post-recovery fill VISIBLE_WITHIN_50!
+    edges_npz = np.load(tg_row["files"]["follower_l2_edges"])
+    edge_samples = [
+        (
+            int(edges_npz["local_ts_ns"][i]),
+            float(edges_npz["best_bid"][i]),
+            float(edges_npz["edge_bid_50"][i]),
+            float(edges_npz["best_ask"][i]),
+            float(edges_npz["edge_ask_50"][i]),
+            int(edges_npz["visible_bid_levels"][i]),
+            int(edges_npz["visible_ask_levels"][i]),
+        )
+        for i in range(len(edges_npz["local_ts_ns"]))
+    ]
+    cov = evaluate_50_level_coverage(
+        [
+            {"ts_ns": gap_fill_rec["observed_ts_ns"], "side": "buy", "price": 90000.0},
+            {"ts_ns": post_fill_rec["observed_ts_ns"], "side": "buy", "price": 90051.0},
+        ],
+        edge_samples,
+    )
+    assert cov["depth_unavailable"] == 1, cov
+    assert cov["visible_within_50"] == 1, cov
+    assert cov["items"][0]["depth_coverage"] == "DEPTH_UNAVAILABLE"
+    assert cov["items"][0]["queue_assumption"] == "UNOBSERVABLE_DEPTH_GAP"
+    assert cov["items"][1]["depth_coverage"] == "VISIBLE_WITHIN_50"
 
-    # Post-recovery (t0 + 4.5s): fresh B-line book (90050 / 90051) is active and matches normally!
-    hbt.elapse(1_500_000_000)
-    assert hbt.depth(0).best_bid == 90050.0
-    assert hbt.depth(0).best_ask == 90051.0
-    hbt.submit_buy_order(0, 2, 90051.0, 1.0, GTC, LIMIT, False)
-    hbt.elapse(100_000_000)
-    assert hbt.position(0) == 1.0
 
 
