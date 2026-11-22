@@ -186,7 +186,7 @@ jobs:
             > "$RUNNER_TEMP/tokyo-qa-auth/rclone.conf"
           echo "RCLONE_CONFIG=$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" >> "$GITHUB_ENV"
           RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsf qa:meta --max-depth 1 > /dev/null
-          INDEX_MODTIME_UTC="$(RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsjson qa:meta --include archive_manifest_index.json --max-depth 1 2>/dev/null | python -c 'import json, sys; arr = json.load(sys.stdin); print(arr[0].get("ModTime", "") if isinstance(arr, list) and arr else "")' 2>/dev/null || true)"
+          INDEX_MODTIME_UTC="$(RCLONE_CONFIG="$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" rclone lsjson qa:meta --files-only --max-depth 1 2>/dev/null | python -c 'import json, sys; arr = json.load(sys.stdin); hit = [x for x in (arr if isinstance(arr, list) else []) if x.get("Name") == "archive_manifest_index.json"]; print(hit[0].get("ModTime", "") if hit else "")' 2>/dev/null || true)"
           echo "QA_INDEX_MODTIME_UTC=${INDEX_MODTIME_UTC}" >> "$GITHUB_ENV"
           echo "Drive archive_manifest_index.json ModTime (UTC): ${INDEX_MODTIME_UTC:-unavailable}"
 
