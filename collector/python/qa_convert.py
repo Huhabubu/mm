@@ -1662,6 +1662,88 @@ def evaluate_50_level_coverage(
     }
 
 
+class MarketAvailability:
+    """Per-stream archive evidence on the collector's receive-wall clock.
+
+    Reports are half-open and clipped to the requested window. An explicit gap
+    can backdate a transition to the nanosecond recorded by the collector.
+    """
+
+    def __init__(self, streams):
+        self._changes = {stream: [] for stream in streams}
+
+    def state(self, stream):
+        changes = self._changes[stream]
+        return changes[-1][1] if changes else "unverified"
+
+    def mark(self, stream, wall_ns, status, reason):
+        changes = self._changes[stream]
+        if changes and wall_ns >= changes[-1][0] and changes[-1][1:] == (status, reason):
+            return
+        while changes and changes[-1][0] >= wall_ns:
+            changes.pop()
+        if not changes or changes[-1][1:] != (status, reason):
+            changes.append((wall_ns, status, reason))
+
+    def report(self, start_ns, end_ns, unverified_exchanges=()):
+        result = []
+        for (exchange, symbol, channel), changes in sorted(self._changes.items()):
+            intervals = []
+            cursor, status, reason = start_ns, "unverified", "initial_state_unverified"
+            for at, next_status, next_reason in changes:
+                if at >= end_ns:
+                    break
+                if at > cursor:
+                    intervals.append({
+                        "start_wall_ns": cursor, "end_wall_ns": at,
+                        "status": status, "reason": reason,
+                    })
+                    cursor = at
+                status, reason = next_status, next_reason
+            if cursor < end_ns:
+                intervals.append({
+                    "start_wall_ns": cursor, "end_wall_ns": end_ns,
+                    "status": status, "reason": reason,
+                })
+            if exchange in unverified_exchanges:
+                for interval in intervals:
+                    if interval["status"] == "verified_usable":
+                        interval.update(status="unverified", reason="archive_structure_unverified")
+            result.append({"exchange": exchange, "symbol": symbol, "channel": channel, "intervals": intervals})
+        return result
+
+
+def common_usable_intervals(market_availability, required_streams, start_ns, end_ns):
+    """Intersect explicitly required streams for a replay episode."""
+    panel = {
+        (item["exchange"], item["symbol"], item["channel"]): item["intervals"]
+        for item in market_availability
+    }
+    spans = [(start_ns, end_ns)] if start_ns < end_ns and required_streams else []
+    for stream in sorted(required_streams):
+        candidates = []
+        for row in panel.get(stream, []):
+            if row["status"] != "verified_usable":
+                continue
+            left, right = row["start_wall_ns"], row["end_wall_ns"]
+            if candidates and left == candidates[-1][1]:
+                candidates[-1] = (candidates[-1][0], right)
+            else:
+                candidates.append((left, right))
+        available = []
+        i = j = 0
+        while i < len(spans) and j < len(candidates):
+            left, right = max(spans[i][0], candidates[j][0]), min(spans[i][1], candidates[j][1])
+            if left < right:
+                available.append((left, right))
+            if spans[i][1] <= candidates[j][1]:
+                i += 1
+            else:
+                j += 1
+        spans = available
+    return [{"start_wall_ns": left, "end_wall_ns": right} for left, right in spans]
+
+
 def audit_fills_against_depth_unavailable_intervals(
     fills: list[dict[str, Any]],
     depth_unavailable_intervals: list[dict[str, Any]] | None,
