@@ -401,7 +401,7 @@ async fn test_live_15m_config_writes_v2_manifest_with_single_ws_epoch() {
                             let bt = json!({
                                 "channel": "futures.book_ticker",
                                 "event": "update",
-                                "result": {"s": "BTC_USDT", "b": "90000.1", "B": 5, "a": "90000.2", "A": 4}
+                                "result": {"s": "BTC_USDT", "b": "90000.1", "B": "5", "a": "90000.2", "A": "4"}
                             });
                             let obu = json!({
                                 "channel": "futures.obu",
@@ -411,7 +411,7 @@ async fn test_live_15m_config_writes_v2_manifest_with_single_ws_epoch() {
                             let tr = json!({
                                 "channel": "futures.trades",
                                 "event": "update",
-                                "result": [{"contract": "BTC_USDT", "size": 1, "price": "90000.1"}]
+                                "result": [{"contract": "BTC_USDT", "id": u, "size": "1", "price": "90000.1"}]
                             });
                             if ws.send(Message::Text(bt.to_string().into())).await.is_err() {
                                 break;

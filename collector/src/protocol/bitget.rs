@@ -9,6 +9,7 @@ struct BitgetBookState {
     seq_snapshot: Option<u64>,
     prev_seq: Option<u64>,
     awaiting_first_delta: bool,
+    refreshing: bool,
 }
 
 impl BitgetBookState {
@@ -18,6 +19,7 @@ impl BitgetBookState {
             seq_snapshot: None,
             prev_seq: None,
             awaiting_first_delta: false,
+            refreshing: false,
         }
     }
 }
@@ -30,6 +32,7 @@ pub struct BitgetValidator {
     seen_trade_set: HashMap<String, HashSet<String>>,
     pending_sub_acks: Vec<(String, String)>,
     overall_invalid: bool,
+    fatal_invalid: bool,
 }
 
 impl BitgetValidator {
@@ -49,7 +52,22 @@ impl BitgetValidator {
             seen_trade_set: HashMap::new(),
             pending_sub_acks: Vec::new(),
             overall_invalid: false,
+            fatal_invalid: false,
         }
+    }
+
+    pub fn build_depth_message(symbols: &[String], op: &str) -> Value {
+        let args: Vec<Value> = symbols
+            .iter()
+            .map(|s| {
+                json!({
+                    "instType": "usdt-futures",
+                    "topic": "books50",
+                    "symbol": s.to_uppercase()
+                })
+            })
+            .collect();
+        json!({"op": op, "args": args})
     }
 
     pub fn build_subscribe_message(symbols: &[String]) -> Value {
@@ -125,6 +143,39 @@ impl BitgetValidator {
         };
         let pseq = Self::parse_u64_flex(item.get("pseq"));
 
+        let is_snapshot = action == "snapshot";
+        let bids = item.get("b").or_else(|| item.get("bids"));
+        let asks = item.get("a").or_else(|| item.get("asks"));
+        if let Err(e) = crate::protocol::validate_book_sides(
+            bids,
+            asks,
+            is_snapshot,
+            is_snapshot,
+            false,
+            if is_snapshot {
+                "bitget book snapshot"
+            } else {
+                "bitget book update"
+            },
+        ) {
+            let map = if topic == "books1" {
+                &mut self.books1_states
+            } else {
+                &mut self.books50_states
+            };
+            let st = map.entry(sym.clone()).or_insert_with(BitgetBookState::new);
+            st.state = ConnState::Invalid;
+            st.prev_seq = None;
+            st.seq_snapshot = None;
+            self.overall_invalid = true;
+            return FrameVerdict::Violation {
+                symbol: Some(sym),
+                reason: e,
+                needs_resubscribe: true,
+                needs_snapshot_refetch: false,
+            };
+        }
+
         let map = if topic == "books1" {
             &mut self.books1_states
         } else {
@@ -134,11 +185,21 @@ impl BitgetValidator {
 
         // Dynamic per-frame action branching: supports both pre-2026-12-01 (all snapshot)
         // and post-2026-12-01 (initial snapshot + incremental update with pseq/seq).
-        if action == "snapshot" {
+        if is_snapshot {
             st.seq_snapshot = Some(seq);
             st.prev_seq = Some(seq);
             st.awaiting_first_delta = true;
             st.state = ConnState::Live;
+            st.refreshing = false;
+            if topic == "books50"
+                && !self.fatal_invalid
+                && self
+                    .books50_states
+                    .values()
+                    .all(|s| s.state != ConnState::Invalid)
+            {
+                self.overall_invalid = false;
+            }
             return FrameVerdict::AcceptData {
                 symbol: sym,
                 channel: topic.to_string(),
@@ -148,6 +209,9 @@ impl BitgetValidator {
         }
 
         if action == "update" {
+            if topic == "books50" && st.refreshing {
+                return FrameVerdict::BufferedWaitAnchor { symbol: sym };
+            }
             if st.state != ConnState::Live {
                 return FrameVerdict::Violation {
                     symbol: Some(sym),
@@ -188,7 +252,7 @@ impl BitgetValidator {
 
             if st.awaiting_first_delta {
                 let s_snap = st.seq_snapshot.unwrap_or(0);
-                if pseq_val <= s_snap && s_snap <= seq {
+                if pseq_val <= s_snap && s_snap <= seq && pseq_val < seq {
                     st.awaiting_first_delta = false;
                     st.prev_seq = Some(seq);
                     return FrameVerdict::AcceptData {
@@ -212,7 +276,7 @@ impl BitgetValidator {
                         needs_snapshot_refetch: false,
                     };
                 }
-            } else if st.prev_seq == Some(pseq_val) {
+            } else if st.prev_seq == Some(pseq_val) && pseq_val < seq {
                 st.prev_seq = Some(seq);
                 return FrameVerdict::AcceptData {
                     symbol: sym,
@@ -229,8 +293,8 @@ impl BitgetValidator {
                 return FrameVerdict::Violation {
                     symbol: Some(sym),
                     reason: format!(
-                        "bitget {} pseq gap: got pseq={}, expected prev_seq={:?}",
-                        topic, pseq_val, expected
+                        "bitget {} pseq gap or non-advancing seq: pseq={} seq={} expected prev_seq={:?}",
+                        topic, pseq_val, seq, expected
                     ),
                     needs_resubscribe: true,
                     needs_snapshot_refetch: false,
@@ -410,8 +474,63 @@ impl ProtocolValidator for BitgetValidator {
         self.expected_symbols.clone()
     }
 
+    fn symbol_depth_state(&self, symbol: &str) -> Option<ConnState> {
+        self.books50_states
+            .get(&symbol.to_uppercase())
+            .map(|st| if st.refreshing { ConnState::Resync } else { st.state })
+    }
+
+    fn prepare_depth_refresh(&mut self) {
+        self.overall_invalid = false;
+        self.fatal_invalid = false;
+        self.pending_sub_acks.clear();
+        for st in self.books50_states.values_mut() {
+            *st = BitgetBookState {
+                state: ConnState::WaitAnchor,
+                seq_snapshot: None,
+                prev_seq: None,
+                awaiting_first_delta: false,
+                refreshing: true,
+            };
+        }
+    }
+
+    fn prepare_symbol_depth_refresh(&mut self, symbol: &str) {
+        if self.overall_invalid
+            && self
+                .books50_states
+                .values()
+                .all(|s| s.state != ConnState::Invalid)
+        {
+            self.fatal_invalid = true;
+        }
+        let sym = symbol.to_uppercase();
+        let st = self
+            .books50_states
+            .entry(sym)
+            .or_insert_with(BitgetBookState::new);
+        let preserved_state = if st.state == ConnState::Invalid {
+            ConnState::Invalid
+        } else {
+            ConnState::WaitAnchor
+        };
+        *st = BitgetBookState {
+            state: preserved_state,
+            seq_snapshot: None,
+            prev_seq: None,
+            awaiting_first_delta: false,
+            refreshing: true,
+        };
+        self.overall_invalid = self.overall_invalid
+            || self
+                .books50_states
+                .values()
+                .any(|s| s.state == ConnState::Invalid);
+    }
+
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.fatal_invalid = false;
         self.pending_sub_acks.clear();
         for st in self.books50_states.values_mut() {
             *st = BitgetBookState::new();

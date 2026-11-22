@@ -38,6 +38,8 @@ fn flush_stderr() {
     let _ = std::io::stderr().flush();
 }
 
+static NEXT_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Debug)]
 enum EngineEvent {
     Frame(RawFrame),
@@ -59,6 +61,12 @@ enum EngineEvent {
         endpoint: EndpointKind,
         conn_id: ConnId,
         epoch: u64,
+    },
+    DepthRefreshSubscribed {
+        endpoint: EndpointKind,
+        conn_id: ConnId,
+        epoch: u64,
+        refresh_id: u64,
     },
     RestSnapshotAttempt {
         request_id: u64,
@@ -97,7 +105,11 @@ struct ConnCommand {
 #[derive(Debug)]
 enum ConnCommandAction {
     Reconnect(String),
-    Resubscribe(String),
+    Resubscribe {
+        refresh_id: u64,
+        symbols: Vec<String>,
+        reason: String,
+    },
 }
 
 async fn next_command_for_epoch(
@@ -1209,13 +1221,17 @@ fn process_engine_event(
     snapshot_tasks: &mut HashMap<u64, tokio::task::JoinHandle<()>>,
     allow_actions: bool,
 ) {
-    let mut outputs: Vec<(EndpointKind, crate::causal_selector::SelectorOutput, Option<(ConnId, u64, i64)>)> = Vec::new();
+    let mut outputs: std::collections::VecDeque<(
+        EndpointKind,
+        crate::causal_selector::SelectorOutput,
+        Option<(ConnId, u64, i64)>,
+    )> = std::collections::VecDeque::new();
     match ev {
         EngineEvent::Frame(f) => {
             let ep = f.endpoint;
             let meta = (f.conn_id, f.epoch, f.recv_wall_ns);
             if let Some(sel) = selectors.get_mut(&ep) {
-                outputs.push((ep, sel.on_frame(f), Some(meta)));
+                outputs.push_back((ep, sel.on_frame(f), Some(meta)));
             }
         }
         EngineEvent::Disconnect {
@@ -1232,7 +1248,7 @@ fn process_engine_event(
             }
             activity.clear_conn_epoch(endpoint, conn_id, epoch);
             if let Some(sel) = active_selector_for_epoch(selectors, endpoint, conn_id, epoch) {
-                outputs.push((
+                outputs.push_back((
                     endpoint,
                     sel.on_disconnect(conn_id, wall_ns, mono_ns, &reason),
                     None,
@@ -1264,6 +1280,16 @@ fn process_engine_event(
             epoch,
         } => {
             activity.record_subscribe_requested(endpoint, conn_id, epoch);
+        }
+        EngineEvent::DepthRefreshSubscribed {
+            endpoint,
+            conn_id,
+            epoch,
+            refresh_id,
+        } => {
+            if let Some(sel) = active_selector_for_epoch(selectors, endpoint, conn_id, epoch) {
+                sel.on_depth_refresh_subscribed(conn_id, epoch, refresh_id);
+            }
         }
         EngineEvent::RestSnapshotAttempt {
             request_id,
@@ -1370,7 +1396,7 @@ fn process_engine_event(
                             );
                             flush_stderr();
                         }
-                        outputs.push((endpoint, sel_out, Some((conn_id, epoch, wall_ns))));
+                        outputs.push_back((endpoint, sel_out, Some((conn_id, epoch, wall_ns))));
                     }
                 }
             }
@@ -1383,7 +1409,7 @@ fn process_engine_event(
             reason,
         } => {
             if let Some(sel) = selectors.get_mut(&endpoint) {
-                outputs.push((
+                outputs.push_back((
                     endpoint,
                     sel.on_local_loss(dropped, wall_ns, mono_ns, &reason),
                     None,
@@ -1396,7 +1422,7 @@ fn process_engine_event(
             mono_ns,
         } => {
             for (&ep, sel) in selectors.iter_mut() {
-                outputs.push((ep, sel.on_planned_rotation(target, wall_ns, mono_ns), None));
+                outputs.push_back((ep, sel.on_planned_rotation(target, wall_ns, mono_ns), None));
             }
         }
         EngineEvent::WatchdogTick { wall_ns, mono_ns } => {
@@ -1429,7 +1455,7 @@ fn process_engine_event(
                 }
             }
             for (&ep, sel) in selectors.iter_mut() {
-                outputs.push((
+                outputs.push_back((
                     ep,
                     sel.check_silence_watchdog(wall_ns, mono_ns, PING_TIMEOUT_NS),
                     None,
@@ -1438,7 +1464,7 @@ fn process_engine_event(
         }
     }
 
-    for (ep, out, frame_meta) in outputs {
+    while let Some((ep, out, frame_meta)) = outputs.pop_front() {
         let ex = ep.exchange();
         if let Some((conn_id, epoch, wall_ns)) = frame_meta {
             for (sym, chan) in out.subscription_acks {
@@ -1534,19 +1560,54 @@ fn process_engine_event(
                         }
                     }
                 }
-                SelectorAction::Resubscribe { conn_id, reason } => {
-                    if let (Some(ctx), Some(selector)) =
-                        (cmd_txs.get(&(ep, conn_id)), selectors.get_mut(&ep))
-                    {
-                        if let Some(epoch) = selector.connected_epoch(conn_id) {
-                            let command = ConnCommand {
-                                epoch,
-                                action: ConnCommandAction::Resubscribe(reason),
-                            };
-                            if ctx.try_send(command).is_ok() && ep == EndpointKind::GatePublic {
-                                selector.prepare_depth_refresh(conn_id);
-                            }
-                        }
+                SelectorAction::Resubscribe {
+                    conn_id,
+                    symbols,
+                    reason,
+                } => {
+                    let Some(selector) = selectors.get_mut(&ep) else {
+                        continue;
+                    };
+                    let target_syms = if symbols.is_empty() {
+                        selector.expected_symbols()
+                    } else {
+                        symbols
+                    };
+                    let Some(epoch) = selector.connected_epoch(conn_id) else {
+                        continue;
+                    };
+                    let refresh_id =
+                        NEXT_REFRESH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let queued = cmd_txs.get(&(ep, conn_id)).is_some_and(|ctx| {
+                        let command = ConnCommand {
+                            epoch,
+                            action: ConnCommandAction::Resubscribe {
+                                refresh_id,
+                                symbols: target_syms.clone(),
+                                reason: reason.clone(),
+                            },
+                        };
+                        ctx.try_send(command).is_ok()
+                    });
+                    if queued {
+                        selector.mark_refresh_queued(conn_id, epoch, refresh_id, &target_syms);
+                    } else {
+                        warn!(
+                            "Resubscribe command was not queued for {} conn={} epoch={} reason={}",
+                            ep.as_str(),
+                            conn_id.as_str(),
+                            epoch,
+                            reason
+                        );
+                        let fail_out = selector.on_depth_refresh_queue_failed(
+                            conn_id,
+                            epoch,
+                            &target_syms,
+                            wall_clock_ns(),
+                            mono_origin.elapsed().as_nanos() as u64,
+                            &format!("depth_refresh_queue_failed:{reason}"),
+                        );
+                        outputs.push_back((ep, fail_out, None));
                     }
                 }
                 SelectorAction::FetchRestSnapshot { conn_id, symbol } => {
@@ -1727,11 +1788,11 @@ async fn ws_connection_loop(
                     let mut ping_timer =
                         tokio::time::interval(Duration::from_secs(ping_secs.max(5)));
                     let disconnect_reason: String;
-                    let mut gate_refresh: Option<GateDepthRefresh> = None;
+                    let mut depth_refresh: Option<DepthRefresh> = None;
 
                     loop {
                         let refresh_deadline =
-                            gate_refresh.as_ref().map(|refresh| refresh.deadline);
+                            depth_refresh.as_ref().map(|refresh| refresh.deadline);
                         tokio::select! {
                             biased;
                             _ = stop_rx.changed() => {
@@ -1746,7 +1807,11 @@ async fn ws_connection_loop(
                                     std::future::pending::<()>().await;
                                 }
                             } => {
-                                disconnect_reason = "gate_depth_refresh_timeout".to_string();
+                                disconnect_reason = if endpoint == EndpointKind::GatePublic {
+                                    "gate_depth_refresh_timeout".to_string()
+                                } else {
+                                    format!("{}_depth_refresh_timeout", endpoint.as_str())
+                                };
                                 break;
                             }
                             _ = ping_timer.tick() => {
@@ -1774,21 +1839,45 @@ async fn ws_connection_loop(
                                         disconnect_reason = format!("cmd_reconnect: {}", r);
                                         break;
                                     }
-                                    ConnCommandAction::Resubscribe(r) => {
+                                    ConnCommandAction::Resubscribe {
+                                        refresh_id,
+                                        symbols: cmd_symbols,
+                                        reason: r,
+                                    } => {
                                         warn!(
-                                            "Resubscribing {} conn={} reason={}",
+                                            "Resubscribing {} conn={} reason={} refresh_id={}",
                                             endpoint.as_str(),
                                             conn_id.as_str(),
-                                            r
+                                            r,
+                                            refresh_id
                                         );
-                                        if endpoint == EndpointKind::GatePublic {
-                                            if gate_refresh.is_none() {
-                                                match GateDepthRefresh::start(&symbols, &mut write).await {
-                                                    Ok(refresh) => gate_refresh = Some(refresh),
-                                                    Err(error) => {
-                                                        disconnect_reason = format!("gate_unsubscribe_error: {error}");
-                                                        break;
+                                        if matches!(
+                                            endpoint,
+                                            EndpointKind::GatePublic
+                                                | EndpointKind::BybitPublic
+                                                | EndpointKind::BitgetPublic
+                                        ) {
+                                            let mut merged_syms: Vec<String> = if cmd_symbols.is_empty() {
+                                                symbols.iter().map(|s| s.to_uppercase()).collect()
+                                            } else {
+                                                cmd_symbols.into_iter().map(|s| s.to_uppercase()).collect()
+                                            };
+                                            if let Some(prev) = depth_refresh.as_ref() {
+                                                for pending in &prev.awaiting_snapshot {
+                                                    if !merged_syms.contains(pending) {
+                                                        merged_syms.push(pending.clone());
                                                     }
+                                                }
+                                            }
+                                            match DepthRefresh::start(endpoint, refresh_id, &merged_syms, &mut write).await {
+                                                Ok(refresh) => depth_refresh = Some(refresh),
+                                                Err(error) => {
+                                                    disconnect_reason = if endpoint == EndpointKind::GatePublic {
+                                                        format!("gate_unsubscribe_error: {error}")
+                                                    } else {
+                                                        format!("{}_unsubscribe_error: {error}", endpoint.as_str())
+                                                    };
+                                                    break;
                                                 }
                                             }
                                         } else if let Err(e) = send_subscriptions(endpoint, &symbols, &mut write).await {
@@ -1804,15 +1893,43 @@ async fn ws_connection_loop(
                                 let mono_ns = mono_origin.elapsed().as_nanos() as u64;
                                 match maybe_msg {
                                     Some(Ok(Message::Text(text))) => {
-                                        if let Some(refresh) = gate_refresh.as_mut() {
-                                            match refresh.on_message(&text, &symbols, &mut write).await {
-                                                Ok(true) => gate_refresh = None,
-                                                Ok(false) => {}
+                                        let mut forward_to_selector = true;
+                                        if let Some(refresh) = depth_refresh.as_mut() {
+                                            match refresh.on_message(&text, &mut write).await {
+                                                Ok(step) => {
+                                                    forward_to_selector = step.forward_to_selector;
+                                                    if step.just_subscribed {
+                                                        if !send_lifecycle_event(
+                                                            &tx,
+                                                            &mut stop_rx,
+                                                            EngineEvent::DepthRefreshSubscribed {
+                                                                endpoint,
+                                                                conn_id,
+                                                                epoch,
+                                                                refresh_id: refresh.refresh_id,
+                                                            },
+                                                        )
+                                                        .await
+                                                        {
+                                                            return;
+                                                        }
+                                                    }
+                                                    if step.completed {
+                                                        depth_refresh = None;
+                                                    }
+                                                }
                                                 Err(error) => {
-                                                    disconnect_reason = format!("gate_depth_refresh_error: {error}");
+                                                    disconnect_reason = if endpoint == EndpointKind::GatePublic {
+                                                        format!("gate_depth_refresh_error: {error}")
+                                                    } else {
+                                                        format!("{}_depth_refresh_error: {error}", endpoint.as_str())
+                                                    };
                                                     break;
                                                 }
                                             }
+                                        }
+                                        if !forward_to_selector {
+                                            continue;
                                         }
                                         let frame = RawFrame {
                                             recv_wall_ns: wall_ns,
@@ -1902,91 +2019,373 @@ async fn ws_connection_loop(
     }
 }
 
-struct GateDepthRefresh {
-    deadline: tokio::time::Instant,
-    awaiting_ack: HashSet<u64>,
-    awaiting_snapshot: HashSet<String>,
+struct DepthRefreshStep {
+    forward_to_selector: bool,
+    just_subscribed: bool,
+    completed: bool,
 }
 
-impl GateDepthRefresh {
-    async fn start<S>(symbols: &[String], write: &mut S) -> Result<Self, String>
+struct DepthRefresh {
+    refresh_id: u64,
+    endpoint: EndpointKind,
+    symbols: Vec<String>,
+    deadline: tokio::time::Instant,
+    gate_ack_ids: HashSet<u64>,
+    bybit_unsub_req_id: Option<String>,
+    bitget_unsub_syms: HashSet<String>,
+    awaiting_snapshot: HashSet<String>,
+    subscribe_sent: bool,
+}
+
+impl DepthRefresh {
+    fn parse_gate_obu_symbol(stream_name: &str) -> Option<String> {
+        let mut parts = stream_name.split('.');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some("ob"), Some(sym), Some("50"), None) => Some(sym.to_uppercase()),
+            _ => None,
+        }
+    }
+
+    async fn start<S>(
+        endpoint: EndpointKind,
+        refresh_id: u64,
+        symbols: &[String],
+        write: &mut S,
+    ) -> Result<Self, String>
     where
         S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
-        let now = Utc::now();
-        let mut awaiting_ack = HashSet::new();
-        let awaiting_snapshot = symbols
-            .iter()
-            .map(|symbol| format!("ob.{}.50", symbol.to_uppercase()))
-            .collect();
-        for (index, mut frame) in
-            GateValidator::build_depth_messages(symbols, now.timestamp(), "unsubscribe")
-                .into_iter()
-                .enumerate()
-        {
-            let id = (now.timestamp_millis() as u64) * 100 + index as u64;
-            frame["id"] = id.into();
-            awaiting_ack.insert(id);
-            write
-                .send(Message::Text(frame.to_string()))
-                .await
-                .map_err(|e| e.to_string())?;
+        let norm_syms: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
+        let awaiting_snapshot: HashSet<String> = norm_syms.iter().cloned().collect();
+        let mut gate_ack_ids = HashSet::new();
+        let mut bybit_unsub_req_id = None;
+        let mut bitget_unsub_syms = HashSet::new();
+
+        match endpoint {
+            EndpointKind::GatePublic => {
+                let now = Utc::now();
+                for (index, mut frame) in
+                    GateValidator::build_depth_messages(&norm_syms, now.timestamp(), "unsubscribe")
+                        .into_iter()
+                        .enumerate()
+                {
+                    let id = refresh_id
+                        .saturating_mul(10_000)
+                        .saturating_add(index as u64)
+                        .saturating_add((now.timestamp_millis() as u64).saturating_mul(100));
+                    frame["id"] = id.into();
+                    gate_ack_ids.insert(id);
+                    write
+                        .send(Message::Text(frame.to_string()))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            EndpointKind::BybitPublic => {
+                let req_id = format!("depth_unsub_{refresh_id}");
+                let frame =
+                    BybitValidator::build_depth_message(&norm_syms, "unsubscribe", &req_id);
+                bybit_unsub_req_id = Some(req_id);
+                write
+                    .send(Message::Text(frame.to_string()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            EndpointKind::BitgetPublic => {
+                let frame = BitgetValidator::build_depth_message(&norm_syms, "unsubscribe");
+                bitget_unsub_syms = norm_syms.iter().cloned().collect();
+                write
+                    .send(Message::Text(frame.to_string()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported depth refresh endpoint {}",
+                    endpoint.as_str()
+                ));
+            }
         }
+
+        let subscribe_sent = match endpoint {
+            EndpointKind::GatePublic => gate_ack_ids.is_empty(),
+            EndpointKind::BybitPublic => bybit_unsub_req_id.is_none() || awaiting_snapshot.is_empty(),
+            EndpointKind::BitgetPublic => bitget_unsub_syms.is_empty(),
+            _ => true,
+        };
+
         Ok(Self {
+            refresh_id,
+            endpoint,
+            symbols: norm_syms,
             deadline: tokio::time::Instant::now() + Duration::from_secs(10),
-            awaiting_ack,
+            gate_ack_ids,
+            bybit_unsub_req_id,
+            bitget_unsub_syms,
             awaiting_snapshot,
+            subscribe_sent,
         })
     }
 
     async fn on_message<S>(
         &mut self,
         text: &str,
-        symbols: &[String],
         write: &mut S,
-    ) -> Result<bool, String>
+    ) -> Result<DepthRefreshStep, String>
     where
         S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
         let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
-            return Ok(false);
+            return Ok(DepthRefreshStep {
+                forward_to_selector: true,
+                just_subscribed: false,
+                completed: false,
+            });
         };
-        if frame.get("channel").and_then(|v| v.as_str()) != Some("futures.obu") {
-            return Ok(false);
-        }
-        if !self.awaiting_ack.is_empty() {
-            if frame.get("event").and_then(|v| v.as_str()) == Some("unsubscribe") {
-                if let Some(id) = frame.get("id").and_then(|v| v.as_u64()) {
-                    if self.awaiting_ack.remove(&id) {
-                        if frame.get("error").is_some_and(|v| !v.is_null())
-                            || frame.pointer("/result/status").and_then(|v| v.as_str())
-                                != Some("success")
-                        {
-                            return Err("Gate rejected depth unsubscribe".into());
+
+        let mut forward_to_selector = true;
+        let mut just_subscribed = false;
+
+        match self.endpoint {
+            EndpointKind::GatePublic => {
+                if frame.get("channel").and_then(|v| v.as_str()) == Some("futures.obu") {
+                    if !self.subscribe_sent {
+                        let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                        if event == "unsubscribe" {
+                            if let Some(id) = frame.get("id").and_then(|v| v.as_u64()) {
+                                if self.gate_ack_ids.remove(&id) {
+                                    if frame.get("error").is_some_and(|v| !v.is_null())
+                                        || frame.pointer("/result/status").and_then(|v| v.as_str())
+                                            != Some("success")
+                                    {
+                                        return Err("Gate rejected depth unsubscribe".into());
+                                    }
+                                    if self.gate_ack_ids.is_empty() {
+                                        for message in GateValidator::build_depth_messages(
+                                            &self.symbols,
+                                            Utc::now().timestamp(),
+                                            "subscribe",
+                                        ) {
+                                            write
+                                                .send(Message::Text(message.to_string()))
+                                                .await
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        self.subscribe_sent = true;
+                                        just_subscribed = true;
+                                    }
+                                }
+                            } else if frame.get("error").is_some_and(|v| !v.is_null()) {
+                                return Err("Gate rejected depth unsubscribe".into());
+                            }
+                        } else if matches!(event, "update" | "all") {
+                            if let Some(stream) = frame.pointer("/result/s").and_then(|v| v.as_str())
+                            {
+                                if let Some(sym) = Self::parse_gate_obu_symbol(stream) {
+                                    if self.awaiting_snapshot.contains(&sym) {
+                                        forward_to_selector = false;
+                                    }
+                                }
+                            }
                         }
-                        if self.awaiting_ack.is_empty() {
-                            for message in GateValidator::build_depth_messages(
-                                symbols,
-                                Utc::now().timestamp(),
-                                "subscribe",
-                            ) {
-                                write
-                                    .send(Message::Text(message.to_string()))
-                                    .await
-                                    .map_err(|e| e.to_string())?;
+                    } else if frame.get("error").is_some_and(|v| !v.is_null()) {
+                        return Err("Gate rejected depth resubscribe".into());
+                    } else if frame.pointer("/result/full").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        if let Some(result) = frame.get("result") {
+                            let valid_snap = result.get("u").and_then(|v| v.as_u64()).is_some()
+                                && crate::protocol::validate_book_sides(
+                                    result.get("b"),
+                                    result.get("a"),
+                                    true,
+                                    true,
+                                    true,
+                                    "gate futures.obu snapshot",
+                                )
+                                .is_ok();
+                            if valid_snap {
+                                if let Some(stream) = result.get("s").and_then(|v| v.as_str()) {
+                                    if let Some(sym) = Self::parse_gate_obu_symbol(stream) {
+                                        self.awaiting_snapshot.remove(&sym);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-        } else if frame.get("error").is_some_and(|v| !v.is_null()) {
-            return Err("Gate rejected depth resubscribe".into());
-        } else if frame.pointer("/result/full").and_then(|v| v.as_bool()) == Some(true) {
-            if let Some(stream) = frame.pointer("/result/s").and_then(|v| v.as_str()) {
-                self.awaiting_snapshot.remove(stream);
+            EndpointKind::BybitPublic => {
+                if !self.subscribe_sent {
+                    if frame.get("op").and_then(|v| v.as_str()) == Some("unsubscribe") {
+                        let req_matches = match (
+                            frame.get("req_id").and_then(|v| v.as_str()),
+                            self.bybit_unsub_req_id.as_deref(),
+                        ) {
+                            (Some(got), Some(expected)) => got == expected,
+                            (None, Some(_)) => true,
+                            _ => false,
+                        };
+                        if req_matches {
+                            if frame.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                                return Err("Bybit rejected depth unsubscribe".into());
+                            }
+                            self.bybit_unsub_req_id = None;
+                            let sub_req = format!("depth_sub_{}", self.refresh_id);
+                            let msg = BybitValidator::build_depth_message(
+                                &self.symbols,
+                                "subscribe",
+                                &sub_req,
+                            );
+                            write
+                                .send(Message::Text(msg.to_string()))
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            self.subscribe_sent = true;
+                            just_subscribed = true;
+                        }
+                    } else if let Some(topic) = frame.get("topic").and_then(|v| v.as_str()) {
+                        if let Some(sym) = topic.strip_prefix("orderbook.50.") {
+                            if self.awaiting_snapshot.contains(&sym.to_uppercase()) {
+                                forward_to_selector = false;
+                            }
+                        }
+                    }
+                } else if frame.get("op").and_then(|v| v.as_str()) == Some("subscribe") {
+                    if frame.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                        return Err("Bybit rejected depth resubscribe".into());
+                    }
+                } else if let Some(topic) = frame.get("topic").and_then(|v| v.as_str()) {
+                    if let Some(sym_raw) = topic.strip_prefix("orderbook.50.") {
+                        if let Some(data) = frame.get("data") {
+                            let sym = data
+                                .get("s")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(sym_raw)
+                                .to_uppercase();
+                            let u_opt = data.get("u").and_then(|v| v.as_u64());
+                            let is_snap =
+                                frame.get("type").and_then(|v| v.as_str()) == Some("snapshot")
+                                    || u_opt == Some(1);
+                            if is_snap
+                                && u_opt.is_some()
+                                && crate::protocol::validate_book_sides(
+                                    data.get("b"),
+                                    data.get("a"),
+                                    true,
+                                    true,
+                                    false,
+                                    "bybit orderbook snapshot",
+                                )
+                                .is_ok()
+                            {
+                                self.awaiting_snapshot.remove(&sym);
+                            }
+                        }
+                    }
+                }
             }
+            EndpointKind::BitgetPublic => {
+                if !self.subscribe_sent {
+                    let event = frame.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                    if event == "error" {
+                        return Err(format!("Bitget rejected depth unsubscribe: {text}"));
+                    }
+                    if let Some(arg) = frame.get("arg") {
+                        let chan = arg
+                            .get("topic")
+                            .or_else(|| arg.get("channel"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if chan == "books50" {
+                            let sym = arg
+                                .get("symbol")
+                                .or_else(|| arg.get("instId"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_uppercase();
+                            if event == "unsubscribe" {
+                                if !sym.is_empty() {
+                                    self.bitget_unsub_syms.remove(&sym);
+                                } else {
+                                    self.bitget_unsub_syms.clear();
+                                }
+                                if self.bitget_unsub_syms.is_empty() {
+                                    let msg = BitgetValidator::build_depth_message(
+                                        &self.symbols,
+                                        "subscribe",
+                                    );
+                                    write
+                                        .send(Message::Text(msg.to_string()))
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    self.subscribe_sent = true;
+                                    just_subscribed = true;
+                                }
+                            } else if frame.get("data").is_some()
+                                && self.awaiting_snapshot.contains(&sym)
+                            {
+                                forward_to_selector = false;
+                            }
+                        }
+                    }
+                } else if frame.get("event").and_then(|v| v.as_str()) == Some("error") {
+                    return Err(format!("Bitget rejected depth resubscribe: {text}"));
+                } else if frame.get("action").and_then(|v| v.as_str()) == Some("snapshot") {
+                    if let Some(arg) = frame.get("arg") {
+                        let chan = arg
+                            .get("topic")
+                            .or_else(|| arg.get("channel"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if chan == "books50" {
+                            let valid_snap = frame
+                                .get("data")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first())
+                                .is_some_and(|item| {
+                                    let has_seq = item
+                                        .get("seq")
+                                        .is_some_and(|v| {
+                                            v.as_u64().is_some()
+                                                || v.as_str()
+                                                    .and_then(|s| s.parse::<u64>().ok())
+                                                    .is_some()
+                                        });
+                                    let bids = item.get("b").or_else(|| item.get("bids"));
+                                    let asks = item.get("a").or_else(|| item.get("asks"));
+                                    has_seq
+                                        && crate::protocol::validate_book_sides(
+                                            bids,
+                                            asks,
+                                            true,
+                                            true,
+                                            false,
+                                            "bitget book snapshot",
+                                        )
+                                        .is_ok()
+                                });
+                            if valid_snap {
+                                let sym = arg
+                                    .get("symbol")
+                                    .or_else(|| arg.get("instId"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_uppercase();
+                                self.awaiting_snapshot.remove(&sym);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
-        Ok(self.awaiting_ack.is_empty() && self.awaiting_snapshot.is_empty())
+
+        let completed = self.subscribe_sent && self.awaiting_snapshot.is_empty();
+        Ok(DepthRefreshStep {
+            forward_to_selector,
+            just_subscribed,
+            completed,
+        })
     }
 }
 
@@ -2069,18 +2468,26 @@ mod tests {
         .unwrap();
         tx.send(ConnCommand {
             epoch: 1,
-            action: ConnCommandAction::Resubscribe("old".into()),
+            action: ConnCommandAction::Resubscribe {
+                refresh_id: 1,
+                symbols: vec!["BTC_USDT".into()],
+                reason: "old".into(),
+            },
         })
         .await
         .unwrap();
         tx.send(ConnCommand {
             epoch: 2,
-            action: ConnCommandAction::Resubscribe("current".into()),
+            action: ConnCommandAction::Resubscribe {
+                refresh_id: 2,
+                symbols: vec!["BTC_USDT".into()],
+                reason: "current".into(),
+            },
         })
         .await
         .unwrap();
         assert!(
-            matches!(next.await.unwrap(), Some(ConnCommandAction::Resubscribe(reason)) if reason == "current")
+            matches!(next.await.unwrap(), Some(ConnCommandAction::Resubscribe { refresh_id: 2, reason, .. }) if reason == "current")
         );
     }
 
@@ -2168,7 +2575,9 @@ mod tests {
         });
         let mut sink = Box::pin(sink);
         let symbols = vec!["BTC_USDT".to_string(), "ETH_USDT".to_string()];
-        let mut refresh = GateDepthRefresh::start(&symbols, &mut sink).await.unwrap();
+        let mut refresh = DepthRefresh::start(EndpointKind::GatePublic, 7, &symbols, &mut sink)
+            .await
+            .unwrap();
         let ids: Vec<_> = frames
             .lock()
             .unwrap()
@@ -2182,13 +2591,35 @@ mod tests {
             .iter()
             .all(|row| row["event"] == "unsubscribe"));
 
+        // Stale pre-unsubscribe depth snapshot/delta MUST be dropped while L1 BBO keeps forwarding.
+        let stale_pre_unsub_snap = json!({"channel": "futures.obu", "event": "update", "result": {
+            "full": true, "s": "ob.BTC_USDT.50", "u": 99
+        }});
+        let step_stale = refresh
+            .on_message(&stale_pre_unsub_snap.to_string(), &mut sink)
+            .await
+            .unwrap();
+        assert!(!step_stale.forward_to_selector);
+        assert!(!step_stale.completed);
+
+        let bbo_during_unsub = json!({"channel": "futures.book_ticker", "event": "update", "result": {
+            "s": "BTC_USDT", "b": "90000.0", "B": "1.0", "a": "90000.1", "A": "1.0", "t": 1700000000000i64
+        }});
+        let step_bbo = refresh
+            .on_message(&bbo_during_unsub.to_string(), &mut sink)
+            .await
+            .unwrap();
+        assert!(step_bbo.forward_to_selector);
+
         for (index, id) in ids.into_iter().enumerate() {
             let ack = json!({"id": id, "channel": "futures.obu", "event": "unsubscribe",
                 "result": {"status": "success"}});
-            assert!(!refresh
-                .on_message(&ack.to_string(), &symbols, &mut sink)
+            let step = refresh
+                .on_message(&ack.to_string(), &mut sink)
                 .await
-                .unwrap());
+                .unwrap();
+            assert!(!step.completed);
+            assert_eq!(step.just_subscribed, index == 1);
             assert_eq!(
                 frames.lock().unwrap().len(),
                 if index == 0 { 2 } else { 4 }
@@ -2197,17 +2628,523 @@ mod tests {
         assert!(frames.lock().unwrap()[2..]
             .iter()
             .all(|row| row["event"] == "subscribe" && row["channel"] == "futures.obu"));
-        for (index, symbol) in symbols.iter().enumerate() {
-            let raw = json!({"channel": "futures.obu", "result": {
-                "full": true, "s": format!("ob.{symbol}.50")
+        // Malformed full=true snapshot missing b/a arrays MUST NOT lift awaiting_snapshot!
+        for symbol in &symbols {
+            let malformed = json!({"channel": "futures.obu", "event": "update", "result": {
+                "full": true, "s": format!("ob.{symbol}.50"), "u": 199
             }});
-            assert_eq!(
-                refresh
-                    .on_message(&raw.to_string(), &symbols, &mut sink)
+            let step_bad = refresh
+                .on_message(&malformed.to_string(), &mut sink)
+                .await
+                .unwrap();
+            assert!(step_bad.forward_to_selector);
+            assert!(!step_bad.completed);
+        }
+        for (index, symbol) in symbols.iter().enumerate() {
+            let raw = json!({"channel": "futures.obu", "event": "update", "result": {
+                "full": true, "s": format!("ob.{symbol}.50"), "u": 200,
+                "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]
+            }});
+            let step = refresh
+                .on_message(&raw.to_string(), &mut sink)
+                .await
+                .unwrap();
+            assert!(step.forward_to_selector);
+            assert_eq!(step.completed, index == 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_and_bitget_depth_refresh_unsubscribe_then_resubscribe_depth_only() {
+        for endpoint in [EndpointKind::BybitPublic, EndpointKind::BitgetPublic] {
+            let frames = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let captured = Arc::clone(&frames);
+            let sink = futures_util::sink::unfold((), move |(), msg: Message| {
+                let Message::Text(text) = msg else {
+                    panic!("expected text frame")
+                };
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+                std::future::ready(Ok::<(), tokio_tungstenite::tungstenite::Error>(()))
+            });
+            let mut sink = Box::pin(sink);
+            let symbols = vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()];
+            let mut refresh = DepthRefresh::start(endpoint, 11, &symbols, &mut sink)
+                .await
+                .unwrap();
+            assert_eq!(frames.lock().unwrap().len(), 1);
+            assert_eq!(frames.lock().unwrap()[0]["op"], "unsubscribe");
+
+            // Stale pre-unsubscribe depth message MUST be suppressed while L1 BBO keeps flowing.
+            let (stale_depth, live_bbo, unsub_acks, snaps) = match endpoint {
+                EndpointKind::BybitPublic => (
+                    json!({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 50, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}}),
+                    json!({"topic": "orderbook.1.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 50, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}}),
+                    vec![json!({"op": "unsubscribe", "success": true, "req_id": "depth_unsub_11"})],
+                    vec![
+                        json!({"topic": "orderbook.50.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 100, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}}),
+                        json!({"topic": "orderbook.50.ETHUSDT", "type": "snapshot", "data": {"s": "ETHUSDT", "u": 100, "b": [["3000.0", "1.0"]], "a": [["3001.0", "1.0"]]}}),
+                    ],
+                ),
+                EndpointKind::BitgetPublic => (
+                    json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 10, "pseq": 0, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}]}),
+                    json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books1", "symbol": "BTCUSDT"}, "data": [{"seq": 1, "pseq": 0, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}]}),
+                    vec![
+                        json!({"event": "unsubscribe", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}}),
+                        json!({"event": "unsubscribe", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "ETHUSDT"}}),
+                    ],
+                    vec![
+                        json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 200, "pseq": 0, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}]}),
+                        json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "ETHUSDT"}, "data": [{"seq": 200, "pseq": 0, "b": [["3000.0", "1.0"]], "a": [["3001.0", "1.0"]]}]}),
+                    ],
+                ),
+                _ => unreachable!(),
+            };
+
+            let step_stale = refresh
+                .on_message(&stale_depth.to_string(), &mut sink)
+                .await
+                .unwrap();
+            assert!(!step_stale.forward_to_selector);
+            let step_bbo = refresh
+                .on_message(&live_bbo.to_string(), &mut sink)
+                .await
+                .unwrap();
+            assert!(step_bbo.forward_to_selector);
+
+            for (idx, ack) in unsub_acks.iter().enumerate() {
+                let step = refresh.on_message(&ack.to_string(), &mut sink).await.unwrap();
+                assert!(!step.completed);
+                assert_eq!(step.just_subscribed, idx + 1 == unsub_acks.len());
+            }
+            assert_eq!(frames.lock().unwrap().len(), 2);
+            assert_eq!(frames.lock().unwrap()[1]["op"], "subscribe");
+
+            for (idx, snap) in snaps.iter().enumerate() {
+                let step = refresh
+                    .on_message(&snap.to_string(), &mut sink)
                     .await
-                    .unwrap(),
-                index == 1
+                    .unwrap();
+                assert!(step.forward_to_selector);
+                assert_eq!(step.completed, idx == 1);
+            }
+        }
+    }
+
+    #[test]
+    fn resubscribe_queue_failure_emits_depth_unavailable_blocks_deltas_and_triggers_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs/config.trial_15m.json");
+        let mut config = CollectorConfig::load(&cfg_path).unwrap();
+        config.deployment.data_root = dir.path().to_string_lossy().to_string();
+        config.exchanges.binance_futures.enabled = false;
+        config.exchanges.bybit_linear.enabled = false;
+        config.exchanges.bitget_v3.enabled = false;
+        config.exchanges.gate_futures.enabled = true;
+        config.exchanges.gate_futures.symbols =
+            vec!["BTC_USDT".to_string(), "ETH_USDT".to_string()];
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let mono_origin = Instant::now();
+        let start_wall_ns = wall_clock_ns();
+        let boot_id = format!("queue_fail_boot_{start_wall_ns}");
+        let data_root = dir.path().to_path_buf();
+        let (tx, _rx) = mpsc::channel::<EngineEvent>(16);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let http_client = reqwest::Client::new();
+
+        let mut selector = CausalSelector::new(
+            EndpointKind::GatePublic,
+            config.exchanges.gate_futures.symbols.clone(),
+            3,
+            5,
+        );
+        selector.start_disconnected();
+        let mut selectors = HashMap::from([(EndpointKind::GatePublic, selector)]);
+
+        let writer_opts = WriterOptions::from_config(
+            &config,
+            Some("queue_fail_run".to_string()),
+            true,
+            Some(start_wall_ns),
+        );
+        let writer = HourlyTsvZstWriter::with_options(
+            data_root.clone(),
+            ExchangeId::GateFutures,
+            boot_id.clone(),
+            3,
+            writer_opts,
+        );
+        let mut writers = BTreeMap::from([(ExchangeId::GateFutures, writer)]);
+        let mut activity = StreamActivity::from_config(&config, boot_id);
+
+        // Pre-fill B's command queue so Resubscribe try_send fails with TrySendError::Full.
+        let (cmd_tx_a, _cmd_rx_a) = mpsc::channel::<ConnCommand>(4);
+        let (cmd_tx_b, _cmd_rx_b) = mpsc::channel::<ConnCommand>(1);
+        cmd_tx_b
+            .try_send(ConnCommand {
+                epoch: 1,
+                action: ConnCommandAction::Reconnect("occupy_queue".to_string()),
+            })
+            .unwrap();
+        let cmd_txs = HashMap::from([
+            ((EndpointKind::GatePublic, ConnId::A), cmd_tx_a),
+            ((EndpointKind::GatePublic, ConnId::B), cmd_tx_b),
+        ]);
+
+        let mut binance_scheduler =
+            BinanceSnapshotScheduler::new(SnapshotSchedulerConfig::for_limit(1000));
+        let mut snapshot_tasks = HashMap::new();
+
+        for conn_id in [ConnId::A, ConnId::B] {
+            process_engine_event(
+                EngineEvent::Reconnect {
+                    endpoint: EndpointKind::GatePublic,
+                    conn_id,
+                    epoch: 1,
+                    mono_ns: 100,
+                },
+                &config,
+                mono_origin,
+                &tx,
+                &http_client,
+                &stop_rx,
+                &mut selectors,
+                &mut writers,
+                &mut activity,
+                &data_root,
+                &cmd_txs,
+                &mut binance_scheduler,
+                &mut snapshot_tasks,
+                true,
             );
+        }
+
+        // Standby B receives BTC_USDT snapshot first (dropped from disk while B != Live),
+        // then ETH_USDT snapshot which pushes B to Live and promotes B -> A while BTC_USDT
+        // needs a fresh B-line anchor via Resubscribe.
+        let btc_snap = json!({
+            "channel": "futures.obu",
+            "event": "update",
+            "result": {"s": "ob.BTC_USDT.50", "full": true, "u": 100, "b": [["90000.0", "1.0"]], "a": [["90001.0", "1.0"]]}
+        })
+        .to_string();
+        let eth_snap = json!({
+            "channel": "futures.obu",
+            "event": "update",
+            "result": {"s": "ob.ETH_USDT.50", "full": true, "u": 200, "b": [["3000.0", "2.0"]], "a": [["3001.0", "2.0"]]}
+        })
+        .to_string();
+        let unanchored_btc_delta = json!({
+            "channel": "futures.obu",
+            "event": "update",
+            "result": {"s": "ob.BTC_USDT.50", "full": false, "U": 101, "u": 101, "b": [["90000.0", "1.5"]], "a": []}
+        })
+        .to_string();
+
+        for (idx, payload) in [btc_snap, eth_snap, unanchored_btc_delta]
+            .into_iter()
+            .enumerate()
+        {
+            process_engine_event(
+                EngineEvent::Frame(RawFrame {
+                    recv_wall_ns: start_wall_ns + ((idx as i64) + 1) * 1_000_000,
+                    recv_mono_ns: 200 + ((idx as u64) + 1) * 1_000_000,
+                    exchange: ExchangeId::GateFutures,
+                    endpoint: EndpointKind::GatePublic,
+                    conn_id: ConnId::B,
+                    epoch: 1,
+                    payload,
+                }),
+                &config,
+                mono_origin,
+                &tx,
+                &http_client,
+                &stop_rx,
+                &mut selectors,
+                &mut writers,
+                &mut activity,
+                &data_root,
+                &cmd_txs,
+                &mut binance_scheduler,
+                &mut snapshot_tasks,
+                true,
+            );
+        }
+
+        let sel = selectors.get(&EndpointKind::GatePublic).unwrap();
+        assert!(
+            sel.in_gap(),
+            "queue failure on primary B with A unready must enter gap recovery"
+        );
+
+        let sealed = writers
+            .get_mut(&ExchangeId::GateFutures)
+            .unwrap()
+            .seal_all()
+            .unwrap();
+        let recs = crate::storage::read_tsv_zst_records(&sealed[0].data_path).unwrap();
+        let metas: Vec<&str> = recs
+            .iter()
+            .filter(|r| r.0.kind == crate::types::RecordKind::Meta)
+            .map(|r| r.1.as_str())
+            .collect();
+        assert!(
+            metas
+                .iter()
+                .any(|m| m.contains("\"DEPTH_UNAVAILABLE\"") && m.contains("\"BTC_USDT\"")),
+            "expected DEPTH_UNAVAILABLE META for BTC_USDT: {metas:?}"
+        );
+        assert!(
+            metas
+                .iter()
+                .any(|m| m.contains("\"GAP_START\"") && m.contains("depth_refresh_queue_failed")),
+            "expected GAP_START META citing depth_refresh_queue_failed: {metas:?}"
+        );
+        assert!(
+            !recs.iter().any(|r| {
+                r.0.kind == crate::types::RecordKind::Data
+                    && r.1.contains("ob.BTC_USDT.50")
+                    && r.1.contains("\"full\":false")
+            }),
+            "unanchored BTC_USDT delta must NEVER be written after Resubscribe queue failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_connection_loop_depth_refresh_timeout_disconnects_and_drops_stale_depth() {
+        let mut tasks = Vec::new();
+        for endpoint in [
+            EndpointKind::GatePublic,
+            EndpointKind::BybitPublic,
+            EndpointKind::BitgetPublic,
+        ] {
+            tasks.push(tokio::spawn(async move {
+                let sym = if endpoint == EndpointKind::GatePublic {
+                    "BTC_USDT".to_string()
+                } else {
+                    "BTCUSDT".to_string()
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+                    // Read initial subscribe + heartbeat frames until unsubscribe arrives.
+                    let unsub_msg = loop {
+                        match ws.next().await {
+                            Some(Ok(Message::Text(t))) => {
+                                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                                    continue;
+                                };
+                                let is_unsub = match endpoint {
+                                    EndpointKind::GatePublic => v["event"] == "unsubscribe",
+                                    EndpointKind::BybitPublic | EndpointKind::BitgetPublic => {
+                                        v["op"] == "unsubscribe"
+                                    }
+                                    _ => false,
+                                };
+                                if is_unsub {
+                                    break v;
+                                }
+                            }
+                            Some(Ok(_)) => continue,
+                            other => panic!(
+                                "unexpected WS read waiting for unsub on {endpoint:?}: {other:?}"
+                            ),
+                        }
+                    };
+
+                    // While unsubscribe ACK is still in flight: emit a stale depth frame (MUST be dropped)
+                    // and a live L1 BBO frame (MUST still be forwarded).
+                    let (stale_depth, live_bbo, unsub_ack) = match endpoint {
+                        EndpointKind::GatePublic => (
+                            json!({"channel": "futures.obu", "event": "update", "result": {"full": true, "s": "ob.BTC_USDT.50", "u": 50}}),
+                            json!({"channel": "futures.book_ticker", "event": "update", "result": {"s": "BTC_USDT", "b": "90000.0", "B": "1.0", "a": "90001.0", "A": "1.0"}}),
+                            json!({"channel": "futures.obu", "event": "unsubscribe", "id": unsub_msg["id"], "result": {"status": "success"}}),
+                        ),
+                        EndpointKind::BybitPublic => (
+                            json!({"topic": "orderbook.50.BTCUSDT", "type": "delta", "data": {"s": "BTCUSDT", "u": 51}}),
+                            json!({"topic": "orderbook.1.BTCUSDT", "type": "snapshot", "data": {"s": "BTCUSDT", "u": 51}}),
+                            json!({"op": "unsubscribe", "success": true, "req_id": unsub_msg["req_id"]}),
+                        ),
+                        EndpointKind::BitgetPublic => (
+                            json!({"action": "update", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}, "data": [{"seq": 51, "pseq": 50}]}),
+                            json!({"action": "snapshot", "arg": {"instType": "usdt-futures", "topic": "books1", "symbol": "BTCUSDT"}, "data": [{"seq": 1, "pseq": 0}]}),
+                            json!({"event": "unsubscribe", "arg": {"instType": "usdt-futures", "topic": "books50", "symbol": "BTCUSDT"}}),
+                        ),
+                        _ => unreachable!(),
+                    };
+
+                    ws.send(Message::Text(stale_depth.to_string())).await.unwrap();
+                    ws.send(Message::Text(live_bbo.to_string())).await.unwrap();
+                    ws.send(Message::Text(unsub_ack.to_string())).await.unwrap();
+
+                    // Verify depth-only re-subscribe frame arrives, then intentionally withhold snapshot
+                    // so DepthRefresh hits its 10s deadline timeout.
+                    loop {
+                        match ws.next().await {
+                            Some(Ok(Message::Text(t))) => {
+                                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                                    continue;
+                                };
+                                let is_resub = match endpoint {
+                                    EndpointKind::GatePublic => {
+                                        v["event"] == "subscribe" && v["channel"] == "futures.obu"
+                                    }
+                                    EndpointKind::BybitPublic | EndpointKind::BitgetPublic => {
+                                        v["op"] == "subscribe"
+                                    }
+                                    _ => false,
+                                };
+                                if is_resub {
+                                    break;
+                                }
+                            }
+                            Some(Ok(_)) => continue,
+                            other => panic!(
+                                "unexpected WS read waiting for resub on {endpoint:?}: {other:?}"
+                            ),
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                });
+
+                let cfg_path =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs/config.trial_15m.json");
+                let mut config = CollectorConfig::load(&cfg_path).unwrap();
+                let ws_url = format!("ws://{addr}/ws");
+                match endpoint {
+                    EndpointKind::GatePublic => config.exchanges.gate_futures.ws_url = ws_url,
+                    EndpointKind::BybitPublic => config.exchanges.bybit_linear.ws_url = ws_url,
+                    EndpointKind::BitgetPublic => config.exchanges.bitget_v3.ws_url = ws_url,
+                    _ => unreachable!(),
+                }
+                let (ev_tx, mut ev_rx) = mpsc::channel(32);
+                let (cmd_tx, cmd_rx) = mpsc::channel(8);
+                let (stop_tx, stop_rx) = watch::channel(false);
+
+                let loop_handle = tokio::spawn(ws_connection_loop(
+                    endpoint,
+                    ConnId::B,
+                    vec![sym.clone()],
+                    Arc::new(config),
+                    Instant::now(),
+                    ev_tx,
+                    cmd_rx,
+                    stop_rx,
+                ));
+
+                // Wait for initial Subscribed(epoch=1), then trigger depth refresh.
+                loop {
+                    let ev = tokio::time::timeout(Duration::from_secs(5), ev_rx.recv())
+                        .await
+                        .expect("timed out waiting for Subscribed")
+                        .expect("event channel closed");
+                    if matches!(ev, EngineEvent::Subscribed { epoch: 1, .. }) {
+                        break;
+                    }
+                }
+
+                cmd_tx
+                    .send(ConnCommand {
+                        epoch: 1,
+                        action: ConnCommandAction::Resubscribe {
+                            refresh_id: 77,
+                            symbols: vec![sym.clone()],
+                            reason: "timeout_test".to_string(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+
+                let mut saw_live_bbo = false;
+                let mut saw_refresh_subscribed = false;
+                let expected_reason = if endpoint == EndpointKind::GatePublic {
+                    "gate_depth_refresh_timeout".to_string()
+                } else {
+                    format!("{}_depth_refresh_timeout", endpoint.as_str())
+                };
+
+                let disconnect_reason = loop {
+                    let ev = tokio::time::timeout(Duration::from_secs(15), ev_rx.recv())
+                        .await
+                        .expect("timed out waiting for depth refresh timeout disconnect")
+                        .expect("event channel closed");
+                    match ev {
+                        EngineEvent::Frame(f) => {
+                            let parsed: Value = serde_json::from_str(&f.payload).unwrap();
+                            let is_depth_data = match endpoint {
+                                EndpointKind::GatePublic => {
+                                    parsed["channel"] == "futures.obu"
+                                        && matches!(parsed["event"].as_str(), Some("update" | "all"))
+                                }
+                                EndpointKind::BybitPublic => {
+                                    parsed["topic"]
+                                        .as_str()
+                                        .is_some_and(|t| t.starts_with("orderbook.50."))
+                                        && matches!(parsed["type"].as_str(), Some("snapshot" | "delta"))
+                                }
+                                EndpointKind::BitgetPublic => {
+                                    parsed.pointer("/arg/topic").and_then(Value::as_str)
+                                        == Some("books50")
+                                        && matches!(
+                                            parsed["action"].as_str(),
+                                            Some("snapshot" | "update")
+                                        )
+                                }
+                                _ => false,
+                            };
+                            assert!(
+                                !is_depth_data,
+                                "stale depth data frame leaked past DepthRefresh filter on {endpoint:?}: {}",
+                                f.payload
+                            );
+                            if f.payload.contains("book_ticker")
+                                || f.payload.contains("orderbook.1")
+                                || f.payload.contains("books1")
+                            {
+                                saw_live_bbo = true;
+                            }
+                        }
+                        EngineEvent::DepthRefreshSubscribed {
+                            epoch: 1,
+                            refresh_id: 77,
+                            ..
+                        } => {
+                            saw_refresh_subscribed = true;
+                        }
+                        EngineEvent::Disconnect {
+                            epoch: 1,
+                            reason,
+                            ..
+                        } => {
+                            break reason;
+                        }
+                        _ => {}
+                    }
+                };
+
+                assert!(saw_live_bbo, "L1 BBO must keep flowing on {endpoint:?}");
+                assert!(
+                    saw_refresh_subscribed,
+                    "DepthRefreshSubscribed must fire before waiting on snapshot timeout ({endpoint:?})"
+                );
+                assert_eq!(disconnect_reason, expected_reason);
+
+                let _ = stop_tx.send(true);
+                server.abort();
+                let _ = loop_handle.await;
+            }));
+        }
+        for handle in tasks {
+            handle.await.unwrap();
         }
     }
 }

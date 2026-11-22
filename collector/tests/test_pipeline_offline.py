@@ -502,19 +502,47 @@ def test_minimal_closed_loop_binance_gate_btc_e2e_hbt_reproducibility(tmp_path: 
         assert int(bin_agg["first_trade_id"][0]) == 100
         assert int(bin_agg["last_trade_id"][0]) == 105  # Unsplit!
 
-        e2e = run_offline_e2e_hbt_replay(
-            out_dir / "gate_futures_l2_BTC_20261203.npz",
-            out_dir / "binance_bbo_BTC_20261203.npz",
-            trade_steps=1100,
-            quote_mode=2,
-            beta=0.5,
-            cross_timestamp_tie_mode="microsecond",
-        )
+        def replay():
+            return run_offline_e2e_hbt_replay(
+                out_dir / "gate_futures_l2_BTC_20261203.npz",
+                out_dir / "binance_bbo_BTC_20261203.npz",
+                trade_steps=1100,
+                quote_mode=2,
+                beta=0.5,
+                cross_timestamp_tie_mode="microsecond",
+            )
+
+        e2e = replay()
         assert e2e["status"] == "ok"
         assert e2e["metrics"]["decisions"] > 0
         assert e2e["metrics"]["submits"] > 0
         assert e2e["metrics"]["binance_events"] > 0
+        assert e2e["execution_status"] == "verified"
         run_results.append(e2e)
+
+        if run_idx == 1:
+            # Exercise normal replay wiring with actual engine fills. Changing just the
+            # calendar must affect certification without altering the simulation ledger.
+            fill_ns = e2e["metrics"]["fill_ts_ns"][0]
+            gate_row["depth_unavailable_intervals"] = [
+                {"start_wall_ns": fill_ns, "end_wall_ns": fill_ns + 1}
+            ]
+            calendar = out_dir / "eligibility_calendar.json"
+            calendar.write_text(json.dumps(cal), encoding="utf-8")
+            with_gap = replay()
+            assert with_gap["execution_status"] == "execution_unverified"
+            assert with_gap["gap_execution_audit"]["unverified_gap_fills"] >= 1
+            assert with_gap["gap_execution_audit"]["total_fills"] == len(e2e["metrics"]["fill_ts_ns"])
+            assert with_gap["ledger_sha256"] == e2e["ledger_sha256"]
+
+            gate_row["sha256"]["follower_l2_hbt"] = "0" * 64
+            calendar.write_text(json.dumps(cal), encoding="utf-8")
+            unmatched = replay()
+            assert unmatched["execution_status"] == "execution_unverified"
+            audit = unmatched["gap_execution_audit"]
+            assert not audit["depth_intervals_available"]
+            assert audit["unassessed_fills"] == audit["total_fills"] > 0
+            assert unmatched["ledger_sha256"] == e2e["ledger_sha256"]
 
     # 100% bit-identical reproducibility across independent runs!
     assert run_results[0]["follower_l2_sha256"] == run_results[1]["follower_l2_sha256"]

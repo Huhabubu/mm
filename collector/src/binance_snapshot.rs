@@ -1209,12 +1209,14 @@ pub fn parse_depth_snapshot_body(text: &str) -> Result<u64, String> {
         .get("lastUpdateId")
         .and_then(|x| x.as_u64())
         .ok_or_else(|| "missing integer lastUpdateId".to_string())?;
-    if !v.get("bids").is_some_and(|x| x.is_array()) {
-        return Err("missing bids array".to_string());
-    }
-    if !v.get("asks").is_some_and(|x| x.is_array()) {
-        return Err("missing asks array".to_string());
-    }
+    crate::protocol::validate_book_sides(
+        v.get("bids"),
+        v.get("asks"),
+        true,
+        false,
+        false,
+        "binance rest depth snapshot",
+    )?;
     Ok(last_update_id)
 }
 

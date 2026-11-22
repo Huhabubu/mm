@@ -117,6 +117,16 @@ pub trait ProtocolValidator: Send {
     fn expected_symbol_count(&self) -> usize;
 }
 
+pub fn is_depth_channel(endpoint: EndpointKind, channel: &str) -> bool {
+    matches!(
+        (endpoint, channel),
+        (EndpointKind::BinancePublic, "depth@100ms")
+            | (EndpointKind::GatePublic, "futures.obu")
+            | (EndpointKind::BybitPublic, "orderbook.50")
+            | (EndpointKind::BitgetPublic, "books50")
+    )
+}
+
 pub fn make_validator(endpoint: EndpointKind, symbols: Vec<String>) -> Box<dyn ProtocolValidator> {
     match endpoint {
         EndpointKind::BinancePublic => Box::new(binance::BinanceValidator::new_public(symbols)),
@@ -126,3 +136,131 @@ pub fn make_validator(endpoint: EndpointKind, symbols: Vec<String>) -> Box<dyn P
         EndpointKind::GatePublic => Box::new(gate::GateValidator::new(symbols)),
     }
 }
+
+fn parse_finite_f64(v: &serde_json::Value) -> Option<f64> {
+    if let Some(s) = v.as_str() {
+        if s.is_empty() {
+            return None;
+        }
+        s.parse::<f64>().ok().filter(|x| x.is_finite())
+    } else if let Some(n) = v.as_f64() {
+        if n.is_finite() {
+            Some(n)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Validate a single orderbook side (`b`/`bids` or `a`/`asks`) array.
+///
+/// Returns `(positive_qty_level_count, best_price)` when valid.
+pub fn validate_book_levels(
+    levels: Option<&serde_json::Value>,
+    required: bool,
+    require_non_empty: bool,
+    require_string_size: bool,
+    is_bid: bool,
+    label: &str,
+) -> Result<(usize, Option<f64>), String> {
+    let arr = match levels {
+        None | Some(serde_json::Value::Null) => {
+            if required {
+                return Err(format!("{label} array missing"));
+            }
+            return Ok((0, None));
+        }
+        Some(v) => v
+            .as_array()
+            .ok_or_else(|| format!("{label} is not a JSON array"))?,
+    };
+    let mut positive_count = 0usize;
+    let mut best_px: Option<f64> = None;
+    for lvl in arr {
+        let pair = lvl
+            .as_array()
+            .ok_or_else(|| format!("{label} level is not a [price, size] array"))?;
+        if pair.len() < 2 {
+            return Err(format!("{label} level has fewer than 2 entries"));
+        }
+        let px = parse_finite_f64(&pair[0])
+            .filter(|&p| p > 0.0)
+            .ok_or_else(|| format!("{label} price is not a finite positive number: {}", pair[0]))?;
+        let qty = if require_string_size {
+            pair[1]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|&q| q.is_finite() && q >= 0.0)
+                .ok_or_else(|| {
+                    format!(
+                        "{label} size is not a valid decimal string (X-Gate-Size-Decimal: 1 missing or ignored?): {}",
+                        pair[1]
+                    )
+                })?
+        } else {
+            parse_finite_f64(&pair[1])
+                .filter(|&q| q >= 0.0)
+                .ok_or_else(|| {
+                    format!("{label} size is not a finite non-negative number: {}", pair[1])
+                })?
+        };
+        if qty > 0.0 {
+            positive_count += 1;
+            best_px = Some(match best_px {
+                None => px,
+                Some(cur) => {
+                    if is_bid {
+                        cur.max(px)
+                    } else {
+                        cur.min(px)
+                    }
+                }
+            });
+        }
+    }
+    if require_non_empty && positive_count == 0 {
+        return Err(format!("{label} snapshot has no positive-size levels"));
+    }
+    Ok((positive_count, best_px))
+}
+
+/// Validate both bid and ask arrays of an orderbook frame, rejecting crossed snapshots.
+pub fn validate_book_sides(
+    bids: Option<&serde_json::Value>,
+    asks: Option<&serde_json::Value>,
+    required: bool,
+    require_non_empty: bool,
+    require_string_size: bool,
+    ctx: &str,
+) -> Result<(), String> {
+    let (_, best_bid) = validate_book_levels(
+        bids,
+        required,
+        require_non_empty,
+        require_string_size,
+        true,
+        &format!("{ctx} bids"),
+    )?;
+    let (_, best_ask) = validate_book_levels(
+        asks,
+        required,
+        require_non_empty,
+        require_string_size,
+        false,
+        &format!("{ctx} asks"),
+    )?;
+    if required {
+        if let (Some(bb), Some(ba)) = (best_bid, best_ask) {
+            if bb >= ba {
+                return Err(format!(
+                    "{ctx} snapshot book is crossed: best_bid={bb} >= best_ask={ba}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
