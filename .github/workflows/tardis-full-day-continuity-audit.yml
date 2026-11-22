@@ -1,0 +1,46 @@
+name: Audit Tardis full-day snapshot and feed gaps (research only)
+on:
+  push:
+    branches: [audit/tardis-full-day-continuity-2026]
+    paths:
+      - 'scripts/tardis_full_day_continuity_audit.py'
+      - '.github/workflows/tardis-full-day-continuity-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  first-day:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - { venue: okex-swap, symbol: BTC-USDT-SWAP, kinds: 'incremental_book_L2,book_ticker,trades' }
+          - { venue: okex-swap, symbol: SOL-USDT-SWAP, kinds: 'incremental_book_L2,book_ticker,trades' }
+          - { venue: bitget-futures, symbol: BTCUSDT, kinds: 'incremental_book_L2,book_ticker,trades' }
+          - { venue: bitget-futures, symbol: SOLUSDT, kinds: 'incremental_book_L2,book_ticker,trades' }
+          - { venue: binance-futures, symbol: BTCUSDT, kinds: 'book_ticker' }
+          - { venue: binance-futures, symbol: SOLUSDT, kinds: 'book_ticker' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Check read-only audit syntax
+        run: python -m py_compile scripts/tardis_full_day_continuity_audit.py
+      - name: Scan original monthly Tardis CSV for June 1 (full UTC day)
+        run: |
+          python -u scripts/tardis_full_day_continuity_audit.py \
+            --day 2026-06-01 --venue '${{ matrix.venue }}' \
+            --symbol '${{ matrix.symbol }}' --kinds '${{ matrix.kinds }}'
+      - name: Save audit summary (no raw tick data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tardis-continuity-2026-06-01-${{ matrix.venue }}-${{ matrix.symbol }}
+          path: reports/tardis_full_day/*.json
+          retention-days: 14
+          if-no-files-found: warn
