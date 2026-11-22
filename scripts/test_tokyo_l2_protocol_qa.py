@@ -282,7 +282,8 @@ class ProtocolTest(unittest.TestCase):
                 wpath.write_text(
                     json.dumps(
                         {
-                            "qa_status": "passed",
+                            "qa_status": "failed" if c is cands[0] else "passed",
+                            "archive_complete_in_index": True,
                             "run_id": run_id,
                             "partition_minutes": 15,
                             "checker_commit_sha": checker_sha,
