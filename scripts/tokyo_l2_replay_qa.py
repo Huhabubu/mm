@@ -33,15 +33,15 @@ def download(remote: str, rel: str, path: Path) -> Path:
     return path
 
 
-def verified_candidates(remote, config, run_id, earliest, state_dir=None):
+def verified_candidates(remote, config, run_id, earliest, state_dir=None, *, historical=False):
     day = datetime.fromtimestamp(earliest, timezone.utc).date().isoformat()
     candidates, discovery, _, _, index_batch = archive._discover_verified_candidates(
         remote, config, since_date=day, since_start_s=earliest, run_id_filter=run_id,
         download_retries=3, sleeper=time.sleep, state_dir=state_dir,
     )
-    if discovery != "archive_manifest_index" or index_batch != run_id:
+    if discovery != "archive_manifest_index" or (not historical and index_batch != run_id):
         raise ValueError("verified archive index does not match the requested collection batch")
-    return candidates
+    return [item for item in candidates if item["run_id"] == run_id] if historical else candidates
 
 
 def input_digests(candidates):
@@ -163,6 +163,34 @@ def on_grid(value, step, *, allow_zero=False):
         return False
 
 
+def valid_non_depth_frame(exchange, symbol, channel, obj):
+    """Validate fields consumed by quote and trade replay before using a frame as evidence."""
+    try:
+        if channel == "bookTicker":
+            record = obj.get("data", obj)
+            bid, ask = float(record["b"]), float(record["a"])
+        elif channel == "futures.book_ticker":
+            bid, ask = float(obj["result"]["b"]), float(obj["result"]["a"])
+        elif channel in {"orderbook.1", "books1"}:
+            record = obj["data"] if channel == "orderbook.1" else obj["data"][0]
+            bid = float((record.get("b") or record["bids"])[0][0])
+            ask = float((record.get("a") or record["asks"])[0][0])
+        else:
+            trades = [obj.get("data", obj)] if exchange == BINANCE else trading_event(exchange, obj)
+            if exchange == GATE:
+                trades = [trade for trade in trades if symbol_key(trade.get("contract") or "") == symbol]
+            return bool(trades) and all(
+                any(trade.get(key) is not None for key in ("id", "i", "tradeId", "a"))
+                and math.isfinite(float(trade.get("price") or trade.get("p") or trade.get("P") or trade["px"]))
+                and float(trade.get("price") or trade.get("p") or trade.get("P") or trade["px"]) > 0
+                and 0 < abs(float(trade.get("size") or trade.get("q") or trade.get("v") or trade["sz"])) < math.inf
+                for trade in trades
+            )
+        return 0 < bid < ask < math.inf
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return False
+
+
 class StreamEvidence:
     """Track independently scoped feed evidence while walking sealed segments."""
 
@@ -183,14 +211,16 @@ class StreamEvidence:
             limit = "event_trade_quiet_max" if category == coverage.CHANNEL_CATEGORY_EVENT_TRADE else category
             self.limits[key] = int(thresholds[limit] * NS)
 
-    def interrupt(self, exchange, wall, event, symbol="ALL", endpoint=None):
+    def interrupt(self, exchange, wall, event, symbol="ALL", endpoint=None, channel=None):
         depth_only = event in {"DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"}
         status = "known_gap" if event in {"DEPTH_UNAVAILABLE", "GAP_START", "SNAPSHOT_BRIDGE_RETRY"} else "unverified"
         for key in self.by_exchange.get(exchange, ()):
-            _, sym, channel = key
+            _, sym, stream_channel = key
+            if channel and channel != stream_channel:
+                continue
             if symbol != "ALL" and symbol != sym:
                 continue
-            if endpoint and endpoint != coverage.stream_owning_endpoint(exchange, channel):
+            if endpoint and endpoint != coverage.stream_owning_endpoint(exchange, stream_channel):
                 continue
             if depth_only and self.depth.get((exchange, sym)) != key:
                 continue
@@ -217,7 +247,7 @@ class StreamEvidence:
         return self.timeline.report(start_ns, end_ns, invalid_exchanges)
 
 
-def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint=None):
+def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint=None, source_restrictions=None):
     boundary_checkpoints = {
         (row["exchange"], row["symbol"]): Chain(
             tuple(row["connection"]), row["seq"], row["awaiting_delta"], anchored=True
@@ -237,8 +267,10 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     book_proofs = ProtocolReport()
     evidence = StreamEvidence(config)
     expected_depths = set(evidence.depth)
-    invalid_exchanges = set()
+    restrictions = source_restrictions or {}
+    invalid_exchanges = set(restrictions.get(start_ns // NS, ()))
     previous_end = {}
+    legacy_ends = {}
     recovered_depth = set()
     buffers = {ex: convert.AssetDayBuffers(ex, BTC, convert.date_utc_from_wall_ns(start_ns)) for ex in FOLLOWERS}
     books = {ex: Book() for ex in FOLLOWERS}
@@ -260,12 +292,17 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         file_end = candidate.get("planned_end_s", candidate["planned_start_s"] + (end_ns - start_ns) // NS) * NS
         discontinuous = exchange in previous_end and previous_end[exchange] < file_start
         audited = archive.check_partition(path, mf, config)
-        structural_failure = bool(audited.get("structural_problems")) or audited.get("coverage_incomplete") is True
+        structural_failure = (
+            bool(audited.get("structural_problems")) or audited.get("coverage_incomplete") is True
+            or exchange in restrictions.get(candidate["planned_start_s"], ())
+        )
         if file_start == start_ns:
             file_reports.append({"exchange": exchange, "qa_status": audited["qa_status"],
                                  "problem_count": len(audited["problems"])})
             if structural_failure:
                 invalid_exchanges.add(exchange)
+            if audited.get("run_id") is None and audited.get("last_wall_ns") is not None:
+                legacy_ends[exchange] = max(legacy_ends.get(exchange, start_ns), audited["last_wall_ns"] + 1)
         if discontinuous or structural_failure:
             evidence.interrupt(exchange, previous_end.get(exchange, file_start), "ARCHIVE_DISCONTINUITY")
             for key in expected_depths:
@@ -333,9 +370,12 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             if kind != "META":
                 for ex, sym, channel in coverage._data_streams(exchange, obj):
                     stream = (ex, symbol_key(sym), channel)
-                    if coverage.classify_channel(exchange, channel) != coverage.CHANNEL_CATEGORY_DEPTH:
-                        evidence.observe(stream, wall)
-            event = depth_event(exchange, mf["boot_id"], conn, epoch, kind, obj)
+                    if stream in evidence.limits and coverage.classify_channel(exchange, channel) != coverage.CHANNEL_CATEGORY_DEPTH:
+                        if valid_non_depth_frame(ex, sym, channel, obj):
+                            evidence.observe(stream, wall)
+                        else:
+                            evidence.interrupt(ex, wall, "INVALID_STREAM_FRAME", sym, channel=channel)
+            event = depth_event(exchange, mf.get("boot_id") or mf["file_name"], conn, epoch, kind, obj)
             if event is not None and (exchange, event.symbol) in expected_depths:
                 key = (exchange, event.symbol)
                 stream = evidence.depth[key]
@@ -517,6 +557,15 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         summary["protocol_status"] = "passed"
     # Preserve structural sequence checkpoints per-market for every cleanly anchored market
     # so one failed/unanchored market never discards continuity state for healthy markets.
+    for exchange, last_ns in legacy_ends.items():
+        if last_ns < end_ns:
+            for stream in evidence.by_exchange[exchange]:
+                if evidence.timeline.state(stream) != "known_gap":
+                    evidence.timeline.mark(stream, last_ns, "unverified", "legacy_actual_end")
+            watchdog_ns = int(config.get("deployment", {}).get("silence_watchdog_seconds", 3) * NS)
+            if end_ns - last_ns > watchdog_ns:
+                for stream in evidence.by_exchange[exchange]:
+                    evidence.last.pop(stream, None)
     market_availability = evidence.report(start_ns, end_ns, invalid_exchanges)
     summary["market_availability"] = market_availability
     summary["end_sequence_checkpoint"] = [
@@ -673,7 +722,7 @@ def run_replay(exchange, buffer, signal, spec, sample_end):
 
 
 def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_windows,
-                 candidates=None, checkpoint=None, anchor_lookback_windows=None):
+                 candidates=None, checkpoint=None, anchor_lookback_windows=None, source_restrictions=None):
     out = {"status": "retryable", "run_id": run_id, "window_id": window,
            "warmup_windows": warmup_windows, "replay_sample_seconds": replay_seconds}
     stage = "validate_window"
@@ -697,7 +746,7 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                 specs = {}
             stage = "validate_archived_events"
             scan(items, config, begin * NS, end * NS, min(end, begin + replay_seconds) * NS,
-                 specs, out, checkpoint=checkpoint)
+                 specs, out, checkpoint=checkpoint, source_restrictions=source_restrictions)
         files_ok = all(x["qa_status"] == "passed" for x in out["archive_file_checks"])
         replay_vals = list(out["replay"].values())
         replay_ok = all(x["status"] == "passed" for x in replay_vals)
@@ -720,6 +769,40 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
     return out
 
 
+def audit_range(remote, config, run_id, first, last):
+    """Process an explicit archive batch in time order with read-only index access."""
+    pm = coverage.configured_partition_minutes(config)
+    step = pm * 60
+    if first % step or last % step or not first <= last < first + 96 * step:
+        raise ValueError("range must contain 1–96 aligned windows")
+    candidates = verified_candidates(remote, config, run_id, first, historical=True)
+    by_window = {}
+    for item in candidates:
+        by_window.setdefault(item["planned_start_s"], []).append(item)
+    reports = []
+    checkpoint = None
+    for start in range(first, last + step, step):
+        window = coverage.window_descriptor(start, pm)["window_id"]
+        report = audit_window(
+            remote, config, run_id, start, window, 0, 0,
+            candidates=by_window.get(start, []), checkpoint=checkpoint,
+        )
+        reports.append(report)
+        checkpoint = report.get("end_sequence_checkpoint") if report["status"] != "retryable" else None
+        panels = report.get("market_availability", ())
+        by_status = Counter(
+            (row["exchange"], status)
+            for row in panels for status in {span["status"] for span in row["intervals"]}
+        )
+        totals = {f"{exchange}/{status}": count for (exchange, status), count in sorted(by_status.items())}
+        print(f"{window} {report['status']} {json.dumps(totals, sort_keys=True)}", flush=True)
+    counts = dict(Counter(report["status"] for report in reports))
+    return {
+        "status": "incomplete" if counts.get("retryable") else "completed",
+        "run_id": run_id, "partition_minutes": pm, "counts": counts, "windows": reports,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote", required=True)
@@ -731,13 +814,22 @@ def main():
     parser.add_argument("--replay-seconds", type=int, default=660, choices=range(0, 3601))
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
-    window = coverage.parse_window_start_s(args.window)
-    out = audit_window(args.remote, config, args.run_id, window, args.window,
-                       args.replay_seconds, args.warmup_windows)
+    if ".." in args.window:
+        first, last = map(coverage.parse_window_start_s, args.window.split("..", 1))
+        run_id = args.run_id
+        if run_id == "legacy-60m":
+            run_id = None
+            config["deployment"]["partition_minutes"] = 60
+        out = audit_range(args.remote, config, run_id, first, last)
+        print(json.dumps({"status": out["status"], "counts": out["counts"]}))
+    else:
+        window = coverage.parse_window_start_s(args.window)
+        out = audit_window(args.remote, config, args.run_id, window, args.window,
+                           args.replay_seconds, args.warmup_windows)
+        print(json.dumps(out, indent=2))
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text(json.dumps(out, indent=2) + "\n")
-    print(json.dumps(out, indent=2))
-    return 0 if out["status"] == "passed" else 2
+    return 0 if out["status"] in {"passed", "completed"} else 2
 
 
 if __name__ == "__main__":

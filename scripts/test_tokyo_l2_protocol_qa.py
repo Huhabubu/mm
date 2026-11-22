@@ -512,7 +512,7 @@ class ProtocolTest(unittest.TestCase):
                     (11, "A", "DATA", book("BTC_USDT", 102)),
                     (12, "A", "DATA", book("ETH_USDT", 202)),
                     (13, "A", "DATA", book("SUI_USDT", 500)),
-                    (14, "A", "DATA", {"channel": "futures.trades", "result": [{"contract": "BTC_USDT", "id": 1}]}),
+                    (14, "A", "DATA", {"channel": "futures.trades", "event": "update", "result": [{"contract": "BTC_USDT", "id": 1, "price": "100", "size": "1"}]}),
                     (20, "B", "META", {"event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT",
                                       "unavailable_since_wall_ns": base + 1800 * NS + 19}),
                     (23, "B", "META", {"event": "DEPTH_RECOVERED", "symbol": "BTC_USDT"}),
@@ -793,7 +793,7 @@ class ProtocolTest(unittest.TestCase):
         calls = []
         revised = False
 
-        def audit(_remote, _config, batch, start, window, _seconds, _warmup, *, candidates, checkpoint):
+        def audit(_remote, _config, batch, start, window, _seconds, _warmup, *, candidates, checkpoint, anchor_lookback_windows):
             calls.append((start, checkpoint))
             if revised and start == w0:
                 status, protocol_status = "data_failed", "failed"

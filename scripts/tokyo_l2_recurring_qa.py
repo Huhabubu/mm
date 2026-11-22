@@ -180,6 +180,8 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     def report_path(start):
         return report_dir / f"{archive._safe_window_filename(wid(start))}.json"
 
+    checked_windows_by_start = {}
+
     def archived_window_checked(start):
         wd = coverage.window_descriptor(start, pm)
         window = wd["window_id"]
@@ -200,13 +202,26 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         complete = status == "passed" or (
             status in {"failed", "needs_review"} and summary.get("archive_complete_in_index") is True
         )
-        return (complete and summary.get("run_id") == run_id
+        if not (complete and summary.get("run_id") == run_id
                 and summary.get("partition_minutes") == pm
                 and summary.get("checker_commit_sha") == checker.split("/", 1)[0]
-                and set(summary.get("files") or []) == {item["source_manifest"] for item in groups[start]})
+                and set(summary.get("files") or []) == {item["source_manifest"] for item in groups[start]}):
+            return False
+        checked_windows_by_start[start] = summary
+        return True
 
     ready = sorted(s for s in groups if cutover <= s and archived_window_checked(s))
     expected_depth_markets = _expected_depth_markets(config)
+
+    def restrictions(start, lookback):
+        result = {}
+        for at in range(start - lookback * step, start + step, step):
+            status = checked_windows_by_start.get(at, {})
+            bad = {loss["exchange"] for loss in status.get("attributed_late_losses", ()) if loss.get("exchange")}
+            if bad:
+                result[str(at)] = sorted(bad)
+        return result
+
     proofs = {}
     saved_reports = {}
     revisions = {}
@@ -224,6 +239,7 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             proof.get("target_inputs") == inputs
             and proof.get("previous_inputs") == earlier
             and (lookback is None or proof.get("anchor_lookback_inputs") == _lookback_inputs(groups, start, step, lookback))
+            and proof.get("source_restrictions", {}) == restrictions(start, lookback or 0)
             and (win_rev is None or proof.get("archive_revision") == win_rev)
         ):
             proofs[start] = proof
@@ -250,9 +266,15 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         if not all_markets_covered:
             lookback = max((i for i in range(1, MAX_ANCHOR_LOOKBACK_WINDOWS + 1)
                             if groups.get(start - i * step)), default=warmup_windows)
+        blocked_sources = restrictions(start, lookback)
+        source_options = (
+            {"source_restrictions": {int(at): values for at, values in blocked_sources.items()}}
+            if blocked_sources else {}
+        )
         report = audit_window(
             remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
             candidates=candidates, checkpoint=checkpoint or None, anchor_lookback_windows=lookback,
+            **source_options,
         )
         report.update(
             checker=checker,
@@ -260,6 +282,7 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             previous_inputs=input_digests(groups[start - step]),
             anchor_lookback_windows=lookback,
             anchor_lookback_inputs=_lookback_inputs(groups, start, step, lookback),
+            source_restrictions=blocked_sources,
             input_checkpoint_digest=_checkpoint_digest(checkpoint),
             completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
