@@ -281,25 +281,44 @@ def evaluate_qa_reports_for_record(
     window_report: dict[str, Any] | None,
     protocol_report: dict[str, Any] | None = None,
     require_protocol_report: bool = False,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
 ) -> dict[str, Any] | None:
-    """Verify whether persisted QA reports satisfy `(run_id, target_window_utc, archive_revision)`.
+    """Verify whether persisted QA reports satisfy `(run_id, target_window_utc, archive_revision, checker)`.
 
     Returns a completion dict (`qa_result_status`, `qa_completed_at_utc`, etc.) only when a
-    matching terminal result is proven; returns `None` if results are missing, non-terminal, or
-    belong to a different batch/revision.
+    matching terminal result is proven across batch, window, archive revision, and checker version;
+    returns `None` if results are missing, non-terminal, lack required identity fields, or belong
+    to an older/mismatched checker or revision.
     """
     if not isinstance(window_report, dict):
         return None
-    exp_run_id = str(record.get("run_id") or "")
-    exp_wid = str(record["target_window_utc"])
-    exp_rev = str(record["archive_revision"])
-    rep_run_id = str(window_report.get("run_id") or "")
-    rep_wid = str(window_report.get("window_id") or "")
-    rep_rev = str(window_report.get("archive_revision") or "")
-    win_status = str(window_report.get("qa_status") or "")
-
-    if rep_run_id != exp_run_id or rep_wid != exp_wid or rep_rev != exp_rev:
+    exp_run_id = str(record.get("run_id") or "").strip()
+    exp_wid = str(record.get("target_window_utc") or "").strip()
+    exp_rev = str(record.get("archive_revision") or "").strip()
+    if not exp_wid or not exp_rev:
         return None
+
+    rep_run_id = str(window_report.get("run_id") or "").strip()
+    rep_wid = str(window_report.get("window_id") or "").strip()
+    rep_rev = str(window_report.get("archive_revision") or "").strip()
+    win_checker = str(window_report.get("checker_commit_sha") or "").strip()
+    win_status = str(window_report.get("qa_status") or "").strip()
+
+    if rep_run_id != exp_run_id or rep_wid != exp_wid or not rep_rev or rep_rev != exp_rev:
+        return None
+    if not win_checker:
+        return None
+
+    exp_commit = str(expected_checker_commit or "").strip()
+    exp_proto_checker = str(expected_protocol_checker or "").strip()
+    if exp_commit and win_checker != exp_commit:
+        return None
+    if exp_proto_checker:
+        exp_proto_commit = exp_proto_checker.split("/", 1)[0].strip()
+        if exp_proto_commit and win_checker != exp_proto_commit:
+            return None
+
     if win_status not in _TERMINAL_ARCHIVE_QA_STATUSES:
         return None
 
@@ -308,22 +327,35 @@ def evaluate_qa_reports_for_record(
             "qa_result_status": win_status,
             "window_qa_status": win_status,
             "protocol_status": None,
-            "checker_commit_sha": window_report.get("checker_commit_sha"),
+            "checker_commit_sha": win_checker,
         }
 
-    # Archive window QA passed; evaluate optional/required protocol QA report.
+    # Archive window QA passed; strictly verify protocol QA report identity and checker version.
     proto_ok = False
     proto_status: str | None = None
     if isinstance(protocol_report, dict):
-        p_status = str(protocol_report.get("status") or "")
-        p_rev = protocol_report.get("archive_revision")
-        p_run_id = protocol_report.get("run_id")
-        p_wid = protocol_report.get("window_id")
+        p_status = str(protocol_report.get("status") or "").strip()
+        p_rev = str(protocol_report.get("archive_revision") or "").strip()
+        p_run_id = str(protocol_report.get("run_id") or "").strip()
+        p_wid = str(protocol_report.get("window_id") or "").strip()
+        p_checker_full = str(protocol_report.get("checker") or "").strip()
+        p_checker_commit = p_checker_full.split("/", 1)[0].strip()
+
+        checker_matches = bool(p_checker_full) and p_checker_commit == win_checker
+        if checker_matches and exp_commit:
+            checker_matches = p_checker_commit == exp_commit
+        if checker_matches and exp_proto_checker:
+            if "/" in exp_proto_checker:
+                checker_matches = p_checker_full == exp_proto_checker
+            else:
+                checker_matches = p_checker_commit == exp_proto_checker
+
         if (
             p_status in _TERMINAL_PROTOCOL_QA_STATUSES
-            and (p_rev in (None, "", exp_rev))
-            and (p_run_id in (None, "", exp_run_id))
-            and (p_wid in (None, "", exp_wid))
+            and p_rev == exp_rev
+            and p_run_id == exp_run_id
+            and p_wid == exp_wid
+            and checker_matches
         ):
             proto_ok = True
             proto_status = str(protocol_report.get("protocol_status") or p_status)
@@ -332,7 +364,8 @@ def evaluate_qa_reports_for_record(
                 "qa_result_status": final_status,
                 "window_qa_status": win_status,
                 "protocol_status": proto_status,
-                "checker_commit_sha": window_report.get("checker_commit_sha"),
+                "checker_commit_sha": win_checker,
+                "protocol_checker": p_checker_full,
                 "qa_completed_at_utc": protocol_report.get("completed_at_utc"),
             }
 
@@ -343,7 +376,7 @@ def evaluate_qa_reports_for_record(
         "qa_result_status": "passed",
         "window_qa_status": win_status,
         "protocol_status": proto_status,
-        "checker_commit_sha": window_report.get("checker_commit_sha"),
+        "checker_commit_sha": win_checker,
     }
 
 
@@ -351,6 +384,8 @@ def make_state_dir_result_fetcher(
     state_dir: Path,
     *,
     require_protocol_report: bool = False,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
 ) -> QaResultFetcherFn:
     """Create a result fetcher reading persisted QA JSON reports from a local state checkout."""
 
@@ -375,6 +410,8 @@ def make_state_dir_result_fetcher(
             window_report=win_rep,
             protocol_report=proto_rep,
             require_protocol_report=require_protocol_report,
+            expected_checker_commit=expected_checker_commit,
+            expected_protocol_checker=expected_protocol_checker,
         )
 
     return _fetch
@@ -390,6 +427,8 @@ def make_github_result_fetcher(
     total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
     http_get: HttpGetFn | None = None,
     require_protocol_report: bool = False,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
 ) -> QaResultFetcherFn:
     """Fetch persisted window/protocol QA JSON reports from GitHub's state branch via Contents API.
 
@@ -436,6 +475,8 @@ def make_github_result_fetcher(
             window_report=win_rep,
             protocol_report=proto_rep,
             require_protocol_report=require_protocol_report,
+            expected_checker_commit=expected_checker_commit,
+            expected_protocol_checker=expected_protocol_checker,
         )
 
     return _fetch
@@ -710,6 +751,8 @@ def dispatch_pending_qa(
     qa_state_branch: str | None = None,
     accepted_stale_timeout_s: float | None = None,
     require_protocol_report: bool | None = None,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
     reconcile_accepted: bool = True,
     result_fetcher: QaResultFetcherFn | None = None,
     recover_from_index: bool = True,
@@ -737,6 +780,16 @@ def dispatch_pending_qa(
         )
     else:
         eff_require_protocol = bool(require_protocol_report)
+    eff_expected_checker_commit = (
+        expected_checker_commit
+        if expected_checker_commit is not None
+        else os.environ.get("TOKYO_L2_GITHUB_QA_EXPECTED_CHECKER_COMMIT", "")
+    ).strip() or None
+    eff_expected_protocol_checker = (
+        expected_protocol_checker
+        if expected_protocol_checker is not None
+        else os.environ.get("TOKYO_L2_GITHUB_QA_EXPECTED_PROTOCOL_CHECKER", "")
+    ).strip() or None
     eff_token = token if token is not None else os.environ.get(token_env, "")
     eff_token = str(eff_token or "").strip()
     sender = http_sender or default_http_sender
@@ -795,6 +848,8 @@ def dispatch_pending_qa(
                     eff_fetcher = make_state_dir_result_fetcher(
                         qa_state_dir,
                         require_protocol_report=eff_require_protocol,
+                        expected_checker_commit=eff_expected_checker_commit,
+                        expected_protocol_checker=eff_expected_protocol_checker,
                     )
                     reconcile_source = f"state_dir:{qa_state_dir}"
                 elif http_get is not None or http_sender is None:
@@ -807,6 +862,8 @@ def dispatch_pending_qa(
                         total_timeout_s=total_timeout_s,
                         http_get=http_get,
                         require_protocol_report=eff_require_protocol,
+                        expected_checker_commit=eff_expected_checker_commit,
+                        expected_protocol_checker=eff_expected_protocol_checker,
                     )
                     reconcile_source = f"github:{eff_repo}@{eff_state_branch}"
                 if eff_fetcher is not None:
@@ -1235,6 +1292,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--qa-state-branch", default=None, help="GitHub QA state branch for result reconciliation (default: tokyo-l2-qa-state)")
     parser.add_argument("--accepted-stale-timeout", type=float, default=None, help="Requeue ACCEPTED entries missing final QA reports after N seconds (default: 1800)")
     parser.add_argument("--require-protocol-report", action="store_true", default=None, help="Require persisted protocol QA report in addition to window QA report before marking QA_COMPLETED")
+    parser.add_argument("--expected-checker-commit", default=None, help="Optional required checker_commit_sha for reconciliation")
+    parser.add_argument("--expected-protocol-checker", default=None, help="Optional required full protocol checker (<commit>/<rules_sha>) for reconciliation")
     parser.add_argument("--no-reconcile", action="store_true", help="Skip reconciling ACCEPTED entries against persisted QA reports")
     parser.add_argument("--require-token", action="store_true", help="Exit non-zero if dispatch token is unset")
     parser.add_argument("--status-only", action="store_true", help="Print outbox status JSON without sending requests")
@@ -1272,6 +1331,8 @@ def main(argv: list[str] | None = None) -> int:
         qa_state_branch=args.qa_state_branch,
         accepted_stale_timeout_s=args.accepted_stale_timeout,
         require_protocol_report=args.require_protocol_report,
+        expected_checker_commit=args.expected_checker_commit,
+        expected_protocol_checker=args.expected_protocol_checker,
         reconcile_accepted=not args.no_reconcile,
         require_token=args.require_token,
     )

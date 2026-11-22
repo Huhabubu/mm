@@ -710,6 +710,8 @@ def cmd_qa_dispatch(args: argparse.Namespace) -> int:
         qa_state_branch=args.qa_state_branch,
         accepted_stale_timeout_s=args.accepted_stale_timeout,
         require_protocol_report=args.require_protocol_report,
+        expected_checker_commit=args.expected_checker_commit,
+        expected_protocol_checker=args.expected_protocol_checker,
         reconcile_accepted=not args.no_reconcile,
         require_token=args.require_token,
     )
@@ -786,6 +788,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_disp.add_argument("--qa-state-branch", default=None)
     p_disp.add_argument("--accepted-stale-timeout", type=float, default=None)
     p_disp.add_argument("--require-protocol-report", action="store_true", default=None)
+    p_disp.add_argument("--expected-checker-commit", default=None)
+    p_disp.add_argument("--expected-protocol-checker", default=None)
     p_disp.add_argument("--no-reconcile", action="store_true")
     p_disp.add_argument("--require-token", action="store_true")
     p_disp.add_argument("--status-only", action="store_true")

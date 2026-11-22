@@ -1155,6 +1155,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
                     "run_id": run_id,
                     "window_id": wid1,
                     "archive_revision": rev1,
+                    "checker": "commit_p2/rules_v1",
                     "completed_at_utc": "2026-11-21T14:33:30Z",
                 }
             ),
@@ -1168,6 +1169,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
                     "run_id": run_id,
                     "window_id": wid0,
                     "archive_revision": "sha256:" + "0" * 64,
+                    "checker_commit_sha": "commit_p2",
                     "qa_status": "passed",
                 }
             ),
@@ -1233,6 +1235,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
                     "run_id": run_id,
                     "window_id": wid0,
                     "archive_revision": rev0,
+                    "checker": "commit_p2/rules_v1",
                     "completed_at_utc": "2026-11-21T15:14:10Z",
                 }
             ),
@@ -1292,6 +1295,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
                             "run_id": run_id,
                             "window_id": wid1,
                             "archive_revision": rev1,
+                            "checker": "commit_p2/rules_v1",
                             "completed_at_utc": "2026-11-21T14:35:00Z",
                         }
                     ),
@@ -1311,4 +1315,132 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
         assert verdict["qa_completed_at_utc"] == "2026-11-21T14:35:00Z"
         assert any(auth for _, auth in get_calls)
         assert any(not auth for _, auth in get_calls)
+
+
+def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_reports():
+    """Review Round 3 #1:
+    Reconciliation MUST NOT prematurely mark a record completed when:
+      1. Protocol report omits archive_revision (None or ''),
+      2. Protocol report omits checker or comes from an older checker commit than window_report,
+      3. Window/protocol reports come from an older checker commit or rules_sha than expected,
+      4. Protocol report is non-terminal (e.g. 'anchor_unverified' or 'retryable').
+    """
+    rec = {
+        "run_id": "trial15_20261121T1400Z",
+        "target_window_utc": "2026-11-22T03:30Z",
+        "archive_revision": "sha256:" + "a" * 64,
+    }
+    good_win = {
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "archive_revision": rec["archive_revision"],
+        "checker_commit_sha": "commit_new",
+        "qa_status": "passed",
+    }
+
+    # 1. Missing archive_revision in protocol report -> MUST return None even with require_protocol_report=True!
+    proto_no_rev = {
+        "status": "passed",
+        "protocol_status": "passed",
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "checker": "commit_new/rules_v2",
+    }
+    assert qd.evaluate_qa_reports_for_record(
+        rec, window_report=good_win, protocol_report=proto_no_rev, require_protocol_report=True
+    ) is None
+
+    # 2. Older checker commit in protocol report than window_report -> MUST return None!
+    proto_old_checker = {
+        "status": "passed",
+        "protocol_status": "passed",
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "archive_revision": rec["archive_revision"],
+        "checker": "commit_old/rules_v1",
+    }
+    assert qd.evaluate_qa_reports_for_record(
+        rec, window_report=good_win, protocol_report=proto_old_checker, require_protocol_report=True
+    ) is None
+
+    # 3. Missing checker in protocol report -> MUST return None!
+    proto_no_checker = {
+        "status": "passed",
+        "protocol_status": "passed",
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "archive_revision": rec["archive_revision"],
+    }
+    assert qd.evaluate_qa_reports_for_record(
+        rec, window_report=good_win, protocol_report=proto_no_checker, require_protocol_report=True
+    ) is None
+
+    # 4. Both reports on old checker when expected_checker_commit or expected_protocol_checker is newer -> MUST return None!
+    old_win = dict(good_win, checker_commit_sha="commit_old")
+    assert qd.evaluate_qa_reports_for_record(
+        rec,
+        window_report=old_win,
+        protocol_report=proto_old_checker,
+        require_protocol_report=True,
+        expected_checker_commit="commit_new",
+    ) is None
+    proto_old_rules = {
+        "status": "passed",
+        "protocol_status": "passed",
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "archive_revision": rec["archive_revision"],
+        "checker": "commit_new/rules_v1",
+    }
+    assert qd.evaluate_qa_reports_for_record(
+        rec,
+        window_report=good_win,
+        protocol_report=proto_old_rules,
+        require_protocol_report=True,
+        expected_protocol_checker="commit_new/rules_v2",
+    ) is None
+
+    # 5. Window report missing checker_commit_sha -> MUST return None!
+    win_no_checker = dict(good_win)
+    win_no_checker.pop("checker_commit_sha")
+    assert qd.evaluate_qa_reports_for_record(
+        rec, window_report=win_no_checker, protocol_report=proto_old_rules, require_protocol_report=False
+    ) is None
+
+    # 6. Non-terminal anchor_unverified protocol report -> MUST return None!
+    proto_unverified = {
+        "status": "anchor_unverified",
+        "protocol_status": "anchor_unverified",
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "archive_revision": rec["archive_revision"],
+        "checker": "commit_new/rules_v2",
+    }
+    assert qd.evaluate_qa_reports_for_record(
+        rec, window_report=good_win, protocol_report=proto_unverified, require_protocol_report=True
+    ) is None
+
+    # 7. All four dimensions (run_id, window_id, archive_revision, checker) match -> completes!
+    proto_ok = {
+        "status": "passed",
+        "protocol_status": "passed",
+        "run_id": rec["run_id"],
+        "window_id": rec["target_window_utc"],
+        "archive_revision": rec["archive_revision"],
+        "checker": "commit_new/rules_v2",
+        "completed_at_utc": "2026-11-22T03:49:00Z",
+    }
+    verdict = qd.evaluate_qa_reports_for_record(
+        rec,
+        window_report=good_win,
+        protocol_report=proto_ok,
+        require_protocol_report=True,
+        expected_checker_commit="commit_new",
+        expected_protocol_checker="commit_new/rules_v2",
+    )
+    assert verdict is not None
+    assert verdict["qa_result_status"] == "passed"
+    assert verdict["checker_commit_sha"] == "commit_new"
+    assert verdict["protocol_checker"] == "commit_new/rules_v2"
+
 
