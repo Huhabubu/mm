@@ -13,6 +13,16 @@ on:
         required: false
         type: string
         default: "feat/tokyo-l2-reliability-fixes"
+      trade_dup_target:
+        description: "UTC window (YYYY-MM-DDTHH:MMZ) scanned for duplicate trade ids"
+        required: false
+        type: string
+        default: "2026-11-24T12:00Z"
+      skip_anchor_search:
+        description: "Only run the duplicate-trade scan (skip event audit and anchor search)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -74,6 +84,8 @@ jobs:
           QA_RUN_ID: ${{ vars.TOKYO_L2_QA_RUN_ID }}
           QA_SINCE_WINDOW: ${{ vars.TOKYO_L2_QA_SINCE_WINDOW }}
           QA_CONFIG_PATH: ${{ vars.TOKYO_L2_QA_CONFIG_PATH }}
+          QA_TRADE_DUP_TARGET: ${{ inputs.trade_dup_target || '2026-11-24T12:00Z' }}
+          QA_SKIP_ANCHOR: ${{ inputs.skip_anchor_search && '--skip-anchor-search' || '' }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/audit"
@@ -84,7 +96,8 @@ jobs:
           } | tee "$RUNNER_TEMP/audit/inputs.txt"
           python workflow_code/scripts/tokyo_l2_qa_incident_audit.py \
             --remote qa: --config "source/$QA_CONFIG_PATH" --run-id "$QA_RUN_ID" --cutover "$QA_SINCE_WINDOW" \
-            --summary state/qa_reports/latest_run_summary.json --out "$RUNNER_TEMP/audit"
+            --summary state/qa_reports/latest_run_summary.json --out "$RUNNER_TEMP/audit" \
+            --trade-dup-target "$QA_TRADE_DUP_TARGET" $QA_SKIP_ANCHOR
           cat "$RUNNER_TEMP/audit/incident_audit.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload summary only
         if: always()
