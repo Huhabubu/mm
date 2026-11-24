@@ -945,6 +945,35 @@ class ProtocolTest(unittest.TestCase):
                 self.assertEqual([window_id(w1)], result["historical_anchor_unverified_windows"])
                 self.assertEqual("anchor_unverified", saved(w2)["status"])
 
+    def test_replay_precondition_separates_missing_signal_from_uninitialised_book(self):
+        from tokyo_l2_replay_qa import replay_precondition_reason
+
+        self.assertEqual("missing_signal", replay_precondition_reason(1, True, True))
+        self.assertEqual("missing_signal", replay_precondition_reason(0, False, False))
+        self.assertEqual("initial_book_not_in_lookback", replay_precondition_reason(5, False, True))
+        self.assertEqual("initial_book_not_in_lookback", replay_precondition_reason(5, False, False))
+        self.assertEqual("missing_target_book_rows", replay_precondition_reason(5, True, False))
+        self.assertIsNone(replay_precondition_reason(5, True, True))
+
+    def test_window_status_reports_replay_init_failure_without_passing(self):
+        from tokyo_l2_replay_qa import window_status
+
+        ok = {"status": "passed"}
+        init = {"status": "blocked", "reason": "initial_book_not_in_lookback"}
+        unanchored = {"status": "blocked", "reason": "anchor_not_in_lookback"}
+        no_signal = {"status": "blocked", "reason": "missing_signal"}
+        engine = {"status": "failed"}
+        self.assertEqual("passed", window_status("passed", True, [ok, ok]))
+        self.assertEqual("replay_init_unverified", window_status("passed", True, [ok, init]))
+        self.assertEqual("replay_init_unverified", window_status("passed", True, [init, unanchored]))
+        self.assertEqual("data_failed", window_status("passed", True, [init, no_signal]))
+        self.assertEqual("data_failed", window_status("passed", True, [init, engine]))
+        self.assertEqual("data_failed", window_status("passed", False, [ok, init]))
+        self.assertEqual("data_failed", window_status("failed", True, [ok, init]))
+        self.assertEqual("anchor_unverified", window_status("anchor_unverified", True, [ok, unanchored]))
+        self.assertEqual("data_failed", window_status("anchor_unverified", True, [ok, init]))
+        self.assertEqual("data_failed", window_status("passed", True, []))
+
 
 if __name__ == "__main__":
     unittest.main()
