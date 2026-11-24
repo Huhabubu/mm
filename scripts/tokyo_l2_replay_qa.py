@@ -27,6 +27,12 @@ from tokyo_l2_protocol_qa import (
 FOLLOWERS = (GATE, BYBIT, BITGET)
 BTC = "BTCUSDT"
 NS = 1_000_000_000
+# A trade id repeated on a different connection is a connection-handover overlap only when the later
+# copy is identical, arrives within this bound of its own connection's first trade and of a connection
+# event on the same exchange. Anything else stays a proven protocol issue.
+TRADE_OVERLAP_NS = 5 * NS
+CONNECTION_EVENTS = frozenset({"SWITCH", "STANDBY_DISCONNECT", "GAP_START", "GAP_END"})
+TRADE_FIELDS = ("contract", "s", "price", "size", "side", "ts", "create_time_ms", "p", "v", "S", "T")
 
 
 def download(remote: str, rel: str, path: Path) -> Path:
@@ -157,7 +163,9 @@ def follower_trade(exchange, obj, wall, buffer):
     record = {"kind": "DATA", "recv_wall_ns": wall, "payload": json.dumps(obj)}
     ingest = {GATE: convert._ingest_gate_record, BYBIT: convert._ingest_bybit_record,
               BITGET: convert._ingest_bitget_record}[exchange]
-    key = (exchange, BTC, buffer.date_utc)
+    # The converter files trades under the canonical asset (BTC), so the buffer must use that key;
+    # its per-buffer trade-id set then keeps only the first received copy.
+    key = (exchange, convert.canonical_asset(exchange, BTC), buffer.date_utc)
     ingest(record, buffer.date_utc, {key: buffer})
 
 
@@ -289,7 +297,10 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     seen_anchors = set()
     missing_anchor_sources = {}
     boundary_events = ProtocolReport()
-    trade_ids = set()
+    trade_ids = {}
+    trade_copies = {}
+    conn_first_trade = {}
+    conn_events = {}
     for candidate, mf, path in sorted(items, key=lambda item: (
         item[0]["exchange"], item[0]["planned_start_s"], item[1].get("start_wall_ns") or 0,
         item[1].get("first_rx_seq") or 0, item[1]["file_name"],
@@ -331,6 +342,11 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             if not wall < end_ns:
                 continue
             in_target = wall >= start_ns
+            if kind == "META" and obj.get("event") in CONNECTION_EVENTS:
+                conn_events.setdefault(exchange, []).append(wall)
+            if (kind != "META" and exchange in FOLLOWERS and (exchange, conn, epoch) not in conn_first_trade
+                    and trading_event(exchange, obj)):
+                conn_first_trade[(exchange, conn, epoch)] = wall
             if kind == "META" and obj.get("event") in {
                 "LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY", "SWITCH",
             }:
@@ -527,9 +543,12 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         book_proofs.count(exchange, sym, "missing_trade_id")
                         continue
                     k = (exchange, sym, str(tid))
+                    copy = ((conn, epoch), wall,
+                            json.dumps({f: trade.get(f) for f in TRADE_FIELDS if f in trade}, sort_keys=True))
                     if k in trade_ids:
-                        book_proofs.count(exchange, sym, "duplicate_trade_id")
-                    trade_ids.add(k)
+                        trade_copies.setdefault(k, [trade_ids[k]]).append(copy)
+                    else:
+                        trade_ids[k] = copy
                 if wall < sample_end and trades and exchange in specs:
                     # Current per-message feeds generally share one symbol. Preserve
                     # trade identity and converter handling for the representative symbol.
@@ -541,6 +560,30 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     for exchange, symbol in expected_depths:
         if not book_proofs.frames[(exchange, symbol)]:
             book_proofs.count(exchange, symbol, "no_depth_frames")
+    overlap_trades = Counter()
+    for (ex, sym, _tid), copies in sorted(trade_copies.items()):
+        copies.sort(key=lambda c: c[1])
+        conns = [c[0] for c in copies]
+        identical = len({c[2] for c in copies}) == 1
+        handover = len(set(conns)) == len(conns) and all(
+            w - conn_first_trade.get((ex, *cid), w) <= TRADE_OVERLAP_NS
+            and any(abs(w - t) <= TRADE_OVERLAP_NS for t in conn_events.get(ex, ()))
+            for cid, w, _ in copies[1:]
+        )
+        if identical and handover:
+            overlap_trades[(ex, sym)] += len(copies) - 1
+        else:
+            for _ in copies[1:]:
+                book_proofs.count(ex, sym, "duplicate_trade_id" if identical else "conflicting_duplicate_trade")
+    summary["connection_overlap_trades"] = [
+        {"exchange": ex, "symbol": sym, "count": n, "bound_seconds": TRADE_OVERLAP_NS // NS}
+        for (ex, sym), n in sorted(overlap_trades.items())
+    ]
+    summary["replay_trade_rows"] = [
+        {"exchange": ex, "trade_rows": sum(1 for r in buffers[ex].hbt_rows if int(r[0]) & 0xFF == convert.TRADE_EVENT),
+         "dedup_trades_dropped": buffers[ex].dedup_trades_dropped}
+        for ex in FOLLOWERS
+    ]
     if quotes_before:
         signal.insert(0, quotes_before)
     signal.sort(key=lambda row: row[0])
