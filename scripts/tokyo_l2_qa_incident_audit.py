@@ -24,7 +24,7 @@ import zstandard as zstd
 
 import data_coverage as coverage
 import hourly_incremental_qa as archive
-from tokyo_l2_protocol_qa import depth_event, symbol_key
+from tokyo_l2_protocol_qa import BITGET, BYBIT, GATE, depth_event, symbol_key
 
 NS = 1_000_000_000
 NL = chr(10)
@@ -311,6 +311,64 @@ def cell(value):
     return "" if value is None else str(value).replace("|", "/").replace(NL, " ")
 
 
+def trading_event(exchange, obj):
+    """Same trade extraction as tokyo_l2_replay_qa.trading_event, without its replay dependencies."""
+    if exchange == GATE and obj.get("channel") == "futures.trades" and obj.get("event") == "update":
+        data = obj.get("result", [])
+        return data if isinstance(data, list) else [data]
+    if exchange == BYBIT and obj.get("topic", "").startswith("publicTrade."):
+        return obj.get("data", [])
+    arg = obj.get("arg") or {}
+    if exchange == BITGET and (arg.get("topic") or arg.get("channel")) == "publicTrade":
+        return obj.get("data", [])
+    return []
+
+
+def trade_symbol(trade, obj):
+    arg = obj.get("arg") or {}
+    return symbol_key(str(trade.get("s") or trade.get("contract") or arg.get("symbol") or arg.get("instId")
+                          or obj.get("topic", "").split(".")[-1]))
+
+
+def trade_duplicates(arc, exchange, start):
+    """Trade ids seen more than once in one window, with the connection and frame action of each copy."""
+    seen, meta = defaultdict(list), []
+    lo, hi = start * NS, (start + arc.step) * NS
+    for item in arc.items(exchange, start):
+        with arc.opened(item) as (_manifest, path):
+            for wall, conn, epoch, kind, payload in raw_lines(path):
+                if wall < lo or wall >= hi:
+                    continue
+                obj = load(kind, payload)
+                if kind == "META":
+                    if obj.get("event") in DETAIL_EVENTS and len(meta) < 60:
+                        meta.append({"wall_utc": iso(wall), "line_conn": f"{conn}:{epoch}", **scalars(obj)})
+                    continue
+                for trade in trading_event(exchange, obj):
+                    tid = trade.get("id") if exchange == GATE else trade.get("i") or trade.get("tradeId")
+                    if tid is None:
+                        continue
+                    fields = {k: trade.get(k) for k in ("price", "size", "side", "ts", "p", "v", "S", "T",
+                                                        "create_time_ms") if k in trade}
+                    seen[(trade_symbol(trade, obj), str(tid))].append({
+                        "wall_utc": iso(wall), "wall_ns": wall, "conn": f"{conn}:{epoch}",
+                        "action": obj.get("action") or obj.get("type") or obj.get("event"), "fields": fields,
+                    })
+    dups = []
+    for (sym, tid), occ in sorted(seen.items()):
+        if len(occ) > 1:
+            dups.append({
+                "symbol": sym, "trade_id": tid, "count": len(occ),
+                "same_connection": len({o["conn"] for o in occ}) == 1,
+                "identical_fields": len({json.dumps(o["fields"], sort_keys=True) for o in occ}) == 1,
+                "gap_ms": round((occ[-1]["wall_ns"] - occ[0]["wall_ns"]) / 1e6, 3),
+                "occurrences": [{k: v for k, v in o.items() if k != "wall_ns"} for o in occ[:6]],
+            })
+    return {"exchange": exchange, "window_id": arc.wid(start), "trade_copies": sum(len(v) for v in seen.values()),
+            "unique_trade_ids": len(seen), "duplicate_count": len(dups), "duplicates": dups[:50],
+            "meta_events": meta}
+
+
 def row(values):
     return "| " + " | ".join(cell(v) for v in values) + " |"
 
@@ -369,6 +427,24 @@ def render(report):
     for a in report["anchor_search"]:
         lines.append(row([a["exchange"], a["target_window"], a["active_connection"], a["found"], a.get("anchor_utc"),
                           a.get("age_seconds"), a.get("windows_back"), a.get("bytes_to_anchor"), a.get("stop_reason")]))
+    lines += ["", "## Duplicate trade ids inside the target window", "",
+              row(["exchange", "window", "trade copies", "unique ids", "duplicates", "symbol", "trade id",
+                   "same connection", "identical fields", "gap ms", "copies (conn@UTC action)"]),
+              row(["---"] * 11)]
+    for d in report.get("trade_duplicates") or []:
+        head = [d["exchange"], d["window_id"], d["trade_copies"], d["unique_trade_ids"], d["duplicate_count"]]
+        if not d["duplicates"]:
+            lines.append(row(head + [None] * 6))
+        for dup in d["duplicates"]:
+            copies = "; ".join(f"{o['conn']}@{o['wall_utc']} {o['action']}" for o in dup["occurrences"])
+            lines.append(row(head + [dup["symbol"], dup["trade_id"], dup["same_connection"],
+                                     dup["identical_fields"], dup["gap_ms"], copies]))
+    for d in report.get("trade_duplicates") or []:
+        if d["duplicates"] and d["meta_events"]:
+            lines += ["", f"META events in {d['exchange']} {d['window_id']}:", ""]
+            lines += [f"- {m['wall_utc']} {m['line_conn']} {m.get('event')} "
+                      + " ".join(f"{k}={v}" for k, v in m.items() if k not in ("wall_utc", "line_conn", "event"))
+                      for m in d["meta_events"]]
     return NL.join(lines) + NL
 
 
@@ -382,6 +458,8 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--anchor-target", action="append", default=None)
     parser.add_argument("--anchor-max-windows", type=int, default=52)
+    parser.add_argument("--trade-dup-target", action="append", default=None)
+    parser.add_argument("--skip-anchor-search", action="store_true")
     args = parser.parse_args()
 
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
@@ -407,13 +485,18 @@ def main():
             },
             "event_audit": {},
             "anchor_search": [],
+            "trade_duplicates": [],
         }
-        for exchange in sorted(per_exchange):
-            report["event_audit"][exchange] = audit_exchange(arc, exchange, per_exchange[exchange])
-        for target in args.anchor_target or ["2026-11-24T10:00Z"]:
-            for exchange in ("gate_futures", "bybit_linear"):
-                report["anchor_search"].append(
-                    anchor_search(arc, exchange, window_start(target), args.anchor_max_windows))
+        for target in args.trade_dup_target or ["2026-11-24T12:00Z"]:
+            for exchange in ("bitget_v3", "gate_futures", "bybit_linear"):
+                report["trade_duplicates"].append(trade_duplicates(arc, exchange, window_start(target)))
+        if not args.skip_anchor_search:
+            for exchange in sorted(per_exchange):
+                report["event_audit"][exchange] = audit_exchange(arc, exchange, per_exchange[exchange])
+            for target in args.anchor_target or ["2026-11-24T10:00Z"]:
+                for exchange in ("gate_futures", "bybit_linear"):
+                    report["anchor_search"].append(
+                        anchor_search(arc, exchange, window_start(target), args.anchor_max_windows))
         report["bytes_downloaded"] = arc.bytes_downloaded
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
