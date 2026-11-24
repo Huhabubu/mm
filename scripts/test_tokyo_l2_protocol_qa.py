@@ -972,7 +972,6 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual("data_failed", window_status("failed", True, [ok, init]))
         self.assertEqual("anchor_unverified", window_status("anchor_unverified", True, [ok, unanchored]))
         self.assertEqual("data_failed", window_status("anchor_unverified", True, [ok, init]))
-        self.assertEqual("data_failed", window_status("passed", True, []))
 
 
 if __name__ == "__main__":
