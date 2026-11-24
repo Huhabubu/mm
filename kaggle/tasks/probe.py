@@ -177,9 +177,38 @@ def _exc_chain(exc: BaseException) -> str:
     parts, seen = [], set()
     while exc is not None and id(exc) not in seen and len(parts) < 4:
         seen.add(id(exc))
-        parts.append(f"{type(exc).__name__}: {str(exc)[:240]}")
+        msg = f"{type(exc).__name__}: {str(exc)[:240]}"
+        # Server's explanation of a 4xx (a failed lookup carries no secret value).
+        if hasattr(exc, "code") and hasattr(exc, "read"):
+            try:
+                body = exc.read()[:600].decode("utf-8", "replace")
+                msg += f" body={body!r}"
+            except Exception as body_exc:
+                msg += f" body_unreadable={type(body_exc).__name__}"
+        parts.append(msg)
         exc = exc.__cause__ or exc.__context__
     return " <- ".join(parts)
+
+
+def _jwt_shape() -> dict:
+    """Non-secret shape of the secrets JWT: claim names and timing only (no claim values otherwise)."""
+    import base64
+    tok = os.environ.get("KAGGLE_USER_SECRETS_TOKEN") or ""
+    parts = tok.split(".")
+    out = {"segments": len(parts)}
+    if len(parts) != 3:
+        return out
+    try:
+        pad = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(pad))
+        now = time.time()
+        out["claim_names"] = sorted(claims)
+        for k in ("iat", "nbf", "exp"):
+            if isinstance(claims.get(k), (int, float)):
+                out[f"{k}_minus_now_s"] = round(claims[k] - now)
+    except Exception as exc:
+        out["decode_error"] = type(exc).__name__
+    return out
 
 
 def _secrets_service_diag() -> dict:
@@ -219,6 +248,7 @@ def _drive():
                                       "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy")}
     report["kernel_run_type"] = os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
     report["secrets_service"] = _secrets_service_diag()
+    report["secrets_jwt_shape"] = _jwt_shape()
     from kaggle_secrets import UserSecretsClient
     got = {}
     attempts_log = {}
