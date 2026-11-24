@@ -166,11 +166,13 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             "archive_file_checks": [],
             "hourly_replay_window": wid(current - current % 3600),
             "hourly_btc_replay": {},
+            "hourly_btc_replay_reasons": {},
             "checked_windows": [],
             "historical_checked_windows": [],
             "historical_passed_windows": [],
             "historical_anchor_unverified_windows": [],
             "deferred_anchor_unverified_windows": [],
+            "historical_replay_init_unverified_windows": [],
             "historical_failed_windows": [],
             "pending_ready_windows": 0,
             "started_at_utc": started_at_utc,
@@ -245,7 +247,10 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             proofs[start] = proof
 
     validated = _reports_with_current_checkpoints(proofs, step)
-    recorded = {s for s, proof in validated.items() if proof.get("status") in {"passed", "data_failed"}}
+    recorded = {
+        s for s, proof in validated.items()
+        if proof.get("status") in {"passed", "data_failed", "replay_init_unverified"}
+    }
     deferred = {s for s, proof in validated.items() if proof.get("status") == "anchor_unverified"}
     eff_max_catchup = (
         int(max_catchup)
@@ -310,7 +315,9 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
 
     all_known = {
         start: proof for start, proof in validated.items()
-        if start in checked or proof.get("status") in {"passed", "data_failed", "anchor_unverified"}
+        if start in checked or proof.get("status") in {
+            "passed", "data_failed", "anchor_unverified", "replay_init_unverified",
+        }
     }
     current_report = all_known.get(current, {})
     reused_current_result = current in all_known and current not in checked
@@ -324,6 +331,8 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
                              if start != current and report.get("status") == "anchor_unverified"]
     historical = [wid(start) for start, report in sorted(all_known.items())
                   if start != current and report.get("status") == "data_failed"]
+    historical_replay_init = [wid(start) for start, report in sorted(all_known.items())
+                              if start != current and report.get("status") == "replay_init_unverified"]
     deferred_windows = [wid(start) for start, report in sorted(all_known.items())
                         if report.get("status") == "anchor_unverified"]
     completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -341,11 +350,15 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         "end_sequence_checkpoint_markets": len(current_report.get("end_sequence_checkpoint") or []),
         "hourly_replay_window": wid(latest_hour),
         "hourly_btc_replay": {ex: v["status"] for ex, v in hourly.get("replay", {}).items()},
+        "hourly_btc_replay_reasons": {
+            ex: v["reason"] for ex, v in hourly.get("replay", {}).items() if v.get("reason")
+        },
         "checked_windows": checked_windows,
         "historical_checked_windows": [w for w in checked_windows if w != wid(current)],
         "historical_passed_windows": historical_passed,
         "historical_anchor_unverified_windows": historical_unverified,
         "deferred_anchor_unverified_windows": deferred_windows,
+        "historical_replay_init_unverified_windows": historical_replay_init,
         "historical_failed_windows": historical,
         "pending_ready_windows": len(set(ready) - set(all_known)),
         "started_at_utc": started_at_utc,
