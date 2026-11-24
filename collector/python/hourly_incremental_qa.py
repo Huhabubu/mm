@@ -622,6 +622,7 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                                 f"line {n}: invalid depth {'snapshot' if is_snap else 'delta'} for {d_sym}: {payload_err}"
                             )
                         elif is_snap:
+                            prev_anchor = depth_anchors.get(d_sym)
                             depth_anchors[d_sym] = {
                                 "conn_id": ev_conn,
                                 "epoch": ev_epoch,
@@ -630,7 +631,30 @@ def check_partition(data_path: Path, manifest: dict[str, Any], config: dict[str,
                             }
                             if d_sym in open_planned_depth_waits:
                                 w = open_planned_depth_waits[d_sym]
-                                if ev_conn == w["conn_id"] and ev_epoch == w["epoch"]:
+                                if (
+                                    exchange == "bitget_v3"
+                                    and w["snapshot_seen"]
+                                    and ev_conn == w["conn_id"]
+                                    and ev_epoch == w["epoch"]
+                                    and prev_anchor is not None
+                                    and prev_anchor["conn_id"] == ev_conn
+                                    and prev_anchor["epoch"] == ev_epoch
+                                    and d_seq > prev_anchor["seq"]
+                                ):
+                                    end_w = w["end_wall_ns"] if w["end_wall_ns"] is not None else ev_wall
+                                    planned_depth_intervals.append(
+                                        {
+                                            "symbol": d_sym,
+                                            "conn_id": w["conn_id"],
+                                            "epoch": w["epoch"],
+                                            "start_wall_ns": w["start_wall_ns"],
+                                            "end_wall_ns": end_w,
+                                            "duration_seconds": round(max(0, end_w - w["start_wall_ns"]) / 1e9, 6),
+                                            "recovered": True,
+                                        }
+                                    )
+                                    del open_planned_depth_waits[d_sym]
+                                elif ev_conn == w["conn_id"] and ev_epoch == w["epoch"]:
                                     w["snapshot_seen"] = True
                                     w["end_wall_ns"] = ev_wall
                                     w["delta_ok"] = False
