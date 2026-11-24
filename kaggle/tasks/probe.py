@@ -239,20 +239,38 @@ def _secrets_service_diag() -> dict:
     return out
 
 
-@section("secrets_and_drive")
-def _drive():
-    # Presence only (never values) of the env the Kaggle secrets client depends on.
-    report["secrets_env_present"] = {k: bool(os.environ.get(k)) for k in
-                                     ("KAGGLE_USER_SECRETS_TOKEN", "KAGGLE_URL_BASE", "KAGGLE_KERNEL_RUN_TYPE",
-                                      "KAGGLE_DATA_PROXY_TOKEN", "KAGGLE_IAP_TOKEN",
-                                      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy")}
-    report["kernel_run_type"] = os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+CRED_FILES = {"TOKYO_L2_QA_GDRIVE_SA_JSON": "tokyo_l2_gdrive_sa.json",
+              "TOKYO_L2_QA_GDRIVE_FOLDER_ID": "tokyo_l2_gdrive_folder_id.txt"}
+
+
+def _creds_from_dataset() -> dict:
+    """Read the Drive credentials from a private dataset mounted under /kaggle/input.
+
+    Records only where the files were found (dataset dir name) and their presence, never content.
+    """
+    root = Path("/kaggle/input")
+    found: dict = {}
+    if root.is_dir():
+        for key, fname in CRED_FILES.items():
+            hits = sorted(p for p in root.rglob(fname) if p.is_file())
+            if hits:
+                found[key] = hits[0]
+    report["credential_dataset"] = {
+        "mounted_dirs": sorted(p.name for p in root.iterdir())[:20] if root.is_dir() else [],
+        "files_found": {k: bool(v) for k, v in found.items()},
+        "dataset_dir": next((str(p.parent.relative_to(root)) for p in found.values()), None)}
+    if len(found) != len(CRED_FILES):
+        return {}
+    return {k: p.read_text(encoding="utf-8").strip() for k, p in found.items()}
+
+
+def _creds_from_secrets() -> dict:
     report["secrets_service"] = _secrets_service_diag()
     report["secrets_jwt_shape"] = _jwt_shape()
     from kaggle_secrets import UserSecretsClient
     got = {}
     attempts_log = {}
-    for name in ("TOKYO_L2_QA_GDRIVE_SA_JSON", "TOKYO_L2_QA_GDRIVE_FOLDER_ID"):
+    for name in CRED_FILES:
         got[name] = ""
         tries = []
         for delay in (0, *SECRET_RETRY_DELAYS_S):
@@ -272,9 +290,28 @@ def _drive():
             report.setdefault("secret_errors", {})[name] = tries[-1].get("error", "empty value")
     report["secret_attempts"] = attempts_log
     save()
+    return got
+
+
+@section("secrets_and_drive")
+def _drive():
+    # Presence only (never values) of the env the Kaggle secrets client depends on.
+    report["secrets_env_present"] = {k: bool(os.environ.get(k)) for k in
+                                     ("KAGGLE_USER_SECRETS_TOKEN", "KAGGLE_URL_BASE", "KAGGLE_KERNEL_RUN_TYPE",
+                                      "KAGGLE_DATA_PROXY_TOKEN", "KAGGLE_IAP_TOKEN",
+                                      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy")}
+    report["kernel_run_type"] = os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+    # API-pushed runs get HTTP 400 from the User Secrets service (runs 45351173905/45351933573),
+    # so a private credential dataset mounted under /kaggle/input is tried first.
+    got = _creds_from_dataset()
+    if got:
+        report["credential_source"] = "private_dataset"
+    else:
+        report["credential_source"] = "user_secrets"
+        got = _creds_from_secrets()
     present = {k: bool(v) for k, v in got.items()}
     if not all(present.values()):
-        raise RuntimeError(f"secrets not readable after {1 + len(SECRET_RETRY_DELAYS_S)} attempts: {present}")
+        raise RuntimeError(f"credentials not readable via {report['credential_source']}: {present}")
     sa = json.loads(got["TOKYO_L2_QA_GDRIVE_SA_JSON"])
     os.umask(0o077)
     sa_path = AUTH / "sa.json"

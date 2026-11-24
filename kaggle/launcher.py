@@ -108,6 +108,9 @@ def main() -> int:
     ap.add_argument("--collector", type=Path, required=True)
     ap.add_argument("--git-sha", required=True)
     ap.add_argument("--collector-sha", required=True)
+    ap.add_argument("--cred-dataset", default="",
+                    help="private Kaggle dataset slug (owner/slug) holding the Drive credential files; "
+                         "attached via dataset_sources because API-pushed runs cannot read User Secrets")
     args = ap.parse_args()
 
     job = json.loads(args.job.read_text(encoding="utf-8"))
@@ -135,10 +138,15 @@ def main() -> int:
     (args.nb_dir / code_file).write_text(json.dumps(nb), encoding="utf-8")
     meta.update(code_file=code_file, language="python", kernel_type="notebook", is_private=True,
                 enable_gpu=False, enable_tpu=False, enable_internet=True)
+    if args.cred_dataset:
+        sources = list(meta.get("dataset_sources") or [])
+        if args.cred_dataset not in sources:
+            sources.append(args.cred_dataset)
+        meta["dataset_sources"] = sources
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print("NOTEBOOK_BUILT", json.dumps({k: run_job[k] for k in ("task", "args", "git_sha", "collector_sha",
                                                                  "bundle_sha256", "bundle_files")}),
-          "bundle_bytes", len(bundle), "kernel_id", meta.get("id"))
+          "bundle_bytes", len(bundle), "kernel_id", meta.get("id"), "dataset_sources", meta.get("dataset_sources"))
     return 0
 
 

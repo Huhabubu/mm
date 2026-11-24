@@ -20,6 +20,10 @@ concurrency:
 env:
   COLLECTOR_SHA: 78f7a69ac070cdb1d823e93a871b0801c4a1e3b7
   NOTEBOOK_NAME: tokyo-l2-glft
+  # Private dataset with the read-only Drive credential files. API-pushed runs get HTTP 400 from
+  # Kaggle User Secrets (runs 45351173905 / 45351933573; kaggle-cli issue #582), so the notebook
+  # mounts this dataset under /kaggle/input instead.
+  CRED_DATASET_NAME: tokyo-l2-gdrive-cred
 
 jobs:
   kaggle:
@@ -89,6 +93,57 @@ jobs:
           echo "notebook=$SLUG"
           kaggle kernels status "$SLUG" || true
 
+      - name: Ensure private credential dataset (create once, never re-upload, never public)
+        env:
+          # Dedicated read-only backtest service account, not the QA workflow's account.
+          QA_SERVICE_ACCOUNT: ${{ secrets.TOKYO_L2_BT_GDRIVE_SA_JSON }}
+          QA_FOLDER_ID: ${{ secrets.TOKYO_L2_QA_GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CRED_DATASET="${KAGGLE_SLUG%%/*}/$CRED_DATASET_NAME"
+          echo "CRED_DATASET=$CRED_DATASET" >> "$GITHUB_ENV"
+          if kaggle datasets files "$CRED_DATASET" >/dev/null 2>&1; then
+            echo "credential dataset exists: $CRED_DATASET (not re-uploaded)"
+          else
+            [[ -n "$QA_SERVICE_ACCOUNT" && -n "$QA_FOLDER_ID" ]] || { echo "::error::Drive secrets missing"; exit 2; }
+            umask 077
+            d="$RUNNER_TEMP/cred_ds"; rm -rf "$d"; mkdir -p "$d"
+            trap 'rm -rf "$d"' EXIT
+            printf '%s' "$QA_SERVICE_ACCOUNT" > "$d/tokyo_l2_gdrive_sa.json"
+            printf '%s' "$QA_FOLDER_ID" > "$d/tokyo_l2_gdrive_folder_id.txt"
+            python - "$d" "$CRED_DATASET" <<'PY'
+          import json, sys, pathlib
+          d, ref = pathlib.Path(sys.argv[1]), sys.argv[2]
+          sa = json.loads((d / "tokyo_l2_gdrive_sa.json").read_text())
+          assert sa.get("type") == "service_account", "not a service-account JSON"
+          (d / "dataset-metadata.json").write_text(json.dumps(
+              {"title": ref.split("/")[1], "id": ref, "licenses": [{"name": "other"}]}))
+          print("credential files staged (values not printed)")
+          PY
+            # No --public flag: Kaggle creates datasets private by default.
+            kaggle datasets create -p "$d" -q 2>&1 | tail -n 3
+          fi
+          s=""
+          for i in $(seq 1 30); do
+            s="$(kaggle datasets status "$CRED_DATASET" 2>&1 | tr 'A-Z' 'a-z' || true)"
+            echo "dataset status: $s"
+            [[ "$s" == *ready* ]] && break
+            sleep 10
+          done
+          [[ "$s" == *ready* ]] || { echo "::error::credential dataset not ready"; exit 2; }
+          python - "$CRED_DATASET" <<'PY'
+          import sys
+          from kaggle.api.kaggle_api_extended import KaggleApi
+          api = KaggleApi(); api.authenticate()
+          owner, slug = sys.argv[1].split("/")
+          hits = [d for d in api.dataset_list(mine=True, search=slug) if str(getattr(d, "ref", "")).endswith("/" + slug)]
+          priv = [getattr(d, "is_private", getattr(d, "isPrivate", None)) for d in hits]
+          print("credential dataset privacy:", priv)
+          if any(p is False for p in priv):
+              sys.exit("credential dataset is PUBLIC - refusing to continue")
+          PY
+
       - name: Build new notebook version from kaggle/job.json
         shell: bash
         run: |
@@ -103,7 +158,7 @@ jobs:
           cat workflow_code/kaggle/job.json
           python workflow_code/kaggle/launcher.py --job workflow_code/kaggle/job.json \
             --nb-dir "$RUNNER_TEMP/nb" --repo workflow_code --collector source \
-            --git-sha "$GITHUB_SHA" --collector-sha "$COLLECTOR_SHA"
+            --git-sha "$GITHUB_SHA" --collector-sha "$COLLECTOR_SHA" --cred-dataset "$CRED_DATASET"
           TIMEOUT="$(python -c "import json;print(int(json.load(open('workflow_code/kaggle/job.json')).get('timeout_minutes',60)))")"
           echo "JOB_TIMEOUT_MIN=$TIMEOUT" >> "$GITHUB_ENV"
 
