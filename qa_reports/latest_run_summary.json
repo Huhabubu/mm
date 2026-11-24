@@ -4,24 +4,24 @@
   "heartbeat_status": "ok",
   "job_execution_status": "ok",
   "target_window_execution_status": "ok",
-  "historical_catchup_status": "ok",
+  "historical_catchup_status": "has_failures",
   "active_window_ready_for_protocol_qa": true,
   "trigger_mode": "archive_dispatch",
-  "started_at_utc": "2026-11-24T20:14:32Z",
-  "completed_at_utc": "2026-11-24T20:14:45Z",
-  "target_window_utc": "2026-11-24T15:45Z",
-  "expected_archive_revision": "sha256:5f7cccc62f14515653b40d9c4cc12bfba61399c2bf0ddc347af8c312ccab9919",
-  "observed_archive_revision": "sha256:5f7cccc62f14515653b40d9c4cc12bfba61399c2bf0ddc347af8c312ccab9919",
+  "started_at_utc": "2026-11-24T20:24:09Z",
+  "completed_at_utc": "2026-11-24T20:25:19Z",
+  "target_window_utc": "2026-11-24T18:30Z",
+  "expected_archive_revision": "sha256:7b72c3acb6dd8f945494cd03375d3ee1cbeb5cb3c06f838707a3d6f8b8fae4a6",
+  "observed_archive_revision": "sha256:7b72c3acb6dd8f945494cd03375d3ee1cbeb5cb3c06f838707a3d6f8b8fae4a6",
   "target_revision_matched": true,
   "target_validation_error": null,
   "target_window_reused_result": true,
-  "current_window_id": "2026-11-24T15:45Z",
+  "current_window_id": "2026-11-24T18:30Z",
   "current_window_completed": true,
   "current_window_verification_status": "passed",
-  "latest_due_window_id": "2026-11-24T19:45Z",
-  "latest_due_window_verification_status": "passed",
-  "latest_verified_window_id": "2026-11-24T19:45Z",
-  "latest_verified_window_status": "passed",
+  "latest_due_window_id": "2026-11-24T20:00Z",
+  "latest_due_window_verification_status": "failed",
+  "latest_verified_window_id": "2026-11-24T20:00Z",
+  "latest_verified_window_status": "failed",
   "historical_data_quality_status": "has_historical_damage",
   "historical_damaged_windows": [
     "2026-11-22T08:00Z",
@@ -44,7 +44,8 @@
     "2026-11-24T12:00Z",
     "2026-11-24T12:30Z",
     "2026-11-24T13:30Z",
-    "2026-11-24T14:30Z"
+    "2026-11-24T14:30Z",
+    "2026-11-24T20:00Z"
   ],
   "historical_overdue_windows": [],
   "historical_archived_pending_qa_windows": [],
@@ -436,6 +437,22 @@
       "problems": [
         "depth unavailable events recorded: 6"
       ]
+    },
+    {
+      "source_manifest": "raw/bitget_v3/2026-11-24/bitget_v3_20261124_2000_p15m_trial15_20261122_da93ae54.manifest.json",
+      "file_name": "bitget_v3_20261124_2000_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "exchange": "bitget_v3",
+      "date_utc": "2026-11-24",
+      "window_id": "2026-11-24T20:00Z",
+      "window_span_id": "2026-11-24T20:00Z__2026-11-24T20:15Z_15m",
+      "partition_minutes": 15,
+      "run_id": "trial15_20261122T0745Z",
+      "local_loss_events": 0,
+      "dropped_frames": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
     }
   ],
   "historical_loss_manifests": [],
@@ -451,20 +468,20 @@
   "effective_since_window": "2026-11-22T07:45Z",
   "discovery_mode": "archive_manifest_index",
   "discovery_warnings": [],
-  "attempted": 0,
-  "ok": 0,
-  "blocked": 0,
+  "attempted": 4,
+  "ok": 3,
+  "blocked": 1,
   "needs_review": 0,
   "retry_needed": 0,
   "target_retry_needed": 0,
   "historical_retry_needed": 0,
   "remaining_backlog": 0,
-  "unresolved_blocked": 23,
+  "unresolved_blocked": 24,
   "unresolved_review": 0,
   "already_checked": 964,
-  "eligible_manifest_count": 964,
-  "expected_window_count": 241,
-  "window_reports_written": 241,
+  "eligible_manifest_count": 968,
+  "expected_window_count": 242,
+  "window_reports_written": 242,
   "day_reports_written": 3,
   "passed_windows": [
     "2026-11-22T07:45Z",
@@ -709,7 +726,8 @@
     "2026-11-24T12:00Z",
     "2026-11-24T12:30Z",
     "2026-11-24T13:30Z",
-    "2026-11-24T14:30Z"
+    "2026-11-24T14:30Z",
+    "2026-11-24T20:00Z"
   ],
   "review_windows": [],
   "archived_pending_qa_windows": [],
@@ -744,7 +762,8 @@
       "2026-11-24T12:00Z",
       "2026-11-24T12:30Z",
       "2026-11-24T13:30Z",
-      "2026-11-24T14:30Z"
+      "2026-11-24T14:30Z",
+      "2026-11-24T20:00Z"
     ],
     "verified_passed": [
       "2026-11-22T07:45Z",
@@ -971,7 +990,11 @@
     "verified_needs_review": []
   },
   "details": [
-    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-24T15:45Z expected_archive_revision=sha256:5f7cccc62f14515653b40d9c4cc12bfba61399c2bf0ddc347af8c312ccab9919 observed_archive_revision=sha256:5f7cccc62f14515653b40d9c4cc12bfba61399c2bf0ddc347af8c312ccab9919 checker_commit=0211a0b3b9d3a3ed3ebd9f0193738d7d25936100",
-    "REUSED_TARGET_RESULT run_id=trial15_20261122T0745Z target_window_utc=2026-11-24T15:45Z archive_revision=sha256:5f7cccc62f14515653b40d9c4cc12bfba61399c2bf0ddc347af8c312ccab9919 checker_commit=0211a0b3b9d3a3ed3ebd9f0193738d7d25936100 files=4"
+    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-24T18:30Z expected_archive_revision=sha256:7b72c3acb6dd8f945494cd03375d3ee1cbeb5cb3c06f838707a3d6f8b8fae4a6 observed_archive_revision=sha256:7b72c3acb6dd8f945494cd03375d3ee1cbeb5cb3c06f838707a3d6f8b8fae4a6 checker_commit=0211a0b3b9d3a3ed3ebd9f0193738d7d25936100",
+    "REUSED_TARGET_RESULT run_id=trial15_20261122T0745Z target_window_utc=2026-11-24T18:30Z archive_revision=sha256:7b72c3acb6dd8f945494cd03375d3ee1cbeb5cb3c06f838707a3d6f8b8fae4a6 checker_commit=0211a0b3b9d3a3ed3ebd9f0193738d7d25936100 files=4",
+    "PASSED raw/binance_futures/2026-11-24/binance_futures_20261124_2000_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "FAILED raw/bitget_v3/2026-11-24/bitget_v3_20261124_2000_p15m_trial15_20261122_da93ae54.manifest.json: 1 issues",
+    "PASSED raw/bybit_linear/2026-11-24/bybit_linear_20261124_2000_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "PASSED raw/gate_futures/2026-11-24/gate_futures_20261124_2000_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
   ]
 }
