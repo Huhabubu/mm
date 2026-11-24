@@ -10,9 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 48,
+  "observed_windows_count": 49,
   "missing_windows": [
-    "2026-11-24T12:00Z",
     "2026-11-24T12:15Z",
     "2026-11-24T12:30Z",
     "2026-11-24T12:45Z",
@@ -64,7 +63,8 @@
   "failed_windows": [
     "2026-11-24T00:00Z",
     "2026-11-24T02:30Z",
-    "2026-11-24T11:15Z"
+    "2026-11-24T11:15Z",
+    "2026-11-24T12:00Z"
   ],
   "overdue_windows": [],
   "pending_windows": [],
@@ -85,7 +85,7 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 724,
+  "clock_certified_minutes": 739,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
   "damaged_partitions": [
@@ -134,6 +134,26 @@
       "local_loss_events": 0,
       "gap_start_events": 0,
       "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-24T12:00Z",
+      "window_span_id": "2026-11-24T12:00Z__2026-11-24T12:15Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261124_1200_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-24/bitget_v3_20261124_1200_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "planned_rotation missing continuous delta after snapshot for BTCUSDT (A:33)",
+        "planned_rotation missing continuous delta after snapshot for DOGEUSDT (A:33)",
+        "planned_rotation missing continuous delta after snapshot for ETHUSDT (A:33)",
+        "planned_rotation missing continuous delta after snapshot for SOLUSDT (A:33)",
+        "planned_rotation missing continuous delta after snapshot for SUIUSDT (A:33)",
+        "planned_rotation missing continuous delta after snapshot for XRPUSDT (A:33)",
         "depth unavailable events recorded: 6"
       ]
     }
