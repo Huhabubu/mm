@@ -523,6 +523,84 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(21, report["end_sequence_checkpoint"][0]["seq"])
         self.assertTrue(report["end_sequence_checkpoint"][0]["awaiting_delta"])
 
+    def _bitget_trade_scan(self, records):
+        import json
+        import zstandard as zstd
+        from unittest.mock import patch
+        import hourly_incremental_qa as archive
+        from tokyo_l2_replay_qa import NS, scan
+
+        start = 1_795_276_800
+        wall = start * NS
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {BITGET: {"enabled": True, "symbols": ["BTCUSDT"], "channels": ["books50", "publicTrade"]}},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(archive, "check_partition", return_value={"qa_status": "passed", "problems": []}):
+            path = Path(directory) / "bitget.tsv.zst"
+            with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as writer:
+                for seq, (offset_ns, conn, kind, obj) in enumerate(records, 1):
+                    writer.write(f"{wall + offset_ns}\t{seq}\t{conn}\t1\t{seq}\t{kind}\t{json.dumps(obj)}\n")
+            report = {}
+            scan(
+                [({"exchange": BITGET, "planned_start_s": start},
+                  {"boot_id": "boot", "file_name": path.name}, path)],
+                cfg, wall, wall + 20 * NS, wall, {}, report,
+            )
+        issues = {(i["symbol"], i["issue"]): i["count"] for i in report["protocol"]["issues"]}
+        overlap = {(o["exchange"], o["symbol"]): o["count"] for o in report["connection_overlap_trades"]}
+        return issues, overlap
+
+    @staticmethod
+    def _bitget_trade(tid, price="100"):
+        return {"arg": {"topic": "publicTrade", "symbol": "BTCUSDT"}, "action": "update",
+                "data": [{"i": tid, "p": price, "v": "1", "S": "buy", "T": 1795276800000}]}
+
+    def test_cross_connection_handover_duplicate_is_reported_as_overlap_not_issue(self):
+        from tokyo_l2_replay_qa import NS
+
+        issues, overlap = self._bitget_trade_scan([
+            (1, "B", "DATA", self._bitget_trade("7")),
+            (NS, "B", "DATA", self._bitget_trade("8")),
+            (NS + 2, "A", "META", {"event": "SWITCH", "endpoint": "bitget_public"}),
+            (NS + 9, "A", "DATA", self._bitget_trade("8")),
+            (NS + 20, "A", "DATA", self._bitget_trade("9")),
+        ])
+        self.assertNotIn(("BTCUSDT", "duplicate_trade_id"), issues)
+        self.assertNotIn(("BTCUSDT", "conflicting_duplicate_trade"), issues)
+        self.assertEqual({(BITGET, "BTCUSDT"): 1}, overlap)
+
+    def test_same_connection_late_and_conflicting_duplicates_stay_proven_issues(self):
+        from tokyo_l2_replay_qa import NS
+
+        issues, overlap = self._bitget_trade_scan([
+            (1, "B", "DATA", self._bitget_trade("1")),
+            (2, "B", "DATA", self._bitget_trade("1")),
+            (3, "B", "DATA", self._bitget_trade("2")),
+            (4, "A", "META", {"event": "SWITCH", "endpoint": "bitget_public"}),
+            (5, "A", "DATA", self._bitget_trade("2", price="101")),
+            (6, "A", "DATA", self._bitget_trade("3")),
+            (12 * NS, "A", "DATA", self._bitget_trade("4")),
+            (13 * NS, "C", "DATA", self._bitget_trade("5")),
+            (13 * NS + 1, "C", "DATA", self._bitget_trade("4")),
+        ])
+        self.assertEqual(2, issues[("BTCUSDT", "duplicate_trade_id")])
+        self.assertEqual(1, issues[("BTCUSDT", "conflicting_duplicate_trade")])
+        self.assertEqual({}, overlap)
+
+    def test_replay_converter_receives_btc_trades_once_per_trade_id(self):
+        import qa_convert as convert
+        from tokyo_l2_replay_qa import BTC, follower_trade
+
+        buffer = convert.AssetDayBuffers(BITGET, BTC, "2026-11-24")
+        follower_trade(BITGET, self._bitget_trade("42"), 10, buffer)
+        follower_trade(BITGET, self._bitget_trade("42"), 20, buffer)
+        follower_trade(BITGET, self._bitget_trade("43"), 30, buffer)
+        trades = [row for row in buffer.hbt_rows if int(row[0]) & 0xFF == convert.TRADE_EVENT]
+        self.assertEqual([10, 30], [int(row[2]) for row in trades])
+        self.assertEqual(1, buffer.dedup_trades_dropped)
+
     def test_range_starts_with_verified_predecessor_then_carries_checkpoint(self):
         from unittest.mock import patch
         import tokyo_l2_replay_qa as replay
