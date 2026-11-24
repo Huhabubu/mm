@@ -636,8 +636,11 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         if (exchange, BTC) in unanchored_sources and not buffers[exchange].seen_snapshot:
             summary["replay"][exchange] = {"status": "blocked", "reason": "anchor_not_in_lookback"}
             continue
-        if len(signal) < 2 or not buffers[exchange].seen_snapshot or not buffers[exchange].hbt_rows:
-            summary["replay"][exchange] = {"status": "blocked", "reason": "missing_signal_or_initial_book"}
+        precondition = replay_precondition_reason(
+            len(signal), buffers[exchange].seen_snapshot, bool(buffers[exchange].hbt_rows)
+        )
+        if precondition is not None:
+            summary["replay"][exchange] = {"status": "blocked", "reason": precondition}
             continue
         if common != [{"start_wall_ns": start_replay, "end_wall_ns": sample_end}]:
             summary["replay"][exchange] = {
@@ -743,6 +746,40 @@ def run_replay(exchange, buffer, signal, spec, sample_end):
             "order_probe": probe, "lot_source": spec["lot_source"]}
 
 
+REPLAY_INIT_REASONS = frozenset({"initial_book_not_in_lookback", "anchor_not_in_lookback"})
+
+
+def replay_precondition_reason(signal_events, seen_snapshot, has_book_rows):
+    """Keep a missing signal, missing target rows and an uninitialised book as separate reasons."""
+    if signal_events < 2:
+        return "missing_signal"
+    if not seen_snapshot:
+        return "initial_book_not_in_lookback"
+    if not has_book_rows:
+        return "missing_target_book_rows"
+    return None
+
+
+def window_status(protocol_status, files_ok, replay_vals):
+    """Classify a window; replay initialisation gaps are never reported as passed."""
+    replay_ok = all(x["status"] == "passed" for x in replay_vals)
+    replay_only_unanchored = bool(replay_vals) and all(
+        x["status"] == "passed" or x.get("reason") == "anchor_not_in_lookback"
+        for x in replay_vals
+    )
+    replay_only_init = bool(replay_vals) and not replay_ok and all(
+        x["status"] == "passed" or x.get("reason") in REPLAY_INIT_REASONS
+        for x in replay_vals
+    )
+    if protocol_status == "passed" and files_ok and replay_ok:
+        return "passed"
+    if protocol_status == "anchor_unverified" and files_ok and (replay_ok or replay_only_unanchored):
+        return "anchor_unverified"
+    if protocol_status == "passed" and files_ok and replay_only_init:
+        return "replay_init_unverified"
+    return "data_failed"
+
+
 def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_windows,
                  candidates=None, checkpoint=None, anchor_lookback_windows=None, source_restrictions=None):
     out = {"status": "retryable", "run_id": run_id, "window_id": window,
@@ -770,18 +807,7 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
             scan(items, config, begin * NS, end * NS, min(end, begin + replay_seconds) * NS,
                  specs, out, checkpoint=checkpoint, source_restrictions=source_restrictions)
         files_ok = all(x["qa_status"] == "passed" for x in out["archive_file_checks"])
-        replay_vals = list(out["replay"].values())
-        replay_ok = all(x["status"] == "passed" for x in replay_vals)
-        replay_only_unanchored = bool(replay_vals) and all(
-            x["status"] == "passed" or x.get("reason") == "anchor_not_in_lookback"
-            for x in replay_vals
-        )
-        if out["protocol_status"] == "passed" and files_ok and replay_ok:
-            out["status"] = "passed"
-        elif out["protocol_status"] == "anchor_unverified" and files_ok and (replay_ok or replay_only_unanchored):
-            out["status"] = "anchor_unverified"
-        else:
-            out["status"] = "data_failed"
+        out["status"] = window_status(out["protocol_status"], files_ok, list(out["replay"].values()))
         if out.get("spec_error_type") or any(x["reason"] == "converter_or_engine_error"
                                              for x in out["replay"].values() if "reason" in x):
             out["status"] = "retryable"
