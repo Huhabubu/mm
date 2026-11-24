@@ -1,0 +1,179 @@
+name: Tokyo L2 Kaggle job (update + run existing private notebook, fetch log and outputs)
+
+# Job spec = kaggle/job.json on this branch. A push that changes kaggle/** launches it.
+# GitHub never touches Drive here; Drive access happens on Kaggle via the notebook's
+# own attached User Secrets. Outputs come back as a private run artifact.
+on:
+  push:
+    branches: [exp/tokyo-l2-glft]
+    paths:
+      - "kaggle/**"
+      - ".github/workflows/tokyo-l2-kaggle.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tokyo-l2-kaggle
+  cancel-in-progress: false
+
+env:
+  COLLECTOR_SHA: 78f7a69ac070cdb1d823e93a871b0801c4a1e3b7
+  NOTEBOOK_NAME: tokyo-l2-glft
+
+jobs:
+  kaggle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          path: workflow_code
+          persist-credentials: false
+
+      - name: Check out frozen collector code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COLLECTOR_SHA }}
+          path: source
+          sparse-checkout: |
+            collector/python
+            collector/specs
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle CLI
+        run: |
+          python -m pip install -q -U kaggle
+          python -m pip show kaggle | sed -n '1,2p'
+
+      - name: Configure Kaggle auth (token never printed)
+        env:
+          KAGGLE_SECRET: ${{ secrets.KAGGLE_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$KAGGLE_SECRET" ]] || { echo "::error::KAGGLE_API_TOKEN secret missing"; exit 2; }
+          umask 077
+          mkdir -p ~/.kaggle
+          if [[ "$KAGGLE_SECRET" == \{* ]]; then
+            printf '%s' "$KAGGLE_SECRET" > ~/.kaggle/kaggle.json
+            echo "auth_mode=kaggle.json"
+          else
+            printf '%s' "$KAGGLE_SECRET" > ~/.kaggle/access_token
+            echo "KAGGLE_API_TOKEN=$KAGGLE_SECRET" >> "$GITHUB_ENV"
+            echo "auth_mode=api_token"
+          fi
+
+      - name: Resolve existing notebook
+        shell: bash
+        run: |
+          set -euo pipefail
+          kaggle kernels list --mine --csv --page-size 100 > "$RUNNER_TEMP/kernels.csv"
+          SLUG="$(python - "$RUNNER_TEMP/kernels.csv" <<'PY'
+          import csv, os, sys
+          rows = list(csv.DictReader(open(sys.argv[1], encoding="utf-8")))
+          hits = [r["ref"].strip("/") for r in rows if r.get("ref", "").rstrip("/").split("/")[-1] == os.environ["NOTEBOOK_NAME"]]
+          if len(hits) != 1:
+              sys.exit(f"expected exactly one existing notebook named {os.environ['NOTEBOOK_NAME']}, found {len(hits)}")
+          print(hits[0].removeprefix("code/"))
+          PY
+          )"
+          echo "KAGGLE_SLUG=$SLUG" >> "$GITHUB_ENV"
+          echo "notebook=$SLUG"
+          kaggle kernels status "$SLUG" || true
+
+      - name: Build new notebook version from kaggle/job.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nb"
+          kaggle kernels pull "$KAGGLE_SLUG" -p "$RUNNER_TEMP/nb" -m
+          python - "$RUNNER_TEMP/nb/kernel-metadata.json" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          print("pulled_metadata", {k: m.get(k) for k in ("id", "code_file", "kernel_type", "is_private", "enable_internet", "enable_gpu", "dataset_sources")})
+          PY
+          cat workflow_code/kaggle/job.json
+          python workflow_code/kaggle/launcher.py --job workflow_code/kaggle/job.json \
+            --nb-dir "$RUNNER_TEMP/nb" --repo workflow_code --collector source \
+            --git-sha "$GITHUB_SHA" --collector-sha "$COLLECTOR_SHA"
+          TIMEOUT="$(python -c "import json;print(int(json.load(open('workflow_code/kaggle/job.json')).get('timeout_minutes',60)))")"
+          echo "JOB_TIMEOUT_MIN=$TIMEOUT" >> "$GITHUB_ENV"
+
+      - name: Push and run on Kaggle
+        shell: bash
+        run: |
+          set -euo pipefail
+          kaggle kernels push -p "$RUNNER_TEMP/nb" 2>&1 | tee "$RUNNER_TEMP/push.txt"
+          grep -qi "successfully pushed" "$RUNNER_TEMP/push.txt" || { echo "::error::kernel push failed"; exit 2; }
+          echo "PUSHED_AT=$(date -u +%s)" >> "$GITHUB_ENV"
+
+      - name: Poll status
+        shell: bash
+        run: |
+          set -uo pipefail
+          deadline=$(( PUSHED_AT + JOB_TIMEOUT_MIN * 60 ))
+          seen_active=0; final=""
+          while (( $(date -u +%s) < deadline )); do
+            s="$(kaggle kernels status "$KAGGLE_SLUG" 2>&1 | tr 'A-Z' 'a-z')"
+            echo "$(date -u +%H:%M:%S) $s"
+            if [[ "$s" == *queued* || "$s" == *running* ]]; then seen_active=1; fi
+            if [[ "$s" == *complete* || "$s" == *error* || "$s" == *cancel* ]]; then
+              if (( seen_active )) || (( $(date -u +%s) - PUSHED_AT > 300 )); then final="$s"; break; fi
+            fi
+            sleep 30
+          done
+          echo "KAGGLE_FINAL=${final:-timeout}" >> "$GITHUB_ENV"
+          echo "final=${final:-timeout}"
+
+      - name: Fetch log and outputs
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p kaggle_out
+          kaggle kernels output "$KAGGLE_SLUG" -p kaggle_out 2>&1 | tail -n 20
+          ls -la kaggle_out
+
+      - name: Secret scan and summary
+        if: always()
+        env:
+          QA_FOLDER_ID: ${{ secrets.TOKYO_L2_QA_GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -rIlE 'BEGIN (RSA )?PRIVATE KEY|"private_key"' kaggle_out >/dev/null 2>&1; then
+            echo "::error::credential material found in outputs; refusing to upload"; rm -rf kaggle_out; exit 2
+          fi
+          if [[ -n "${QA_FOLDER_ID:-}" ]] && grep -rIlF "$QA_FOLDER_ID" kaggle_out >/dev/null 2>&1; then
+            echo "::error::Drive folder id found in outputs; refusing to upload"; rm -rf kaggle_out; exit 2
+          fi
+          {
+            echo "### Kaggle job: \`$KAGGLE_SLUG\` final=\`${KAGGLE_FINAL:-unknown}\`"
+            for f in job_status.json probe_report.json; do
+              if [[ -f "kaggle_out/$f" ]]; then echo "#### $f"; echo '```json'; head -c 12000 "kaggle_out/$f"; echo; echo '```'; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          [[ -f kaggle_out/job_status.json ]] && cat kaggle_out/job_status.json
+          [[ -f kaggle_out/run.log ]] && tail -n 60 kaggle_out/run.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaggle-${{ github.run_id }}
+          path: kaggle_out
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Fail unless Kaggle job succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc="$(python -c "import json;print(json.load(open('kaggle_out/job_status.json'))['returncode'])" 2>/dev/null || echo missing)"
+          echo "kaggle_final=$KAGGLE_FINAL task_rc=$rc"
+          [[ "$KAGGLE_FINAL" == *complete* && "$rc" == "0" ]]

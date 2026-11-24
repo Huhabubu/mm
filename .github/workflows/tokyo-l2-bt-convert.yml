@@ -2,15 +2,8 @@ name: Tokyo L2 backtest input (fetch + narrowed qa_convert, one day x one Gate s
 
 # Read-only w.r.t. Drive and the QA state branch. Produces HBT NPZ as a run artifact only.
 on:
-  # workflow_dispatch is only offered once this file is on the default branch, so a push to
-  # the experiment branch runs the default smoke case (2026-11-23, BTC_USDT).
-  push:
-    branches: [exp/tokyo-l2-glft]
-    paths:
-      - ".github/workflows/tokyo-l2-bt-convert.yml"
-      - "scripts/tokyo_l2_bt_fetch.py"
-      - "scripts/tokyo_l2_bt_convert.py"
-      - "scripts/test_tokyo_l2_bt_convert.py"
+  # Retired as the compute path (GitHub runner lost contact mid-convert, run 45327724533);
+  # heavy work now runs on Kaggle via tokyo-l2-kaggle.yml. Kept for manual dispatch only.
   workflow_dispatch:
     inputs:
       date_utc:
