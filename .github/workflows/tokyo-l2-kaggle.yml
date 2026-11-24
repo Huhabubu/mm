@@ -159,7 +159,7 @@ jobs:
           fi
           {
             echo "### Kaggle job: \`${KAGGLE_SLUG:-unresolved}\` final=\`${KAGGLE_FINAL:-unknown}\`"
-            for f in job_status.json probe_report.json; do
+            for f in job_status.json secrets_precheck.json probe_report.json; do
               if [[ -f "kaggle_out/$f" ]]; then echo "#### $f"; echo '```json'; head -c 12000 "kaggle_out/$f"; echo; echo '```'; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"

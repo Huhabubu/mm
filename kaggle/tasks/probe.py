@@ -24,6 +24,8 @@ WORK = Path("/kaggle/working")
 REPORT = WORK / "probe_report.json"
 RCLONE_VERSION = "v1.68.2"
 PROBE_DATE = "2026-11-23"
+# Kaggle secrets service can be transiently unreachable early in a Batch run; retry with backoff.
+SECRET_RETRY_DELAYS_S = (5, 10, 20)
 report: dict = {"started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
@@ -170,25 +172,79 @@ def _rclone():
     return {"version": ver, "source": url.split("/")[2], "earlier_errors": errors}
 
 
+def _exc_chain(exc: BaseException) -> str:
+    """Type/message of the exception and its causes (no secret values are ever in these)."""
+    parts, seen = [], set()
+    while exc is not None and id(exc) not in seen and len(parts) < 4:
+        seen.add(id(exc))
+        parts.append(f"{type(exc).__name__}: {str(exc)[:240]}")
+        exc = exc.__cause__ or exc.__context__
+    return " <- ".join(parts)
+
+
+def _secrets_service_diag() -> dict:
+    """Where the secrets client would connect, and whether that host is reachable. No tokens."""
+    import socket
+    import urllib.parse
+    out: dict = {}
+    try:
+        import kaggle_secrets
+        out["client_module"] = getattr(kaggle_secrets, "__file__", None)
+    except Exception as exc:
+        out["client_module_error"] = _exc_chain(exc)
+    base = os.environ.get("KAGGLE_URL_BASE", "")
+    host = urllib.parse.urlparse(base).hostname or ""
+    out["url_base_host"] = host
+    out["url_base_scheme"] = urllib.parse.urlparse(base).scheme
+    if host:
+        try:
+            out["dns"] = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443)})[:4]
+        except Exception as exc:
+            out["dns_error"] = _exc_chain(exc)
+        try:
+            t0 = time.time()
+            with socket.create_connection((host, 443), timeout=10):
+                out["tcp443_s"] = round(time.time() - t0, 3)
+        except Exception as exc:
+            out["tcp443_error"] = _exc_chain(exc)
+    return out
+
+
 @section("secrets_and_drive")
 def _drive():
     # Presence only (never values) of the env the Kaggle secrets client depends on.
     report["secrets_env_present"] = {k: bool(os.environ.get(k)) for k in
                                      ("KAGGLE_USER_SECRETS_TOKEN", "KAGGLE_URL_BASE", "KAGGLE_KERNEL_RUN_TYPE",
-                                      "KAGGLE_DATA_PROXY_TOKEN", "KAGGLE_IAP_TOKEN")}
+                                      "KAGGLE_DATA_PROXY_TOKEN", "KAGGLE_IAP_TOKEN",
+                                      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy")}
     report["kernel_run_type"] = os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+    report["secrets_service"] = _secrets_service_diag()
     from kaggle_secrets import UserSecretsClient
-    client = UserSecretsClient()
     got = {}
+    attempts_log = {}
     for name in ("TOKYO_L2_QA_GDRIVE_SA_JSON", "TOKYO_L2_QA_GDRIVE_FOLDER_ID"):
-        try:
-            got[name] = client.get_secret(name) or ""
-        except Exception as exc:
-            got[name] = ""
-            report.setdefault("secret_errors", {})[name] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        got[name] = ""
+        tries = []
+        for delay in (0, *SECRET_RETRY_DELAYS_S):
+            if delay:
+                time.sleep(delay)
+            t0 = time.time()
+            try:
+                got[name] = UserSecretsClient().get_secret(name) or ""
+                tries.append({"after_wait_s": delay, "ok": bool(got[name]), "s": round(time.time() - t0, 2)})
+                if got[name]:
+                    break
+            except Exception as exc:
+                tries.append({"after_wait_s": delay, "ok": False, "s": round(time.time() - t0, 2),
+                              "error": _exc_chain(exc)})
+        attempts_log[name] = tries
+        if not got[name]:
+            report.setdefault("secret_errors", {})[name] = tries[-1].get("error", "empty value")
+    report["secret_attempts"] = attempts_log
+    save()
     present = {k: bool(v) for k, v in got.items()}
     if not all(present.values()):
-        return {"secrets_present": present, "drive_listed": False}
+        raise RuntimeError(f"secrets not readable after {1 + len(SECRET_RETRY_DELAYS_S)} attempts: {present}")
     sa = json.loads(got["TOKYO_L2_QA_GDRIVE_SA_JSON"])
     os.umask(0o077)
     sa_path = AUTH / "sa.json"
@@ -226,7 +282,9 @@ def _drive():
 shutil.rmtree(AUTH, ignore_errors=True)
 report["auth_dir_removed"] = not AUTH.exists()
 report["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-report["all_ok"] = all(v.get("ok") for v in report.values() if isinstance(v, dict) and "ok" in v)
+# Every section must pass AND Drive must actually have been listed; unread secrets are a failure.
+report["all_ok"] = (all(v.get("ok") for v in report.values() if isinstance(v, dict) and "ok" in v)
+                    and bool(report.get("secrets_and_drive", {}).get("drive_listed")))
 save()
 print("PROBE_DONE all_ok=", report["all_ok"], flush=True)
 sys.exit(0 if report["all_ok"] else 3)

@@ -32,6 +32,26 @@ work = "/kaggle/working"
 os.makedirs(work, exist_ok=True)
 with open(os.path.join(work, "job_manifest.json"), "w") as fh:
     json.dump(JOB, fh, indent=2)
+# Secrets precheck in the notebook kernel process itself (the task runs in a child process).
+# Records presence/error only, never values; distinguishes kernel-vs-subprocess env issues.
+pre = {"run_type": os.environ.get("KAGGLE_KERNEL_RUN_TYPE"), "checks": {}}
+for _name in ("TOKYO_L2_QA_GDRIVE_FOLDER_ID",):
+    _tries = []
+    for _delay in (0, 5, 10, 20):
+        if _delay:
+            time.sleep(_delay)
+        try:
+            from kaggle_secrets import UserSecretsClient
+            _ok = bool(UserSecretsClient().get_secret(_name))
+            _tries.append({"after_wait_s": _delay, "ok": _ok})
+            if _ok:
+                break
+        except Exception as _exc:
+            _tries.append({"after_wait_s": _delay, "ok": False, "error": f"{type(_exc).__name__}: {str(_exc)[:200]}"})
+    pre["checks"][_name] = _tries
+with open(os.path.join(work, "secrets_precheck.json"), "w") as fh:
+    json.dump(pre, fh, indent=2)
+print("SECRETS_PRECHECK", json.dumps(pre))
 env = dict(os.environ, PYTHONUNBUFFERED="1", TOKYO_L2_CODE_ROOT=root,
            PYTHONPATH=os.pathsep.join([root + "/collector/python", root + "/repo/scripts", root + "/repo"]))
 cmd = [sys.executable, "-u", os.path.join(root, "repo", JOB["task"]), *JOB.get("args", [])]
