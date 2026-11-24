@@ -147,20 +147,36 @@ AUTH = Path(tempfile.mkdtemp(prefix="tokyo_l2_auth_"))
 
 @section("rclone_install")
 def _rclone():
-    url = f"https://downloads.rclone.org/{RCLONE_VERSION}/rclone-{RCLONE_VERSION}-linux-amd64.zip"
     zpath = Path("/tmp/rclone.zip")
-    urllib.request.urlretrieve(url, zpath)
+    urls = [f"https://github.com/rclone/rclone/releases/download/{RCLONE_VERSION}/rclone-{RCLONE_VERSION}-linux-amd64.zip",
+            f"https://downloads.rclone.org/{RCLONE_VERSION}/rclone-{RCLONE_VERSION}-linux-amd64.zip"]
+    errors = []
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                zpath.write_bytes(r.read())
+            break
+        except Exception as exc:
+            errors.append(f"{url.split('/')[2]}: {type(exc).__name__}: {exc}")
+    else:
+        raise RuntimeError("; ".join(errors))
     RCLONE.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zpath) as z:
         member = next(m for m in z.namelist() if m.endswith("/rclone"))
         RCLONE.write_bytes(z.read(member))
     RCLONE.chmod(0o755)
     ver = subprocess.run([str(RCLONE), "version"], capture_output=True, text=True).stdout.splitlines()[0]
-    return {"version": ver}
+    return {"version": ver, "source": url.split("/")[2], "earlier_errors": errors}
 
 
 @section("secrets_and_drive")
 def _drive():
+    # Presence only (never values) of the env the Kaggle secrets client depends on.
+    report["secrets_env_present"] = {k: bool(os.environ.get(k)) for k in
+                                     ("KAGGLE_USER_SECRETS_TOKEN", "KAGGLE_URL_BASE", "KAGGLE_KERNEL_RUN_TYPE",
+                                      "KAGGLE_DATA_PROXY_TOKEN", "KAGGLE_IAP_TOKEN")}
+    report["kernel_run_type"] = os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
     from kaggle_secrets import UserSecretsClient
     client = UserSecretsClient()
     got = {}
@@ -169,7 +185,7 @@ def _drive():
             got[name] = client.get_secret(name) or ""
         except Exception as exc:
             got[name] = ""
-            report.setdefault("secret_errors", {})[name] = type(exc).__name__
+            report.setdefault("secret_errors", {})[name] = f"{type(exc).__name__}: {str(exc)[:300]}"
     present = {k: bool(v) for k, v in got.items()}
     if not all(present.values()):
         return {"secrets_present": present, "drive_listed": False}
