@@ -12,10 +12,7 @@
   "expected_windows_count": 96,
   "observed_windows_count": 96,
   "missing_windows": [],
-  "failed_windows": [],
-  "overdue_windows": [],
-  "pending_windows": [],
-  "archived_pending_qa_windows": [
+  "failed_windows": [
     "2026-11-23T00:00Z",
     "2026-11-23T06:30Z",
     "2026-11-23T12:45Z",
@@ -26,14 +23,11 @@
     "2026-11-23T14:45Z",
     "2026-11-23T19:30Z"
   ],
+  "overdue_windows": [],
+  "pending_windows": [],
+  "archived_pending_qa_windows": [],
   "review_windows": [],
-  "cross_window_sequence_issues": [
-    "binance_futures:2026-11-23T14:30Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=173033541,got=179440644",
-    "bitget_v3:2026-11-23T06:45Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=33030008,got=33408165",
-    "bitget_v3:2026-11-23T13:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=42237766,got=42685324",
-    "bitget_v3:2026-11-23T15:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=43857898,got=48959575",
-    "bitget_v3:2026-11-23T19:45Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=59264382,got=59870552"
-  ],
+  "cross_window_sequence_issues": [],
   "restarts_by_exchange": {
     "binance_futures": [
       "trial15_20261122T0745Z_1795333473410706867"
@@ -51,7 +45,163 @@
   "clock_certified_minutes": 1440,
   "clock_certification_passed": true,
   "startup_stub_segments": [],
-  "damaged_partitions": [],
+  "damaged_partitions": [
+    {
+      "exchange": "binance_futures",
+      "window_id": "2026-11-23T00:00Z",
+      "window_span_id": "2026-11-23T00:00Z__2026-11-23T00:15Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "binance_futures_20261123_0000_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/binance_futures/2026-11-23/binance_futures_20261123_0000_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 1"
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "window_id": "2026-11-23T14:15Z",
+      "window_span_id": "2026-11-23T14:15Z__2026-11-23T14:30Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "binance_futures_20261123_1415_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/binance_futures/2026-11-23/binance_futures_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T00:00Z",
+      "window_span_id": "2026-11-23T00:00Z__2026-11-23T00:15Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_0000_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_0000_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T06:30Z",
+      "window_span_id": "2026-11-23T06:30Z__2026-11-23T06:45Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_0630_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_0630_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T12:45Z",
+      "window_span_id": "2026-11-23T12:45Z__2026-11-23T13:00Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_1245_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1245_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T13:45Z",
+      "window_span_id": "2026-11-23T13:45Z__2026-11-23T14:00Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_1345_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1345_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 3,
+      "problems": [
+        "recorded loss/gap events: loss=0, gap_start=3",
+        "depth unavailable events recorded: 27"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T14:00Z",
+      "window_span_id": "2026-11-23T14:00Z__2026-11-23T14:15Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_1400_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1400_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 18"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T14:15Z",
+      "window_span_id": "2026-11-23T14:15Z__2026-11-23T14:30Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_1415_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T14:30Z",
+      "window_span_id": "2026-11-23T14:30Z__2026-11-23T14:45Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_1430_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1430_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 18"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T14:45Z",
+      "window_span_id": "2026-11-23T14:45Z__2026-11-23T15:00Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_1445_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1445_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-23T19:30Z",
+      "window_span_id": "2026-11-23T19:30Z__2026-11-23T19:45Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261123_1930_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1930_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    }
+  ],
   "qa_status": "failed",
   "status": "blocked"
 }

@@ -16,7 +16,7 @@
   "observed_batches": [
     "trial15_20261122T0745Z"
   ],
-  "qa_status": "archived_pending_qa",
+  "qa_status": "failed",
   "status": "blocked",
   "expected_exchanges": [
     "binance_futures",
@@ -25,75 +25,63 @@
     "gate_futures"
   ],
   "present_exchanges": [
+    "binance_futures",
+    "bitget_v3",
     "bybit_linear",
     "gate_futures"
   ],
-  "missing_exchanges": [
-    "binance_futures",
-    "bitget_v3"
-  ],
+  "missing_exchanges": [],
   "expected_channel_count": 72,
-  "observed_channel_count": 36,
-  "missing_hard_channels": [
-    "binance_futures/BTCUSDT/bookTicker",
-    "binance_futures/BTCUSDT/depth@100ms",
-    "binance_futures/DOGEUSDT/bookTicker",
-    "binance_futures/DOGEUSDT/depth@100ms",
-    "binance_futures/ETHUSDT/bookTicker",
-    "binance_futures/ETHUSDT/depth@100ms",
-    "binance_futures/SOLUSDT/bookTicker",
-    "binance_futures/SOLUSDT/depth@100ms",
-    "binance_futures/SUIUSDT/bookTicker",
-    "binance_futures/SUIUSDT/depth@100ms",
-    "binance_futures/XRPUSDT/bookTicker",
-    "binance_futures/XRPUSDT/depth@100ms",
-    "bitget_v3/BTCUSDT/books1",
-    "bitget_v3/BTCUSDT/books50",
-    "bitget_v3/DOGEUSDT/books1",
-    "bitget_v3/DOGEUSDT/books50",
-    "bitget_v3/ETHUSDT/books1",
-    "bitget_v3/ETHUSDT/books50",
-    "bitget_v3/SOLUSDT/books1",
-    "bitget_v3/SOLUSDT/books50",
-    "bitget_v3/SUIUSDT/books1",
-    "bitget_v3/SUIUSDT/books50",
-    "bitget_v3/XRPUSDT/books1",
-    "bitget_v3/XRPUSDT/books50"
-  ],
-  "missing_trade_channels": [
-    "binance_futures/BTCUSDT/aggTrade",
-    "binance_futures/DOGEUSDT/aggTrade",
-    "binance_futures/ETHUSDT/aggTrade",
-    "binance_futures/SOLUSDT/aggTrade",
-    "binance_futures/SUIUSDT/aggTrade",
-    "binance_futures/XRPUSDT/aggTrade",
-    "bitget_v3/BTCUSDT/publicTrade",
-    "bitget_v3/DOGEUSDT/publicTrade",
-    "bitget_v3/ETHUSDT/publicTrade",
-    "bitget_v3/SOLUSDT/publicTrade",
-    "bitget_v3/SUIUSDT/publicTrade",
-    "bitget_v3/XRPUSDT/publicTrade"
-  ],
+  "observed_channel_count": 72,
+  "missing_hard_channels": [],
+  "missing_trade_channels": [],
   "worst_head_gap_seconds": 0.653363,
-  "worst_tail_gap_seconds": 0.206539,
+  "worst_tail_gap_seconds": 0.296684,
   "max_gap_by_category": {
-    "continuous_quote": 0.896022,
-    "depth": 0.70891,
-    "event_trade": 6.155142
+    "event_trade": 7.280678,
+    "continuous_quote": 1.007804,
+    "depth": 0.742553
   },
   "local_loss_events": 0,
   "dropped_frames": 0,
   "attributed_late_frames_rejected": 0,
   "attributed_late_losses": [],
   "gap_start_events": 0,
-  "depth_unavailable_events": 0,
+  "depth_unavailable_events": 12,
   "sequence_breaks": [],
-  "segment_count": 2,
+  "segment_count": 4,
   "startup_stub_segments": [],
-  "damaged_segments": [],
+  "damaged_segments": [
+    {
+      "exchange": "binance_futures",
+      "file_name": "binance_futures_20261123_1415_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/binance_futures/2026-11-23/binance_futures_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
+      "run_id": "trial15_20261122T0745Z",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "file_name": "bitget_v3_20261123_1415_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
+      "run_id": "trial15_20261122T0745Z",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    }
+  ],
   "review_reasons": [],
   "hard_problems": [],
   "files": [
+    "raw/binance_futures/2026-11-23/binance_futures_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
+    "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
     "raw/bybit_linear/2026-11-23/bybit_linear_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
     "raw/gate_futures/2026-11-23/gate_futures_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json"
   ]
