@@ -10,11 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 13,
+  "observed_windows_count": 16,
   "missing_windows": [
-    "2026-11-25T03:15Z",
-    "2026-11-25T03:30Z",
-    "2026-11-25T03:45Z",
     "2026-11-25T04:00Z",
     "2026-11-25T04:15Z",
     "2026-11-25T04:30Z",
@@ -97,22 +94,16 @@
     "2026-11-25T23:45Z"
   ],
   "failed_windows": [
+    "2026-11-25T01:30Z",
     "2026-11-25T03:00Z"
   ],
   "overdue_windows": [],
-  "pending_windows": [],
-  "archived_pending_qa_windows": [
-    "2026-11-25T01:30Z",
-    "2026-11-25T02:45Z"
+  "pending_windows": [
+    "2026-11-25T03:45Z"
   ],
+  "archived_pending_qa_windows": [],
   "review_windows": [],
-  "cross_window_sequence_issues": [
-    "binance_futures:2026-11-25T03:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=499590832,got=501223743",
-    "bitget_v3:2026-11-25T01:45Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=110367336,got=110906948",
-    "bitget_v3:2026-11-25T03:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=112947532,got=113364711",
-    "bybit_linear:2026-11-25T03:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=86984703,got=87300368",
-    "gate_futures:2026-11-25T03:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=85068695,got=85360322"
-  ],
+  "cross_window_sequence_issues": [],
   "restarts_by_exchange": {
     "binance_futures": [
       "trial15_20261122T0745Z_1795333473410706867"
@@ -127,10 +118,25 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 214,
+  "clock_certified_minutes": 244,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
   "damaged_partitions": [
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-25T01:30Z",
+      "window_span_id": "2026-11-25T01:30Z__2026-11-25T01:45Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261125_0130_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-25/bitget_v3_20261125_0130_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 1,
+      "problems": [
+        "recorded loss/gap events: loss=0, gap_start=1",
+        "depth unavailable events recorded: 5"
+      ]
+    },
     {
       "exchange": "bitget_v3",
       "window_id": "2026-11-25T03:00Z",
