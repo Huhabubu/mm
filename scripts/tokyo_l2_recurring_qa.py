@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import time
 import zlib
 
@@ -239,6 +239,39 @@ def _expected_depth_markets(config):
     }
 
 
+def _load_prechecked_file_reports(state: Path, candidates, checker: str, config: dict) -> dict:
+    """Load cryptographically verified per-file partition QA reports already persisted by hourly_incremental_qa."""
+    if not isinstance(config, dict) or not config.get("exchanges"):
+        return {}
+    checker_sha = checker.split("/", 1)[0]
+    config_sha = coverage.effective_config_hash(config)
+    reports = {}
+    for cand in candidates or ():
+        rel = str(cand.get("source_manifest") or "")
+        data_sha = str(cand.get("data_sha256") or "")
+        if not rel or not data_sha or ".." in PurePosixPath(rel).parts or PurePosixPath(rel).is_absolute():
+            continue
+        key = (rel, data_sha)
+        if key in reports:
+            continue
+        doc = read_report(state / "qa_reports" / f"{rel}.qa.json")
+        if (
+            doc
+            and doc.get("qa_version") == archive.QA_VERSION
+            and doc.get("checker_commit_sha") == checker_sha
+            and doc.get("effective_config_sha256") == config_sha
+            and doc.get("source_manifest") == rel
+            and doc.get("manifest_sha256") == cand.get("manifest_sha256")
+            and doc.get("sha256") == data_sha
+            and doc.get("three_way_verified") is True
+            and doc.get("qa_status") in {"passed", "failed", "needs_review"}
+            and isinstance(doc.get("problems"), list)
+            and isinstance(doc.get("structural_problems"), list)
+        ):
+            reports[key] = doc
+    return reports
+
+
 def run(
     remote,
     config,
@@ -434,6 +467,16 @@ def run(
         "download_timeout_seconds" in audit_params
         or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in audit_params.values())
     )
+    supports_cache_audit = (
+        "prechecked_file_reports" in audit_params
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in audit_params.values())
+    )
+    prechecked_file_reports = (
+        _load_prechecked_file_reports(state, candidates, checker, config)
+        if supports_cache_audit
+        else {}
+    )
+    specs_cache = {}
 
     def persist_consistent_state(just_checked=None):
         current_validated = _reports_with_current_checkpoints(proofs, step)
@@ -530,6 +573,9 @@ def run(
                 eff_lb_timeout = min(float(eff_lb_timeout), max(30.0, deadline_mono - time.monotonic()))
             extra_audit_kwargs["download_timeout_seconds"] = download_timeout_seconds
             extra_audit_kwargs["lookback_timeout_seconds"] = eff_lb_timeout
+        if supports_cache_audit:
+            extra_audit_kwargs["prechecked_file_reports"] = prechecked_file_reports
+            extra_audit_kwargs["specs_cache"] = specs_cache
         report = audit_window(
             remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
             candidates=candidates, checkpoint=checkpoint or None, anchor_lookback_windows=lookback,

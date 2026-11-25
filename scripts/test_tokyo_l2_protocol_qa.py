@@ -1836,6 +1836,68 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual([wid0], r["retryable_windows"])
             self.assertEqual(1, r["pending_ready_windows"])
 
+    def test_prechecked_file_report_reuse_and_digest_mismatch_fallback(self):
+        import json
+        from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
+        import tokyo_l2_recurring_qa as recurring
+        import tokyo_l2_replay_qa as replay
+
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
+        }
+        cfg_sha = coverage.effective_config_hash(cfg)
+        checker_sha = "31590e1ab0f58436b0967a969384994aabfc6b82"
+        rel = "raw/gate_futures/2026-11-23/gate_20261123_0000.manifest.json"
+        cand = {
+            "exchange": "gate_futures",
+            "source_manifest": rel,
+            "source_data": rel.replace(".manifest.json", ".tsv.zst"),
+            "manifest_sha256": "1" * 64,
+            "data_sha256": "2" * 64,
+        }
+        mf = {"file_name": "gate_20261123_0000.tsv.zst", "bytes": 1234, "sha256": "2" * 64}
+        good_doc = {
+            "qa_version": archive.QA_VERSION,
+            "checker_commit_sha": checker_sha,
+            "effective_config_sha256": cfg_sha,
+            "source_manifest": rel,
+            "manifest_sha256": "1" * 64,
+            "sha256": "2" * 64,
+            "bytes": 1234,
+            "file_name": "gate_20261123_0000.tsv.zst",
+            "three_way_verified": True,
+            "qa_status": "passed",
+            "problems": [],
+            "structural_problems": [],
+            "coverage_incomplete": False,
+            "is_startup_stub": False,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            qa_path = state / "qa_reports" / f"{rel}.qa.json"
+            qa_path.parent.mkdir(parents=True, exist_ok=True)
+            qa_path.write_text(json.dumps(good_doc), encoding="utf-8")
+
+            loaded = recurring._load_prechecked_file_reports(state, [cand], f"{checker_sha}/rules1", cfg)
+            self.assertIn((rel, "2" * 64), loaded)
+            # Reused without calling archive.check_partition!
+            with patch.object(replay.archive, "check_partition", side_effect=AssertionError("should reuse cached report")):
+                res = replay._cached_partition_audit(Path("/unused"), mf, cfg, cand, loaded)
+            self.assertEqual("passed", res["qa_status"])
+
+            # Digest mismatch on manifest forces live archive.check_partition fallback!
+            bad_mf = {**mf, "sha256": "f" * 64}
+            with patch.object(replay.archive, "check_partition", return_value={"qa_status": "failed", "problems": ["x"], "structural_problems": []}) as live_chk:
+                res2 = replay._cached_partition_audit(Path("/unused"), bad_mf, cfg, cand, loaded)
+            live_chk.assert_called_once()
+            self.assertEqual("failed", res2["qa_status"])
+
+            # Checker mismatch refuses cache load completely.
+            self.assertEqual({}, recurring._load_prechecked_file_reports(state, [cand], "other_sha/rules1", cfg))
+
 
 if __name__ == "__main__":
     unittest.main()
