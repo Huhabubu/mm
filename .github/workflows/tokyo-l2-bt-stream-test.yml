@@ -1,0 +1,55 @@
+name: Tokyo L2 stream converter tests
+
+# Synthetic, deterministic unit tests only: no credentials, no Drive, no market data.
+on:
+  push:
+    branches: [exp/tokyo-l2-glft]
+    paths:
+      - scripts/tokyo_l2_bt_stream_convert.py
+      - scripts/test_tokyo_l2_bt_stream_convert.py
+      - scripts/tokyo_l2_bt_convert.py
+      - scripts/test_tokyo_l2_bt_convert.py
+      - .github/workflows/tokyo-l2-bt-stream-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  COLLECTOR_SHA: 78f7a69ac070cdb1d823e93a871b0801c4a1e3b7
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: workflow_code
+          sparse-checkout: |
+            scripts
+          persist-credentials: false
+
+      - name: Check out frozen collector code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COLLECTOR_SHA }}
+          path: source
+          sparse-checkout: |
+            collector/python
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: python -m pip install --quiet "hftbacktest==2.4.4" zstandard
+
+      - name: Unit tests
+        working-directory: workflow_code/scripts
+        env:
+          PYTHONPATH: ${{ github.workspace }}/source/collector/python:${{ github.workspace }}/workflow_code/scripts
+        run: |
+          python -c "import hftbacktest, numpy; print('hftbacktest', hftbacktest.__version__ if hasattr(hftbacktest, '__version__') else '?', 'numpy', numpy.__version__)"
+          python -m unittest -v test_tokyo_l2_bt_stream_convert test_tokyo_l2_bt_convert
