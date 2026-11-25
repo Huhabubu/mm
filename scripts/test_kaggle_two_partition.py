@@ -114,14 +114,21 @@ class AcceptanceTests(unittest.TestCase):
             part = {"exchange": "gate_futures", "window_id": window, "data_sha256": "raw",
                     "manifest_sha256": "manifest"}
             q = {"run_id": "run", "window_id": window, "checker": "current/rules", "status": "passed",
-                 "protocol_status": "passed", "target_inputs": [part], "market_availability": []}
+                 "protocol_status": "passed", "archive_revision": "sha256:rev1",
+                 "target_inputs": [part], "market_availability": []}
+            revs = {window: "sha256:rev1"}
             path.write_text(json.dumps(q))
-            self.assertTrue(audit.protocol_evidence(tmp, [window], [part], "run", "current")["passed"])
-            for update in ({"checker": "old/rules"}, {"status": "data_failed"},
-                           {"target_inputs": []}, {"run_id": "wrong"},
+            self.assertTrue(audit.protocol_evidence(
+                tmp, [window], [part], "run", "current", rules_sha="rules", expected_archive_revisions=revs)["passed"])
+            # Commit-only checker without rules digest must fail closed.
+            self.assertFalse(audit.protocol_evidence(tmp, [window], [part], "run", "current")["passed"])
+            for update in ({"checker": "old/rules"}, {"checker": "current/stale_rules"},
+                           {"archive_revision": "sha256:other"}, {"archive_revision": None},
+                           {"status": "data_failed"}, {"target_inputs": []}, {"run_id": "wrong"},
                            {"replay": {"gate_futures": {"status": "blocked"}}}):
                 path.write_text(json.dumps({**q, **update}))
-                self.assertFalse(audit.protocol_evidence(tmp, [window], [part], "run", "current")["passed"])
+                self.assertFalse(audit.protocol_evidence(
+                    tmp, [window], [part], "run", "current", rules_sha="rules", expected_archive_revisions=revs)["passed"])
 
     def test_actual_packaged_import_closure(self):
         job = json.loads((ROOT / "kaggle" / "job.json").read_text())

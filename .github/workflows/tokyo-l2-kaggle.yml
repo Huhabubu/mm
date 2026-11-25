@@ -140,8 +140,8 @@ jobs:
           hits = [d for d in api.dataset_list(mine=True, search=slug) if str(getattr(d, "ref", "")).endswith("/" + slug)]
           priv = [getattr(d, "is_private", getattr(d, "isPrivate", None)) for d in hits]
           print("credential dataset privacy:", priv)
-          if any(p is False for p in priv):
-              sys.exit("credential dataset is PUBLIC - refusing to continue")
+          if len(priv) != 1 or priv[0] is not True:
+              sys.exit(f"cannot confirm credential dataset is PRIVATE (got {priv!r}) - refusing to continue")
           PY
 
       - name: Check out QA day reports (read-only)
@@ -154,6 +154,19 @@ jobs:
             /qa_reports/days/
             /qa_reports/protocol/*/15m/2026-11-23T0000Z.json
             /qa_reports/protocol/*/15m/2026-11-23T0015Z.json
+            /qa_reports/windows/*/2026-11-23/2026-11-23T0000Z__*.window.qa.json
+            /qa_reports/windows/*/2026-11-23/2026-11-23T0015Z__*.window.qa.json
+          persist-credentials: false
+
+      - name: Check out current protocol QA rules (read-only)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: qa_rules/workflow_code
+          sparse-checkout: |
+            scripts/tokyo_l2_protocol_qa.py
+            scripts/tokyo_l2_replay_qa.py
+            scripts/tokyo_l2_recurring_qa.py
           persist-credentials: false
 
       - name: Stage QA day reports listed in kaggle/job.json
@@ -176,8 +189,25 @@ jobs:
           protocol_dst = pathlib.Path("workflow_code/kaggle/qa_protocol")
           protocol_dst.mkdir(parents=True, exist_ok=True)
           qa_sha = subprocess.check_output(["git", "-C", "qa_state", "rev-parse", "HEAD"], text=True).strip()
-          provenance = {"qa_state_sha": qa_sha, "protocol_files": [], "missing_protocol_windows": []}
+          qa_rules_sha = subprocess.check_output(["git", "-C", "qa_rules/workflow_code", "rev-parse", "HEAD"], text=True).strip()
+          rules_digest = subprocess.check_output(
+              ["bash", "-c", "cd qa_rules && sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum | cut -d ' ' -f1"],
+              text=True,
+          ).strip()
+          provenance = {
+              "qa_state_sha": qa_sha,
+              "qa_rules_main_sha": qa_rules_sha,
+              "expected_protocol_rules_sha": rules_digest,
+              "window_archive_revisions": {},
+              "protocol_files": [],
+              "missing_protocol_windows": [],
+          }
           for window in job.get("qa_protocol_windows", []):
+              whits = sorted(pathlib.Path("qa_state/qa_reports/windows").glob(f"*/2026-11-23/{window}__*.window.qa.json"))
+              if len(whits) == 1:
+                  wdata = json.loads(whits[0].read_text())
+                  if wdata.get("window_id") and wdata.get("archive_revision"):
+                      provenance["window_archive_revisions"][wdata["window_id"]] = wdata["archive_revision"]
               hits = sorted(pathlib.Path("qa_state/qa_reports/protocol").glob(f"*/15m/{window}.json"))
               if len(hits) != 1:
                   provenance["missing_protocol_windows"].append(window)
@@ -198,6 +228,8 @@ jobs:
           import json, sys
           m = json.load(open(sys.argv[1]))
           print("pulled_metadata", {k: m.get(k) for k in ("id", "code_file", "kernel_type", "is_private", "enable_internet", "enable_gpu", "dataset_sources")})
+          if m.get("is_private") is not True:
+              sys.exit(f"cannot confirm notebook is PRIVATE (is_private={m.get('is_private')!r}) - refusing to continue")
           PY
           cat workflow_code/kaggle/job.json
           python workflow_code/kaggle/launcher.py --job workflow_code/kaggle/job.json \

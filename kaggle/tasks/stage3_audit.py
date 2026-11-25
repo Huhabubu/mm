@@ -159,26 +159,41 @@ def scan(parts):
             "pre": pre, "chain_errors": chain_errors}
 
 
-def protocol_evidence(folder, windows, parts, run_id, checker):
+def protocol_evidence(folder, windows, parts, run_id, checker, rules_sha=None, expected_archive_revisions=None):
     reports, blocked, problems = [], [], []
+    expected_checker = f"{checker}/{rules_sha}" if rules_sha else str(checker or "")
+    has_rules_digest = "/" in expected_checker and bool(expected_checker.split("/", 1)[1])
     for window in windows:
         hits = list(Path(folder).glob(window.replace(":", "") + ".json"))
         if len(hits) != 1:
             problems.append("protocol_report_missing:" + window)
             continue
         q = json.loads(hits[0].read_text())
-        current = str(q.get("checker", "")).split("/")[0] == checker
+        current = has_rules_digest and str(q.get("checker", "")) == expected_checker
         expected = {(p["exchange"], p["data_sha256"], p["manifest_sha256"]) for p in parts
                     if p["window_id"] == window}
         actual = {(p["exchange"], p["data_sha256"], p["manifest_sha256"]) for p in q.get("target_inputs", [])}
         bound = bool(expected) and expected.issubset(actual) and q.get("run_id") == run_id and q.get("window_id") == window
+        expected_rev = (expected_archive_revisions or {}).get(window) if expected_archive_revisions is not None else None
+        if expected_archive_revisions is not None:
+            rev_ok = bool(expected_rev) and q.get("archive_revision") == expected_rev
+        else:
+            rev_ok = bool(q.get("archive_revision"))
         gate_replay = (q.get("replay") or {}).get("gate_futures", {})
-        passed = current and bound and q.get("status") == "passed" and q.get("protocol_status") == "passed" \
+        passed = current and bound and rev_ok and q.get("status") == "passed" and q.get("protocol_status") == "passed" \
             and gate_replay.get("status") not in ("blocked", "failed")
-        reports.append({"window_id": window, "checker": q.get("checker"), "current_checker": current,
-                        "completed_at_utc": q.get("completed_at_utc"), "archive_revision": q.get("archive_revision"),
-                        "bound_to_raw_inputs": bound, "status": q.get("status"),
-                        "protocol_status": q.get("protocol_status"), "gate_replay": gate_replay, "passed": passed})
+        reports.append({"window_id": window, "checker": q.get("checker"), "expected_checker": expected_checker,
+                        "current_checker": current, "completed_at_utc": q.get("completed_at_utc"),
+                        "archive_revision": q.get("archive_revision"), "expected_archive_revision": expected_rev,
+                        "archive_revision_matched": rev_ok, "bound_to_raw_inputs": bound,
+                        "status": q.get("status"), "protocol_status": q.get("protocol_status"),
+                        "gate_replay": gate_replay, "passed": passed})
+        if not current:
+            problems.append("protocol_checker_stale:" + window)
+        if not rev_ok:
+            problems.append("protocol_archive_revision_mismatch:" + window)
+        if not bound:
+            problems.append("protocol_inputs_unmatched:" + window)
         if not passed:
             problems.append("protocol_not_accepted:" + window)
         for market in q.get("market_availability", []):

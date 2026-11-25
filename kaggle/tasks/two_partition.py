@@ -212,12 +212,16 @@ def fetch():
         parts.append(info)
         print('FETCHED', ex, slot, info['data_bytes'], info['raw_lines'], flush=True)
     from stage3_audit import protocol_evidence
-    protocol = protocol_evidence(QA_PROTOCOL, SAMPLE_WINDOWS, parts, run_id, day['checker_commit_sha'])
+    provenance = json.loads((QA_PROTOCOL / 'provenance.json').read_text())
+    protocol = protocol_evidence(
+        QA_PROTOCOL, SAMPLE_WINDOWS, parts, run_id, day['checker_commit_sha'],
+        rules_sha=provenance.get('expected_protocol_rules_sha'),
+        expected_archive_revisions=provenance.get('window_archive_revisions'),
+    )
     sample_day = dict(day)
     for key in (*F.BLOCKING_DAY_LISTS, 'cross_window_sequence_issues', 'startup_stub_segments', 'damaged_partitions'):
         sample_day[key] = [v for v in day.get(key, []) if any(w in json.dumps(v) for w in SAMPLE_WINDOWS)]
     sample_integrity = F.integrity_gate(sample_day, EXCHANGES, effective_config_hash(config), DATE)
-    provenance = json.loads((QA_PROTOCOL / 'provenance.json').read_text())
     CTX.update(protocol=protocol, qa_provenance=provenance)
     meta = F.fetch_meta(REMOTE, DATE, EXCHANGES, fetched)
     contract = F.gate_live_contract(REMOTE, fetched / 'meta', GATE_SYMBOL, start_s * 1_000_000_000)
