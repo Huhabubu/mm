@@ -658,7 +658,7 @@ def make_github_result_fetcher(
                 token=token,
                 connect_timeout_s=connect_timeout_s,
                 total_timeout_s=total_timeout_s,
-                http_get=getter,
+                http_get=http_get,
                 include_protocol_rules=require_protocol_report,
             )
             if needs_commit:
