@@ -931,13 +931,30 @@ def probe_orders(depth, tick, lot, multiplier, order_qty):
     )
     from hftbacktest.order import IOC
 
+    npz_data = np.load(depth)["data"]
+    if len(npz_data) == 0:
+        return {"status": "failed", "reason": "probe_no_feed"}
+    exch_mask = (npz_data["ev"] & convert.EXCH_EVENT) != 0
+    local_depth_mask = ((npz_data["ev"] & convert.LOCAL_EVENT) != 0) & np.isin(
+        npz_data["ev"] & 0xFF, (convert.DEPTH_SNAPSHOT_EVENT, convert.DEPTH_EVENT),
+    )
+    first_ts_candidates = []
+    if np.any(exch_mask):
+        first_ts_candidates.append(int(np.min(npz_data["exch_ts"][exch_mask])))
+    local_mask = (npz_data["ev"] & convert.LOCAL_EVENT) != 0
+    if np.any(local_mask):
+        first_ts_candidates.append(int(np.min(npz_data["local_ts"][local_mask])))
+    first_ts = min(first_ts_candidates) if first_ts_candidates else int(npz_data["local_ts"][0])
+    init_local_depth_ts = int(npz_data["local_ts"][local_depth_mask][0]) if np.any(local_depth_mask) else first_ts
+    warmup_elapse_ns = max(NS, init_local_depth_ts - first_ts + NS)
+
     asset = (BacktestAsset().data([str(depth)]).linear_asset(multiplier)
              .constant_order_latency(1_000_000, 1_000_000).power_prob_queue_model(2.0)
              .no_partial_fill_exchange().trading_value_fee_model(0.0, 0.0005)
              .tick_size(tick).lot_size(lot))
     engine = HashMapMarketDepthBacktest([asset])
     try:
-        if engine.elapse(NS) != 0:
+        if engine.elapse(warmup_elapse_ns) != 0:
             return {"status": "failed", "reason": "probe_no_feed"}
         bid, ask = engine.depth(0).best_bid, engine.depth(0).best_ask
         if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 100 * tick or bid >= ask:
