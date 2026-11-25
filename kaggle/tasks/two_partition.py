@@ -14,7 +14,6 @@ partition 1 -> checkpoint -> a new process resumes with partition 2.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -44,10 +43,12 @@ CRED_FILES = {'TOKYO_L2_QA_GDRIVE_SA_JSON': 'tokyo_l2_gdrive_sa.json',
               'TOKYO_L2_QA_GDRIVE_FOLDER_ID': 'tokyo_l2_gdrive_folder_id.txt'}
 WINDOW_NS = 900 * 1_000_000_000
 BOOK_STEP_NS = 100_000_000
-THROUGHPUT_WORKERS = (1, 2, 4, 8)
-THROUGHPUT_BATCH = 8
-STAGES = ('setup', 'fetch', 'convert_old', 'convert_new', 'compare', 'book_rebuild', 'glft_replay',
-          'download_throughput')
+SAMPLE_WINDOWS = ('2026-11-23T00:00Z', '2026-11-23T00:15Z')
+STAGES = ('setup', 'fetch', 'convert_old', 'convert_new', 'compare', 'book_rebuild', 'raw_audit', 'glft_replay')
+# Download concurrency is not re-measured; result of the earlier stage-3 run, kept for the record.
+PRIOR_THROUGHPUT = {'source': 'Actions run 45551773265 (commit 6c748e8), artifact kaggle-45551773265',
+                    'workers': [1, 2, 4, 8], 'MBps': [1.8, 3.9, 6.4, 11.5], 'recommended_workers': 8,
+                    'rerun': False}
 NL = chr(10)
 NLB = bytes([10])
 
