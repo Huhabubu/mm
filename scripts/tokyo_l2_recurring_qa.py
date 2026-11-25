@@ -241,6 +241,8 @@ def _expected_depth_markets(config):
 
 def _load_prechecked_file_reports(state: Path, candidates, checker: str, config: dict) -> dict:
     """Load cryptographically verified per-file partition QA reports already persisted by hourly_incremental_qa."""
+    if not isinstance(config, dict) or not config.get("exchanges"):
+        return {}
     checker_sha = checker.split("/", 1)[0]
     config_sha = coverage.effective_config_hash(config)
     reports = {}
