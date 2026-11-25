@@ -28,6 +28,56 @@
     }
   ],
   "boundary_checkpoint_markets": 24,
+  "boundary_book_anchored_markets": 24,
+  "connection_overlap_trades": [
+    {
+      "exchange": "bitget_v3",
+      "symbol": "BTCUSDT",
+      "count": 61,
+      "bound_seconds": 5
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "DOGEUSDT",
+      "count": 8,
+      "bound_seconds": 5
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "ETHUSDT",
+      "count": 10,
+      "bound_seconds": 5
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SOLUSDT",
+      "count": 14,
+      "bound_seconds": 5
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "XRPUSDT",
+      "count": 17,
+      "bound_seconds": 5
+    }
+  ],
+  "replay_trade_rows": [
+    {
+      "exchange": "gate_futures",
+      "trade_rows": 0,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bybit_linear",
+      "trade_rows": 0,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bitget_v3",
+      "trade_rows": 0,
+      "dedup_trades_dropped": 0
+    }
+  ],
   "observed_snapshot_markets": [
     {
       "exchange": "bitget_v3",
@@ -459,72 +509,10 @@
         "count": 27436
       }
     ],
-    "issues": [
-      {
-        "exchange": "bitget_v3",
-        "symbol": "BTCUSDT",
-        "issue": "duplicate_trade_id",
-        "count": 61
-      },
-      {
-        "exchange": "bitget_v3",
-        "symbol": "DOGEUSDT",
-        "issue": "duplicate_trade_id",
-        "count": 8
-      },
-      {
-        "exchange": "bitget_v3",
-        "symbol": "ETHUSDT",
-        "issue": "duplicate_trade_id",
-        "count": 10
-      },
-      {
-        "exchange": "bitget_v3",
-        "symbol": "SOLUSDT",
-        "issue": "duplicate_trade_id",
-        "count": 14
-      },
-      {
-        "exchange": "bitget_v3",
-        "symbol": "XRPUSDT",
-        "issue": "duplicate_trade_id",
-        "count": 17
-      }
-    ]
+    "issues": []
   },
-  "proven_protocol_issues": [
-    {
-      "exchange": "bitget_v3",
-      "symbol": "BTCUSDT",
-      "issue": "duplicate_trade_id",
-      "count": 61
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "DOGEUSDT",
-      "issue": "duplicate_trade_id",
-      "count": 8
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "ETHUSDT",
-      "issue": "duplicate_trade_id",
-      "count": 10
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "SOLUSDT",
-      "issue": "duplicate_trade_id",
-      "count": 14
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "XRPUSDT",
-      "issue": "duplicate_trade_id",
-      "count": 17
-    }
-  ],
-  "protocol_status": "failed",
+  "proven_protocol_issues": [],
+  "protocol_status": "passed",
   "market_availability": [
     {
       "exchange": "binance_futures",
@@ -533,12 +521,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500160917130,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500160917130,
           "end_wall_ns": 1795442192349793512,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -564,12 +546,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500003271574,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500003271574,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -596,12 +572,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500259584522,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500259584522,
           "end_wall_ns": 1795442192349793512,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -627,12 +597,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500033197555,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500033197555,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -659,12 +623,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500331046317,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500331046317,
           "end_wall_ns": 1795442192349793512,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -690,12 +648,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500003278849,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500003278849,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -722,12 +674,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500043008031,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500043008031,
           "end_wall_ns": 1795442192349793512,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -753,12 +699,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500008498131,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500008498131,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -785,12 +725,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500482086980,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500482086980,
           "end_wall_ns": 1795442192349793512,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -816,12 +750,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500017065787,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500017065787,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -848,12 +776,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500124282632,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500124282632,
           "end_wall_ns": 1795442192349793512,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -879,12 +801,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500039240836,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500039240836,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -911,12 +827,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500102548466,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500102548466,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1081,12 +991,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500260905674,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500260905674,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1160,12 +1064,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500102485227,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500102485227,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1318,12 +1216,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500103521139,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500103521139,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1397,12 +1289,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500102489501,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500102489501,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1567,12 +1453,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500407739952,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500407739952,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1646,12 +1526,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500102547763,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500102547763,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1810,12 +1684,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500407743551,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500407743551,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1889,12 +1757,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500056634952,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500056634952,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2059,12 +1921,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500875941606,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500875941606,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2138,12 +1994,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500056447767,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500056447767,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2308,12 +2158,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441509351750891,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441509351750891,
           "end_wall_ns": 1795442150130283806,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2387,12 +2231,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500019837074,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500019837074,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2419,12 +2257,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500342259538,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500342259538,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2438,12 +2270,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500044093659,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500044093659,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2470,12 +2296,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500118547808,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500118547808,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2489,12 +2309,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500045422696,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500045422696,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2521,12 +2335,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500179709574,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500179709574,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2540,12 +2348,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500015746976,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500015746976,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2572,12 +2374,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500339454549,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500339454549,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2591,12 +2387,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500056011838,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500056011838,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2623,12 +2413,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500423200607,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500423200607,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2642,12 +2426,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500058378391,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500058378391,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2674,12 +2452,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500354015381,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500354015381,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2693,12 +2465,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500046461988,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500046461988,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2725,12 +2491,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500340267906,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500340267906,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2744,12 +2504,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500112779733,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500112779733,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2776,12 +2530,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500418807251,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500418807251,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2795,12 +2543,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500046463306,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500046463306,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2827,12 +2569,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500318171195,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500318171195,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2846,12 +2582,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500019743021,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500019743021,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2878,12 +2608,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441501122398712,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441501122398712,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2897,12 +2621,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500023836990,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500023836990,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2929,12 +2647,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441505668861638,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441505668861638,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2948,12 +2660,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500049496685,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500049496685,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -2980,12 +2686,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795441500000000000,
-          "end_wall_ns": 1795441500072704154,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
-        },
-        {
-          "start_wall_ns": 1795441500072704154,
           "end_wall_ns": 1795442400000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -3004,7 +2704,12 @@
       ],
       "seq": 12210997174673,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399901866784
+      "last_wall_ns": 1795442399901866784,
+      "book_anchored": true,
+      "book_sha256": "2ac7bbf1158a363ebade59598ecf2fc6b66f406cacb4b1405f704d3cc7eb772d",
+      "last_exchange_ns": 1795442399900000000,
+      "bid_levels": 19771,
+      "ask_levels": 8300
     },
     {
       "exchange": "binance_futures",
@@ -3016,7 +2721,12 @@
       ],
       "seq": 12210997180568,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399942899762
+      "last_wall_ns": 1795442399942899762,
+      "book_anchored": true,
+      "book_sha256": "06bb395fd0e25bd58b7d04297ae76076f46ccf0981694ea5aafc76a74ec23b74",
+      "last_exchange_ns": 1795442399934000000,
+      "bid_levels": 1539,
+      "ask_levels": 1024
     },
     {
       "exchange": "binance_futures",
@@ -3028,7 +2738,12 @@
       ],
       "seq": 12210997181420,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399940963537
+      "last_wall_ns": 1795442399940963537,
+      "book_anchored": true,
+      "book_sha256": "12ba96365ecce2fcb51a1c3d8951a61ea56a80a62f0fc45976cbb0a87cab3453",
+      "last_exchange_ns": 1795442399939000000,
+      "bid_levels": 15494,
+      "ask_levels": 7048
     },
     {
       "exchange": "binance_futures",
@@ -3040,7 +2755,12 @@
       ],
       "seq": 12210997172124,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399898803512
+      "last_wall_ns": 1795442399898803512,
+      "book_anchored": true,
+      "book_sha256": "aa9963583a9d3c7098b1f1eba7620d67812fa10e5dfbce8467488756fceb1ee6",
+      "last_exchange_ns": 1795442399889000000,
+      "bid_levels": 2808,
+      "ask_levels": 1554
     },
     {
       "exchange": "binance_futures",
@@ -3052,7 +2772,12 @@
       ],
       "seq": 12210997194018,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399975507933
+      "last_wall_ns": 1795442399975507933,
+      "book_anchored": true,
+      "book_sha256": "3619df9090fb2cb042f3c0706ce0bd56626dc3cf08849feaf8494572953bcdef",
+      "last_exchange_ns": 1795442399967000000,
+      "bid_levels": 1422,
+      "ask_levels": 891
     },
     {
       "exchange": "binance_futures",
@@ -3064,7 +2789,12 @@
       ],
       "seq": 12210997200575,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399989077328
+      "last_wall_ns": 1795442399989077328,
+      "book_anchored": true,
+      "book_sha256": "42c1ad7c5fa5848f4e74d43bd2270d43d38fa54ff2d2f6abe5ae5515febdaaff",
+      "last_exchange_ns": 1795442399987000000,
+      "bid_levels": 2530,
+      "ask_levels": 1249
     },
     {
       "exchange": "bitget_v3",
@@ -3076,7 +2806,12 @@
       ],
       "seq": 1294534934163,
       "awaiting_delta": true,
-      "last_wall_ns": 1795442399866245134
+      "last_wall_ns": 1795442399866245134,
+      "book_anchored": true,
+      "book_sha256": "2fb194b0480959f7e04f37a1ab462ce27c340520d544bec90bc372c68054a269",
+      "last_exchange_ns": 1795442399850000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -3088,7 +2823,12 @@
       ],
       "seq": 527793954026,
       "awaiting_delta": true,
-      "last_wall_ns": 1795442399866248716
+      "last_wall_ns": 1795442399866248716,
+      "book_anchored": true,
+      "book_sha256": "81e510e98aaa86c1fbb3cf33387850336b5014eeb9d330699d01986fa933a84c",
+      "last_exchange_ns": 1795442399852000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -3100,7 +2840,12 @@
       ],
       "seq": 1064601096588,
       "awaiting_delta": true,
-      "last_wall_ns": 1795442399866247254
+      "last_wall_ns": 1795442399866247254,
+      "book_anchored": true,
+      "book_sha256": "255ad6abc03a35fe368a587315cfbc12be6e439378377aa12a1b376ff7cfbc57",
+      "last_exchange_ns": 1795442399850000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -3112,7 +2857,12 @@
       ],
       "seq": 222966065834,
       "awaiting_delta": true,
-      "last_wall_ns": 1795442399866238292
+      "last_wall_ns": 1795442399866238292,
+      "book_anchored": true,
+      "book_sha256": "4e3049d602aad203540923509579b667233985da6a96a7ff239440ab6aa3f5bb",
+      "last_exchange_ns": 1795442399850000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -3124,7 +2874,12 @@
       ],
       "seq": 527793954256,
       "awaiting_delta": true,
-      "last_wall_ns": 1795442399871186113
+      "last_wall_ns": 1795442399871186113,
+      "book_anchored": true,
+      "book_sha256": "ca41e32b8e4fc39f23ef9ddd9297837004f7d3f6aca9186afc6196604dc0e1a6",
+      "last_exchange_ns": 1795442399858000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -3136,7 +2891,12 @@
       ],
       "seq": 222966065846,
       "awaiting_delta": true,
-      "last_wall_ns": 1795442399866243746
+      "last_wall_ns": 1795442399866243746,
+      "book_anchored": true,
+      "book_sha256": "9c03b30cf0793adeaac1985a1440da07d7d6d961e251f8de9535de86245fcc69",
+      "last_exchange_ns": 1795442399850000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -3148,7 +2908,12 @@
       ],
       "seq": 14921266,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399998274447
+      "last_wall_ns": 1795442399998274447,
+      "book_anchored": true,
+      "book_sha256": "7529f6f6535ded0da8551c5396e404ba672c7578ca80fff103a6502425007edd",
+      "last_exchange_ns": 1795442399992000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -3160,7 +2925,12 @@
       ],
       "seq": 11505379,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399989425506
+      "last_wall_ns": 1795442399989425506,
+      "book_anchored": true,
+      "book_sha256": "c8656ed67885cc7288e5ddc26298e72f13891b3f167cf2cda417ff3b40f45f2c",
+      "last_exchange_ns": 1795442399982000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -3172,7 +2942,12 @@
       ],
       "seq": 15896920,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399997894063
+      "last_wall_ns": 1795442399997894063,
+      "book_anchored": true,
+      "book_sha256": "14043afded77c504e2e219d130c884289596f19d0bccd8079e62f9d67e4e657d",
+      "last_exchange_ns": 1795442399991000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -3184,7 +2959,12 @@
       ],
       "seq": 13696447,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399992942961
+      "last_wall_ns": 1795442399992942961,
+      "book_anchored": true,
+      "book_sha256": "549ac2595be5d403ff36b287d8f5f988427a08d407992fa3d74ddd713f2a57bd",
+      "last_exchange_ns": 1795442399986000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -3196,7 +2976,12 @@
       ],
       "seq": 10458682,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399996718529
+      "last_wall_ns": 1795442399996718529,
+      "book_anchored": true,
+      "book_sha256": "e569afb39772d9aacbfbd3c14e55e590b83b7404fe14878c577e26c3a3ce4cf9",
+      "last_exchange_ns": 1795442399990000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -3208,7 +2993,12 @@
       ],
       "seq": 14375192,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399992945019
+      "last_wall_ns": 1795442399992945019,
+      "book_anchored": true,
+      "book_sha256": "7c7fd28a82e758acbf8a3d4ed199228faf1fee531190af4e911fe15bcbcc80d3",
+      "last_exchange_ns": 1795442399987000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -3220,7 +3010,12 @@
       ],
       "seq": 134120844535,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399986422038
+      "last_wall_ns": 1795442399986422038,
+      "book_anchored": true,
+      "book_sha256": "05081dcadb1cbcd02b80d9c4eec272c75638233acdddf18ef23b4c0fdad2a7bd",
+      "last_exchange_ns": 1795442399966000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -3232,7 +3027,12 @@
       ],
       "seq": 40023279555,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399982533037
+      "last_wall_ns": 1795442399982533037,
+      "book_anchored": true,
+      "book_sha256": "e5bd4ba79aca59d9a4f3324caa991f050b0e0b1790a0038bebc07c87448badc3",
+      "last_exchange_ns": 1795442399965000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -3244,7 +3044,12 @@
       ],
       "seq": 116284281481,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399972448946
+      "last_wall_ns": 1795442399972448946,
+      "book_anchored": true,
+      "book_sha256": "7c71cd5d4dbcdbd64e5596cc8060b2ff4777a10a67b810bac0154549cb97e399",
+      "last_exchange_ns": 1795442399956000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -3256,7 +3061,12 @@
       ],
       "seq": 44814410294,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399990316330
+      "last_wall_ns": 1795442399990316330,
+      "book_anchored": true,
+      "book_sha256": "ebb38026fcefa55fd2f70ec1e0567b6b60fb6e4892e9cbdb5f894b162fb7983e",
+      "last_exchange_ns": 1795442399968000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -3268,7 +3078,12 @@
       ],
       "seq": 15644003097,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399990271709
+      "last_wall_ns": 1795442399990271709,
+      "book_anchored": true,
+      "book_sha256": "e0cf2e95e2e06494091a757afe17692cdea6b7b0ce8b872f54caa81c632228d1",
+      "last_exchange_ns": 1795442399967000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -3280,11 +3095,17 @@
       ],
       "seq": 28818956079,
       "awaiting_delta": false,
-      "last_wall_ns": 1795442399978171866
+      "last_wall_ns": 1795442399978171866,
+      "book_anchored": true,
+      "book_sha256": "f07c723fb185bbdbfb9f69232d5c33aa194fcde30476c4d0455549c4a400b73e",
+      "last_exchange_ns": 1795442399958000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     }
   ],
   "replay": {},
-  "checker": "78f7a69ac070cdb1d823e93a871b0801c4a1e3b7/65a2445a06d347ad4d101d6c70af53a672c0b03ac2512c940e0f8c654a18a7d6",
+  "protocol_qa_version": 2,
+  "checker": "31590e1ab0f58436b0967a969384994aabfc6b82/9e9dfb0f32482e3d0cc93fb66a05ff08963aed0f9d3d06ba889554f3bd1f9274",
   "archive_revision": "sha256:21b1c23ea384d2dcc9f4bdd93a69dcbf0b4846b434958319e32faa44e48c57f6",
   "previous_inputs": [
     {
@@ -3311,6 +3132,6 @@
   "anchor_lookback_windows": 0,
   "anchor_lookback_inputs": [],
   "source_restrictions": {},
-  "input_checkpoint_digest": "6dd561ff62ff4f2f0030ecd7ae7897c63fef02b102edf50ede97f6fe2448316c",
-  "completed_at_utc": "2026-11-23T14:38:09Z"
+  "input_checkpoint_digest": "ad5fb74b02bd11862a5d317df65fd729a8e8811d05db787b1fec2f3e7d2bb6b9",
+  "completed_at_utc": "2026-11-25T18:32:18Z"
 }
