@@ -1524,5 +1524,88 @@ class ProtocolTest(unittest.TestCase):
                     self.assertEqual(2, recurring.main())
 
 
+    def test_lookback_stops_at_interruption_barrier_and_catchup_first_orders_oldest_first(self):
+        import io
+        import json
+        from unittest.mock import patch
+        import zstandard as zstd
+        import tokyo_l2_recurring_qa as recurring
+        import tokyo_l2_replay_qa as replay
+
+        self.assertEqual([100, 200, 300], recurring.plan_windows([100, 200, 300], set(), 300, max_catchup=5, catchup_first=True))
+        self.assertEqual([100, 200], recurring.plan_windows([100, 200, 300], set(), 300, max_catchup=1, catchup_first=True))
+        self.assertEqual([300, 100], recurring.plan_windows([100, 200, 300], set(), 300, max_catchup=1, catchup_first=False))
+
+        w0 = 1_795_276_800
+        step = 900
+        windows = [w0 + i * step for i in range(4)]  # w0 (snap), w1 (delta), w2 (unrecovered gap!), w3 (target)
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
+        }
+
+        def make_zst(path, rows_list):
+            buf = io.StringIO()
+            for r in rows_list:
+                buf.write("\t".join(map(str, r)) + "\n")
+            path.write_bytes(zstd.ZstdCompressor().compress(buf.getvalue().encode("utf-8")))
+
+        with tempfile.TemporaryDirectory() as temp:
+            tmp = Path(temp)
+            files_by_w = {}
+            cands = []
+            for idx, w in enumerate(windows[:-1]):
+                w_ns = w * 1_000_000_000
+                if idx == 0:
+                    msgs = [(w_ns + 1_000_000_000, w_ns + 1_000_000_000, "c1", 1, 10, "DATA", json.dumps({
+                        "channel": "futures.obu", "event": "update",
+                        "result": {"s": "ob.BTC_USDT.50", "full": True, "u": 10, "t": w * 1000 + 1000, "b": [["50000.0", "2"]], "a": [["50001.0", "2"]]},
+                    }))]
+                elif idx == 1:
+                    msgs = [(w_ns + 1_000_000_000, w_ns + 1_000_000_000, "c1", 1, 11, "DATA", json.dumps({
+                        "channel": "futures.obu", "event": "update",
+                        "result": {"s": "ob.BTC_USDT.50", "u": 11, "U": 11, "t": w * 1000 + 1000, "b": [["50000.0", "3"]], "a": [["50001.0", "2"]]},
+                    }))]
+                else:
+                    # w2 has DEPTH_UNAVAILABLE barrier after delta -> stops backward lookback at w2 immediately!
+                    msgs = [
+                        (w_ns + 1_000_000_000, w_ns + 1_000_000_000, "c1", 1, 12, "DATA", json.dumps({
+                            "channel": "futures.obu", "event": "update",
+                            "result": {"s": "ob.BTC_USDT.50", "u": 12, "U": 12, "t": w * 1000 + 1000, "b": [["50000.0", "4"]], "a": [["50001.0", "2"]]},
+                        })),
+                        (w_ns + 2_000_000_000, w_ns + 2_000_000_000, "c1", 1, 13, "META", json.dumps({
+                            "event": "DEPTH_UNAVAILABLE", "symbol": "BTC_USDT",
+                        })),
+                    ]
+                fp = tmp / f"gate_{w}.tsv.zst"
+                make_zst(fp, msgs)
+                cand = {
+                    "exchange": "gate_futures", "planned_start_s": w, "planned_end_s": w + step,
+                    "source_manifest": f"raw/gate_futures/{w}.manifest.json",
+                    "source_data": f"raw/gate_futures/{w}.tsv.zst",
+                    "manifest_sha256": "a" * 64, "data_sha256": "b" * 64, "data_bytes": 100,
+                }
+                cands.append(cand)
+                files_by_w[w] = (cand, {"file_name": fp.name, "boot_id": "b1"}, fp)
+
+            prepared_windows = []
+
+            def fake_prepare(_remote, cand, _run_id, _dest_dir):
+                prepared_windows.append(cand["planned_start_s"])
+                return files_by_w[cand["planned_start_s"]]
+
+            fake_check = {"qa_status": "passed", "problems": [], "structural_problems": [], "coverage_incomplete": False}
+            with patch.object(replay, "_prepare_single_candidate", side_effect=fake_prepare), \
+                 patch.object(replay.archive, "check_partition", return_value=fake_check):
+                ckpt, books, _q, diag = replay.reconstruct_historical_checkpoint(
+                    "qa:", cfg, "r1", windows[-1], step, 10, tmp, candidates=cands,
+                )
+            self.assertIsNone(ckpt)
+            self.assertIsNone(books)
+            self.assertEqual({}, diag)
+            # Only w2 was downloaded before barrier truncation — never touched w1 or w0!
+            self.assertEqual([windows[2]], prepared_windows)
+
+
 if __name__ == "__main__":
     unittest.main()

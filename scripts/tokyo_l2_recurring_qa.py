@@ -24,14 +24,17 @@ def read_report(path):
         return {}
 
 
-def plan_windows(ready, recorded, current, *, max_catchup=1, deferred=None):
-    # Prioritize the notified target / latest due window, then bounded oldest-first catch-up.
+def plan_windows(ready, recorded, current, *, max_catchup=1, deferred=None, catchup_first=False):
+    # Prioritize the notified target / latest due window, or oldest-first chronological catch-up when enabled.
     # Windows in `deferred` (e.g. anchor_unverified awaiting a new predecessor checkpoint) are
     # skipped so they never starve subsequent ready windows.
     skip = set(recorded) | set(deferred or ())
     backlog = sorted(set(ready) - skip - {current})
     budget = max(0, int(max_catchup))
-    return ([current] if current in ready and current not in skip else []) + backlog[:budget]
+    cur = [current] if current in ready and current not in skip else []
+    if catchup_first:
+        return (backlog + cur)[: budget + len(cur)]
+    return cur + backlog[:budget]
 
 
 PROTOCOL_QA_VERSION = 2
@@ -211,7 +214,7 @@ def _summarize_protocol_diagnostics(report):
     return out
 
 
-MAX_ANCHOR_LOOKBACK_WINDOWS = 64
+MAX_ANCHOR_LOOKBACK_WINDOWS = 24
 
 
 def _lookback_inputs(groups, start, step, windows):
@@ -232,7 +235,7 @@ def _expected_depth_markets(config):
     }
 
 
-def run(remote, config, run_id, cutover, current, state, checker, *, archive_revision=None, trigger_mode=None, max_catchup=None):
+def run(remote, config, run_id, cutover, current, state, checker, *, archive_revision=None, trigger_mode=None, max_catchup=None, catchup_first=False):
     started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     pm = coverage.configured_partition_minutes(config)
     step = pm * 60
@@ -404,7 +407,7 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         "checkpoint_books" in audit_params
         or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in audit_params.values())
     )
-    for start in plan_windows(ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred):
+    for start in plan_windows(ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred, catchup_first=catchup_first):
         replay_seconds = 660 if start % 3600 == 0 else 0
         checkpoint = validated.get(start - step, {}).get("end_sequence_checkpoint") or []
         prev_books, prev_quote, prev_streams = (None, None, {})
@@ -586,6 +589,11 @@ def main():
     parser.add_argument("--trigger-mode", default=None)
     parser.add_argument("--max-catchup", type=int, default=None)
     parser.add_argument(
+        "--catchup-first",
+        action="store_true",
+        help="Process backlog windows chronologically before the current window.",
+    )
+    parser.add_argument(
         "--exit-zero-on-clean-execution",
         action="store_true",
         help="Return exit code 0 whenever job_execution_status == 'ok', even if data quality is failed/unverified.",
@@ -595,7 +603,7 @@ def main():
                coverage.parse_window_start_s(args.cutover), coverage.parse_window_start_s(args.current),
                args.state_dir, args.checker,
                archive_revision=args.archive_revision, trigger_mode=args.trigger_mode,
-               max_catchup=args.max_catchup)
+               max_catchup=args.max_catchup, catchup_first=args.catchup_first)
     body = json.dumps(data, indent=2)
     print(body)
     if os.environ.get("GITHUB_STEP_SUMMARY"):

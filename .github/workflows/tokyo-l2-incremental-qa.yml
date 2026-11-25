@@ -81,6 +81,11 @@ on:
         required: false
         type: string
         default: ""
+      catchup_first:
+        description: "Process backlog windows chronologically before current window"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -387,6 +392,9 @@ jobs:
           fi
           if [[ -n "${{ inputs.max_catchup }}" ]]; then
             extra_proto+=(--max-catchup "${{ inputs.max_catchup }}")
+          fi
+          if [[ "${{ inputs.catchup_first }}" == "true" ]]; then
+            extra_proto+=(--catchup-first)
           fi
           python workflow_code/scripts/tokyo_l2_recurring_qa.py \
             --remote qa: --state-dir state --config "source/$QA_BOUND_CONFIG_PATH" \
