@@ -32,7 +32,10 @@ NS = 1_000_000_000
 # event on the same exchange. Anything else stays a proven protocol issue.
 TRADE_OVERLAP_NS = 5 * NS
 CONNECTION_EVENTS = frozenset({"SWITCH", "STANDBY_DISCONNECT", "GAP_START", "GAP_END"})
-TRADE_FIELDS = ("contract", "s", "price", "size", "side", "ts", "create_time_ms", "p", "v", "S", "T")
+TRADE_FIELDS = (
+    "contract", "s", "price", "size", "side", "ts", "create_time", "create_time_ms",
+    "is_internal", "p", "px", "P", "v", "sz", "S", "T", "BT", "RPI", "isRPI",
+)
 
 
 def download(remote: str, rel: str, path: Path) -> Path:
@@ -228,11 +231,12 @@ class StreamEvidence:
     def interrupt(self, exchange, wall, event, symbol="ALL", endpoint=None, channel=None):
         depth_only = event in {"DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"}
         status = "known_gap" if event in {"DEPTH_UNAVAILABLE", "GAP_START", "SNAPSHOT_BRIDGE_RETRY"} else "unverified"
+        target_sym = "ALL" if symbol == "ALL" else symbol_key(symbol)
         for key in self.by_exchange.get(exchange, ()):
             _, sym, stream_channel = key
             if channel and channel != stream_channel:
                 continue
-            if symbol != "ALL" and symbol != sym:
+            if target_sym != "ALL" and target_sym != sym:
                 continue
             if endpoint and endpoint != coverage.stream_owning_endpoint(exchange, stream_channel):
                 continue
@@ -287,7 +291,8 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     legacy_ends = {}
     recovered_depth = set()
     depth_frames_by_mode = Counter()
-    buffers = {ex: convert.AssetDayBuffers(ex, BTC, convert.date_utc_from_wall_ns(start_ns)) for ex in FOLLOWERS}
+    btc_asset = convert.canonical_asset(GATE, BTC)
+    buffers = {ex: convert.AssetDayBuffers(ex, btc_asset, convert.date_utc_from_wall_ns(start_ns)) for ex in FOLLOWERS}
     books = {ex: Book() for ex in FOLLOWERS}
     last_depth_exchange_ns = {}
     seeded = set()
@@ -299,8 +304,11 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     boundary_events = ProtocolReport()
     trade_ids = {}
     trade_copies = {}
-    conn_first_trade = {}
+    conn_segment_seq = Counter()
+    last_trade_conn = {}
+    conn_segment_first_trade = {}
     conn_events = {}
+    trade_order = 0
     for candidate, mf, path in sorted(items, key=lambda item: (
         item[0]["exchange"], item[0]["planned_start_s"], item[1].get("start_wall_ns") or 0,
         item[1].get("first_rx_seq") or 0, item[1]["file_name"],
@@ -344,9 +352,12 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             in_target = wall >= start_ns
             if kind == "META" and obj.get("event") in CONNECTION_EVENTS:
                 conn_events.setdefault(exchange, []).append(wall)
-            if (kind != "META" and exchange in FOLLOWERS and (exchange, conn, epoch) not in conn_first_trade
-                    and trading_event(exchange, obj)):
-                conn_first_trade[(exchange, conn, epoch)] = wall
+            if kind != "META" and exchange in FOLLOWERS and trading_event(exchange, obj):
+                cid = (conn, epoch)
+                if last_trade_conn.get(exchange) != cid:
+                    conn_segment_seq[(exchange, conn, epoch)] += 1
+                    last_trade_conn[exchange] = cid
+                    conn_segment_first_trade[(exchange, conn, epoch, conn_segment_seq[(exchange, conn, epoch)])] = wall
             if kind == "META" and obj.get("event") in {
                 "LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY", "SWITCH",
             }:
@@ -399,7 +410,7 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         if valid_non_depth_frame(ex, stream[1], channel, obj):
                             evidence.observe(stream, wall)
                         else:
-                            evidence.interrupt(ex, wall, "INVALID_STREAM_FRAME", sym, channel=channel)
+                            evidence.interrupt(ex, wall, "INVALID_STREAM_FRAME", stream[1], channel=channel)
             event = depth_event(exchange, mf.get("boot_id") or mf["file_name"], conn, epoch, kind, obj)
             if event is not None and (exchange, event.symbol) in expected_depths:
                 key = (exchange, event.symbol)
@@ -534,41 +545,45 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                                                       convert._parse_price_qty_pairs(event.asks or []))
             elif in_target and kind != "META" and exchange in FOLLOWERS:
                 trades = trading_event(exchange, obj)
+                btc_trades = []
                 for trade in trades:
                     sym = symbol_key(str(trade.get("s") or trade.get("contract") or
                                          (obj.get("arg") or {}).get("symbol") or
                                          (obj.get("arg") or {}).get("instId") or obj.get("topic", "").split(".")[-1]))
+                    if sym == BTC:
+                        btc_trades.append(trade)
                     tid = trade.get("id") if exchange == GATE else trade.get("i") or trade.get("tradeId")
                     if tid is None:
                         book_proofs.count(exchange, sym, "missing_trade_id")
                         continue
                     k = (exchange, sym, str(tid))
-                    copy = ((conn, epoch), wall,
+                    seg_id = conn_segment_seq[(exchange, conn, epoch)]
+                    trade_order += 1
+                    copy = ((conn, epoch), seg_id, wall, trade_order,
                             json.dumps({f: trade.get(f) for f in TRADE_FIELDS if f in trade}, sort_keys=True))
                     if k in trade_ids:
                         trade_copies.setdefault(k, [trade_ids[k]]).append(copy)
                     else:
                         trade_ids[k] = copy
-                if wall < sample_end and trades and exchange in specs:
-                    # Current per-message feeds generally share one symbol. Preserve
-                    # trade identity and converter handling for the representative symbol.
-                    last_sym = symbol_key(str(trades[-1].get("s") or trades[-1].get("contract") or
-                                             (obj.get("arg") or {}).get("symbol") or
-                                             (obj.get("arg") or {}).get("instId") or obj.get("topic", "").split(".")[-1]))
-                    if last_sym == BTC:
+                if wall < sample_end and btc_trades and exchange in specs:
+                    if len(btc_trades) == len(trades):
                         follower_trade(exchange, obj, wall, buffers[exchange])
+                    elif exchange == GATE:
+                        follower_trade(exchange, {**obj, "result": btc_trades}, wall, buffers[exchange])
+                    else:
+                        follower_trade(exchange, {**obj, "data": btc_trades}, wall, buffers[exchange])
     for exchange, symbol in expected_depths:
         if not book_proofs.frames[(exchange, symbol)]:
             book_proofs.count(exchange, symbol, "no_depth_frames")
     overlap_trades = Counter()
     for (ex, sym, _tid), copies in sorted(trade_copies.items()):
-        copies.sort(key=lambda c: c[1])
+        copies.sort(key=lambda c: (c[2], c[3]))
         conns = [c[0] for c in copies]
-        identical = len({c[2] for c in copies}) == 1
+        identical = len({c[4] for c in copies}) == 1
         handover = len(set(conns)) == len(conns) and all(
-            w - conn_first_trade.get((ex, *cid), w) <= TRADE_OVERLAP_NS
+            w - conn_segment_first_trade.get((ex, *cid, seg_id), w) <= TRADE_OVERLAP_NS
             and any(abs(w - t) <= TRADE_OVERLAP_NS for t in conn_events.get(ex, ()))
-            for cid, w, _ in copies[1:]
+            for cid, seg_id, w, _ord, _sig in copies[1:]
         )
         if identical and handover:
             overlap_trades[(ex, sym)] += len(copies) - 1

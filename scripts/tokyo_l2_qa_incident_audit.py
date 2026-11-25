@@ -363,8 +363,9 @@ def trade_duplicates(arc, exchange, start):
                     tid = trade.get("id") if exchange == GATE else trade.get("i") or trade.get("tradeId")
                     if tid is None:
                         continue
-                    fields = {k: trade.get(k) for k in ("price", "size", "side", "ts", "p", "v", "S", "T",
-                                                        "create_time_ms") if k in trade}
+                    fields = {k: trade.get(k) for k in ("contract", "s", "price", "size", "side", "ts", "create_time",
+                                                        "create_time_ms", "is_internal", "p", "px", "P",
+                                                        "v", "sz", "S", "T", "BT", "RPI", "isRPI") if k in trade}
                     seen[(trade_symbol(trade, obj), str(tid))].append({
                         "wall_utc": iso(wall), "wall_ns": wall, "conn": f"{conn}:{epoch}",
                         "action": obj.get("action") or obj.get("type") or obj.get("event"), "fields": fields,

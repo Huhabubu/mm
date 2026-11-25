@@ -589,17 +589,81 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(1, issues[("BTCUSDT", "conflicting_duplicate_trade")])
         self.assertEqual({}, overlap)
 
-    def test_replay_converter_receives_btc_trades_once_per_trade_id(self):
-        import qa_convert as convert
-        from tokyo_l2_replay_qa import BTC, follower_trade
+    def test_bitget_px_sz_conflict_and_refailover_segment_overlap(self):
+        from tokyo_l2_replay_qa import NS
 
-        buffer = convert.AssetDayBuffers(BITGET, BTC, "2026-11-24")
+        px_trade = lambda tid, px: {
+            "arg": {"topic": "publicTrade", "symbol": "BTCUSDT"}, "action": "update",
+            "data": [{"tradeId": tid, "px": px, "sz": "1", "side": "buy", "ts": 1795276800000}],
+        }
+        issues, overlap = self._bitget_trade_scan([
+            (1, "B", "DATA", px_trade("10", "100")),
+            (2, "A", "META", {"event": "SWITCH", "endpoint": "bitget_public"}),
+            (3, "A", "DATA", px_trade("10", "101")),  # px differs -> conflicting_duplicate_trade!
+            (4, "A", "DATA", px_trade("11", "100")),
+            (10 * NS, "B", "META", {"event": "SWITCH", "endpoint": "bitget_public"}),
+            (10 * NS + 5, "B", "DATA", px_trade("11", "100")),  # A->B second switch within 5s of B segment start
+        ])
+        self.assertEqual(1, issues[("BTCUSDT", "conflicting_duplicate_trade")])
+        self.assertNotIn(("BTCUSDT", "duplicate_trade_id"), issues)
+        self.assertEqual({(BITGET, "BTCUSDT"): 1}, overlap)
+
+    def test_replay_converter_receives_btc_trades_once_per_trade_id(self):
+        import json
+        import zstandard as zstd
+        from unittest.mock import patch
+        import hourly_incremental_qa as archive
+        import qa_convert as convert
+        from tokyo_l2_replay_qa import BTC, NS, follower_trade, scan
+
+        buffer = convert.AssetDayBuffers(BITGET, convert.canonical_asset(BITGET, BTC), "2026-11-24")
         follower_trade(BITGET, self._bitget_trade("42"), 10, buffer)
         follower_trade(BITGET, self._bitget_trade("42"), 20, buffer)
         follower_trade(BITGET, self._bitget_trade("43"), 30, buffer)
         trades = [row for row in buffer.hbt_rows if int(row[0]) & 0xFF == convert.TRADE_EVENT]
         self.assertEqual([10, 30], [int(row[2]) for row in trades])
         self.assertEqual(1, buffer.dedup_trades_dropped)
+
+        # Mixed-symbol Gate batch [BTC_USDT, ETH_USDT] must NOT drop BTC_USDT trades when last item is ETH_USDT,
+        # and cross-connection duplicate trade across SWITCH must feed converter only the earliest received copy.
+        start = 1_795_276_800
+        wall = start * NS
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {GATE: {"enabled": True, "symbols": ["BTC_USDT", "ETH_USDT"],
+                                 "channels": ["futures.obu.50", "futures.trades"]}},
+        }
+        mixed = {"channel": "futures.trades", "event": "update", "result": [
+            {"id": 100, "contract": "BTC_USDT", "price": "90000", "size": "1", "create_time_ms": start * 1000},
+            {"id": 200, "contract": "ETH_USDT", "price": "3000", "size": "1", "create_time_ms": start * 1000},
+        ]}
+        dup_btc = {"channel": "futures.trades", "event": "update", "result": [
+            {"id": 100, "contract": "BTC_USDT", "price": "90000", "size": "1", "create_time_ms": start * 1000},
+        ]}
+        with tempfile.TemporaryDirectory() as directory,              patch.object(archive, "check_partition", return_value={"qa_status": "passed", "problems": []}):
+            path = Path(directory) / "gate.tsv.zst"
+            with path.open("wb") as raw, zstd.open(raw, "wt", encoding="utf-8") as writer:
+                writer.write(f"{wall + 10}	1	A	1	1	DATA	{json.dumps(mixed)}\n")
+                writer.write(f"{wall + 20}	2	B	1	2	META	{json.dumps({'event': 'SWITCH'})}\n")
+                writer.write(f"{wall + 30}	3	B	1	3	DATA	{json.dumps(dup_btc)}\n")
+            report = {}
+            scan(
+                [({"exchange": GATE, "planned_start_s": start}, {"boot_id": "boot", "file_name": path.name}, path)],
+                cfg, wall, wall + 20 * NS, wall + 10 * NS, {GATE: {"tick": "0.1", "lot": "1", "multiplier": 1, "order_qty": "1", "lot_source": "step"}}, report,
+            )
+        gate_rows = next(r for r in report["replay_trade_rows"] if r["exchange"] == GATE)
+        self.assertEqual(1, gate_rows["trade_rows"])
+        self.assertEqual(1, gate_rows["dedup_trades_dropped"])
+
+    def test_stream_evidence_interrupt_normalizes_gate_underscore_symbol(self):
+        from tokyo_l2_replay_qa import StreamEvidence
+
+        cfg = {"exchanges": {GATE: {"enabled": True, "symbols": ["BTC_USDT", "ETH_USDT"],
+                                    "channels": ["futures.obu.50", "futures.trades"]}}}
+        ev = StreamEvidence(cfg)
+        ev.observe((GATE, "ETHUSDT", "futures.trades"), 10)
+        ev.interrupt(GATE, 20, "INVALID_STREAM_FRAME", "ETH_USDT", channel="futures.trades")
+        self.assertEqual("unverified", ev.timeline.state((GATE, "ETHUSDT", "futures.trades")))
 
     def test_range_starts_with_verified_predecessor_then_carries_checkpoint(self):
         from unittest.mock import patch
