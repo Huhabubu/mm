@@ -7,20 +7,20 @@
   "historical_catchup_status": "ok",
   "active_window_ready_for_protocol_qa": true,
   "trigger_mode": "archive_dispatch",
-  "started_at_utc": "2026-11-25T23:16:42Z",
-  "completed_at_utc": "2026-11-25T23:16:56Z",
-  "target_window_utc": "2026-11-25T11:30Z",
-  "expected_archive_revision": "sha256:36245f1476aaecd7d80a3f705a8de0d711c3b64b094494f4c70c17b7ce304d89",
-  "observed_archive_revision": "sha256:36245f1476aaecd7d80a3f705a8de0d711c3b64b094494f4c70c17b7ce304d89",
+  "started_at_utc": "2026-11-25T23:32:41Z",
+  "completed_at_utc": "2026-11-25T23:34:07Z",
+  "target_window_utc": "2026-11-25T23:00Z",
+  "expected_archive_revision": "sha256:f7fefc7f8635965170886e7da1630068c35e33ad61c5487a3fb97f485066850a",
+  "observed_archive_revision": "sha256:f7fefc7f8635965170886e7da1630068c35e33ad61c5487a3fb97f485066850a",
   "target_revision_matched": true,
   "target_validation_error": null,
-  "target_window_reused_result": true,
-  "current_window_id": "2026-11-25T11:30Z",
+  "target_window_reused_result": false,
+  "current_window_id": "2026-11-25T23:00Z",
   "current_window_completed": true,
   "current_window_verification_status": "passed",
-  "latest_due_window_id": "2026-11-25T23:00Z",
+  "latest_due_window_id": "2026-11-25T23:15Z",
   "latest_due_window_verification_status": "pending_archive",
-  "latest_verified_window_id": "2026-11-25T22:45Z",
+  "latest_verified_window_id": "2026-11-25T23:00Z",
   "latest_verified_window_status": "passed",
   "historical_data_quality_status": "has_historical_damage",
   "historical_damaged_windows": [
@@ -536,8 +536,8 @@
   "effective_since_window": "2026-11-22T07:45Z",
   "discovery_mode": "archive_manifest_index",
   "discovery_warnings": [],
-  "attempted": 0,
-  "ok": 0,
+  "attempted": 4,
+  "ok": 4,
   "blocked": 0,
   "needs_review": 0,
   "retry_needed": 0,
@@ -547,9 +547,9 @@
   "unresolved_blocked": 29,
   "unresolved_review": 0,
   "already_checked": 1396,
-  "eligible_manifest_count": 1396,
-  "expected_window_count": 350,
-  "window_reports_written": 350,
+  "eligible_manifest_count": 1400,
+  "expected_window_count": 351,
+  "window_reports_written": 351,
   "day_reports_written": 4,
   "passed_windows": [
     "2026-11-22T07:45Z",
@@ -874,7 +874,8 @@
     "2026-11-25T22:00Z",
     "2026-11-25T22:15Z",
     "2026-11-25T22:30Z",
-    "2026-11-25T22:45Z"
+    "2026-11-25T22:45Z",
+    "2026-11-25T23:00Z"
   ],
   "failed_windows": [
     "2026-11-22T08:00Z",
@@ -907,23 +908,23 @@
   "review_windows": [],
   "archived_pending_qa_windows": [],
   "not_archived_windows": [
-    "2026-11-25T23:00Z"
+    "2026-11-25T23:15Z"
   ],
   "not_archived_overdue_windows": [],
   "not_archived_pending_grace_windows": [
-    "2026-11-25T23:00Z"
+    "2026-11-25T23:15Z"
   ],
   "overdue_windows": [],
   "pending_archive_windows": [
-    "2026-11-25T23:00Z"
+    "2026-11-25T23:15Z"
   ],
   "window_classification": {
     "not_archived": [
-      "2026-11-25T23:00Z"
+      "2026-11-25T23:15Z"
     ],
     "not_archived_overdue": [],
     "not_archived_pending_grace": [
-      "2026-11-25T23:00Z"
+      "2026-11-25T23:15Z"
     ],
     "archived_pending_qa": [],
     "verified_failed": [
@@ -1277,12 +1278,16 @@
       "2026-11-25T22:00Z",
       "2026-11-25T22:15Z",
       "2026-11-25T22:30Z",
-      "2026-11-25T22:45Z"
+      "2026-11-25T22:45Z",
+      "2026-11-25T23:00Z"
     ],
     "verified_needs_review": []
   },
   "details": [
-    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-25T11:30Z expected_archive_revision=sha256:36245f1476aaecd7d80a3f705a8de0d711c3b64b094494f4c70c17b7ce304d89 observed_archive_revision=sha256:36245f1476aaecd7d80a3f705a8de0d711c3b64b094494f4c70c17b7ce304d89 checker_commit=31590e1ab0f58436b0967a969384994aabfc6b82",
-    "REUSED_TARGET_RESULT run_id=trial15_20261122T0745Z target_window_utc=2026-11-25T11:30Z archive_revision=sha256:36245f1476aaecd7d80a3f705a8de0d711c3b64b094494f4c70c17b7ce304d89 checker_commit=31590e1ab0f58436b0967a969384994aabfc6b82 files=4"
+    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-25T23:00Z expected_archive_revision=sha256:f7fefc7f8635965170886e7da1630068c35e33ad61c5487a3fb97f485066850a observed_archive_revision=sha256:f7fefc7f8635965170886e7da1630068c35e33ad61c5487a3fb97f485066850a checker_commit=31590e1ab0f58436b0967a969384994aabfc6b82",
+    "TARGET PASSED raw/binance_futures/2026-11-25/binance_futures_20261125_2300_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/bitget_v3/2026-11-25/bitget_v3_20261125_2300_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/bybit_linear/2026-11-25/bybit_linear_20261125_2300_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/gate_futures/2026-11-25/gate_futures_20261125_2300_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
   ]
 }
