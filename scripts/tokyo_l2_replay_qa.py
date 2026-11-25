@@ -7,9 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path, PurePosixPath
+import subprocess
 import tempfile
 import time
 
@@ -38,9 +40,72 @@ TRADE_FIELDS = (
 )
 
 
-def download(remote: str, rel: str, path: Path) -> Path:
-    archive._download_with_retry(remote, rel, path, retries=3, sleeper=time.sleep)
-    return path
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 120.0
+DEFAULT_LOOKBACK_TIMEOUT_SECONDS = 300.0
+
+
+def _download_once(remote: str, rel: str, path: Path, timeout_seconds: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["rclone", "copyto", f"{remote.rstrip('/')}/{rel}", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=max(1.0, float(timeout_seconds)),
+    )
+
+
+def download(
+    remote: str,
+    rel: str,
+    path: Path,
+    *,
+    timeout_seconds: float | None = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+) -> Path:
+    if (
+        timeout_seconds is None
+        or float(timeout_seconds) <= 0
+        or getattr(archive._download_with_retry, "__module__", "") != "hourly_incremental_qa"
+    ):
+        archive._download_with_retry(remote, rel, path, retries=3, sleeper=time.sleep)
+        return path
+    attempts = 3
+    per_try = max(1.0, float(timeout_seconds))
+    deadline = time.monotonic() + per_try * 2.0
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        remaining = deadline - time.monotonic()
+        if attempt > 1 and remaining <= 1.0:
+            break
+        try:
+            _download_once(remote, rel, path, min(per_try, max(1.0, remaining)))
+            return path
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            last_exc = exc
+            if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (3, 4):
+                raise
+            if attempt < attempts:
+                sleep_s = min(float(attempt), max(0.0, deadline - time.monotonic() - 1.0))
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _call_download(
+    remote: str,
+    rel: str,
+    path: Path,
+    timeout_seconds: float | None = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+) -> Path:
+    target = download.side_effect if callable(getattr(download, "side_effect", None)) else download
+    try:
+        params = inspect.signature(target).parameters
+        if "timeout_seconds" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return download(remote, rel, path, timeout_seconds=timeout_seconds)
+    except (TypeError, ValueError):
+        pass
+    return download(remote, rel, path)
 
 
 def verified_candidates(remote, config, run_id, earliest, state_dir=None, *, historical=False):
@@ -62,7 +127,19 @@ def input_digests(candidates):
     )
 
 
-def selected_archives(remote, config, run_id, begin, end, tmp, warmup_windows, report, candidates=None):
+def selected_archives(
+    remote,
+    config,
+    run_id,
+    begin,
+    end,
+    tmp,
+    warmup_windows,
+    report,
+    candidates=None,
+    *,
+    download_timeout_seconds=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+):
     step = coverage.configured_partition_minutes(config) * 60
     earliest = begin - step * warmup_windows
     if candidates is None:
@@ -89,8 +166,8 @@ def selected_archives(remote, config, run_id, begin, end, tmp, warmup_windows, r
             raise ValueError("invalid path in verified index")
         if str(data) != str(rel).removesuffix(".manifest.json") + ".tsv.zst":
             raise ValueError("index data and manifest paths do not match")
-        mf_path = download(remote, str(rel), dest / rel.name)
-        data_path = download(remote, str(data), dest / data.name)
+        mf_path = _call_download(remote, str(rel), dest / rel.name, download_timeout_seconds)
+        data_path = _call_download(remote, str(data), dest / data.name, download_timeout_seconds)
         manifest = json.loads(mf_path.read_bytes())
         archive._verify_three_way_index_manifest_data(
             cand=c, manifest_path=mf_path, manifest=manifest, data_path=data_path, run_id_filter=run_id,
@@ -1064,7 +1141,14 @@ def window_status(protocol_status, files_ok, replay_vals):
     return "data_failed"
 
 
-def _prepare_single_candidate(remote, cand, run_id, dest_dir):
+def _prepare_single_candidate(
+    remote,
+    cand,
+    run_id,
+    dest_dir,
+    *,
+    download_timeout_seconds=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+):
     rel = PurePosixPath(cand["source_manifest"])
     data = PurePosixPath(cand["source_data"])
     if rel.parts[0] != "raw" or ".." in rel.parts or rel.is_absolute():
@@ -1072,13 +1156,32 @@ def _prepare_single_candidate(remote, cand, run_id, dest_dir):
     if str(data) != str(rel).removesuffix(".manifest.json") + ".tsv.zst":
         raise ValueError("index data and manifest paths do not match")
     dest_dir.mkdir(parents=True, exist_ok=True)
-    mf_path = download(remote, str(rel), dest_dir / rel.name)
-    data_path = download(remote, str(data), dest_dir / data.name)
+    mf_path = _call_download(remote, str(rel), dest_dir / rel.name, download_timeout_seconds)
+    data_path = _call_download(remote, str(data), dest_dir / data.name, download_timeout_seconds)
     manifest = json.loads(mf_path.read_bytes())
     archive._verify_three_way_index_manifest_data(
         cand=cand, manifest_path=mf_path, manifest=manifest, data_path=data_path, run_id_filter=run_id,
     )
     return cand, manifest, data_path
+
+
+def _call_prepare_single_candidate(remote, cand, run_id, dest_dir, download_timeout_seconds):
+    target = (
+        _prepare_single_candidate.side_effect
+        if callable(getattr(_prepare_single_candidate, "side_effect", None))
+        else _prepare_single_candidate
+    )
+    try:
+        params = inspect.signature(target).parameters
+        if "download_timeout_seconds" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            return _prepare_single_candidate(
+                remote, cand, run_id, dest_dir, download_timeout_seconds=download_timeout_seconds,
+            )
+    except (TypeError, ValueError):
+        pass
+    return _prepare_single_candidate(remote, cand, run_id, dest_dir)
 
 
 def _cleanup_tree(path):
@@ -1166,6 +1269,8 @@ def reconstruct_historical_checkpoint(
     checkpoint_streams=None,
     ancestor_checkpoints=None,
     source_restrictions=None,
+    download_timeout_seconds=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+    lookback_timeout_seconds=DEFAULT_LOOKBACK_TIMEOUT_SECONDS,
 ):
     """Walk back up to anchor_lookback_windows, stopping per market at snapshots or barriers, and rebuild forward."""
     expected_depths = _expected_depth_markets_set(config)
@@ -1206,10 +1311,29 @@ def reconstruct_historical_checkpoint(
     cached_bytes = 0
     max_cache_bytes = 1_500_000_000
     reconstructed_windows = 0
+    deadline = (
+        time.monotonic() + float(lookback_timeout_seconds)
+        if lookback_timeout_seconds is not None and float(lookback_timeout_seconds) > 0
+        else None
+    )
+    lookback_timed_out = False
+    base_dl_timeout = (
+        float(download_timeout_seconds)
+        if download_timeout_seconds is not None and float(download_timeout_seconds) > 0
+        else DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+    )
+
+    def _effective_dl_timeout() -> float:
+        if deadline is None:
+            return base_dl_timeout
+        return min(base_dl_timeout, max(5.0, deadline - time.monotonic()))
 
     try:
         for k in range(1, anchor_lookback_windows + 1):
             if not missing_by_ex:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                lookback_timed_out = True
                 break
             w = begin - k * step
             prev_w = w - step
@@ -1241,10 +1365,13 @@ def reconstruct_historical_checkpoint(
                 probe_list.append((ex, cand, tmp_root / f"lb_cache_{w}_{ex}"))
 
             if probe_list:
+                step_dl_timeout = _effective_dl_timeout()
                 with ThreadPoolExecutor(max_workers=min(4, len(probe_list))) as pool:
                     prepared = list(
                         pool.map(
-                            lambda item: _prepare_single_candidate(remote, item[1], run_id, item[2]),
+                            lambda item: _call_prepare_single_candidate(
+                                remote, item[1], run_id, item[2], step_dl_timeout,
+                            ),
                             probe_list,
                         )
                     )
@@ -1280,7 +1407,8 @@ def reconstruct_historical_checkpoint(
                         _cleanup_tree(w_tmp)
 
         if not replay_start:
-            return checkpoint, checkpoint_books, checkpoint_quote, {}
+            diag = {"lookback_timed_out": True} if lookback_timed_out else {}
+            return checkpoint, checkpoint_books, checkpoint_quote, diag
 
         min_w = min(replay_start.values())
         carry_rows = list(checkpoint or ())
@@ -1290,8 +1418,13 @@ def reconstruct_historical_checkpoint(
         fwd_books = {}
         fwd_quote = None
         fwd_streams = {}
+        forward_completed = True
 
         for w in range(min_w, begin, step):
+            if deadline is not None and time.monotonic() >= deadline:
+                lookback_timed_out = True
+                forward_completed = False
+                break
             active_ex = sorted(ex for ex, ew in replay_start.items() if ew <= w)
             if not active_ex:
                 continue
@@ -1335,10 +1468,13 @@ def reconstruct_historical_checkpoint(
 
             try:
                 if uncached:
+                    step_dl_timeout = _effective_dl_timeout()
                     with ThreadPoolExecutor(max_workers=min(4, len(uncached))) as pool:
                         fetched = list(
                             pool.map(
-                                lambda item: _prepare_single_candidate(remote, item[1], run_id, item[2]),
+                                lambda item: _call_prepare_single_candidate(
+                                    remote, item[1], run_id, item[2], step_dl_timeout,
+                                ),
                                 uncached,
                             )
                         )
@@ -1385,6 +1521,13 @@ def reconstruct_historical_checkpoint(
             _cleanup_tree(c_dir)
         cached_files.clear()
 
+    if not forward_completed:
+        return checkpoint, checkpoint_books, checkpoint_quote, {
+            "lookback_timed_out": True,
+            "reconstructed_lookback_windows": reconstructed_windows,
+            "reconstructed_exchanges": [],
+        }
+
     merged_rows = {(r["exchange"], r["symbol"]): r for r in carry_rows}
     merged_books = dict(carry_books)
     for r in fwd_ckpt:
@@ -1403,13 +1546,17 @@ def reconstruct_historical_checkpoint(
         "reconstructed_inputs": input_digests(used_lookback_cands),
         "merged_streams": merged_streams,
     }
+    if lookback_timed_out:
+        diag["lookback_timed_out"] = True
     return list(merged_rows.values()), merged_books, merged_quote, diag
 
 
 def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_windows,
                  candidates=None, checkpoint=None, anchor_lookback_windows=None, source_restrictions=None,
                  checkpoint_books=None, checkpoint_quote=None, checkpoint_streams=None,
-                 ancestor_checkpoints=None, export_checkpoint_state=None):
+                 ancestor_checkpoints=None, export_checkpoint_state=None,
+                 download_timeout_seconds=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+                 lookback_timeout_seconds=DEFAULT_LOOKBACK_TIMEOUT_SECONDS):
     out = {"status": "retryable", "run_id": run_id, "window_id": window,
            "warmup_windows": warmup_windows, "replay_sample_seconds": replay_seconds}
     stage = "validate_window"
@@ -1445,6 +1592,8 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                     checkpoint_streams=eff_streams,
                     ancestor_checkpoints=ancestor_checkpoints,
                     source_restrictions=source_restrictions,
+                    download_timeout_seconds=download_timeout_seconds,
+                    lookback_timeout_seconds=lookback_timeout_seconds,
                 )
                 if lb_diag:
                     eff_streams = lb_diag.pop("merged_streams", eff_streams)
@@ -1453,7 +1602,10 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
             else:
                 selected_warmup = lookback
             stage = "read_verified_archives"
-            items = list(selected_archives(remote, config, run_id, begin, end, tmp, selected_warmup, out, candidates))
+            items = list(selected_archives(
+                remote, config, run_id, begin, end, tmp, selected_warmup, out, candidates,
+                download_timeout_seconds=download_timeout_seconds,
+            ))
             stage = "read_effective_btc_specs"
             try:
                 specs = load_btc_specs(remote, begin * NS, tmp) if replay_seconds else {}

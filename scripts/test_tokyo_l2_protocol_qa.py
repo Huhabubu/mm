@@ -1607,5 +1607,154 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual([windows[2]], prepared_windows)
 
 
+    def test_recurring_soft_runtime_budget_persists_per_window_and_resumes(self):
+        import json
+        from unittest.mock import patch
+        import tokyo_l2_recurring_qa as recurring
+
+        w0 = 1_795_276_800
+        step = 900
+        ws = [w0 + i * step for i in range(4)]  # w0, w1, w2, w3 (current)
+        run_id = "budget_resume_run"
+        sha = "ccc333"
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
+        }
+        cands = []
+        for s in ws:
+            wid = coverage.window_descriptor(s, 15)["window_id"]
+            mf = f"raw/gate_futures/{wid[:10]}/gate_{s}.manifest.json"
+            cands.append({
+                "exchange": "gate_futures", "source_manifest": mf,
+                "source_data": mf.replace(".manifest.json", ".tsv.zst"),
+                "manifest_sha256": f"{s:064x}", "data_sha256": f"{s+1:064x}",
+                "manifest_bytes": 100, "data_bytes": 200, "planned_start_s": s,
+            })
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            for c in cands:
+                wid = coverage.window_descriptor(c["planned_start_s"], 15)["window_id"]
+                p = state / "qa_reports" / "windows" / wid[:10] / f"{archive._safe_window_filename(wid)}.window.qa.json"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps({
+                    "qa_status": "passed", "run_id": run_id, "partition_minutes": 15,
+                    "checker_commit_sha": sha, "files": [c["source_manifest"]],
+                }), encoding="utf-8")
+
+            from hashlib import sha256
+            from tokyo_l2_protocol_qa import Book
+            rdir = state / "qa_reports" / "protocol" / sha256(run_id.encode()).hexdigest()[:24] / "15m"
+            cdir = state / "qa_reports" / "checkpoints" / sha256(run_id.encode()).hexdigest()[:24] / "15m"
+            calls = []
+            seen_prev_on_disk = []
+            clock = [100.0]
+
+            def fake_monotonic():
+                return clock[0]
+
+            def fake_audit(_r, _cfg, _rid, start, window, _rs, _wu, **kw):
+                if calls:
+                    prev_wid = coverage.window_descriptor(calls[-1], 15)["window_id"]
+                    prev_rp = rdir / f"{archive._safe_window_filename(prev_wid)}.json"
+                    prev_cp = cdir / f"{archive._safe_window_filename(prev_wid)}.checkpoint.json"
+                    seen_prev_on_disk.append((prev_rp.exists(), prev_cp.exists()))
+                calls.append(start)
+                clock[0] += 600.0
+                b = Book.from_levels({"bids": [[50000.0, 1.0]], "asks": [[50001.0, 1.0]]})
+                bhash = b.digest()
+                exp = kw.get("export_checkpoint_state")
+                if exp is not None:
+                    exp["books"] = {("gate_futures", "BTCUSDT"): {
+                        "book_sha256": bhash, "last_exchange_ns": start * 1_000_000_000,
+                        **b.canonical_levels(),
+                    }}
+                c_match = next(c for c in cands if c["planned_start_s"] == start)
+                return {
+                    "status": "passed", "protocol_status": "passed", "run_id": run_id, "window_id": window,
+                    "target_inputs": recurring.input_digests([c_match]),
+                    "end_sequence_checkpoint": [{
+                        "exchange": "gate_futures", "symbol": "BTCUSDT", "connection": ["b", "c", 1],
+                        "seq": 10 + ws.index(start), "awaiting_delta": False,
+                        "last_wall_ns": start * 1_000_000_000,
+                        "book_anchored": True, "book_sha256": bhash, "last_exchange_ns": start * 1_000_000_000,
+                    }],
+                }
+
+            with patch.object(recurring, "verified_candidates", return_value=cands), \
+                 patch.object(recurring, "audit_window", side_effect=fake_audit), \
+                 patch.object(recurring.time, "monotonic", side_effect=fake_monotonic):
+                # Budget = 1000s, each window advances fake clock by 600s -> processes w0 (t=700) and w1 (t=1300), then stops cleanly before w2!
+                r1 = recurring.run(
+                    "qa:", cfg, run_id, w0, ws[-1], state, f"{sha}/r1",
+                    max_catchup=10, catchup_first=True, max_runtime_seconds=1000.0,
+                )
+                self.assertEqual([w0, ws[1]], calls)
+                # w0's report & sidecar were ALREADY persisted on disk before w1 even started!
+                self.assertEqual([(True, True)], seen_prev_on_disk)
+                self.assertTrue(r1["stopped_by_runtime_budget"])
+                self.assertEqual("ok", r1["job_execution_status"])
+                self.assertEqual(2, r1["pending_ready_windows"])
+
+                # Next run resumes strictly from w2 and w3 without re-running w0 or w1!
+                calls.clear()
+                seen_prev_on_disk.clear()
+                r2 = recurring.run(
+                    "qa:", cfg, run_id, w0, ws[-1], state, f"{sha}/r1",
+                    max_catchup=10, catchup_first=True, max_runtime_seconds=2000.0,
+                )
+                self.assertEqual([ws[2], ws[3]], calls)
+                self.assertFalse(r2["stopped_by_runtime_budget"])
+                self.assertEqual("ok", r2["job_execution_status"])
+                self.assertEqual("passed", r2["status"])
+                self.assertEqual(0, r2["pending_ready_windows"])
+
+    def test_lookback_and_download_timeouts_abort_cleanly(self):
+        import subprocess
+        from unittest.mock import patch
+        import tokyo_l2_replay_qa as replay
+
+        w0 = 1_795_276_800
+        step = 900
+        windows = [w0 + i * step for i in range(4)]
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
+        }
+        cands = [{
+            "exchange": "gate_futures", "planned_start_s": w, "planned_end_s": w + step,
+            "source_manifest": f"raw/gate_futures/{w}.manifest.json",
+            "source_data": f"raw/gate_futures/{w}.tsv.zst",
+            "manifest_sha256": "a" * 64, "data_sha256": "b" * 64, "data_bytes": 100,
+        } for w in windows[:-1]]
+
+        with tempfile.TemporaryDirectory() as temp:
+            tmp = Path(temp)
+            mono_vals = iter([100.0, 500.0, 500.0, 500.0])
+            with patch.object(replay.time, "monotonic", side_effect=lambda: next(mono_vals, 500.0)):
+                ckpt, books, _q, diag = replay.reconstruct_historical_checkpoint(
+                    "qa:", cfg, "r1", windows[-1], step, 10, tmp,
+                    candidates=cands, lookback_timeout_seconds=10.0,
+                )
+            self.assertIsNone(ckpt)
+            self.assertIsNone(books)
+            self.assertTrue(diag.get("lookback_timed_out"))
+            self.assertEqual([], list(tmp.glob("lb_cache_*")))
+
+            seen_timeouts = []
+
+            def fake_run(cmd, **kw):
+                seen_timeouts.append(kw.get("timeout"))
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout"))
+
+            with patch.object(replay.subprocess, "run", side_effect=fake_run), \
+                 patch.object(replay.time, "sleep", return_value=None):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    replay.download("qa:", "raw/a.tsv.zst", tmp / "a.tsv.zst", timeout_seconds=15.0)
+            self.assertTrue(seen_timeouts)
+            self.assertTrue(all(t is not None and t <= 15.0 for t in seen_timeouts))
+
+
 if __name__ == "__main__":
     unittest.main()
