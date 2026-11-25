@@ -42,6 +42,7 @@ from archive_sync import (  # noqa: E402
 )
 
 DEFAULT_GITHUB_API_BASE = "https://api.github.com"
+DEFAULT_GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
 DEFAULT_GITHUB_REPO = "Huhabubu/mm"
 DEFAULT_WORKFLOW_FILE = "tokyo-l2-incremental-qa.yml"
 DEFAULT_WORKFLOW_REF = "main"
@@ -363,10 +364,20 @@ def evaluate_qa_reports_for_record(
 
     if rep_run_id != exp_run_id or rep_wid != exp_wid or not rep_rev or rep_rev != exp_rev:
         return None
-    if not win_checker or win_checker != eff_expected_commit:
+    if not win_checker or win_status not in _TERMINAL_ARCHIVE_QA_STATUSES:
         return None
 
-    if win_status not in _TERMINAL_ARCHIVE_QA_STATUSES:
+    # PROTOCOL_QA_VERSION >= 2 terminal quality verdicts (`passed` / `data_failed`) preserve valid
+    # historical verification across benign checker/rules bumps without full re-dispatch; unverified
+    # (`anchor_unverified` / `replay_init_unverified`) and v1 reports still require the latest checker.
+    p_status = str(protocol_report.get("status") or "").strip() if isinstance(protocol_report, dict) else ""
+    p_ver = int(protocol_report.get("protocol_qa_version") or 0) if isinstance(protocol_report, dict) else 0
+    v2_terminal_survival = (
+        win_status == "passed"
+        and p_ver >= 2
+        and p_status in {"passed", "data_failed"}
+    )
+    if not v2_terminal_survival and win_checker != eff_expected_commit:
         return None
 
     if win_status in {"failed", "needs_review"}:
@@ -381,14 +392,15 @@ def evaluate_qa_reports_for_record(
     proto_ok = False
     proto_status: str | None = None
     if isinstance(protocol_report, dict):
-        p_status = str(protocol_report.get("status") or "").strip()
         p_rev = str(protocol_report.get("archive_revision") or "").strip()
         p_run_id = str(protocol_report.get("run_id") or "").strip()
         p_wid = str(protocol_report.get("window_id") or "").strip()
         p_checker_full = str(protocol_report.get("checker") or "").strip()
         p_checker_commit = p_checker_full.split("/", 1)[0].strip()
 
-        if exp_proto_sep and exp_proto_rules:
+        if v2_terminal_survival:
+            checker_matches = bool(p_checker_full and "/" in p_checker_full and p_checker_commit == win_checker)
+        elif exp_proto_sep and exp_proto_rules:
             checker_matches = p_checker_full == f"{eff_expected_commit}/{exp_proto_rules}"
         else:
             checker_matches = bool(p_checker_full) and p_checker_commit == eff_expected_commit
@@ -519,12 +531,23 @@ def resolve_expected_checker_from_github(
         return checker_commit, None
 
     scripts_bytes: dict[str, bytes] = {}
+    use_raw = http_get is None and api_base.rstrip("/") == DEFAULT_GITHUB_API_BASE
     for rel in _PROTOCOL_RULE_SCRIPT_PATHS:
-        s_url = (
-            f"{api_base.rstrip('/')}/repos/{repo}/contents/{quote(rel, safe='/')}"
-            f"?ref={quote(workflow_ref, safe='')}"
-        )
-        s_resp = _get(s_url, "application/vnd.github.raw+json")
+        s_resp: HttpDispatchResponse | None = None
+        if use_raw:
+            raw_url = f"{DEFAULT_GITHUB_RAW_BASE}/{repo}/{quote(workflow_ref, safe='')}/{quote(rel, safe='/')}"
+            try:
+                candidate = getter(raw_url, {"User-Agent": "tokyo-l2-qa-dispatcher/1.0"}, connect_timeout_s, total_timeout_s)
+                if 200 <= candidate.status_code < 300:
+                    s_resp = candidate
+            except Exception:
+                s_resp = None
+        if s_resp is None:
+            s_url = (
+                f"{api_base.rstrip('/')}/repos/{repo}/contents/{quote(rel, safe='/')}"
+                f"?ref={quote(workflow_ref, safe='')}"
+            )
+            s_resp = _get(s_url, "application/vnd.github.raw+json")
         if not (200 <= s_resp.status_code < 300):
             raise RuntimeError(
                 f"Failed to resolve protocol rule script {rel}@{workflow_ref}: HTTP {s_resp.status_code}"
@@ -635,7 +658,7 @@ def make_github_result_fetcher(
                 token=token,
                 connect_timeout_s=connect_timeout_s,
                 total_timeout_s=total_timeout_s,
-                http_get=getter,
+                http_get=http_get,
                 include_protocol_rules=require_protocol_report,
             )
             if needs_commit:
@@ -647,8 +670,26 @@ def make_github_result_fetcher(
         resolved_cache["initialized"] = "1"
         return commit, proto_chk
 
+    use_raw_state = http_get is None and api_base.rstrip("/") == DEFAULT_GITHUB_API_BASE
+
     def _get_json(rel_path: str) -> dict[str, Any] | None:
         encoded_path = quote(rel_path, safe="/")
+        if use_raw_state:
+            raw_url = f"{DEFAULT_GITHUB_RAW_BASE}/{repo}/{quote(state_branch, safe='')}/{encoded_path}"
+            try:
+                raw_resp = getter(
+                    raw_url,
+                    {"User-Agent": "tokyo-l2-qa-dispatcher/1.0", "Accept": "application/json"},
+                    connect_timeout_s,
+                    total_timeout_s,
+                )
+                if raw_resp.status_code == 404:
+                    return None
+                if 200 <= raw_resp.status_code < 300:
+                    parsed = json.loads(raw_resp.body)
+                    return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                pass
         url = f"{api_base.rstrip('/')}/repos/{repo}/contents/{encoded_path}?ref={quote(state_branch, safe='')}"
         hdrs = dict(base_headers)
         if token:
@@ -739,7 +780,7 @@ def reconcile_accepted_dispatches(
             newest_first=True,
         )
         if int(r.get("attempt_count") or 0) > 0
-    ]
+    ][:25]
 
     completed_items: list[dict[str, Any]] = []
     requeued_items: list[dict[str, Any]] = []

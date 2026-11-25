@@ -1828,3 +1828,71 @@ def test_unverified_termination_inflight_throttle_backoff_and_conditional_revali
     prev_fail = dict(prev_pass, qa_status="failed")
     assert qa._is_memoized_up_to_date(prev_pass, cand, cfg_hash="cfg", config_pm=15, checker_commit="new", recheck_non_passed_on_checker_change=True) is True
     assert qa._is_memoized_up_to_date(prev_fail, cand, cfg_hash="cfg", config_pm=15, checker_commit="new", recheck_non_passed_on_checker_change=True) is False
+
+
+def test_v2_terminal_reports_survive_checker_bump_and_raw_fetcher_skips_contents_api(monkeypatch):
+    rec = {
+        "run_id": "r1",
+        "target_window_utc": "2026-11-24T00:00Z",
+        "archive_revision": "rev1",
+    }
+    win_old = {
+        "qa_version": 1,
+        "run_id": "r1",
+        "window_id": "2026-11-24T00:00Z",
+        "archive_revision": "rev1",
+        "qa_status": "passed",
+        "checker_commit_sha": "old_sha",
+    }
+    proto_v2_passed = {
+        "protocol_qa_version": 2,
+        "run_id": "r1",
+        "window_id": "2026-11-24T00:00Z",
+        "archive_revision": "rev1",
+        "status": "passed",
+        "protocol_status": "passed",
+        "checker": "old_sha/old_rules",
+        "completed_at_utc": "2026-11-24T00:16:00Z",
+    }
+    verdict = qd.evaluate_qa_reports_for_record(
+        rec,
+        window_report=win_old,
+        protocol_report=proto_v2_passed,
+        require_protocol_report=True,
+        expected_checker_commit="new_sha",
+        expected_protocol_checker="new_sha/new_rules",
+    )
+    assert verdict is not None
+    assert verdict["qa_result_status"] == "passed"
+
+    # Unverified v2 report still rejects stale checker/rules so revalidation happens.
+    proto_v2_unverified = {**proto_v2_passed, "status": "anchor_unverified", "protocol_status": "anchor_unverified"}
+    assert (
+        qd.evaluate_qa_reports_for_record(
+            rec,
+            window_report=win_old,
+            protocol_report=proto_v2_unverified,
+            require_protocol_report=True,
+            expected_checker_commit="new_sha",
+            expected_protocol_checker="new_sha/new_rules",
+        )
+        is None
+    )
+
+    seen_urls: list[str] = []
+
+    def fake_default_get(url: str, _hdrs: dict[str, str], _ct: float, _tt: float):
+        seen_urls.append(url)
+        if url.startswith("https://api.github.com/repos/Huhabubu/mm/commits/"):
+            return qd.HttpDispatchResponse(200, {}, "a" * 40)
+        if url.startswith("https://raw.githubusercontent.com/Huhabubu/mm/main/scripts/"):
+            return qd.HttpDispatchResponse(200, {}, "# rule script\n")
+        if url.startswith("https://raw.githubusercontent.com/Huhabubu/mm/tokyo-l2-qa-state/"):
+            return qd.HttpDispatchResponse(404, {}, "")
+        raise AssertionError(f"Unexpected REST contents call: {url}")
+
+    monkeypatch.setattr(qd, "default_http_get", fake_default_get)
+    fetcher = qd.make_github_result_fetcher(repo="Huhabubu/mm", require_protocol_report=True)
+    assert fetcher(rec) is None
+    assert any("raw.githubusercontent.com" in u for u in seen_urls)
+    assert not any("/contents/" in u for u in seen_urls)
