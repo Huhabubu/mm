@@ -2,26 +2,9 @@
   "status": "data_failed",
   "run_id": "trial15_20261122T0745Z",
   "window_id": "2026-11-23T01:00Z",
-  "warmup_windows": 1,
+  "warmup_windows": 0,
   "replay_sample_seconds": 660,
-  "warmup_inputs": [
-    {
-      "exchange": "binance_futures",
-      "window_id": "2026-11-23T00:45Z"
-    },
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-23T00:45Z"
-    },
-    {
-      "exchange": "bybit_linear",
-      "window_id": "2026-11-23T00:45Z"
-    },
-    {
-      "exchange": "gate_futures",
-      "window_id": "2026-11-23T00:45Z"
-    }
-  ],
+  "warmup_inputs": [],
   "target_inputs": [
     {
       "exchange": "binance_futures",
@@ -45,6 +28,25 @@
     }
   ],
   "boundary_checkpoint_markets": 24,
+  "boundary_book_anchored_markets": 24,
+  "connection_overlap_trades": [],
+  "replay_trade_rows": [
+    {
+      "exchange": "gate_futures",
+      "trade_rows": 12494,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bybit_linear",
+      "trade_rows": 27919,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bitget_v3",
+      "trade_rows": 18709,
+      "dedup_trades_dropped": 0
+    }
+  ],
   "observed_snapshot_markets": [
     {
       "exchange": "bitget_v3",
@@ -55,22 +57,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "BTCUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 11
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "DOGEUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 11
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "DOGEUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 11
     },
@@ -83,22 +71,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "ETHUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 11
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "SOLUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 11
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "SOLUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 11
     },
@@ -111,22 +85,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "SUIUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 11
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "XRPUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 11
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "XRPUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 11
     }
@@ -1290,7 +1250,12 @@
       ],
       "seq": 12205344446440,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499923884657
+      "last_wall_ns": 1795396499923884657,
+      "book_anchored": true,
+      "book_sha256": "ba8bf1bff42d7e7137a346dd0c33d16e85b7572c70c88ec70fb7bd03106b8591",
+      "last_exchange_ns": 1795396499922000000,
+      "bid_levels": 11916,
+      "ask_levels": 8801
     },
     {
       "exchange": "binance_futures",
@@ -1302,7 +1267,12 @@
       ],
       "seq": 12205344452014,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499985254779
+      "last_wall_ns": 1795396499985254779,
+      "book_anchored": true,
+      "book_sha256": "7960ae9ccce6b7429b4b1abb2dab007c14cdfef99b51635e22b968eba41474cb",
+      "last_exchange_ns": 1795396499978000000,
+      "bid_levels": 1187,
+      "ask_levels": 1126
     },
     {
       "exchange": "binance_futures",
@@ -1314,7 +1284,12 @@
       ],
       "seq": 12205344446429,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499924768078
+      "last_wall_ns": 1795396499924768078,
+      "book_anchored": true,
+      "book_sha256": "b85235bc3e47b52dfb16a8d6cd982925389da1a9bd98286791586bdd704321d8",
+      "last_exchange_ns": 1795396499922000000,
+      "bid_levels": 8270,
+      "ask_levels": 8059
     },
     {
       "exchange": "binance_futures",
@@ -1326,7 +1301,12 @@
       ],
       "seq": 12205344450626,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499984203332
+      "last_wall_ns": 1795396499984203332,
+      "book_anchored": true,
+      "book_sha256": "0d151042ea7112963630b2bf2a59ea26601145d34764edb6194aa568e2aee834",
+      "last_exchange_ns": 1795396499967000000,
+      "bid_levels": 1507,
+      "ask_levels": 1387
     },
     {
       "exchange": "binance_futures",
@@ -1338,7 +1318,12 @@
       ],
       "seq": 12205344453332,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499998746210
+      "last_wall_ns": 1795396499998746210,
+      "book_anchored": true,
+      "book_sha256": "9f8b380e5ded2dfcb72187bf2d2ce6039a4dbfae49e4ffe99aa73f7e2f1b8e55",
+      "last_exchange_ns": 1795396499995000000,
+      "bid_levels": 1027,
+      "ask_levels": 1146
     },
     {
       "exchange": "binance_futures",
@@ -1350,7 +1335,12 @@
       ],
       "seq": 12205344445888,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499918892757
+      "last_wall_ns": 1795396499918892757,
+      "book_anchored": true,
+      "book_sha256": "46249415a64762bc27a6d0d0ade39b7a8125f82e5cb4a4fd7fafd5f648fc1241",
+      "last_exchange_ns": 1795396499915000000,
+      "bid_levels": 1438,
+      "ask_levels": 1267
     },
     {
       "exchange": "bitget_v3",
@@ -1362,7 +1352,12 @@
       ],
       "seq": 1291166079545,
       "awaiting_delta": true,
-      "last_wall_ns": 1795396499984571711
+      "last_wall_ns": 1795396499984571711,
+      "book_anchored": true,
+      "book_sha256": "fcc3664991b5a3f6f54f74566bed787b43f70765149bdd97c11bf97cc0c2f987",
+      "last_exchange_ns": 1795396499980000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -1374,7 +1369,12 @@
       ],
       "seq": 526988107107,
       "awaiting_delta": true,
-      "last_wall_ns": 1795396499996082716
+      "last_wall_ns": 1795396499996082716,
+      "book_anchored": true,
+      "book_sha256": "b29d7a0edaa333b632753bb5321adcc239a19e60f496177c43a11e684412d1bf",
+      "last_exchange_ns": 1795396499981000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -1386,7 +1386,12 @@
       ],
       "seq": 1062545578362,
       "awaiting_delta": true,
-      "last_wall_ns": 1795396499985528023
+      "last_wall_ns": 1795396499985528023,
+      "book_anchored": true,
+      "book_sha256": "378e91845e8e0573e5f2a0f8e7209f746dda19164f3eb17e52d827ef4fddb89e",
+      "last_exchange_ns": 1795396499980000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -1398,7 +1403,12 @@
       ],
       "seq": 222415906198,
       "awaiting_delta": true,
-      "last_wall_ns": 1795396499948046892
+      "last_wall_ns": 1795396499948046892,
+      "book_anchored": true,
+      "book_sha256": "03fce43096ed88970e06cef1183014680550b4353b7ac7c8d07867f30bd0e73b",
+      "last_exchange_ns": 1795396499943000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -1410,7 +1420,12 @@
       ],
       "seq": 526988107061,
       "awaiting_delta": true,
-      "last_wall_ns": 1795396499980468413
+      "last_wall_ns": 1795396499980468413,
+      "book_anchored": true,
+      "book_sha256": "ebc35606b02568484c588a70b439a40f1faf25ea2370cd9d0ffe6e84b71039b7",
+      "last_exchange_ns": 1795396499977000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -1422,7 +1437,12 @@
       ],
       "seq": 222415906477,
       "awaiting_delta": true,
-      "last_wall_ns": 1795396499985524319
+      "last_wall_ns": 1795396499985524319,
+      "book_anchored": true,
+      "book_sha256": "84dd8802bffc48e3d862616016cbea82c0e19526649a3dd57e3935a73009ae8a",
+      "last_exchange_ns": 1795396499981000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -1434,7 +1454,12 @@
       ],
       "seq": 13060939,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499997902409
+      "last_wall_ns": 1795396499997902409,
+      "book_anchored": true,
+      "book_sha256": "b1469725d6e138c09b8e7eab42764ce9f1bf78d88975ca5a3d28c9102aee70ef",
+      "last_exchange_ns": 1795396499991000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -1446,7 +1471,12 @@
       ],
       "seq": 10266594,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499988739387
+      "last_wall_ns": 1795396499988739387,
+      "book_anchored": true,
+      "book_sha256": "02eb0f30b7c0f09769974638ca1b0e04562c06fc345821f32fdeeb5260057fbb",
+      "last_exchange_ns": 1795396499979000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -1458,7 +1488,12 @@
       ],
       "seq": 13909305,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499997384977
+      "last_wall_ns": 1795396499997384977,
+      "book_anchored": true,
+      "book_sha256": "0aba3e15b54e23d1d09c02248a773f15c550a904f7fa968cba6385ae8e376ce5",
+      "last_exchange_ns": 1795396499986000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -1470,7 +1505,12 @@
       ],
       "seq": 12222755,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499952361293
+      "last_wall_ns": 1795396499952361293,
+      "book_anchored": true,
+      "book_sha256": "fcd3f794b499344144278cab757473f2fb6cddadda71ebc920a941b46e74d99d",
+      "last_exchange_ns": 1795396499932000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -1482,7 +1522,12 @@
       ],
       "seq": 9373652,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499996585370
+      "last_wall_ns": 1795396499996585370,
+      "book_anchored": true,
+      "book_sha256": "5ad6dd1f390aa2522be9acdd4742a2098d65c74212ea934a6bffa822f75cafda",
+      "last_exchange_ns": 1795396499980000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -1494,7 +1539,12 @@
       ],
       "seq": 12715093,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499992975102
+      "last_wall_ns": 1795396499992975102,
+      "book_anchored": true,
+      "book_sha256": "212490a3a533a1a4f0823f2fc2949f2e5cd8f8f5aeca169ba3d3aec9a271c39b",
+      "last_exchange_ns": 1795396499986000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -1506,7 +1556,12 @@
       ],
       "seq": 133994534020,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499990202898
+      "last_wall_ns": 1795396499990202898,
+      "book_anchored": true,
+      "book_sha256": "bed34aca58447ca5d79aba7246188b68c32c2f3da29c91dc99850d740bff6e93",
+      "last_exchange_ns": 1795396499988000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -1518,7 +1573,12 @@
       ],
       "seq": 40018698496,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499978921777
+      "last_wall_ns": 1795396499978921777,
+      "book_anchored": true,
+      "book_sha256": "b4c89ea0b32e065e3e61d23446e445b5f7ab6e49f92a8363e2b1c57d5ac30566",
+      "last_exchange_ns": 1795396499976000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -1530,7 +1590,12 @@
       ],
       "seq": 116210124832,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499996872891
+      "last_wall_ns": 1795396499996872891,
+      "book_anchored": true,
+      "book_sha256": "482fc72d3214a3d5b5ba0b2263b2a80138a5b931559038edda44190a94e6e906",
+      "last_exchange_ns": 1795396499995000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -1542,7 +1607,12 @@
       ],
       "seq": 44798635350,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499978905112
+      "last_wall_ns": 1795396499978905112,
+      "book_anchored": true,
+      "book_sha256": "5c5b5987040db90ce0c7490b0fccb0ab29934f8d58d3a77784f04cd9bef2105c",
+      "last_exchange_ns": 1795396499977000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -1554,7 +1624,12 @@
       ],
       "seq": 15638430743,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499980064842
+      "last_wall_ns": 1795396499980064842,
+      "book_anchored": true,
+      "book_sha256": "2abc924875f86417bce936611ecfb4bdca085a922be00db0dc71ed399ab9c37a",
+      "last_exchange_ns": 1795396499979000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -1566,29 +1641,66 @@
       ],
       "seq": 28809021885,
       "awaiting_delta": false,
-      "last_wall_ns": 1795396499979973633
+      "last_wall_ns": 1795396499979973633,
+      "book_anchored": true,
+      "book_sha256": "0a9debebf956288bf26553666c33b441975e04741864754d0b03ff203e8e4047",
+      "last_exchange_ns": 1795396499979000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     }
   ],
   "replay": {
     "gate_futures": {
-      "status": "blocked",
-      "reason": "initial_book_not_in_lookback"
+      "status": "passed",
+      "symbol": "BTCUSDT",
+      "source_rows": 399099,
+      "converted_rows": 405331,
+      "feed_events": 44111,
+      "signal_events": 667241,
+      "submits": 294,
+      "cancels": 292,
+      "fills": 0,
+      "raw_exchange_reversals": 737,
+      "order_probe": {
+        "status": "passed",
+        "submitted": 2,
+        "canceled": 1,
+        "taker_filled": 1,
+        "ledger_ok": true
+      },
+      "lot_source": "minimum_order_size"
     },
     "bybit_linear": {
-      "status": "blocked",
-      "reason": "initial_book_not_in_lookback"
+      "status": "passed",
+      "symbol": "BTCUSDT",
+      "source_rows": 461861,
+      "converted_rows": 462529,
+      "feed_events": 44913,
+      "signal_events": 667241,
+      "submits": 374,
+      "cancels": 306,
+      "fills": 59,
+      "raw_exchange_reversals": 22,
+      "order_probe": {
+        "status": "passed",
+        "submitted": 2,
+        "canceled": 1,
+        "taker_filled": 1,
+        "ledger_ok": true
+      },
+      "lot_source": "qtyStep"
     },
     "bitget_v3": {
       "status": "failed",
       "symbol": "BTCUSDT",
-      "source_rows": 2937282,
-      "converted_rows": 2937282,
-      "feed_events": 29081,
+      "source_rows": 2955991,
+      "converted_rows": 2959716,
+      "feed_events": 37630,
       "signal_events": 667240,
-      "submits": 0,
-      "cancels": 0,
-      "fills": 0,
-      "raw_exchange_reversals": 0,
+      "submits": 261,
+      "cancels": 248,
+      "fills": 10,
+      "raw_exchange_reversals": 323,
       "order_probe": {
         "status": "failed",
         "reason": "probe_fill_unconfirmed"
@@ -1599,13 +1711,13 @@
   "common_replay_intervals": {
     "gate_futures": [
       {
-        "start_wall_ns": 1795395600005971722,
+        "start_wall_ns": 1795395600000000000,
         "end_wall_ns": 1795396260000000000
       }
     ],
     "bybit_linear": [
       {
-        "start_wall_ns": 1795395600018677169,
+        "start_wall_ns": 1795395600000000000,
         "end_wall_ns": 1795396260000000000
       }
     ],
@@ -1616,7 +1728,8 @@
       }
     ]
   },
-  "checker": "0211a0b3b9d3a3ed3ebd9f0193738d7d25936100/100cbe92b5da86ba373fe98dc5a855237b6abc38a7b60488e979e204686a2de2",
+  "protocol_qa_version": 2,
+  "checker": "31590e1ab0f58436b0967a969384994aabfc6b82/9e9dfb0f32482e3d0cc93fb66a05ff08963aed0f9d3d06ba889554f3bd1f9274",
   "archive_revision": "sha256:fb3ae6330495a3ce687d07696d926dc223078782697a31b46dc600cd55f1dc74",
   "previous_inputs": [
     {
@@ -1640,30 +1753,9 @@
       "data_sha256": "f64ab1748a98af067c42b828465a011483992e24bbaef4c5912f31af265fae66"
     }
   ],
-  "anchor_lookback_windows": 1,
-  "anchor_lookback_inputs": [
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "ba71bd3d9eba101153220029e021f8e72e716282f7cb7d01ea614cabe2301cff",
-      "data_sha256": "4a60a0219606c3d69e12d3739dee16da026c6479f69b172c7b03ecbcc0c642af"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "4610134dc39e408ac808bc60e508dc9097962fadea49928cd2266af37447ac0d",
-      "data_sha256": "eb0a02923d923d3acc66ee69a1e884db776d6e81cfa593eaeafff9ab46f372a9"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "1c6796edc5558f46c86c10291c176cb1433f40cf0624a27123daa70cc59ac9c5",
-      "data_sha256": "159b6b033d228e0018cf54a4a10ec89c13cdd484f5706a26e6ec81b79be48003"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "220606dc045e9dac39469c88b4ed751992fbe9a0cb3ca6441149a50712b8b11e",
-      "data_sha256": "f64ab1748a98af067c42b828465a011483992e24bbaef4c5912f31af265fae66"
-    }
-  ],
+  "anchor_lookback_windows": 0,
+  "anchor_lookback_inputs": [],
   "source_restrictions": {},
-  "input_checkpoint_digest": "81f4bf822b147147e87befe9f2ac6b74dd6c1511cb45c3d71aa8e9923cbfab26",
-  "completed_at_utc": "2026-11-24T22:40:13Z"
+  "input_checkpoint_digest": "75386c06c1c192dd595bc99e6800c1281b5f9ab107590dae28812e3179f907f1",
+  "completed_at_utc": "2026-11-25T13:52:14Z"
 }
