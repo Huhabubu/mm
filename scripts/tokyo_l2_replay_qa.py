@@ -1630,6 +1630,21 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
             )
         files_ok = all(x["qa_status"] == "passed" for x in out["archive_file_checks"])
         out["status"] = window_status(out["protocol_status"], files_ok, list(out["replay"].values()))
+        has_initial_unverified = any(
+            iv.get("status") == "unverified" and iv.get("reason") == "initial_state_unverified"
+            for row in out.get("market_availability") or ()
+            for iv in row.get("intervals") or ()
+        )
+        if out.get("lookback_timed_out") and (
+            out["status"] != "passed"
+            or out.get("protocol_status") != "passed"
+            or bool(out.get("unanchored_lookback_markets"))
+            or has_initial_unverified
+        ):
+            out["status"] = "retryable"
+            out["protocol_status"] = "retryable"
+            out.setdefault("error_type", "LookbackTimeout")
+            out.setdefault("error_stage", "reconstruct_historical_checkpoint")
         if out.get("spec_error_type") or any(x["reason"] == "converter_or_engine_error"
                                              for x in out["replay"].values() if "reason" in x):
             out["status"] = "retryable"

@@ -423,7 +423,7 @@ jobs:
 
       - name: Persist QA summary reports to tokyo-l2-qa-state
         id: persist
-        if: ${{ !cancelled() && !inputs.preview_recurring }}
+        if: ${{ always() && !cancelled() && !inputs.preview_recurring && (steps.inspect.outcome == 'success' || steps.protocols.outcome == 'success' || steps.protocols.outcome == 'failure') }}
         working-directory: state
         shell: bash
         run: |

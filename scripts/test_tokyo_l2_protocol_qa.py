@@ -1757,6 +1757,85 @@ class ProtocolTest(unittest.TestCase):
             self.assertTrue(seen_timeouts)
             self.assertTrue(all(t is not None and t <= 15.0 for t in seen_timeouts))
 
+    def test_timeout_insufficient_evidence_stays_retryable_never_data_failed_or_passed(self):
+        import json
+        from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
+        import tokyo_l2_recurring_qa as recurring
+        import tokyo_l2_replay_qa as replay
+
+        w0 = 1_795_276_800
+        step = 900
+        wid0 = coverage.window_descriptor(w0, 15)["window_id"]
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
+        }
+        cand = {
+            "exchange": "gate_futures", "planned_start_s": w0, "planned_end_s": w0 + step,
+            "source_manifest": f"raw/gate_futures/{wid0[:10]}/gate_{w0}.manifest.json",
+            "source_data": f"raw/gate_futures/{wid0[:10]}/gate_{w0}.tsv.zst",
+            "manifest_sha256": "a" * 64, "data_sha256": "b" * 64, "manifest_bytes": 100, "data_bytes": 200,
+        }
+
+        def make_scan_side_effect(protocol_status, unanchored, availability, replay_res):
+            def _fake_scan(_items, _cfg, _s, _e, _se, _specs, out, **_kw):
+                out["archive_file_checks"] = [{"exchange": "gate_futures", "qa_status": "passed", "problem_count": 0}]
+                out["protocol_status"] = protocol_status
+                out["unanchored_lookback_markets"] = unanchored
+                out["market_availability"] = availability
+                out["replay"] = replay_res
+                out["end_sequence_checkpoint"] = []
+            return _fake_scan
+
+        # Case 1: lookback timed out leaving unanchored market + blocked replay -> MUST be retryable (not data_failed or anchor_unverified)
+        with patch.object(replay, "reconstruct_historical_checkpoint", return_value=(None, {}, None, {"lookback_timed_out": True})), \
+             patch.object(replay, "selected_archives", return_value=iter([])), \
+             patch.object(replay, "scan", side_effect=make_scan_side_effect(
+                 "anchor_unverified",
+                 [{"exchange": "gate_futures", "symbol": "BTCUSDT"}],
+                 [],
+                 {"gate_futures": {"status": "blocked", "reason": "required_stream_interval_unverified"}},
+             )):
+            res1 = replay.audit_window("qa:", cfg, "r1", w0, wid0, 0, 0, candidates=[cand], anchor_lookback_windows=2)
+        self.assertEqual("retryable", res1["status"])
+        self.assertEqual("retryable", res1["protocol_status"])
+        self.assertEqual("LookbackTimeout", res1["error_type"])
+
+        # Case 2: lookback timed out and mid-window snapshot passed protocol, leaving initial_state_unverified prefix -> MUST be retryable (never passed!)
+        with patch.object(replay, "reconstruct_historical_checkpoint", return_value=(None, {}, None, {"lookback_timed_out": True})), \
+             patch.object(replay, "selected_archives", return_value=iter([])), \
+             patch.object(replay, "scan", side_effect=make_scan_side_effect(
+                 "passed",
+                 [],
+                 [{"exchange": "gate_futures", "symbol": "BTCUSDT", "channel": "futures.obu", "intervals": [
+                     {"start_wall_ns": w0 * 1_000_000_000, "end_wall_ns": (w0 + 30) * 1_000_000_000,
+                      "status": "unverified", "reason": "initial_state_unverified"},
+                 ]}],
+                 {},
+             )):
+            res2 = replay.audit_window("qa:", cfg, "r1", w0, wid0, 0, 0, candidates=[cand], anchor_lookback_windows=2)
+        self.assertEqual("retryable", res2["status"])
+        self.assertEqual("retryable", res2["protocol_status"])
+
+        # Case 3: recurring.run never persists retryable as terminal report/sidecar and keeps it in pending_ready_windows.
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            p = state / "qa_reports" / "windows" / wid0[:10] / f"{archive._safe_window_filename(wid0)}.window.qa.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({
+                "qa_status": "passed", "run_id": "r1", "partition_minutes": 15,
+                "checker_commit_sha": "sha1", "files": [cand["source_manifest"]],
+            }), encoding="utf-8")
+            with patch.object(recurring, "verified_candidates", return_value=[cand]), \
+                 patch.object(recurring, "audit_window", return_value=dict(res1)):
+                r = recurring.run("qa:", cfg, "r1", w0, w0, state, "sha1/r1", max_catchup=1)
+            self.assertEqual("retryable", r["status"])
+            self.assertEqual("failed", r["job_execution_status"])
+            self.assertEqual([wid0], r["retryable_windows"])
+            self.assertEqual(1, r["pending_ready_windows"])
+
 
 if __name__ == "__main__":
     unittest.main()
