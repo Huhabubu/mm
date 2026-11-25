@@ -28,6 +28,16 @@ on:
         required: false
         type: boolean
         default: false
+      chain_checkpoints:
+        description: "Carry checkpoint/books/streams from window i to window i+1 to benchmark inheritance"
+        required: false
+        type: boolean
+        default: false
+      reuse_file_qa:
+        description: "Reuse verified persisted per-file qa.json from tokyo-l2-qa-state"
+        required: false
+        type: boolean
+        default: false
       ref:
         description: "Optional branch/SHA for workflow_code scripts"
         required: false
@@ -67,6 +77,15 @@ jobs:
           path: source
           persist-credentials: false
 
+      - name: Checkout persistent QA reports (read-only state branch)
+        uses: actions/checkout@v4
+        with:
+          ref: tokyo-l2-qa-state
+          path: state
+          sparse-checkout: |
+            qa_reports
+          persist-credentials: false
+
       - name: Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -104,6 +123,13 @@ jobs:
           extra=()
           if [[ "${{ inputs.compare_parallel }}" == "true" ]]; then
             extra+=(--compare-parallel)
+          fi
+          if [[ "${{ inputs.chain_checkpoints }}" == "true" ]]; then
+            extra+=(--chain-checkpoints)
+          fi
+          if [[ "${{ inputs.reuse_file_qa }}" == "true" ]]; then
+            CHECKER_SHA="$(git -C source rev-parse HEAD)"
+            extra+=(--reuse-file-qa --state-dir state --checker-sha "$CHECKER_SHA")
           fi
           python workflow_code/scripts/profile_tokyo_l2_qa.py \
             --remote qa: \

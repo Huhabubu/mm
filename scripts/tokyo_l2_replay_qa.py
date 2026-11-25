@@ -179,8 +179,14 @@ def selected_archives(
         yield from pool.map(prepare, enumerate(candidates))
 
 
-def load_btc_specs(remote: str, start_ns: int, tmp: Path) -> dict:
-    names = archive._list_meta_files(remote)
+def load_btc_specs(remote: str, start_ns: int, tmp: Path, *, specs_cache: dict | None = None) -> dict:
+    if specs_cache is not None and "meta_files" in specs_cache:
+        names = specs_cache["meta_files"]
+    else:
+        names = archive._list_meta_files(remote)
+        if specs_cache is not None:
+            specs_cache["meta_files"] = names
+    file_cache = specs_cache.setdefault("files", {}) if specs_cache is not None else None
     result = {}
     for exchange in FOLLOWERS:
         # The specification already observed by the time the sample starts.
@@ -195,15 +201,22 @@ def load_btc_specs(remote: str, start_ns: int, tmp: Path) -> dict:
             seen_s = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
             if seen_s * NS > start_ns:
                 continue
-            meta = json.loads(download(remote, "meta/" + name, tmp / "instrument.meta.json").read_bytes())
+            if file_cache is not None and name in file_cache:
+                meta, raw = file_cache[name]
+            else:
+                meta = json.loads(_call_download(remote, "meta/" + name, tmp / "instrument.meta.json").read_bytes())
+                if meta["exchange"] != exchange or int(meta["reply_wall_ns"]) > start_ns:
+                    continue
+                raw_name = meta["raw_file"]
+                if Path(raw_name).name != raw_name or not raw_name.startswith(exchange + "_"):
+                    raise ValueError("invalid instrument snapshot path")
+                raw = _call_download(remote, "meta/specs/" + raw_name, tmp / "instrument.json").read_bytes()
+                if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
+                    raise ValueError("instrument snapshot digest mismatch")
+                if file_cache is not None:
+                    file_cache[name] = (meta, raw)
             if meta["exchange"] != exchange or int(meta["reply_wall_ns"]) > start_ns:
                 continue
-            raw_name = meta["raw_file"]
-            if Path(raw_name).name != raw_name or not raw_name.startswith(exchange + "_"):
-                raise ValueError("invalid instrument snapshot path")
-            raw = download(remote, "meta/specs/" + raw_name, tmp / "instrument.json").read_bytes()
-            if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
-                raise ValueError("instrument snapshot digest mismatch")
             result[exchange] = btc_spec(exchange, json.loads(raw))
             break
     return result
@@ -399,6 +412,27 @@ def _valid_checkpoint_quote(checkpoint_quote, start_ns):
     return (wall, mid)
 
 
+def _cached_partition_audit(path, mf, config, cand, prechecked_file_reports):
+    """Reuse a verified partition audit report when its identity and digests match exactly."""
+    if prechecked_file_reports:
+        key = (str(cand.get("source_manifest") or ""), str(cand.get("data_sha256") or ""))
+        cached = prechecked_file_reports.get(key)
+        if (
+            isinstance(cached, dict)
+            and cached.get("file_name") == mf.get("file_name")
+            and int(cached.get("bytes") or -1) == int(mf.get("bytes") or -2)
+            and cached.get("sha256") == mf.get("sha256")
+            and cached.get("qa_status") in {"passed", "failed", "needs_review"}
+            and isinstance(cached.get("problems"), list)
+            and isinstance(cached.get("structural_problems"), list)
+        ):
+            return cached
+    audited = archive.check_partition(path, mf, config)
+    if prechecked_file_reports is not None and cand.get("source_manifest") and cand.get("data_sha256"):
+        prechecked_file_reports[(str(cand["source_manifest"]), str(cand["data_sha256"]))] = audited
+    return audited
+
+
 def scan(
     items,
     config,
@@ -415,6 +449,7 @@ def scan(
     checkpoint_streams=None,
     export_checkpoint_state=None,
     allow_startup_stub_exchanges=None,
+    prechecked_file_reports=None,
 ):
     (
         boundary_checkpoints,
@@ -468,7 +503,7 @@ def scan(
         file_start = candidate["planned_start_s"] * NS
         file_end = candidate.get("planned_end_s", candidate["planned_start_s"] + (end_ns - start_ns) // NS) * NS
         discontinuous = exchange in previous_end and previous_end[exchange] < file_start
-        audited = archive.check_partition(path, mf, config)
+        audited = _cached_partition_audit(path, mf, config, candidate, prechecked_file_reports)
         structural_failure = (
             bool(audited.get("structural_problems"))
             or (audited.get("coverage_incomplete") is True
@@ -1271,6 +1306,7 @@ def reconstruct_historical_checkpoint(
     source_restrictions=None,
     download_timeout_seconds=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     lookback_timeout_seconds=DEFAULT_LOOKBACK_TIMEOUT_SECONDS,
+    prechecked_file_reports=None,
 ):
     """Walk back up to anchor_lookback_windows, stopping per market at snapshots or barriers, and rebuild forward."""
     expected_depths = _expected_depth_markets_set(config)
@@ -1377,7 +1413,7 @@ def reconstruct_historical_checkpoint(
                     )
                 for (ex, cand, w_tmp), (_c, mf, data_path) in zip(probe_list, prepared):
                     expected_for_ex = {(ex, sym) for sym in missing_by_ex.get(ex, ())}
-                    audited = archive.check_partition(data_path, mf, config)
+                    audited = _cached_partition_audit(data_path, mf, config, cand, prechecked_file_reports)
                     bad = (
                         bool(audited.get("structural_problems"))
                         or (audited.get("coverage_incomplete") is True and audited.get("is_startup_stub") is not True)
@@ -1507,6 +1543,7 @@ def reconstruct_historical_checkpoint(
                     checkpoint_streams=fwd_streams,
                     export_checkpoint_state=export_state,
                     allow_startup_stub_exchanges=allowed_stubs,
+                    prechecked_file_reports=prechecked_file_reports,
                 )
                 fwd_ckpt = step_summary.get("end_sequence_checkpoint") or []
                 fwd_books = export_state.get("books") or {}
@@ -1556,7 +1593,8 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                  checkpoint_books=None, checkpoint_quote=None, checkpoint_streams=None,
                  ancestor_checkpoints=None, export_checkpoint_state=None,
                  download_timeout_seconds=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
-                 lookback_timeout_seconds=DEFAULT_LOOKBACK_TIMEOUT_SECONDS):
+                 lookback_timeout_seconds=DEFAULT_LOOKBACK_TIMEOUT_SECONDS,
+                 prechecked_file_reports=None, specs_cache=None):
     out = {"status": "retryable", "run_id": run_id, "window_id": window,
            "warmup_windows": warmup_windows, "replay_sample_seconds": replay_seconds}
     stage = "validate_window"
@@ -1568,6 +1606,7 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
         end = begin + step
         if end > time.time():
             raise ValueError("target window has not ended")
+        audit_cache = {} if prechecked_file_reports is None else prechecked_file_reports
         with tempfile.TemporaryDirectory(prefix="tokyo_archive_qa_") as directory:
             tmp = Path(directory)
             eff_checkpoint = checkpoint
@@ -1577,6 +1616,20 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
             lookback = warmup_windows if anchor_lookback_windows is None else anchor_lookback_windows
             if anchor_lookback_windows is not None and anchor_lookback_windows > warmup_windows:
                 stage = "reconstruct_historical_checkpoint"
+                lb_kwargs = {}
+                lb_target = (
+                    reconstruct_historical_checkpoint.side_effect
+                    if callable(getattr(reconstruct_historical_checkpoint, "side_effect", None))
+                    else reconstruct_historical_checkpoint
+                )
+                try:
+                    lb_params = inspect.signature(lb_target).parameters
+                    if "prechecked_file_reports" in lb_params or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in lb_params.values()
+                    ):
+                        lb_kwargs["prechecked_file_reports"] = audit_cache
+                except (TypeError, ValueError):
+                    pass
                 eff_checkpoint, eff_books, eff_quote, lb_diag = reconstruct_historical_checkpoint(
                     remote,
                     config,
@@ -1594,6 +1647,7 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                     source_restrictions=source_restrictions,
                     download_timeout_seconds=download_timeout_seconds,
                     lookback_timeout_seconds=lookback_timeout_seconds,
+                    **lb_kwargs,
                 )
                 if lb_diag:
                     eff_streams = lb_diag.pop("merged_streams", eff_streams)
@@ -1608,11 +1662,38 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
             ))
             stage = "read_effective_btc_specs"
             try:
-                specs = load_btc_specs(remote, begin * NS, tmp) if replay_seconds else {}
+                if replay_seconds:
+                    specs_target = (
+                        load_btc_specs.side_effect
+                        if callable(getattr(load_btc_specs, "side_effect", None))
+                        else load_btc_specs
+                    )
+                    try:
+                        sp_params = inspect.signature(specs_target).parameters
+                        if "specs_cache" in sp_params or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sp_params.values()
+                        ):
+                            specs = load_btc_specs(remote, begin * NS, tmp, specs_cache=specs_cache)
+                        else:
+                            specs = load_btc_specs(remote, begin * NS, tmp)
+                    except (TypeError, ValueError):
+                        specs = load_btc_specs(remote, begin * NS, tmp)
+                else:
+                    specs = {}
             except (KeyError, OSError, RuntimeError, StopIteration, ValueError) as exc:
                 out["spec_error_type"] = type(exc).__name__
                 specs = {}
             stage = "validate_archived_events"
+            scan_kwargs = {}
+            scan_target = scan.side_effect if callable(getattr(scan, "side_effect", None)) else scan
+            try:
+                sc_params = inspect.signature(scan_target).parameters
+                if "prechecked_file_reports" in sc_params or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sc_params.values()
+                ):
+                    scan_kwargs["prechecked_file_reports"] = audit_cache
+            except (TypeError, ValueError):
+                pass
             scan(
                 items,
                 config,
@@ -1627,6 +1708,7 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                 checkpoint_quote=eff_quote,
                 checkpoint_streams=eff_streams,
                 export_checkpoint_state=export_checkpoint_state,
+                **scan_kwargs,
             )
         files_ok = all(x["qa_status"] == "passed" for x in out["archive_file_checks"])
         out["status"] = window_status(out["protocol_status"], files_ok, list(out["replay"].values()))

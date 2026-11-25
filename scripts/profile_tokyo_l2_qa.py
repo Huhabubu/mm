@@ -38,7 +38,13 @@ def profile_window(
     replay_seconds: int = 660,
     warmup_windows: int = 0,
     lookback_windows: int = 0,
-) -> dict:
+    checkpoint=None,
+    checkpoint_books=None,
+    checkpoint_quote=None,
+    checkpoint_streams=None,
+    prechecked_file_reports=None,
+    specs_cache=None,
+) -> tuple[dict, dict, dict]:
     begin = coverage.parse_window_start_s(window_id)
     pm = coverage.configured_partition_minutes(config)
     step = pm * 60
@@ -154,19 +160,28 @@ def profile_window(
             replay_seconds,
             warmup_windows,
             candidates=candidates,
+            checkpoint=checkpoint,
             anchor_lookback_windows=lookback_windows if lookback_windows > 0 else warmup_windows,
+            checkpoint_books=checkpoint_books,
+            checkpoint_quote=checkpoint_quote,
+            checkpoint_streams=checkpoint_streams,
             export_checkpoint_state=export_state,
+            prechecked_file_reports=prechecked_file_reports,
+            specs_cache=specs_cache,
         )
     timings["audit_window_wall_s"] = time.perf_counter() - t_total0
 
-    return {
+    profile_row = {
         "cpu_count": os.cpu_count(),
         "window_id": window_id,
         "replay_seconds": replay_seconds,
         "warmup_windows": warmup_windows,
         "lookback_windows": lookback_windows,
+        "used_checkpoint": bool(checkpoint and checkpoint_books),
+        "used_prechecked_cache": prechecked_file_reports is not None,
         "status": report.get("status"),
         "protocol_status": report.get("protocol_status"),
+        "boundary_checkpoint_markets": report.get("boundary_checkpoint_markets"),
         "end_checkpoint_markets": len(report.get("end_sequence_checkpoint") or []),
         "proven_issues_count": len(report.get("proven_protocol_issues") or []),
         "unanchored_count": len(report.get("unanchored_lookback_markets") or []),
@@ -178,6 +193,7 @@ def profile_window(
         "counts": dict(counts),
         "memory": _peak_rss_mb(),
     }
+    return profile_row, report, export_state
 
 
 def main() -> int:
@@ -190,22 +206,57 @@ def main() -> int:
     parser.add_argument("--lookback-windows", type=int, default=0)
     parser.add_argument("--replay-seconds", type=int, default=660)
     parser.add_argument("--compare-parallel", action="store_true")
+    parser.add_argument("--chain-checkpoints", action="store_true", help="Carry checkpoint/books/streams from window i to window i+1")
+    parser.add_argument("--reuse-file-qa", action="store_true", help="Pre-populate and reuse verified partition audit cache across passes")
+    parser.add_argument("--state-dir", type=Path, default=None, help="Optional tokyo-l2-qa-state dir for loading persisted file qa.json & sidecars")
+    parser.add_argument("--checker-sha", default="", help="Expected checker commit SHA for persisted file qa.json validation")
     args = parser.parse_args()
 
     config = json.loads(args.config.read_text(encoding="utf-8"))
     results = []
-    for wid in [w.strip() for w in args.windows.split(",") if w.strip()]:
+    carry_ckpt = None
+    carry_books = None
+    carry_quote = None
+    carry_streams = None
+    shared_file_cache = None
+    if args.reuse_file_qa:
+        if args.state_dir and args.checker_sha:
+            import tokyo_l2_recurring_qa as recurring
+            first_wid = [w.strip() for w in args.windows.split(",") if w.strip()][0]
+            first_begin = coverage.parse_window_start_s(first_wid)
+            pm = coverage.configured_partition_minutes(config)
+            cands = replay.verified_candidates(
+                args.remote, config, args.run_id, first_begin - max(args.lookback_windows, args.warmup_windows, 2) * pm * 60,
+                historical=True,
+            )
+            shared_file_cache = recurring._load_prechecked_file_reports(args.state_dir, cands, args.checker_sha, config)
+        else:
+            shared_file_cache = {}
+    specs_cache = {}
+    for idx, wid in enumerate(w.strip() for w in args.windows.split(",") if w.strip()):
         rs = args.replay_seconds if wid.endswith(":00Z") else 0
-        res = profile_window(
+        use_ckpt = args.chain_checkpoints and idx > 0 and carry_ckpt is not None
+        res, rep, exp = profile_window(
             args.remote,
             config,
             args.run_id,
             wid,
             replay_seconds=rs,
-            warmup_windows=args.warmup_windows,
-            lookback_windows=args.lookback_windows,
+            warmup_windows=0 if use_ckpt else args.warmup_windows,
+            lookback_windows=0 if use_ckpt else args.lookback_windows,
+            checkpoint=carry_ckpt if use_ckpt else None,
+            checkpoint_books=carry_books if use_ckpt else None,
+            checkpoint_quote=carry_quote if use_ckpt else None,
+            checkpoint_streams=carry_streams if use_ckpt else None,
+            prechecked_file_reports=shared_file_cache,
+            specs_cache=specs_cache,
         )
         results.append(res)
+        if args.chain_checkpoints:
+            carry_ckpt = rep.get("end_sequence_checkpoint") or None
+            carry_books = exp.get("books") or None
+            carry_quote = exp.get("end_signal_quote")
+            carry_streams = exp.get("streams") or None
     print(json.dumps({"profiles": results}, indent=2))
     return 0
 
