@@ -470,6 +470,7 @@ def run(
         ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred, catchup_first=catchup_first,
     )
     stopped_by_runtime_budget = False
+    retryable_windows = []
     for idx, start in enumerate(planned):
         if idx > 0 and deadline_mono is not None and time.monotonic() >= deadline_mono:
             stopped_by_runtime_budget = True
@@ -545,6 +546,16 @@ def run(
             input_checkpoint_digest=_checkpoint_digest(checkpoint),
             completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
+        checked.add(start)
+        checked_windows.append(wid(start))
+        if report.get("status") == "retryable":
+            # Never persist a timeout/retryable window as a verified report or checkpoint sidecar.
+            retryable_windows.append(wid(start))
+            proofs.pop(start, None)
+            new_exports.pop(start, None)
+            sidecar_cache.pop(start, None)
+            validated = persist_consistent_state()
+            continue
         proofs[start] = report
         new_exports[start] = export_state
         if export_state.get("books") or export_state.get("end_signal_quote") is not None or export_state.get("streams"):
@@ -553,8 +564,6 @@ def run(
                 export_state.get("end_signal_quote"),
                 export_state.get("streams") or {},
             )
-        checked.add(start)
-        checked_windows.append(wid(start))
         # Persist each completed window + checkpoint sidecar atomically and revoke stale downstream reports immediately.
         validated = persist_consistent_state(start)
 
@@ -562,7 +571,7 @@ def run(
 
     all_known = {
         start: proof for start, proof in validated.items()
-        if start in checked or proof.get("status") in {
+        if proof.get("status") in {
             "passed", "data_failed", "anchor_unverified", "replay_init_unverified",
         }
     }
@@ -583,9 +592,9 @@ def run(
     deferred_windows = [wid(start) for start, report in sorted(all_known.items())
                         if report.get("status") == "anchor_unverified"]
     completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    cur_status = current_report.get("status", "pending")
+    cur_status = "retryable" if wid(current) in retryable_windows else current_report.get("status", "pending")
     terminal_quality = {"passed", "data_failed", "anchor_unverified", "replay_init_unverified"}
-    any_checked_retryable = any(proofs[s].get("status") == "retryable" for s in checked if s in proofs)
+    any_checked_retryable = bool(retryable_windows)
     clean_exec = (
         not any_checked_retryable
         and (
@@ -620,6 +629,7 @@ def run(
         "deferred_anchor_unverified_windows": deferred_windows,
         "historical_replay_init_unverified_windows": historical_replay_init,
         "historical_failed_windows": historical,
+        "retryable_windows": retryable_windows,
         "pending_ready_windows": len(set(ready) - set(all_known)),
         "stopped_by_runtime_budget": stopped_by_runtime_budget,
         "max_runtime_seconds": budget_s,
