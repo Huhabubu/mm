@@ -199,6 +199,48 @@ class RawAuditIntegration(unittest.TestCase):
             self.assertTrue(result["passed"], result["checks"])
             self.assertEqual(result["gate_trades"]["unique_ids"], 3)
 
+    def test_raw_audit_matches_gate_obu_50_channel(self):
+        import zstandard as zstd
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fetched, out, old = root / "f", root / "out", root / "old"
+            two_partitions(fetched)
+            # Rewrite fixture Gate OBU symbol from ob.BTC_USDT.400 to production ob.BTC_USDT.50.
+            for zst in sorted(fetched.rglob("gate_futures*.tsv.zst")):
+                raw_txt = zstd.ZstdDecompressor().decompress(zst.read_bytes()).decode("utf-8")
+                assert "ob.BTC_USDT.400" in raw_txt
+                new_bytes = zstd.ZstdCompressor().compress(raw_txt.replace("ob.BTC_USDT.400", "ob.BTC_USDT.50").encode("utf-8"))
+                zst.write_bytes(new_bytes)
+                mf_path = Path(str(zst).removesuffix(".tsv.zst") + ".manifest.json")
+                mf = json.loads(mf_path.read_text())
+                import hashlib
+                mf["sha256"] = hashlib.sha256(new_bytes).hexdigest()
+                mf["bytes"] = len(new_bytes)
+                mf_path.write_text(json.dumps(mf))
+            rc = sc.main(["--fetched", str(fetched), "--gate-symbol", "BTC_USDT",
+                          "--state", str(root / "state"), "--label-date", DATE, "--finalize", "--out", str(out)])
+            self.assertEqual(rc, 0)
+            report = json.loads((out / "stream_report.json").read_text())
+            parts = [{"exchange": ex, "data": str(data), "manifest": str(manifest),
+                      "slot": 0 if "T0000" in data.name else 1}
+                     for ex, data, manifest, _ in sc.discover_partitions(fetched)]
+            old.mkdir()
+            names = tp.artifact_names()
+            for key in ("binance_bbo", "gate_l1_bbo"):
+                with np.load(out / names[key]) as z:
+                    values = dict(z)
+                for ts in ("local_ts_ns", "exch_ts_ns"):
+                    values[ts] = values[ts].astype(np.float64).astype(np.int64)
+                np.savez_compressed(old / names[key], **values)
+            calendar = [{"exchange": "gate_futures", "unrebuildable_depth_intervals": [
+                {"reason": "missing_same_connection_anchor", "excluded_frames": 1,
+                 "start_wall_ns": D0 + NS, "end_wall_ns": D0 + NS}]}]
+            protocol = {"execution_unavailable_intervals": [
+                {"exchange": "gate_futures", "channel": "futures.obu", "end_wall_ns": D0 + 3 * NS}]}
+            result = audit.audit(parts, out, old, names, report, calendar, protocol)
+            self.assertTrue(result["passed"], result["checks"])
+            self.assertEqual(result["gate_depth"]["obu_symbols"], ["ob.BTC_USDT.50"])
+
 
 if __name__ == "__main__":
     unittest.main()

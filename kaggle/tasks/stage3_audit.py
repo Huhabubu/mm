@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 
 import numpy as np
 import zstandard as zstd
@@ -16,6 +17,7 @@ from hftbacktest import (BUY_EVENT, SELL_EVENT, EXCH_EVENT, LOCAL_EVENT, DEPTH_E
 EVENT = np.dtype([("kind", "<u8"), ("side", "<u8"), ("exch", "<i8"), ("local", "<i8"),
                   ("px", "<f8"), ("qty", "<f8"), ("flags", "<i8")])
 QUOTE_KEYS = ("local_ts_ns", "exch_ts_ns", "bid_px", "bid_qty", "ask_px", "ask_qty", "mid_px")
+GATE_BTC_OBU_RE = re.compile(r"^ob\.btc_usdt\.\d+$")
 
 
 def error_stats(a, b):
@@ -73,6 +75,7 @@ def scan(parts):
     quotes = {"binance_bbo": [], "gate_l1_bbo": []}
     trades, copies, conflicts = {}, 0, 0
     depths, trace, recoveries, pre = [], [], [], []
+    obu_symbols = set()
     anchor = None
     pending = None
     first_snapshot = None
@@ -123,9 +126,12 @@ def scan(parts):
             symbol = str(row.get("s", ""))
             if channel == "futures.book_ticker" and symbol == "BTC_USDT":
                 quotes["gate_l1_bbo"].append(quote_row(wall, obj, row, False))
-            if channel != "futures.obu" or symbol.lower() != "ob.btc_usdt.400":
+            if channel != "futures.obu" or not GATE_BTC_OBU_RE.match(symbol.lower()):
                 continue
-            full, u, parent = bool(row.get("full", False)), row.get("u"), row.get("U")
+            obu_symbols.add(symbol)
+            full = bool(row.get("full", False))
+            u = int(row["u"]) if row.get("u") is not None else None
+            parent = int(row["U"]) if row.get("U") is not None else None
             if first_snapshot is None and not full:
                 pre.append(wall)
                 continue
@@ -150,13 +156,13 @@ def scan(parts):
                               "U": parent, "u": u, "connection": conn[1:], "slot": part["slot"],
                               "line": line_no})
             exch = int(row.get("t") or obj.get("time_ms") or wall // 1_000_000) * 1_000_000
-            for levels, side in ((row.get("b", []), BUY_EVENT), (row.get("a", []), SELL_EVENT)):
+            for levels, side in ((row.get("b") or (), BUY_EVENT), (row.get("a") or (), SELL_EVENT)):
                 for px, qty in levels:
                     depths.append((DEPTH_SNAPSHOT_EVENT if full else DEPTH_EVENT, side, exch, wall,
                                    float(px), float(qty), 0))
     return {"quotes": quotes, "trades": trades, "copies": copies, "conflicts": conflicts,
             "depths": depths, "trace": trace, "recoveries": recoveries,
-            "pre": pre, "chain_errors": chain_errors}
+            "pre": pre, "chain_errors": chain_errors, "obu_symbols": sorted(obu_symbols)}
 
 
 def protocol_evidence(folder, windows, parts, run_id, checker, rules_sha=None, expected_archive_revisions=None):
@@ -268,7 +274,8 @@ def audit(parts, new_out, old_out, names, new_report, old_calendar, protocol):
     ids_hash = hashlib.sha256(json.dumps(sorted(raw["trades"]), separators=(",", ":")).encode()).hexdigest()
     return {"passed": all(checks.values()), "checks": checks, "quote_timestamps": quote_reports,
             "gate_depth": {"raw_chain_errors": raw["chain_errors"], "expected_event_rows": len(raw["depths"]),
-                           "trace": raw["trace"], "recoveries": raw["recoveries"], "old_calendar": gate_cal},
+                           "obu_symbols": raw["obu_symbols"], "trace": raw["trace"],
+                           "recoveries": raw["recoveries"], "old_calendar": gate_cal},
             "gate_trades": {"raw_copies": raw["copies"], "unique_ids": len(raw["trades"]),
                             "removed_copies": raw["copies"] - len(raw["trades"]), "conflicts": raw["conflicts"],
                             "unique_ids_sha256": ids_hash, "earliest_receive_events_exact":
