@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -99,6 +100,14 @@ def depth_event(exchange: str, boot: str, conn: str, epoch: int, kind: str, obj:
     return None
 
 
+def extract_exchange_ms(event: Depth) -> int:
+    """Return exchange event timestamp in milliseconds across scalar or tuple payloads."""
+    raw = event.exchange_ms
+    if isinstance(raw, (tuple, list)):
+        raw = raw[0] if raw else 0
+    return int(raw or 0)
+
+
 @dataclass
 class Chain:
     connection: tuple[str, str, int] | None = None
@@ -192,6 +201,47 @@ class Book:
 
     def crossed(self) -> bool:
         return bool(self.bids and self.asks and max(self.bids) >= min(self.asks))
+
+    def is_valid_uncrossed(self) -> bool:
+        if not self.bids or not self.asks or self.crossed():
+            return False
+        return all(
+            math.isfinite(px) and math.isfinite(qty) and px > 0 and qty > 0
+            for side in (self.bids, self.asks)
+            for px, qty in side.items()
+        )
+
+    def canonical_levels(self) -> dict[str, list[list[float]]]:
+        return {
+            "bids": [[float(px), float(qty)] for px, qty in sorted(self.bids.items(), reverse=True) if qty > 0],
+            "asks": [[float(px), float(qty)] for px, qty in sorted(self.asks.items()) if qty > 0],
+        }
+
+    def digest(self) -> str:
+        payload = json.dumps(self.canonical_levels(), separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def from_levels(cls, data: dict[str, Any]) -> "Book":
+        if not isinstance(data, dict):
+            raise ValueError("book checkpoint must be a mapping")
+        bids: dict[float, float] = {}
+        asks: dict[float, float] = {}
+        for target, key in ((bids, "bids"), (asks, "asks")):
+            levels = data.get(key)
+            if not isinstance(levels, list):
+                raise ValueError(f"missing {key} list in book checkpoint")
+            for level in levels:
+                if not isinstance(level, (list, tuple)) or len(level) < 2:
+                    raise ValueError("invalid price level in book checkpoint")
+                px, qty = float(level[0]), float(level[1])
+                if not math.isfinite(px) or not math.isfinite(qty) or px <= 0 or qty <= 0:
+                    raise ValueError("non-finite or non-positive level in book checkpoint")
+                target[px] = qty
+        book = cls(bids=bids, asks=asks)
+        if not book.is_valid_uncrossed():
+            raise ValueError("book checkpoint is empty or crossed")
+        return book
 
 
 def verify_gate_sizes(event: Depth) -> bool:

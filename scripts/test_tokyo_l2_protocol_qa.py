@@ -1116,5 +1116,411 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual("data_failed", window_status("anchor_unverified", True, [ok, init]))
 
 
+    def test_cross_partition_pure_delta_book_inheritance_and_hourly_replay(self):
+        import io
+        import json
+        from unittest.mock import patch
+        import zstandard as zstd
+        import data_coverage as coverage
+        import tokyo_l2_protocol_qa as protocol
+        import tokyo_l2_replay_qa as replay
+
+        w0 = 1_795_276_800 - 1800  # 15:30Z (initial snapshot)
+        w1 = w0 + 900               # 15:45Z (pure deltas only)
+        w2 = w1 + 900               # 16:00Z (hourly replay, pure deltas only!)
+        step_ns = 900 * 1_000_000_000
+
+        def write_zst(path, rows_list):
+            buf = io.StringIO()
+            for r in rows_list:
+                buf.write("\t".join(map(str, r)) + "\n")
+            cctx = zstd.ZstdCompressor()
+            path.write_bytes(cctx.compress(buf.getvalue().encode("utf-8")))
+
+        def gate_depth(wall_ns, ms, u, prev_u, bids, asks, full=False):
+            payload = {
+                "channel": "futures.obu",
+                "event": "update",
+                "result": {
+                    "s": "ob.BTC_USDT.50",
+                    "u": u,
+                    "U": prev_u,
+                    "t": ms,
+                    "b": bids,
+                    "a": asks,
+                },
+            }
+            if full:
+                payload["result"]["full"] = True
+                del payload["result"]["U"]
+            return (wall_ns, wall_ns, "c1", 1, u, "DATA", json.dumps(payload))
+
+        def gate_trade(wall_ns, ms, tid, px="50000.5", sz="1"):
+            payload = {
+                "channel": "futures.trades",
+                "event": "update",
+                "result": [
+                    {
+                        "id": tid,
+                        "contract": "BTC_USDT",
+                        "price": px,
+                        "size": sz,
+                        "create_time_ms": ms,
+                        "ts": ms,
+                    }
+                ],
+            }
+            return (wall_ns, wall_ns, "c1", 1, tid, "DATA", json.dumps(payload))
+
+        def binance_bbo(wall_ns, ms, bid="50000.0", ask="50001.0"):
+            payload = {"e": "bookTicker", "s": "BTCUSDT", "b": bid, "a": ask, "T": ms}
+            return (wall_ns, wall_ns, "b1", 1, ms, "DATA", json.dumps(payload))
+
+        def binance_depth(wall_ns, ms, u, pu, is_snap=False):
+            if is_snap:
+                payload = {
+                    "event": "REST_SNAPSHOT",
+                    "symbol": "BTCUSDT",
+                    "conn_id": "b1",
+                    "epoch": 1,
+                    "snapshot": {"lastUpdateId": u, "T": ms, "bids": [["50000.0", "1"]], "asks": [["50001.0", "1"]]},
+                }
+                return (wall_ns, wall_ns, "b1", 1, u, "META", json.dumps(payload))
+            payload = {
+                "e": "depthUpdate", "s": "BTCUSDT", "U": pu + 1, "u": u, "pu": pu, "T": ms,
+                "b": [["50000.0", "1.5"]], "a": [["50001.0", "1.5"]],
+            }
+            return (wall_ns, wall_ns, "b1", 1, u, "DATA", json.dumps(payload))
+
+        cfg = {
+            "deployment": {
+                "partition_minutes": 15,
+                "channel_silence_max_seconds": {
+                    "depth": 1000,
+                    "signal": 1000,
+                    "bbo": 1000,
+                    "event_trade": 1000,
+                    "event_trade_quiet_max": 1000,
+                    "other": 1000,
+                },
+            },
+            "exchanges": {
+                "binance_futures": {"enabled": True, "symbols": ["BTCUSDT"], "channels": ["bookTicker", "depth@100ms"]},
+                "gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu", "futures.trades"]},
+            },
+        }
+        specs = {
+            "gate_futures": {"tick": "0.1", "lot": "1", "multiplier": "0.0001", "order_qty": "1", "lot_source": "step"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp:
+            tmp = Path(temp)
+            files = {}
+            for idx, (w, u_start, is_first) in enumerate(((w0, 100, True), (w1, 103, False), (w2, 106, False))):
+                w_ns = w * 1_000_000_000
+                g_rows = []
+                b_rows = []
+                if is_first:
+                    g_rows.append(gate_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, None,
+                                             [["50000.0", "2"], ["49999.0", "2"]], [["50001.0", "2"], ["50002.0", "2"]], full=True))
+                    b_rows.append(binance_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, None, is_snap=True))
+                else:
+                    g_rows.append(gate_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, u_start - 1,
+                                             [["50000.0", "3"]], [["50001.0", "3"]]))
+                    b_rows.append(binance_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, u_start - 1))
+                # Second & third updates covering target + replay window (>600s for w2).
+                t_mid = w + (650 if w == w2 else 450)
+                t_end = w + 850
+                for step_idx, t_s in enumerate((t_mid, t_end), start=1):
+                    u_val = u_start + step_idx
+                    g_rows.append(gate_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val - 1,
+                                             [["50000.0", str(2 + step_idx)]], [["50001.0", str(2 + step_idx)]]))
+                    b_rows.append(binance_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val - 1))
+                g_rows.append(gate_trade((w + 10) * 1_000_000_000, (w + 10) * 1000, idx * 10 + 1))
+                b_rows.append(binance_bbo((w + 2) * 1_000_000_000, (w + 2) * 1000))
+                b_rows.append(binance_bbo((w + 610) * 1_000_000_000, (w + 610) * 1000))
+                b_rows.append(binance_bbo((w + 700) * 1_000_000_000, (w + 700) * 1000))
+                g_rows.sort(key=lambda r: r[0])
+                b_rows.sort(key=lambda r: r[0])
+                g_path = tmp / f"gate_{w}.tsv.zst"
+                b_path = tmp / f"binance_{w}.tsv.zst"
+                write_zst(g_path, g_rows)
+                write_zst(b_path, b_rows)
+                files[w] = [
+                    ({"exchange": "binance_futures", "planned_start_s": w, "planned_end_s": w + 900},
+                     {"file_name": b_path.name, "boot_id": "boot1"}, b_path),
+                    ({"exchange": "gate_futures", "planned_start_s": w, "planned_end_s": w + 900},
+                     {"file_name": g_path.name, "boot_id": "boot1"}, g_path),
+                ]
+
+            fake_check = {"qa_status": "passed", "problems": [], "structural_problems": [], "coverage_incomplete": False}
+            with patch.object(replay.archive, "check_partition", return_value=fake_check), \
+                 patch.object(replay, "FOLLOWERS", ("gate_futures",)):
+                # W0 (15:30Z) establishes anchored books.
+                exp0 = {}
+                s0 = {}
+                replay.scan(files[w0], cfg, w0 * 1_000_000_000, w1 * 1_000_000_000, 0, {}, s0, export_checkpoint_state=exp0)
+                self.assertEqual("passed", s0["protocol_status"])
+                self.assertEqual(2, len(s0["end_sequence_checkpoint"]))
+                self.assertTrue(all(r.get("book_anchored") for r in s0["end_sequence_checkpoint"]))
+
+                # W1 (15:45Z) has pure deltas only and zero warmup files passed — inherits & extends book state!
+                exp1 = {}
+                s1 = {}
+                replay.scan(
+                    files[w1], cfg, w1 * 1_000_000_000, w2 * 1_000_000_000, 0, {}, s1,
+                    checkpoint=s0["end_sequence_checkpoint"],
+                    checkpoint_books=exp0["books"],
+                    checkpoint_quote=exp0["end_signal_quote"],
+                    export_checkpoint_state=exp1,
+                )
+                self.assertEqual("passed", s1["protocol_status"])
+                self.assertEqual(2, s1["boundary_book_anchored_markets"])
+                self.assertEqual(2, len(s1["end_sequence_checkpoint"]))
+                self.assertEqual([[50000.0, 4.0], [49999.0, 2.0]], exp1["books"][("gate_futures", "BTCUSDT")]["bids"])
+
+                # W2 (16:00Z) runs real hourly HftBacktest smoke replay + probe_orders on pure deltas with warmup=0!
+                s2 = {}
+                replay.scan(
+                    files[w2], cfg, w2 * 1_000_000_000, (w2 + 900) * 1_000_000_000, (w2 + 660) * 1_000_000_000,
+                    specs, s2,
+                    checkpoint=s1["end_sequence_checkpoint"],
+                    checkpoint_books=exp1["books"],
+                    checkpoint_quote=exp1["end_signal_quote"],
+                )
+                self.assertEqual("passed", s2["protocol_status"])
+                self.assertEqual("passed", s2["replay"]["gate_futures"]["status"])
+                self.assertEqual("passed", replay.window_status(s2["protocol_status"], True, list(s2["replay"].values())))
+
+                # Tampering book levels fails digest validation closed (never silently accepts bad state).
+                tampered_books = {
+                    k: ({**v, "bids": [[99999.0, 1.0]]} if k == ("gate_futures", "BTCUSDT") else v)
+                    for k, v in exp1["books"].items()
+                }
+                s_tampered = {}
+                replay.scan(
+                    files[w2], cfg, w2 * 1_000_000_000, (w2 + 900) * 1_000_000_000, (w2 + 660) * 1_000_000_000,
+                    specs, s_tampered,
+                    checkpoint=s1["end_sequence_checkpoint"],
+                    checkpoint_books=tampered_books,
+                    checkpoint_quote=exp1["end_signal_quote"],
+                )
+                self.assertEqual("anchor_unverified", s_tampered["protocol_status"])
+                self.assertEqual("blocked", s_tampered["replay"]["gate_futures"]["status"])
+                self.assertIn("gate_futures", {m["exchange"] for m in s_tampered["rejected_checkpoint_markets"]})
+
+    def test_reconstruct_historical_checkpoint_walks_past_four_windows_and_stops_on_gap(self):
+        import io
+        import json
+        from unittest.mock import patch
+        import zstandard as zstd
+        import data_coverage as coverage
+        import tokyo_l2_replay_qa as replay
+
+        w0 = 1_795_276_800
+        step = 900
+        windows = [w0 + i * step for i in range(7)]  # w0..w6 (6-window span > legacy lookback=4)
+        cfg = {
+            "deployment": {
+                "partition_minutes": 15,
+                "channel_silence_max_seconds": {
+                    "depth": 1000, "signal": 1000, "bbo": 1000,
+                    "event_trade": 1000, "event_trade_quiet_max": 1000, "other": 1000,
+                },
+            },
+            "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
+        }
+
+        def make_zst(path, msgs):
+            buf = io.StringIO()
+            for r in msgs:
+                buf.write("\t".join(map(str, r)) + "\n")
+            path.write_bytes(zstd.ZstdCompressor().compress(buf.getvalue().encode("utf-8")))
+
+        with tempfile.TemporaryDirectory() as temp:
+            tmp = Path(temp)
+            files_by_w = {}
+            cands = []
+            seq = 10
+            for idx, w in enumerate(windows):
+                w_ns = w * 1_000_000_000
+                msgs = []
+                if idx == 0:
+                    payload = {"channel": "futures.obu", "event": "update", "result": {
+                        "s": "ob.BTC_USDT.50", "full": True, "u": seq, "t": w * 1000 + 1000,
+                        "b": [["50000.0", "2"]], "a": [["50001.0", "2"]],
+                    }}
+                    msgs.append((w_ns + 1_000_000_000, w_ns + 1_000_000_000, "c1", 1, seq, "DATA", json.dumps(payload)))
+                else:
+                    # Break sequence on window 3 in a copy below; here keep strictly continuous.
+                    seq += 1
+                    payload = {"channel": "futures.obu", "event": "update", "result": {
+                        "s": "ob.BTC_USDT.50", "u": seq, "U": seq - 1, "t": w * 1000 + 1000,
+                        "b": [["50000.0", str(2 + idx)]], "a": [["50001.0", "2"]],
+                    }}
+                    msgs.append((w_ns + 1_000_000_000, w_ns + 1_000_000_000, "c1", 1, seq, "DATA", json.dumps(payload)))
+                seq += 1
+                msgs.append(((w + 600) * 1_000_000_000, (w + 600) * 1_000_000_000, "c1", 1, seq, "DATA", json.dumps({
+                    "channel": "futures.obu", "event": "update", "result": {
+                        "s": "ob.BTC_USDT.50", "u": seq, "U": seq - 1, "t": (w + 600) * 1000,
+                        "b": [["50000.0", str(3 + idx)]], "a": [["50001.0", "2"]],
+                    },
+                })))
+                fpath = tmp / f"gate_{w}.tsv.zst"
+                make_zst(fpath, msgs)
+                cand = {
+                    "exchange": "gate_futures",
+                    "planned_start_s": w,
+                    "planned_end_s": w + step,
+                    "source_manifest": f"raw/gate_futures/{w}.manifest.json",
+                    "source_data": f"raw/gate_futures/{w}.tsv.zst",
+                    "manifest_sha256": "a" * 64,
+                    "data_sha256": "b" * 64,
+                    "data_bytes": 100,
+                }
+                cands.append(cand)
+                files_by_w[w] = (cand, {"file_name": fpath.name, "boot_id": "b1"}, fpath)
+
+            def fake_prepare(_remote, cand, _run_id, _dest_dir):
+                return files_by_w[cand["planned_start_s"]]
+
+            fake_check = {"qa_status": "passed", "problems": [], "structural_problems": [], "coverage_incomplete": False}
+            with patch.object(replay, "_prepare_single_candidate", side_effect=fake_prepare), \
+                 patch.object(replay.archive, "check_partition", return_value=fake_check):
+                ckpt, books, _q, diag = replay.reconstruct_historical_checkpoint(
+                    "qa:", cfg, "r1", windows[-1], step, 12, tmp, candidates=cands,
+                )
+                self.assertEqual(6, diag["reconstructed_lookback_windows"])
+                self.assertEqual(1, len(ckpt))
+                self.assertTrue(ckpt[0]["book_anchored"])
+                self.assertEqual([[50000.0, 8.0]], books[("gate_futures", "BTCUSDT")]["bids"])
+
+                # Inject a sequence break in window 3 -> reconstruction MUST refuse to anchor window 6.
+                w3 = windows[3]
+                broken_path = tmp / "gate_w3_broken.tsv.zst"
+                make_zst(broken_path, [
+                    (w3 * 1_000_000_000 + 1_000_000_000, w3 * 1_000_000_000 + 1_000_000_000, "c1", 1, 999, "DATA", json.dumps({
+                        "channel": "futures.obu", "event": "update", "result": {
+                            "s": "ob.BTC_USDT.50", "u": 999, "U": 998, "t": w3 * 1000 + 1000,
+                            "b": [["50000.0", "1"]], "a": [["50001.0", "2"]],
+                        },
+                    })),
+                ])
+                files_by_w[w3] = (files_by_w[w3][0], files_by_w[w3][1], broken_path)
+                ckpt_bad, books_bad, _qb, _db = replay.reconstruct_historical_checkpoint(
+                    "qa:", cfg, "r1", windows[-1], step, 12, tmp, candidates=cands,
+                )
+                self.assertEqual([], ckpt_bad)
+                self.assertEqual({}, books_bad)
+
+    def test_recurring_v2_checker_survival_and_clean_execution_exit_code(self):
+        import json
+        import sys
+        from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
+        import tokyo_l2_recurring_qa as recurring
+
+        w0 = 1_795_276_800
+        w1 = w0 + 900
+        run_id = "v2_cache_run"
+        sha1 = "aaa111"
+        sha2 = "bbb222"
+        cfg = {
+            "deployment": {"partition_minutes": 15},
+            "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
+        }
+        cands = []
+        for s in (w0, w1):
+            wid = coverage.window_descriptor(s, 15)["window_id"]
+            mf = f"raw/gate_futures/{wid[:10]}/gate_{s}.manifest.json"
+            cands.append({
+                "exchange": "gate_futures", "source_manifest": mf,
+                "source_data": mf.replace(".manifest.json", ".tsv.zst"),
+                "manifest_sha256": f"{s:064x}", "data_sha256": f"{s+1:064x}",
+                "manifest_bytes": 100, "data_bytes": 200, "planned_start_s": s,
+            })
+
+        def set_window_reports(sha):
+            for c in cands:
+                wid = coverage.window_descriptor(c["planned_start_s"], 15)["window_id"]
+                p = state / "qa_reports" / "windows" / wid[:10] / f"{archive._safe_window_filename(wid)}.window.qa.json"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps({
+                    "qa_status": "passed", "run_id": run_id, "partition_minutes": 15,
+                    "checker_commit_sha": sha, "files": [c["source_manifest"]],
+                }), encoding="utf-8")
+
+        calls = []
+
+        def fake_audit(_r, _cfg, _rid, start, window, _rs, _wu, **kw):
+            calls.append(start)
+            exp = kw.get("export_checkpoint_state")
+            if start == w0:
+                from tokyo_l2_protocol_qa import Book
+                b = Book.from_levels({"bids": [[50000.0, 1.0]], "asks": [[50001.0, 1.0]]})
+                bhash = b.digest()
+                if exp is not None:
+                    exp["books"] = {("gate_futures", "BTCUSDT"): {
+                        "book_sha256": bhash, "last_exchange_ns": start * 1_000_000_000,
+                        **b.canonical_levels(),
+                    }}
+                return {
+                    "status": "passed", "protocol_status": "passed", "run_id": run_id, "window_id": window,
+                    "target_inputs": recurring.input_digests([cands[0]]),
+                    "end_sequence_checkpoint": [{
+                        "exchange": "gate_futures", "symbol": "BTCUSDT", "connection": ["b", "c", 1],
+                        "seq": 10, "awaiting_delta": False, "last_wall_ns": start * 1_000_000_000,
+                        "book_anchored": True, "book_sha256": bhash, "last_exchange_ns": start * 1_000_000_000,
+                    }],
+                }
+            return {
+                "status": "anchor_unverified", "protocol_status": "anchor_unverified",
+                "run_id": run_id, "window_id": window,
+                "target_inputs": recurring.input_digests([cands[1]]),
+                "end_sequence_checkpoint": [],
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            set_window_reports(sha1)
+            with patch.object(recurring, "verified_candidates", return_value=cands), \
+                 patch.object(recurring, "audit_window", side_effect=fake_audit):
+                r1 = recurring.run("qa:", cfg, run_id, w0, w1, state, f"{sha1}/r1", max_catchup=2)
+                self.assertEqual([w1, w0], calls)
+                self.assertEqual("anchor_unverified", r1["status"])
+                self.assertEqual("ok", r1["job_execution_status"])
+
+                # Same checker: neither w0 nor w1 re-runs (w1 deferred).
+                calls.clear()
+                r2 = recurring.run("qa:", cfg, run_id, w0, w1, state, f"{sha1}/r1", max_catchup=2)
+                self.assertEqual([], calls)
+                self.assertTrue(r2["reused_current_result"])
+
+                # New checker SHA: w0 (passed, v2) stays cached with intact sidecar; w1 (anchor_unverified) re-evaluates once!
+                set_window_reports(sha2)
+                calls.clear()
+                r3 = recurring.run("qa:", cfg, run_id, w0, w1, state, f"{sha2}/r2", max_catchup=2)
+                self.assertEqual([w1], calls)
+                self.assertEqual("ok", r3["job_execution_status"])
+
+                # CLI --exit-zero-on-clean-execution exits 0 on anchor_unverified and 2 on revision_mismatch.
+                cfg_path = state / "cfg.json"
+                cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+                argv = [
+                    "tokyo_l2_recurring_qa.py", "--remote", "qa:", "--config", str(cfg_path),
+                    "--run-id", run_id, "--cutover", coverage.window_descriptor(w0, 15)["window_id"],
+                    "--current", coverage.window_descriptor(w1, 15)["window_id"],
+                    "--state-dir", str(state), "--checker", f"{sha2}/r2",
+                    "--exit-zero-on-clean-execution",
+                ]
+                with patch.object(sys, "argv", argv), patch.object(recurring, "run", return_value=r3):
+                    self.assertEqual(0, recurring.main())
+                with patch.object(sys, "argv", argv), patch.object(
+                    recurring, "run", return_value={**r3, "status": "revision_mismatch", "job_execution_status": "failed"}
+                ):
+                    self.assertEqual(2, recurring.main())
+
+
 if __name__ == "__main__":
     unittest.main()

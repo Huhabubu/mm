@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import defaultdict
+import inspect
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import zlib
 
 import data_coverage as coverage
 import hourly_incremental_qa as archive
@@ -31,6 +34,10 @@ def plan_windows(ready, recorded, current, *, max_catchup=1, deferred=None):
     return ([current] if current in ready and current not in skip else []) + backlog[:budget]
 
 
+PROTOCOL_QA_VERSION = 2
+CHECKPOINT_FORMAT_VERSION = 1
+
+
 def _checkpoint_digest(checkpoint):
     norm = sorted(
         (
@@ -40,10 +47,96 @@ def _checkpoint_digest(checkpoint):
             r.get("seq"),
             bool(r.get("awaiting_delta")),
             r.get("last_wall_ns"),
+            bool(r.get("book_anchored")),
+            str(r.get("book_sha256") or ""),
         )
         for r in (checkpoint or ())
     )
     return sha256(json.dumps(norm, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _checkpoint_sidecar_path(state, run_id, pm, window_id):
+    return (
+        state
+        / "qa_reports"
+        / "checkpoints"
+        / sha256(run_id.encode()).hexdigest()[:24]
+        / f"{pm}m"
+        / f"{archive._safe_window_filename(window_id)}.checkpoint.json"
+    )
+
+
+def write_checkpoint_sidecar(path, run_id, window_id, checkpoint_rows, export_state):
+    books = (export_state or {}).get("books") or {}
+    end_quote = (export_state or {}).get("end_signal_quote")
+    anchored_keys = {
+        (row["exchange"], row["symbol"]): row
+        for row in checkpoint_rows or ()
+        if row.get("book_anchored")
+    }
+    if not anchored_keys and end_quote is None:
+        if path.exists():
+            path.unlink()
+        return False
+    encoded_books = {}
+    for (ex, sym), row in sorted(anchored_keys.items()):
+        entry = books.get((ex, sym))
+        if not entry or entry.get("book_sha256") != row.get("book_sha256"):
+            continue
+        levels_blob = json.dumps(
+            {"bids": entry["bids"], "asks": entry["asks"]}, separators=(",", ":"),
+        ).encode("utf-8")
+        encoded_books[f"{ex}|{sym}"] = {
+            "book_sha256": entry["book_sha256"],
+            "last_exchange_ns": entry["last_exchange_ns"],
+            "levels_zlib_b64": base64.b64encode(zlib.compress(levels_blob, level=6)).decode("ascii"),
+        }
+    payload = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "run_id": run_id,
+        "window_id": window_id,
+        "end_signal_quote": end_quote,
+        "books": encoded_books,
+    }
+    archive._atomic_write_json(path, payload)
+    return True
+
+
+def read_checkpoint_sidecar(path, expected_checkpoint):
+    """Load and verify compressed orderbook levels; return None if any anchored market is corrupt."""
+    from tokyo_l2_protocol_qa import Book
+
+    expected_anchored = [row for row in expected_checkpoint or () if row.get("book_anchored")]
+    data = read_report(path)
+    if not data:
+        return None if expected_anchored else ({}, None)
+    if data.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        return None
+    raw_books = data.get("books")
+    if not isinstance(raw_books, dict):
+        return None
+    decoded = {}
+    for row in expected_anchored:
+        key = (row["exchange"], row["symbol"])
+        entry = raw_books.get(f"{key[0]}|{key[1]}")
+        if not isinstance(entry, dict) or entry.get("book_sha256") != row.get("book_sha256"):
+            return None
+        try:
+            raw_json = zlib.decompress(base64.b64decode(entry["levels_zlib_b64"].encode("ascii")))
+            levels = json.loads(raw_json.decode("utf-8"))
+            book = Book.from_levels(levels)
+            if book.digest() != row["book_sha256"]:
+                return None
+        except Exception:
+            return None
+        decoded[key] = {
+            "book_sha256": entry["book_sha256"],
+            "last_exchange_ns": entry.get("last_exchange_ns") or row.get("last_exchange_ns"),
+            "bids": levels["bids"],
+            "asks": levels["asks"],
+        }
+    quote = data.get("end_signal_quote")
+    return decoded, quote
 
 
 def _reports_with_current_checkpoints(proofs, step):
@@ -107,7 +200,7 @@ def _summarize_protocol_diagnostics(report):
     return out
 
 
-MAX_ANCHOR_LOOKBACK_WINDOWS = 4
+MAX_ANCHOR_LOOKBACK_WINDOWS = 64
 
 
 def _lookback_inputs(groups, start, step, windows):
@@ -149,6 +242,7 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return {
             "status": "revision_mismatch",
+            "job_execution_status": "failed",
             "run_id": run_id,
             "trigger_mode": trigger_mode or "unknown",
             "current_window": wid(current),
@@ -227,18 +321,42 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     proofs = {}
     saved_reports = {}
     revisions = {}
+    def sidecar_path(start):
+        return _checkpoint_sidecar_path(state, run_id, pm, wid(start))
+
+    sidecar_cache = {}
+    new_exports = {}
+
+    def load_sidecar(start, expected_ckpt):
+        if not expected_ckpt:
+            return {}, None
+        if not any(r.get("book_anchored") for r in expected_ckpt):
+            return None, None
+        cached = sidecar_cache.get(start)
+        if cached is not None:
+            return cached
+        loaded = read_checkpoint_sidecar(sidecar_path(start), expected_ckpt)
+        if loaded is not None:
+            sidecar_cache[start] = loaded
+        return loaded
+
     for start in ready:
         inputs = input_digests(groups[start])
         earlier = input_digests(groups[start - step])
         win_rev = _window_archive_revision(groups[start], run_id, wid(start), pm)
         revisions[start] = win_rev
         proof = read_report(report_path(start))
-        if proof.get("checker") != checker:
+        if proof.get("protocol_qa_version") != PROTOCOL_QA_VERSION:
             continue
         saved_reports[start] = proof
         lookback = proof.get("anchor_lookback_windows")
+        ckpt_rows = proof.get("end_sequence_checkpoint") or []
+        sidecar_ok = (not any(r.get("book_anchored") for r in ckpt_rows)) or (
+            load_sidecar(start, ckpt_rows) is not None
+        )
         if (
-            proof.get("target_inputs") == inputs
+            sidecar_ok
+            and proof.get("target_inputs") == inputs
             and proof.get("previous_inputs") == earlier
             and (lookback is None or proof.get("anchor_lookback_inputs") == _lookback_inputs(groups, start, step, lookback))
             and proof.get("source_restrictions", {}) == restrictions(start, lookback or 0)
@@ -247,11 +365,17 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             proofs[start] = proof
 
     validated = _reports_with_current_checkpoints(proofs, step)
+    # Validated passed/data_failed reports survive benign checker commits without redundant re-runs;
+    # unverified reports are re-evaluated once when checker changes, then wait on evidence/checkpoint updates.
     recorded = {
         s for s, proof in validated.items()
-        if proof.get("status") in {"passed", "data_failed", "replay_init_unverified"}
+        if proof.get("status") in {"passed", "data_failed"}
+        or (proof.get("status") == "replay_init_unverified" and proof.get("checker") == checker)
     }
-    deferred = {s for s, proof in validated.items() if proof.get("status") == "anchor_unverified"}
+    deferred = {
+        s for s, proof in validated.items()
+        if proof.get("status") == "anchor_unverified" and proof.get("checker") == checker
+    }
     eff_max_catchup = (
         int(max_catchup)
         if max_catchup is not None
@@ -259,15 +383,24 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     )
     checked = set()
     checked_windows = []
+    supports_extended_audit = "checkpoint_books" in inspect.signature(audit_window).parameters
     for start in plan_windows(ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred):
         replay_seconds = 660 if start % 3600 == 0 else 0
         checkpoint = validated.get(start - step, {}).get("end_sequence_checkpoint") or []
-        covered_markets = {(row["exchange"], row["symbol"]) for row in checkpoint}
+        prev_books, prev_quote = (None, None)
+        if checkpoint:
+            loaded_prev = load_sidecar(start - step, checkpoint)
+            if loaded_prev is not None:
+                prev_books, prev_quote = loaded_prev
+        covered_markets = {
+            (row["exchange"], row["symbol"])
+            for row in checkpoint
+            if (prev_books is None or (row.get("book_anchored") and (row["exchange"], row["symbol"]) in prev_books))
+        }
         all_markets_covered = bool(expected_depth_markets) and expected_depth_markets.issubset(covered_markets)
-        warmup_windows = 1 if (replay_seconds or not all_markets_covered) else 0
-        # Check a longer continuous archive prefix only when a market's preceding
-        # checkpoint is unavailable. Missing partition files reset their own chains.
-        lookback = 1 if replay_seconds else 0
+        need_warmup_quote = bool(replay_seconds and prev_books is not None and prev_quote is None)
+        warmup_windows = 1 if (not all_markets_covered or (replay_seconds and prev_books is None) or need_warmup_quote) else 0
+        lookback = warmup_windows
         if not all_markets_covered:
             lookback = max((i for i in range(1, MAX_ANCHOR_LOOKBACK_WINDOWS + 1)
                             if groups.get(start - i * step)), default=warmup_windows)
@@ -276,12 +409,31 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             {"source_restrictions": {int(at): values for at, values in blocked_sources.items()}}
             if blocked_sources else {}
         )
+        extra_audit_kwargs = {}
+        export_state = {}
+        if supports_extended_audit:
+            ancestors = {}
+            if lookback > warmup_windows:
+                for back in range(2, lookback + 2):
+                    anc_s = start - back * step
+                    anc_ckpt = validated.get(anc_s, {}).get("end_sequence_checkpoint") or []
+                    if any(r.get("book_anchored") for r in anc_ckpt):
+                        loaded_anc = load_sidecar(anc_s, anc_ckpt)
+                        if loaded_anc is not None:
+                            ancestors[anc_s] = (anc_ckpt, loaded_anc[0], loaded_anc[1])
+            extra_audit_kwargs = {
+                "checkpoint_books": prev_books,
+                "checkpoint_quote": prev_quote,
+                "ancestor_checkpoints": ancestors or None,
+                "export_checkpoint_state": export_state,
+            }
         report = audit_window(
             remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
             candidates=candidates, checkpoint=checkpoint or None, anchor_lookback_windows=lookback,
-            **source_options,
+            **source_options, **extra_audit_kwargs,
         )
         report.update(
+            protocol_qa_version=PROTOCOL_QA_VERSION,
             checker=checker,
             archive_revision=revisions.get(start),
             previous_inputs=input_digests(groups[start - step]),
@@ -292,6 +444,9 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
             completed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         proofs[start] = report
+        new_exports[start] = export_state
+        if export_state.get("books") or export_state.get("end_signal_quote") is not None:
+            sidecar_cache[start] = (export_state.get("books") or {}, export_state.get("end_signal_quote"))
         # The target runs first. A subsequent catch-up can change the checkpoint the target used.
         validated = _reports_with_current_checkpoints(proofs, step)
         checked.add(start)
@@ -301,9 +456,15 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         if start in validated:
             if start in checked:
                 archive._atomic_write_json(report_path(start), validated[start])
+                write_checkpoint_sidecar(
+                    sidecar_path(start), run_id, wid(start),
+                    validated[start].get("end_sequence_checkpoint") or [],
+                    new_exports.get(start),
+                )
         elif start in checked or saved_reports[start].get("status") != "pending":
             # Reconciliation reads these reports directly, so revoke stale terminal results on disk.
             archive._atomic_write_json(report_path(start), {
+                "protocol_qa_version": PROTOCOL_QA_VERSION,
                 "status": "pending",
                 "protocol_status": "pending",
                 "reason": "protocol_inputs_changed",
@@ -312,6 +473,8 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
                 "archive_revision": revisions[start],
                 "checker": checker,
             })
+            if sidecar_path(start).exists():
+                sidecar_path(start).unlink()
 
     all_known = {
         start: proof for start, proof in validated.items()
@@ -336,8 +499,20 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     deferred_windows = [wid(start) for start, report in sorted(all_known.items())
                         if report.get("status") == "anchor_unverified"]
     completed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cur_status = current_report.get("status", "pending")
+    terminal_quality = {"passed", "data_failed", "anchor_unverified", "replay_init_unverified"}
+    any_checked_retryable = any(proofs[s].get("status") == "retryable" for s in checked if s in proofs)
+    clean_exec = (
+        not any_checked_retryable
+        and (
+            cur_status in terminal_quality
+            or (cur_status == "pending" and current not in ready)
+        )
+    )
     out = {
-        "status": current_report.get("status", "pending"),
+        "status": cur_status,
+        "job_execution_status": "ok" if clean_exec else "failed",
+        "protocol_qa_version": PROTOCOL_QA_VERSION,
         "run_id": run_id,
         "trigger_mode": trigger_mode or "unknown",
         "current_window": wid(current),
@@ -379,6 +554,11 @@ def main():
     parser.add_argument("--archive-revision", default=None)
     parser.add_argument("--trigger-mode", default=None)
     parser.add_argument("--max-catchup", type=int, default=None)
+    parser.add_argument(
+        "--exit-zero-on-clean-execution",
+        action="store_true",
+        help="Return exit code 0 whenever job_execution_status == 'ok', even if data quality is failed/unverified.",
+    )
     args = parser.parse_args()
     data = run(args.remote, json.loads(args.config.read_text()), args.run_id,
                coverage.parse_window_start_s(args.cutover), coverage.parse_window_start_s(args.current),
@@ -413,10 +593,14 @@ def main():
     if os.environ.get("GITHUB_ENV"):
         with open(os.environ["GITHUB_ENV"], "a") as dest:
             dest.write(f"QA_PROTOCOL_STATUS={data['protocol_status']}\n")
+            dest.write(f"QA_PROTOCOL_WINDOW_STATUS={data.get('status', 'pending')}\n")
+            dest.write(f"QA_PROTOCOL_JOB_EXECUTION_STATUS={data.get('job_execution_status', 'failed')}\n")
             dest.write(f"QA_PROTOCOL_REUSED={'true' if data.get('reused_current_result') else 'false'}\n")
             dest.write(f"QA_PROTOCOL_COMPLETED_AT_UTC={data.get('completed_at_utc', '')}\n")
             replay = ",".join(f"{e}={s}" for e, s in data["hourly_btc_replay"].items()) or "pending"
             dest.write(f"QA_HOURLY_BTC_REPLAY={replay}\n")
+    if args.exit_zero_on_clean_execution:
+        return 0 if data.get("job_execution_status") == "ok" else 2
     return 0 if data["status"] == "passed" else 2
 
 

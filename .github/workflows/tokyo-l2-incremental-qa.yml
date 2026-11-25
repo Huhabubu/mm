@@ -76,6 +76,11 @@ on:
         required: false
         type: string
         default: ""
+      max_catchup:
+        description: "Optional max historical protocol catch-up windows for recurring_qa"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -254,6 +259,7 @@ jobs:
             --checker-commit "$TOKYO_L2_QA_CHECKER_COMMIT" \
             --sla-grace-minutes "$QA_SLA_GRACE_MINUTES" \
             --limit "$QA_LIMIT" \
+            --exit-zero-on-clean-execution \
             "${extra[@]}" | tee "$RUNNER_TEMP/qa_summary.json"
           QA_RC=${PIPESTATUS[0]}
           set -e
@@ -379,10 +385,14 @@ jobs:
           if [[ -n "${QA_TRIGGER_MODE:-}" ]]; then
             extra_proto+=(--trigger-mode "$QA_TRIGGER_MODE")
           fi
+          if [[ -n "${{ inputs.max_catchup }}" ]]; then
+            extra_proto+=(--max-catchup "${{ inputs.max_catchup }}")
+          fi
           python workflow_code/scripts/tokyo_l2_recurring_qa.py \
             --remote qa: --state-dir state --config "source/$QA_BOUND_CONFIG_PATH" \
             --run-id "$QA_BOUND_RUN_ID" --cutover "$QA_BOUND_SINCE_WINDOW" \
             --current "$QA_PROTOCOL_CURRENT_WINDOW_ID" --checker "$TOKYO_L2_QA_CHECKER_COMMIT/$rules_sha" \
+            --exit-zero-on-clean-execution \
             "${extra_proto[@]}"
 
       - name: Persist QA summary reports to tokyo-l2-qa-state
@@ -437,6 +447,9 @@ jobs:
           url="${QA_HEALTHCHECKS_URL%/}"
           hb_status="${QA_HEARTBEAT_STATUS:-failed}"
           job_status="${QA_JOB_EXECUTION_STATUS:-failed}"
+          proto_ready="${QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA:-false}"
+          proto_exec="${QA_PROTOCOL_JOB_EXECUTION_STATUS:-ok}"
+          proto_wstatus="${QA_PROTOCOL_WINDOW_STATUS:-${QA_PROTOCOL_STATUS:-pending}}"
           cur_wid="${QA_CURRENT_WINDOW_ID:-none}"
           cur_done="${QA_CURRENT_WINDOW_COMPLETED:-false}"
           cur_vstatus="${QA_CURRENT_WINDOW_VERIFICATION_STATUS:-unknown}"
@@ -445,12 +458,11 @@ jobs:
           hist_overdue_count="${QA_HISTORICAL_OVERDUE_WINDOWS_COUNT:-0}"
           hist_loss_mfs_count="${QA_HISTORICAL_LOSS_MANIFESTS_COUNT:-0}"
 
-          # Heartbeat reflects job execution + active window completion & verification independently,
-          # while historical damaged, unarchived/overdue, or archived-pending-QA backlog windows are
-          # preserved and reported separately in the payload without failing active-window heartbeats.
-          # When the active window is not completed (cur_done != true), NEVER send a false success ping.
+          # Heartbeat reflects job execution + active window completion & data quality independently
+          # (including protocol anchor_unverified / replay_init_unverified / data_failed),
+          # while keeping GitHub Actions job exit green when execution itself completed cleanly.
           status="success"
-          if [[ "$INSPECT_OUTCOME" != "success" || "$PROTOCOL_OUTCOME" != "success" || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
+          if [[ "$INSPECT_OUTCOME" != "success" || ("$proto_ready" == "true" && ("$PROTOCOL_OUTCOME" != "success" || "$proto_exec" != "ok" || "$proto_wstatus" != "passed")) || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
             status="failure"
             url="${url}/fail"
           fi
@@ -482,6 +494,8 @@ jobs:
             --data-urlencode "run_id=${QA_BOUND_RUN_ID:-unbound}" \
             --data-urlencode "since_window=${QA_BOUND_SINCE_WINDOW:-unbound}" \
             --data-urlencode "protocol_status=${QA_PROTOCOL_STATUS:-pending}" \
+            --data-urlencode "protocol_window_status=${proto_wstatus}" \
+            --data-urlencode "protocol_job_execution_status=${proto_exec}" \
             --data-urlencode "hourly_btc_replay=${QA_HOURLY_BTC_REPLAY:-pending}" \
             --data-urlencode "checker_commit=${TOKYO_L2_QA_CHECKER_COMMIT:-unknown}" \
             "$url"

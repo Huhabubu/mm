@@ -21,7 +21,7 @@ import qa_convert as convert
 
 from tokyo_l2_protocol_qa import (
     BINANCE, GATE, BYBIT, BITGET, Book, Chain, Depth, ProtocolReport,
-    depth_event, rows, symbol_key, verify_gate_sizes,
+    depth_event, extract_exchange_ms, rows, symbol_key, verify_gate_sizes,
 )
 
 FOLLOWERS = (GATE, BYBIT, BITGET)
@@ -265,16 +265,86 @@ class StreamEvidence:
         return self.timeline.report(start_ns, end_ns, invalid_exchanges)
 
 
-def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint=None, source_restrictions=None):
-    boundary_checkpoints = {
-        (row["exchange"], row["symbol"]): Chain(
-            tuple(row["connection"]), row["seq"], row["awaiting_delta"], anchored=True
-        )
-        for row in checkpoint or ()
+def _expected_depth_markets_set(config):
+    return {
+        (ex, symbol_key(sym))
+        for ex, sym, ch in coverage.expected_streams(config)
+        if coverage.classify_channel(ex, ch) == coverage.CHANNEL_CATEGORY_DEPTH
     }
-    checkpoint_wall = {
-        (row["exchange"], row["symbol"]): row.get("last_wall_ns") for row in checkpoint or ()
-    }
+
+
+def _load_boundary_state(checkpoint, checkpoint_books, summary):
+    boundary_checkpoints = {}
+    checkpoint_wall = {}
+    books = {}
+    book_anchored = set()
+    last_depth_exchange_ns = {}
+    rejected = []
+    for row in checkpoint or ():
+        key = (row["exchange"], row["symbol"])
+        chain = Chain(tuple(row["connection"]), row["seq"], row["awaiting_delta"], anchored=True)
+        has_book_meta = bool(row.get("book_anchored") or row.get("book_sha256"))
+        if has_book_meta and checkpoint_books is not None:
+            raw_book = checkpoint_books.get(key)
+            book_sha = str(row.get("book_sha256") or "")
+            exch_ns = int(row.get("last_exchange_ns") or 0)
+            if raw_book is None or not book_sha or exch_ns <= 0:
+                rejected.append({"exchange": key[0], "symbol": key[1], "reason": "missing_book_state"})
+                continue
+            try:
+                book = Book.from_levels(raw_book)
+            except ValueError as exc:
+                rejected.append({"exchange": key[0], "symbol": key[1], "reason": str(exc)})
+                continue
+            if book.digest() != book_sha:
+                rejected.append({"exchange": key[0], "symbol": key[1], "reason": "book_sha256_mismatch"})
+                continue
+            books[key] = book
+            book_anchored.add(key)
+            last_depth_exchange_ns[key] = exch_ns
+        boundary_checkpoints[key] = chain
+        checkpoint_wall[key] = row.get("last_wall_ns")
+    if rejected:
+        summary["rejected_checkpoint_markets"] = rejected
+    return boundary_checkpoints, checkpoint_wall, books, book_anchored, last_depth_exchange_ns
+
+
+def _valid_checkpoint_quote(checkpoint_quote, start_ns):
+    if not isinstance(checkpoint_quote, (list, tuple)) or len(checkpoint_quote) != 2:
+        return None
+    try:
+        wall = int(checkpoint_quote[0])
+        mid = float(checkpoint_quote[1])
+    except (TypeError, ValueError):
+        return None
+    if wall <= 0 or wall > start_ns or not math.isfinite(mid) or mid <= 0:
+        return None
+    return (wall, mid)
+
+
+def scan(
+    items,
+    config,
+    start_ns,
+    end_ns,
+    sample_end,
+    specs,
+    summary,
+    checkpoint=None,
+    source_restrictions=None,
+    *,
+    checkpoint_books=None,
+    checkpoint_quote=None,
+    export_checkpoint_state=None,
+    allow_startup_stub_exchanges=None,
+):
+    (
+        boundary_checkpoints,
+        checkpoint_wall,
+        books,
+        book_anchored,
+        last_depth_exchange_ns,
+    ) = _load_boundary_state(checkpoint, checkpoint_books, summary)
     chains = {}
     replay_warmup_chains = {}
     checkpoint_applied = set()
@@ -282,23 +352,24 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
     unanchored_delta_counts = Counter()
     unanchored_sources = {}
     summary["boundary_checkpoint_markets"] = len(boundary_checkpoints)
+    summary["boundary_book_anchored_markets"] = len(book_anchored)
     book_proofs = ProtocolReport()
     evidence = StreamEvidence(config)
     expected_depths = set(evidence.depth)
     restrictions = source_restrictions or {}
     invalid_exchanges = set(restrictions.get(start_ns // NS, ()))
+    allowed_stubs = set(allow_startup_stub_exchanges or ())
     previous_end = {}
     legacy_ends = {}
     recovered_depth = set()
     depth_frames_by_mode = Counter()
     btc_asset = convert.canonical_asset(GATE, BTC)
     buffers = {ex: convert.AssetDayBuffers(ex, btc_asset, convert.date_utc_from_wall_ns(start_ns)) for ex in FOLLOWERS}
-    books = {ex: Book() for ex in FOLLOWERS}
-    last_depth_exchange_ns = {}
     seeded = set()
     signal = []
     file_reports = []
-    quotes_before = None
+    quotes_before = _valid_checkpoint_quote(checkpoint_quote, start_ns)
+    last_target_signal_quote = None
     seen_anchors = set()
     missing_anchor_sources = {}
     boundary_events = ProtocolReport()
@@ -321,7 +392,8 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
         structural_failure = (
             bool(audited.get("structural_problems"))
             or (audited.get("coverage_incomplete") is True
-                and not (file_start < start_ns and audited.get("is_startup_stub") is True))
+                and not ((file_start < start_ns or exchange in allowed_stubs)
+                         and audited.get("is_startup_stub") is True))
             or exchange in restrictions.get(candidate["planned_start_s"], ())
         )
         if file_start == start_ns:
@@ -333,16 +405,20 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                 legacy_ends[exchange] = max(legacy_ends.get(exchange, start_ns), audited["last_wall_ns"] + 1)
         if discontinuous or structural_failure:
             evidence.interrupt(exchange, previous_end.get(exchange, file_start), "ARCHIVE_DISCONTINUITY")
+            if exchange == BINANCE and (file_start >= start_ns or file_end == start_ns or (BINANCE, BTC) not in boundary_checkpoints):
+                quotes_before = None
             for key in expected_depths:
                 if key[0] == exchange:
                     chains.pop(key, None)
                     replay_warmup_chains.pop(key, None)
                     recovered_depth.discard(key)
+                    drop_boundary = file_start >= start_ns or file_end == start_ns or key not in boundary_checkpoints
                     if file_start >= start_ns or file_end == start_ns:
                         checkpoint_applied.add(key)
-            if exchange in books:
-                books[exchange] = Book()
-                last_depth_exchange_ns.pop(exchange, None)
+                    if drop_boundary:
+                        books.pop(key, None)
+                        book_anchored.discard(key)
+                        last_depth_exchange_ns.pop(key, None)
         previous_end[exchange] = file_end
         if structural_failure:
             continue
@@ -383,24 +459,29 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                             checkpoint_applied.add(key)
                             reset_seen.add(key)
                             chains.pop(key, None)
+                            books.pop(key, None)
+                            book_anchored.discard(key)
+                            last_depth_exchange_ns.pop(key, None)
                         elif key not in boundary_checkpoints:
                             reset_seen.add(key)
                             chains.pop(key, None)
+                            books.pop(key, None)
+                            book_anchored.discard(key)
+                            last_depth_exchange_ns.pop(key, None)
                         replay_warmup_chains.pop(key, None)
-                        if ex in books and sym == BTC:
-                            books[ex] = Book()
-                            last_depth_exchange_ns.pop(ex, None)
-            if sample_end > start_ns and exchange == BINANCE and kind != "META" and wall < sample_end:
+            if exchange == BINANCE and kind != "META":
                 data = obj.get("data", obj)
                 if data.get("e") == "bookTicker" and data.get("s") == BTC:
                     bid, ask = float(data["b"]), float(data["a"])
                     if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid < ask):
-                        if in_target:
+                        if in_target and sample_end > start_ns and wall < sample_end:
                             book_proofs.count(exchange, BTC, "invalid_signal_quote")
                     else:
                         quote = (wall, (bid + ask) / 2)
                         if in_target:
-                            signal.append(quote)
+                            last_target_signal_quote = quote
+                            if sample_end > start_ns and wall < sample_end:
+                                signal.append(quote)
                         else:
                             quotes_before = quote
             if kind != "META":
@@ -423,17 +504,22 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                     ctx=exchange,
                 )
                 if not in_target and key in boundary_checkpoints:
-                    # Preserve the verified boundary checkpoint at start_ns; only warm up BTC book for replay.
+                    # Preserve the verified boundary checkpoint at start_ns; only warm up BTC book if not already anchored.
                     if event.mode == "snapshot":
                         seen_anchors.add((exchange, event.symbol, "warmup", event.connection[1], event.connection[2]))
-                    if sample_end > start_ns and exchange in books and event.symbol == BTC:
+                    if key not in book_anchored and sample_end > start_ns and exchange in FOLLOWERS and event.symbol == BTC:
                         w_chain = replay_warmup_chains.setdefault(key, Chain())
                         if not payload_issue and w_chain.apply(exchange, event) is None:
-                            books[exchange].apply(event)
-                            last_depth_exchange_ns[exchange] = int(event.exchange_ms or 0) * 1_000_000
+                            w_book = books.setdefault(key, Book())
+                            w_book.apply(event)
+                            ms = extract_exchange_ms(event)
+                            if w_chain.anchored and w_book.is_valid_uncrossed() and ms > 0:
+                                book_anchored.add(key)
+                                last_depth_exchange_ns[key] = ms * 1_000_000
                         else:
-                            books[exchange] = Book()
-                            last_depth_exchange_ns.pop(exchange, None)
+                            books.pop(key, None)
+                            book_anchored.discard(key)
+                            last_depth_exchange_ns.pop(key, None)
                     continue
 
                 using_boundary = in_target and key in boundary_checkpoints and key not in checkpoint_applied
@@ -445,18 +531,21 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                 if in_target:
                     book_proofs.frames[key] += 1
                     depth_frames_by_mode[(exchange, event.mode)] += 1
-                if sample_end > start_ns and exchange in FOLLOWERS and event.symbol == BTC and in_target and exchange not in seeded:
-                    seeded.add(exchange)
-                    if chain.anchored and chain.seq is not None and chain.connection == event.connection and event.mode != "snapshot":
-                        book = books[exchange]
-                        previous_exchange_ns = last_depth_exchange_ns.get(exchange)
-                        target_exchange_ns = int(event.exchange_ms or 0) * 1_000_000
-                        if book.bids and book.asks and not book.crossed() and previous_exchange_ns is not None:
-                            if previous_exchange_ns > target_exchange_ns:
-                                book_proofs.count(exchange, BTC, "depth_timestamp_reversal_at_boundary")
-                            else:
-                                convert._emit_depth_batch(buffers[exchange], True, previous_exchange_ns, start_ns - 1,
-                                                          list(book.bids.items()), list(book.asks.items()))
+                need_boundary_seed = (
+                    sample_end > start_ns
+                    and exchange in FOLLOWERS
+                    and event.symbol == BTC
+                    and in_target
+                    and exchange not in seeded
+                )
+                pre_seed_ready = (
+                    need_boundary_seed
+                    and key in book_anchored
+                    and chain.anchored
+                    and chain.seq is not None
+                    and chain.connection == event.connection
+                    and event.mode != "snapshot"
+                )
                 consecutive_full_books = (
                     exchange == BITGET and event.mode == "snapshot" and key in recovered_depth
                     and chain.connection == event.connection and chain.seq is not None and event.seq > chain.seq
@@ -492,9 +581,9 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         book_proofs.count(exchange, event.symbol, problem)
                         if problem == "missing_same_connection_anchor":
                             missing_anchor_sources.setdefault(key, event.connection[1:])
-                    if sample_end > start_ns and exchange in books and event.symbol == BTC:
-                        books[exchange] = Book()
-                        last_depth_exchange_ns.pop(exchange, None)
+                    books.pop(key, None)
+                    book_anchored.discard(key)
+                    last_depth_exchange_ns.pop(key, None)
                     continue
                 if chain.anchored and chain.seq is not None:
                     if event.mode == "snapshot":
@@ -517,14 +606,46 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         )
                     if event.mode != "snapshot" or evidence.timeline.state(stream) == "verified_usable":
                         recovered_depth.discard(key)
-                if chain.anchored and sample_end > start_ns and exchange in books and event.symbol == BTC:
-                    book = books[exchange]
-                    book.apply(event)
-                    ms = int(event.exchange_ms or 0)
-                    last_depth_exchange_ns[exchange] = ms * 1_000_000
-                    if book.crossed() and in_target:
-                        book_proofs.count(exchange, BTC, "crossed_book")
-                    if in_target and wall < sample_end and exchange in specs:
+                if need_boundary_seed:
+                    seeded.add(exchange)
+                    if pre_seed_ready:
+                        seed_book = books[key]
+                        previous_exchange_ns = last_depth_exchange_ns.get(key)
+                        target_exchange_ns = extract_exchange_ms(event) * 1_000_000
+                        if seed_book.is_valid_uncrossed() and previous_exchange_ns is not None and previous_exchange_ns > 0:
+                            if previous_exchange_ns > target_exchange_ns:
+                                book_proofs.count(exchange, BTC, "depth_timestamp_reversal_at_boundary")
+                            else:
+                                convert._emit_depth_batch(
+                                    buffers[exchange],
+                                    True,
+                                    previous_exchange_ns,
+                                    start_ns - 1,
+                                    sorted(seed_book.bids.items(), reverse=True),
+                                    sorted(seed_book.asks.items()),
+                                )
+                                buffers[exchange].seen_snapshot = True
+                if chain.anchored:
+                    if event.mode == "snapshot":
+                        book = Book()
+                        book.apply(event)
+                        books[key] = book
+                        book_anchored.add(key)
+                    elif key in book_anchored:
+                        book = books[key]
+                        book.apply(event)
+                    else:
+                        book = None
+                    ms = extract_exchange_ms(event)
+                    if book is not None:
+                        if ms > 0:
+                            last_depth_exchange_ns[key] = ms * 1_000_000
+                        if book.crossed() and in_target:
+                            book_proofs.count(exchange, event.symbol, "crossed_book")
+                            book_anchored.discard(key)
+                            books.pop(key, None)
+                            last_depth_exchange_ns.pop(key, None)
+                    if sample_end > start_ns and exchange in FOLLOWERS and event.symbol == BTC and in_target and wall < sample_end and exchange in specs:
                         tick = Decimal(str(specs[exchange]["tick"]))
                         if tick <= 0:
                             raise ValueError("invalid instrument tick size")
@@ -540,9 +661,17 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                         if ms <= 0:
                             book_proofs.count(exchange, BTC, "invalid_exchange_time")
                         else:
-                            convert._emit_depth_batch(buffers[exchange], event.mode == "snapshot", ms * 1_000_000,
-                                                      wall, convert._parse_price_qty_pairs(event.bids or []),
-                                                      convert._parse_price_qty_pairs(event.asks or []))
+                            is_snap = event.mode == "snapshot"
+                            convert._emit_depth_batch(
+                                buffers[exchange],
+                                is_snap,
+                                ms * 1_000_000,
+                                wall,
+                                convert._parse_price_qty_pairs(event.bids or []),
+                                convert._parse_price_qty_pairs(event.asks or []),
+                            )
+                            if is_snap:
+                                buffers[exchange].seen_snapshot = True
             elif in_target and kind != "META" and exchange in FOLLOWERS:
                 trades = trading_event(exchange, obj)
                 btc_trades = []
@@ -648,12 +777,11 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
                     evidence.last.pop(stream, None)
     market_availability = evidence.report(start_ns, end_ns, invalid_exchanges)
     summary["market_availability"] = market_availability
-    summary["end_sequence_checkpoint"] = [
-        {"exchange": ex, "symbol": sym, "connection": list(chain.connection),
-         "seq": chain.seq, "awaiting_delta": chain.awaiting_delta,
-         "last_wall_ns": evidence.last[evidence.depth[(ex, sym)]]}
-        for (ex, sym), chain in sorted(chains.items())
-        if (
+    issue_markets = {(e, s) for e, s, _ in book_proofs.issues}
+    exported_books = {}
+    end_checkpoints = []
+    for (ex, sym), chain in sorted(chains.items()):
+        if not (
             (ex, sym) in expected_depths
             and ex not in invalid_exchanges
             and book_proofs.frames[(ex, sym)] > 0
@@ -663,8 +791,49 @@ def scan(items, config, start_ns, end_ns, sample_end, specs, summary, checkpoint
             and (ex, sym) not in recovered_depth
             and chain.seq is not None
             and chain.connection is not None
+        ):
+            continue
+        row = {
+            "exchange": ex,
+            "symbol": sym,
+            "connection": list(chain.connection),
+            "seq": chain.seq,
+            "awaiting_delta": chain.awaiting_delta,
+            "last_wall_ns": evidence.last[evidence.depth[(ex, sym)]],
+        }
+        book = books.get((ex, sym))
+        exch_ns = last_depth_exchange_ns.get((ex, sym), 0)
+        if (
+            (ex, sym) in book_anchored
+            and (ex, sym) not in issue_markets
+            and book is not None
+            and book.is_valid_uncrossed()
+            and exch_ns > 0
+        ):
+            levels = book.canonical_levels()
+            book_sha = hashlib.sha256(
+                json.dumps(levels, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            row["book_anchored"] = True
+            row["book_sha256"] = book_sha
+            row["last_exchange_ns"] = exch_ns
+            row["bid_levels"] = len(levels["bids"])
+            row["ask_levels"] = len(levels["asks"])
+            if export_checkpoint_state is not None:
+                exported_books[(ex, sym)] = {
+                    "book_sha256": book_sha,
+                    "last_exchange_ns": exch_ns,
+                    **levels,
+                }
+        end_checkpoints.append(row)
+    summary["end_sequence_checkpoint"] = end_checkpoints
+    if export_checkpoint_state is not None:
+        export_checkpoint_state["books"] = exported_books
+        export_checkpoint_state["end_signal_quote"] = (
+            list(last_target_signal_quote)
+            if last_target_signal_quote is not None and BINANCE not in invalid_exchanges
+            else None
         )
-    ]
     summary["replay"] = {}
     if sample_end <= start_ns:
         return
@@ -838,23 +1007,308 @@ def window_status(protocol_status, files_ok, replay_vals):
     return "data_failed"
 
 
+def _prepare_single_candidate(remote, cand, run_id, dest_dir):
+    rel = PurePosixPath(cand["source_manifest"])
+    data = PurePosixPath(cand["source_data"])
+    if rel.parts[0] != "raw" or ".." in rel.parts or rel.is_absolute():
+        raise ValueError("invalid path in verified index")
+    if str(data) != str(rel).removesuffix(".manifest.json") + ".tsv.zst":
+        raise ValueError("index data and manifest paths do not match")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    mf_path = download(remote, str(rel), dest_dir / rel.name)
+    data_path = download(remote, str(data), dest_dir / data.name)
+    manifest = json.loads(mf_path.read_bytes())
+    archive._verify_three_way_index_manifest_data(
+        cand=cand, manifest_path=mf_path, manifest=manifest, data_path=data_path, run_id_filter=run_id,
+    )
+    return cand, manifest, data_path
+
+
+def _clean_snapshot_markets_in_file(exchange, manifest, data_path, expected_for_ex):
+    seen_snap = set()
+    boot = manifest.get("boot_id") or manifest["file_name"]
+    for _wall, conn, epoch, kind, obj in rows(data_path):
+        if kind == "META" and obj.get("event") in {
+            "LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY", "SWITCH",
+        }:
+            if exchange == BINANCE and obj.get("endpoint") == "binance_market" and obj.get("event") in {
+                "SWITCH", "GAP_START", "LOCAL_LOSS",
+            }:
+                continue
+            sym = symbol_key(str(obj.get("symbol") or "ALL"))
+            for market in list(seen_snap):
+                if sym == "ALL" or market[1] == sym:
+                    seen_snap.discard(market)
+            continue
+        event = depth_event(exchange, boot, conn, epoch, kind, obj)
+        if event is None or (exchange, event.symbol) not in expected_for_ex:
+            continue
+        payload_issue = archive._validate_depth_book_sides(
+            event.bids, event.asks, required=event.mode == "snapshot",
+            require_non_empty=event.mode == "snapshot", require_string_size=exchange == GATE,
+            ctx=exchange,
+        )
+        if payload_issue or (exchange == GATE and not verify_gate_sizes(event)):
+            seen_snap.discard((exchange, event.symbol))
+            continue
+        if event.mode == "snapshot":
+            seen_snap.add((exchange, event.symbol))
+    return seen_snap
+
+
+def reconstruct_historical_checkpoint(
+    remote,
+    config,
+    run_id,
+    begin,
+    step,
+    anchor_lookback_windows,
+    tmp_root,
+    *,
+    candidates=None,
+    checkpoint=None,
+    checkpoint_books=None,
+    checkpoint_quote=None,
+    ancestor_checkpoints=None,
+    source_restrictions=None,
+):
+    """Walk back up to anchor_lookback_windows, stopping per exchange at snapshots or gaps, and rebuild forward."""
+    expected_depths = _expected_depth_markets_set(config)
+    if not expected_depths or anchor_lookback_windows <= 0:
+        return checkpoint, checkpoint_books, checkpoint_quote, {}
+
+    existing_rows = {
+        (row["exchange"], row["symbol"]): row
+        for row in checkpoint or ()
+    }
+    anchored_now = {
+        key for key, row in existing_rows.items()
+        if row.get("book_anchored") and checkpoint_books is not None and key in checkpoint_books
+    }
+    missing = expected_depths - anchored_now
+    if not missing:
+        return checkpoint, checkpoint_books, checkpoint_quote, {}
+
+    earliest = begin - anchor_lookback_windows * step
+    if candidates is None:
+        candidates = verified_candidates(remote, config, run_id, earliest, historical=True)
+    by_ws_ex = {}
+    for cand in candidates:
+        if earliest <= cand["planned_start_s"] < begin:
+            by_ws_ex[(cand["planned_start_s"], cand["exchange"])] = cand
+
+    restrictions = source_restrictions or {}
+    ancestors = ancestor_checkpoints or {}
+    missing_by_ex = {}
+    for ex, sym in missing:
+        missing_by_ex.setdefault(ex, set()).add(sym)
+
+    replay_start = {}
+    startup_stub_windows = set()
+    used_lookback_cands = []
+
+    for k in range(1, anchor_lookback_windows + 1):
+        if not missing_by_ex:
+            break
+        w = begin - k * step
+        prev_w = w - step
+        anc = ancestors.get(prev_w)
+        if anc is not None:
+            anc_rows, anc_books, _ = anc
+            anc_row_map = {(r["exchange"], r["symbol"]): r for r in anc_rows or ()}
+            for ex in list(missing_by_ex):
+                for sym in list(missing_by_ex[ex]):
+                    key = (ex, sym)
+                    r = anc_row_map.get(key)
+                    if r and r.get("book_anchored") and anc_books and key in anc_books:
+                        replay_start[ex] = min(replay_start.get(ex, w), w)
+                        missing_by_ex[ex].discard(sym)
+                if not missing_by_ex[ex]:
+                    missing_by_ex.pop(ex)
+        if not missing_by_ex:
+            break
+
+        for ex in list(missing_by_ex):
+            if w in restrictions and ex in restrictions[w]:
+                missing_by_ex.pop(ex, None)
+                continue
+            cand = by_ws_ex.get((w, ex))
+            if cand is None:
+                missing_by_ex.pop(ex, None)
+                continue
+            expected_for_ex = {(ex, sym) for sym in missing_by_ex[ex]}
+            w_tmp = tmp_root / f"lb_probe_{k}_{ex}"
+            try:
+                _cand, mf, data_path = _prepare_single_candidate(remote, cand, run_id, w_tmp)
+                audited = archive.check_partition(data_path, mf, config)
+                bad = (
+                    bool(audited.get("structural_problems"))
+                    or (audited.get("coverage_incomplete") is True and audited.get("is_startup_stub") is not True)
+                )
+                if bad:
+                    missing_by_ex.pop(ex, None)
+                    continue
+                if audited.get("is_startup_stub") is True and audited.get("coverage_incomplete") is True:
+                    startup_stub_windows.add((w, ex))
+                found = _clean_snapshot_markets_in_file(ex, mf, data_path, expected_for_ex)
+                if found:
+                    replay_start[ex] = w
+                    for _e, sym in found:
+                        missing_by_ex[ex].discard(sym)
+                    if not missing_by_ex[ex]:
+                        missing_by_ex.pop(ex)
+            finally:
+                if w_tmp.exists():
+                    for p in sorted(w_tmp.rglob("*"), reverse=True):
+                        if p.is_file() or p.is_symlink():
+                            p.unlink(missing_ok=True)
+                        elif p.is_dir():
+                            p.rmdir()
+
+    if not replay_start:
+        return checkpoint, checkpoint_books, checkpoint_quote, {}
+
+    min_w = min(replay_start.values())
+    carry_rows = list(checkpoint or ())
+    carry_books = dict(checkpoint_books) if checkpoint_books is not None else {}
+    carry_quote = checkpoint_quote
+    # Reset carry maps to empty for forward reconstruction from min_w, merging caller state afterwards.
+    fwd_ckpt = []
+    fwd_books = {}
+    fwd_quote = None
+    reconstructed_windows = 0
+
+    for w in range(min_w, begin, step):
+        active_ex = sorted(ex for ex, ew in replay_start.items() if ew <= w)
+        if not active_ex:
+            continue
+        reconstructed_windows += 1
+        anc = ancestors.get(w - step)
+        if anc is not None:
+            anc_rows, anc_books, anc_q = anc
+            have = {(r["exchange"], r["symbol"]): r for r in fwd_ckpt}
+            for r in anc_rows or ():
+                key = (r["exchange"], r["symbol"])
+                if key[0] in active_ex and (key not in have or (r.get("book_anchored") and not have[key].get("book_anchored"))):
+                    have[key] = r
+                    if r.get("book_anchored") and anc_books and key in anc_books:
+                        fwd_books[key] = anc_books[key]
+            fwd_ckpt = list(have.values())
+            if fwd_quote is None and anc_q is not None:
+                fwd_quote = anc_q
+
+        w_tmp = tmp_root / f"lb_fwd_{w}"
+        step_items = []
+        valid_ex = []
+        try:
+            for ex in active_ex:
+                if w in restrictions and ex in restrictions[w]:
+                    continue
+                cand = by_ws_ex.get((w, ex))
+                if cand is None:
+                    continue
+                step_items.append(_prepare_single_candidate(remote, cand, run_id, w_tmp / ex))
+                used_lookback_cands.append(cand)
+                valid_ex.append(ex)
+            if not step_items:
+                continue
+            sub_config = {
+                **config,
+                "exchanges": {ex: spec for ex, spec in config.get("exchanges", {}).items() if ex in valid_ex},
+            }
+            step_summary = {}
+            export_state = {}
+            allowed_stubs = {ex for ex in valid_ex if (w, ex) in startup_stub_windows}
+            scan(
+                step_items,
+                sub_config,
+                w * NS,
+                (w + step) * NS,
+                0,
+                {},
+                step_summary,
+                checkpoint=fwd_ckpt or None,
+                source_restrictions=source_restrictions,
+                checkpoint_books=fwd_books,
+                checkpoint_quote=fwd_quote,
+                export_checkpoint_state=export_state,
+                allow_startup_stub_exchanges=allowed_stubs,
+            )
+            fwd_ckpt = step_summary.get("end_sequence_checkpoint") or []
+            fwd_books = export_state.get("books") or {}
+            if BINANCE in valid_ex and export_state.get("end_signal_quote") is not None:
+                fwd_quote = export_state["end_signal_quote"]
+        finally:
+            if w_tmp.exists():
+                for p in sorted(w_tmp.rglob("*"), reverse=True):
+                    if p.is_file() or p.is_symlink():
+                        p.unlink(missing_ok=True)
+                    elif p.is_dir():
+                        p.rmdir()
+
+    merged_rows = {(r["exchange"], r["symbol"]): r for r in carry_rows}
+    merged_books = dict(carry_books)
+    for r in fwd_ckpt:
+        key = (r["exchange"], r["symbol"])
+        prev_r = merged_rows.get(key)
+        if prev_r is None or (r.get("book_anchored") and not prev_r.get("book_anchored")):
+            merged_rows[key] = r
+            if key in fwd_books:
+                merged_books[key] = fwd_books[key]
+    merged_quote = carry_quote if carry_quote is not None else fwd_quote
+    diag = {
+        "reconstructed_lookback_windows": reconstructed_windows,
+        "reconstructed_exchanges": sorted(replay_start),
+        "reconstructed_inputs": input_digests(used_lookback_cands),
+    }
+    return list(merged_rows.values()), merged_books, merged_quote, diag
+
+
 def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_windows,
-                 candidates=None, checkpoint=None, anchor_lookback_windows=None, source_restrictions=None):
+                 candidates=None, checkpoint=None, anchor_lookback_windows=None, source_restrictions=None,
+                 checkpoint_books=None, checkpoint_quote=None, ancestor_checkpoints=None,
+                 export_checkpoint_state=None):
     out = {"status": "retryable", "run_id": run_id, "window_id": window,
            "warmup_windows": warmup_windows, "replay_sample_seconds": replay_seconds}
     stage = "validate_window"
     try:
         pm = coverage.configured_partition_minutes(config)
+        step = pm * 60
         if coverage.window_descriptor(begin, pm)["planned_start_s"] != begin:
             raise ValueError("target window must align to the configured partition length")
-        end = begin + pm * 60
+        end = begin + step
         if end > time.time():
             raise ValueError("target window has not ended")
         with tempfile.TemporaryDirectory(prefix="tokyo_archive_qa_") as directory:
             tmp = Path(directory)
-            stage = "read_verified_archives"
+            eff_checkpoint = checkpoint
+            eff_books = checkpoint_books
+            eff_quote = checkpoint_quote
             lookback = warmup_windows if anchor_lookback_windows is None else anchor_lookback_windows
-            items = list(selected_archives(remote, config, run_id, begin, end, tmp, lookback, out, candidates))
+            if anchor_lookback_windows is not None and anchor_lookback_windows > warmup_windows:
+                stage = "reconstruct_historical_checkpoint"
+                eff_checkpoint, eff_books, eff_quote, lb_diag = reconstruct_historical_checkpoint(
+                    remote,
+                    config,
+                    run_id,
+                    begin,
+                    step,
+                    anchor_lookback_windows,
+                    tmp,
+                    candidates=candidates,
+                    checkpoint=eff_checkpoint,
+                    checkpoint_books=eff_books if eff_books is not None else {},
+                    checkpoint_quote=eff_quote,
+                    ancestor_checkpoints=ancestor_checkpoints,
+                    source_restrictions=source_restrictions,
+                )
+                if lb_diag:
+                    out.update(lb_diag)
+                selected_warmup = warmup_windows
+            else:
+                selected_warmup = lookback
+            stage = "read_verified_archives"
+            items = list(selected_archives(remote, config, run_id, begin, end, tmp, selected_warmup, out, candidates))
             stage = "read_effective_btc_specs"
             try:
                 specs = load_btc_specs(remote, begin * NS, tmp) if replay_seconds else {}
@@ -862,8 +1316,20 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                 out["spec_error_type"] = type(exc).__name__
                 specs = {}
             stage = "validate_archived_events"
-            scan(items, config, begin * NS, end * NS, min(end, begin + replay_seconds) * NS,
-                 specs, out, checkpoint=checkpoint, source_restrictions=source_restrictions)
+            scan(
+                items,
+                config,
+                begin * NS,
+                end * NS,
+                min(end, begin + replay_seconds) * NS,
+                specs,
+                out,
+                checkpoint=eff_checkpoint,
+                source_restrictions=source_restrictions,
+                checkpoint_books=eff_books,
+                checkpoint_quote=eff_quote,
+                export_checkpoint_state=export_checkpoint_state,
+            )
         files_ok = all(x["qa_status"] == "passed" for x in out["archive_file_checks"])
         out["status"] = window_status(out["protocol_status"], files_ok, list(out["replay"].values()))
         if out.get("spec_error_type") or any(x["reason"] == "converter_or_engine_error"
@@ -887,15 +1353,27 @@ def audit_range(remote, config, run_id, first, last):
         by_window.setdefault(item["planned_start_s"], []).append(item)
     reports = []
     checkpoint = None
+    checkpoint_books = None
+    checkpoint_quote = None
     for start in range(first, last + step, step):
         window = coverage.window_descriptor(start, pm)["window_id"]
         context = by_window.get(start - step, []) if start == first else []
+        export_state = {}
         report = audit_window(
             remote, config, run_id, start, window, 0, int(bool(context)),
             candidates=context + by_window.get(start, []), checkpoint=checkpoint,
+            checkpoint_books=checkpoint_books, checkpoint_quote=checkpoint_quote,
+            export_checkpoint_state=export_state,
         )
         reports.append(report)
-        checkpoint = report.get("end_sequence_checkpoint") if report["status"] != "retryable" else None
+        if report["status"] != "retryable":
+            checkpoint = report.get("end_sequence_checkpoint")
+            checkpoint_books = export_state.get("books")
+            checkpoint_quote = export_state.get("end_signal_quote")
+        else:
+            checkpoint = None
+            checkpoint_books = None
+            checkpoint_quote = None
         panels = report.get("market_availability", ())
         by_status = Counter(
             (row["exchange"], status)
