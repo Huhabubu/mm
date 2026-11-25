@@ -144,6 +144,34 @@ jobs:
               sys.exit("credential dataset is PUBLIC - refusing to continue")
           PY
 
+      - name: Check out QA day reports (read-only)
+        uses: actions/checkout@v4
+        with:
+          ref: tokyo-l2-qa-state
+          path: qa_state
+          sparse-checkout: |
+            qa_reports/days
+          persist-credentials: false
+
+      - name: Stage QA day reports listed in kaggle/job.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, pathlib, shutil
+          job = json.load(open("workflow_code/kaggle/job.json"))
+          src = pathlib.Path("qa_state/qa_reports/days")
+          dst = pathlib.Path("workflow_code/kaggle/qa_days")
+          for d in job.get("qa_days_dates", []):
+              hits = sorted(src.glob(f"*/{d}_p15m.day.qa.json"))
+              if len(hits) != 1:
+                  raise SystemExit(f"need exactly one 15m QA day report for {d}, found {[str(h) for h in hits]}")
+              out = dst / hits[0].parent.name / hits[0].name
+              out.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(hits[0], out)
+              print("staged", out)
+          PY
+
       - name: Build new notebook version from kaggle/job.json
         shell: bash
         run: |
@@ -214,7 +242,7 @@ jobs:
           fi
           {
             echo "### Kaggle job: \`${KAGGLE_SLUG:-unresolved}\` final=\`${KAGGLE_FINAL:-unknown}\`"
-            for f in job_status.json secrets_precheck.json probe_report.json; do
+            for f in job_status.json secrets_precheck.json probe_report.json two_partition_report.json; do
               if [[ -f "kaggle_out/$f" ]]; then echo "#### $f"; echo '```json'; head -c 12000 "kaggle_out/$f"; echo; echo '```'; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
