@@ -1610,6 +1610,8 @@ class ProtocolTest(unittest.TestCase):
     def test_recurring_soft_runtime_budget_persists_per_window_and_resumes(self):
         import json
         from unittest.mock import patch
+        import data_coverage as coverage
+        import hourly_incremental_qa as archive
         import tokyo_l2_recurring_qa as recurring
 
         w0 = 1_795_276_800
