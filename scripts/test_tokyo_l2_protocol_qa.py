@@ -1600,8 +1600,8 @@ class ProtocolTest(unittest.TestCase):
                 ckpt, books, _q, diag = replay.reconstruct_historical_checkpoint(
                     "qa:", cfg, "r1", windows[-1], step, 10, tmp, candidates=cands,
                 )
-            self.assertEqual([], ckpt)
-            self.assertEqual({}, books)
+            self.assertIsNone(ckpt)
+            self.assertIsNone(books)
             self.assertEqual({}, diag)
             # Only w2 was downloaded before barrier truncation — never touched w1 or w0!
             self.assertEqual([windows[2]], prepared_windows)
