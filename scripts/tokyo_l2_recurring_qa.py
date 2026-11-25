@@ -218,7 +218,7 @@ def _summarize_protocol_diagnostics(report):
 MAX_ANCHOR_LOOKBACK_WINDOWS = 24
 DEFAULT_MAX_RUNTIME_SECONDS = 1500.0
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 120.0
-DEFAULT_LOOKBACK_TIMEOUT_SECONDS = 300.0
+DEFAULT_LOOKBACK_TIMEOUT_SECONDS = 720.0
 
 
 def _lookback_inputs(groups, start, step, windows):
@@ -514,6 +514,7 @@ def run(
     )
     stopped_by_runtime_budget = False
     retryable_windows = []
+    retryable_details = []
     for idx, start in enumerate(planned):
         if idx > 0 and deadline_mono is not None and time.monotonic() >= deadline_mono:
             stopped_by_runtime_budget = True
@@ -597,6 +598,12 @@ def run(
         if report.get("status") == "retryable":
             # Never persist a timeout/retryable window as a verified report or checkpoint sidecar.
             retryable_windows.append(wid(start))
+            retryable_details.append({
+                "window_id": wid(start),
+                "error_type": report.get("error_type"),
+                "error_stage": report.get("error_stage"),
+                "lookback_timed_out": bool(report.get("lookback_timed_out")),
+            })
             proofs.pop(start, None)
             new_exports.pop(start, None)
             sidecar_cache.pop(start, None)
@@ -676,6 +683,7 @@ def run(
         "historical_replay_init_unverified_windows": historical_replay_init,
         "historical_failed_windows": historical,
         "retryable_windows": retryable_windows,
+        "retryable_details": retryable_details,
         "pending_ready_windows": len(set(ready) - set(all_known)),
         "stopped_by_runtime_budget": stopped_by_runtime_budget,
         "max_runtime_seconds": budget_s,

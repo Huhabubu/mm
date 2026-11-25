@@ -41,7 +41,7 @@ TRADE_FIELDS = (
 
 
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 120.0
-DEFAULT_LOOKBACK_TIMEOUT_SECONDS = 300.0
+DEFAULT_LOOKBACK_TIMEOUT_SECONDS = 720.0
 
 
 def _download_once(remote: str, rel: str, path: Path, timeout_seconds: float) -> None:
