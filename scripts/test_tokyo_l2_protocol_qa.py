@@ -1193,17 +1193,7 @@ class ProtocolTest(unittest.TestCase):
             return (wall_ns, wall_ns, "b1", 1, u, "DATA", json.dumps(payload))
 
         cfg = {
-            "deployment": {
-                "partition_minutes": 15,
-                "channel_silence_max_seconds": {
-                    "depth": 1000,
-                    "signal": 1000,
-                    "bbo": 1000,
-                    "event_trade": 1000,
-                    "event_trade_quiet_max": 1000,
-                    "other": 1000,
-                },
-            },
+            "deployment": {"partition_minutes": 15},
             "exchanges": {
                 "binance_futures": {
                     "enabled": True,
@@ -1225,7 +1215,7 @@ class ProtocolTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             tmp = Path(temp)
             files = {}
-            for idx, (w, u_start, is_first) in enumerate(((w0, 100, True), (w1, 103, False), (w2, 106, False))):
+            for idx, (w, u_start, is_first) in enumerate(((w0, 100, True), (w1, 107, False), (w2, 114, False))):
                 w_ns = w * 1_000_000_000
                 g_rows = []
                 b_rows = []
@@ -1237,19 +1227,17 @@ class ProtocolTest(unittest.TestCase):
                     g_rows.append(gate_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, u_start,
                                              [["50000.0", "3"]], [["50001.0", "3"]]))
                     b_rows.append(binance_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, u_start - 1))
-                # Second & third updates covering target + replay window (>600s for w2).
-                t_mid = w + (650 if w == w2 else 450)
-                t_end = w + 850
-                for step_idx, t_s in enumerate((t_mid, t_end), start=1):
+                # Dense cadence (< 300s default silence limit) covering full 900s + [0, 660s) replay.
+                for step_idx, offset_s in enumerate((150, 300, 450, 600, 650, 780), start=1):
+                    t_s = w + offset_s
                     u_val = u_start + step_idx
                     g_rows.append(gate_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val,
                                              [["50000.0", str(2 + step_idx)]], [["50001.0", str(2 + step_idx)]]))
                     b_rows.append(binance_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val - 1))
-                g_rows.append(gate_trade((w + 10) * 1_000_000_000, (w + 10) * 1000, idx * 10 + 1))
-                g_rows.append(gate_trade((w + 700) * 1_000_000_000, (w + 700) * 1000, idx * 10 + 2))
-                b_rows.append(binance_bbo((w + 2) * 1_000_000_000, (w + 2) * 1000))
-                b_rows.append(binance_bbo((w + 610) * 1_000_000_000, (w + 610) * 1000))
-                b_rows.append(binance_bbo((w + 700) * 1_000_000_000, (w + 700) * 1000))
+                for tr_idx, tr_off in enumerate((10, 250, 500, 750), start=1):
+                    g_rows.append(gate_trade((w + tr_off) * 1_000_000_000, (w + tr_off) * 1000, idx * 10 + tr_idx))
+                for q_off in (2, 152, 302, 452, 610, 782):
+                    b_rows.append(binance_bbo((w + q_off) * 1_000_000_000, (w + q_off) * 1000))
                 g_rows.sort(key=lambda r: r[0])
                 b_rows.sort(key=lambda r: r[0])
                 g_path = tmp / f"gate_{w}.tsv.zst"
@@ -1288,7 +1276,7 @@ class ProtocolTest(unittest.TestCase):
                 self.assertEqual("passed", s1["protocol_status"])
                 self.assertEqual(2, s1["boundary_book_anchored_markets"])
                 self.assertEqual(2, len(s1["end_sequence_checkpoint"]))
-                self.assertEqual([[50000.0, 4.0], [49999.0, 2.0]], exp1["books"][("gate_futures", "BTCUSDT")]["bids"])
+                self.assertEqual([[50000.0, 8.0], [49999.0, 2.0]], exp1["books"][("gate_futures", "BTCUSDT")]["bids"])
 
                 # W2 (16:00Z) runs real hourly HftBacktest smoke replay + probe_orders on pure deltas with warmup=0!
                 s2 = {}
@@ -1334,13 +1322,7 @@ class ProtocolTest(unittest.TestCase):
         step = 900
         windows = [w0 + i * step for i in range(7)]  # w0..w6 (6-window span > legacy lookback=4)
         cfg = {
-            "deployment": {
-                "partition_minutes": 15,
-                "channel_silence_max_seconds": {
-                    "depth": 1000, "signal": 1000, "bbo": 1000,
-                    "event_trade": 1000, "event_trade_quiet_max": 1000, "other": 1000,
-                },
-            },
+            "deployment": {"partition_minutes": 15},
             "exchanges": {"gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu"]}},
         }
 
@@ -1372,13 +1354,14 @@ class ProtocolTest(unittest.TestCase):
                         "b": [["50000.0", str(2 + idx)]], "a": [["50001.0", "2"]],
                     }}
                     msgs.append((w_ns + 1_000_000_000, w_ns + 1_000_000_000, "c1", 1, seq, "DATA", json.dumps(payload)))
-                seq += 1
-                msgs.append(((w + 600) * 1_000_000_000, (w + 600) * 1_000_000_000, "c1", 1, seq, "DATA", json.dumps({
-                    "channel": "futures.obu", "event": "update", "result": {
-                        "s": "ob.BTC_USDT.50", "u": seq, "U": seq, "t": (w + 600) * 1000,
-                        "b": [["50000.0", str(3 + idx)]], "a": [["50001.0", "2"]],
-                    },
-                })))
+                for off_s in (250, 500, 750):
+                    seq += 1
+                    msgs.append(((w + off_s) * 1_000_000_000, (w + off_s) * 1_000_000_000, "c1", 1, seq, "DATA", json.dumps({
+                        "channel": "futures.obu", "event": "update", "result": {
+                            "s": "ob.BTC_USDT.50", "u": seq, "U": seq, "t": (w + off_s) * 1000,
+                            "b": [["50000.0", str(3 + idx)]], "a": [["50001.0", "2"]],
+                        },
+                    })))
                 fpath = tmp / f"gate_{w}.tsv.zst"
                 make_zst(fpath, msgs)
                 cand = {
