@@ -35,6 +35,9 @@ DETAIL_EVENTS = {
     "LATE_FRAME_REJECTED",
 }
 WAIT_EVENTS = {"DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"}
+CONNECTION_EVENTS = {"SWITCH", "STANDBY_DISCONNECT", "GAP_START", "GAP_END"}
+OVERLAP_SECONDS = 5.0
+DUP_TARGETS = ["2026-11-22T09:45Z", "2026-11-23T12:00Z", "2026-11-23T13:45Z", "2026-11-24T12:00Z"]
 BTC_MARKERS = {"gate_futures": "ob.BTC_USDT.50", "bybit_linear": "orderbook.50.BTCUSDT"}
 
 
@@ -333,6 +336,8 @@ def trade_symbol(trade, obj):
 def trade_duplicates(arc, exchange, start):
     """Trade ids seen more than once in one window, with the connection and frame action of each copy."""
     seen, meta = defaultdict(list), []
+    first_trade_wall, first_line_wall, meta_conns, conn_events = {}, {}, set(), []
+    event_names = Counter()
     lo, hi = start * NS, (start + arc.step) * NS
     for item in arc.items(exchange, start):
         with arc.opened(item) as (_manifest, path):
@@ -340,33 +345,77 @@ def trade_duplicates(arc, exchange, start):
                 if wall < lo or wall >= hi:
                     continue
                 obj = load(kind, payload)
+                first_line_wall.setdefault(f"{conn}:{epoch}", wall)
                 if kind == "META":
-                    if obj.get("event") in DETAIL_EVENTS and len(meta) < 60:
+                    event = obj.get("event")
+                    event_names[str(event)] += 1
+                    meta_conns.add(f"{conn}:{epoch}")
+                    if event in CONNECTION_EVENTS:
+                        conn_events.append(wall)
+                    if event in DETAIL_EVENTS and event not in ("DEPTH_UNAVAILABLE", "DEPTH_RECOVERED") \
+                            and len(meta) < 80:
                         meta.append({"wall_utc": iso(wall), "line_conn": f"{conn}:{epoch}", **scalars(obj)})
                     continue
-                for trade in trading_event(exchange, obj):
+                trades = trading_event(exchange, obj)
+                if trades:
+                    first_trade_wall.setdefault(f"{conn}:{epoch}", wall)
+                for trade in trades:
                     tid = trade.get("id") if exchange == GATE else trade.get("i") or trade.get("tradeId")
                     if tid is None:
                         continue
-                    fields = {k: trade.get(k) for k in ("price", "size", "side", "ts", "p", "v", "S", "T",
-                                                        "create_time_ms") if k in trade}
+                    fields = {k: trade.get(k) for k in ("contract", "s", "price", "size", "side", "ts", "create_time",
+                                                        "create_time_ms", "is_internal", "p", "px", "P",
+                                                        "v", "sz", "S", "T", "BT", "RPI", "isRPI") if k in trade}
                     seen[(trade_symbol(trade, obj), str(tid))].append({
                         "wall_utc": iso(wall), "wall_ns": wall, "conn": f"{conn}:{epoch}",
                         "action": obj.get("action") or obj.get("type") or obj.get("event"), "fields": fields,
                     })
-    dups = []
+    conn_events.sort()
+    dups, classes, by_symbol = [], Counter(), Counter()
     for (sym, tid), occ in sorted(seen.items()):
         if len(occ) > 1:
+            conns = [o["conn"] for o in occ]
+            identical = len({json.dumps(o["fields"], sort_keys=True) for o in occ}) == 1
+            cross = len(set(conns)) == len(conns)
+            later = occ[1:]
+            since_conn_start = [round((o["wall_ns"] - first_trade_wall[o["conn"]]) / NS, 3) for o in later]
+            nearest_events = [min(conn_events, key=lambda t, w=o["wall_ns"]: abs(w - t), default=None) for o in later]
+            since_event = [None if t is None else round((o["wall_ns"] - t) / NS, 3)
+                           for o, t in zip(later, nearest_events)]
+            started_here = [first_line_wall[o["conn"]] - lo > NS or (s is not None and abs(s) <= OVERLAP_SECONDS)
+                            for o, s in zip(later, since_event)]
+            later_initial = all(o["conn"] != occ[0]["conn"] and s <= OVERLAP_SECONDS and here
+                                for o, s, here in zip(later, since_conn_start, started_here))
+            if cross and identical and later_initial:
+                cls = "connection_overlap"
+            elif not identical:
+                cls = "conflicting_fields"
+            elif not cross:
+                cls = "same_connection_repeat"
+            else:
+                cls = "cross_connection_late"
+            classes[cls] += 1
+            by_symbol[(sym, cls)] += 1
             dups.append({
-                "symbol": sym, "trade_id": tid, "count": len(occ),
-                "same_connection": len({o["conn"] for o in occ}) == 1,
-                "identical_fields": len({json.dumps(o["fields"], sort_keys=True) for o in occ}) == 1,
+                "symbol": sym, "trade_id": tid, "count": len(occ), "class": cls,
+                "same_connection": len(set(conns)) == 1, "identical_fields": identical,
                 "gap_ms": round((occ[-1]["wall_ns"] - occ[0]["wall_ns"]) / 1e6, 3),
+                "later_seconds_since_connection_first_trade": since_conn_start,
+                "later_seconds_since_connection_event": since_event,
+                "later_connection_started_in_window": started_here,
                 "occurrences": [{k: v for k, v in o.items() if k != "wall_ns"} for o in occ[:6]],
             })
+    non_overlap = [d for d in dups if d["class"] != "connection_overlap"]
+    shown = non_overlap[:60] + [d for d in dups if d["class"] == "connection_overlap"][:max(0, 60 - len(non_overlap))]
     return {"exchange": exchange, "window_id": arc.wid(start), "trade_copies": sum(len(v) for v in seen.values()),
-            "unique_trade_ids": len(seen), "duplicate_count": len(dups), "duplicates": dups[:50],
-            "meta_events": meta}
+            "unique_trade_ids": len(seen), "duplicate_count": len(dups), "classes": dict(classes),
+            "by_symbol_class": {f"{s}|{c}": n for (s, c), n in sorted(by_symbol.items())},
+            "connections_first_trade_utc": {k: iso(v) for k, v in sorted(first_trade_wall.items())},
+            "connections_with_meta": sorted(meta_conns), "meta_event_counts": dict(event_names),
+            "max_gap_ms": max((d["gap_ms"] for d in dups), default=None),
+            "max_later_seconds_since_connection_first_trade": max(
+                (x for d in dups for x in d["later_seconds_since_connection_first_trade"]), default=None),
+            "duplicates": shown, "meta_events": meta}
 
 
 def row(values):
@@ -428,17 +477,27 @@ def render(report):
         lines.append(row([a["exchange"], a["target_window"], a["active_connection"], a["found"], a.get("anchor_utc"),
                           a.get("age_seconds"), a.get("windows_back"), a.get("bytes_to_anchor"), a.get("stop_reason")]))
     lines += ["", "## Duplicate trade ids inside the target window", "",
-              row(["exchange", "window", "trade copies", "unique ids", "duplicates", "symbol", "trade id",
-                   "same connection", "identical fields", "gap ms", "copies (conn@UTC action)"]),
-              row(["---"] * 11)]
+              f"`connection_overlap` = copies on distinct connection epochs, identical fields, and every later copy "
+              f"arrives within {OVERLAP_SECONDS}s of its connection's first trade frame.", "",
+              row(["exchange", "window", "trade copies", "unique ids", "duplicates", "classes", "by symbol",
+                   "connections (first trade UTC)", "max gap ms", "max later s after conn start"]),
+              row(["---"] * 10)]
     for d in report.get("trade_duplicates") or []:
-        head = [d["exchange"], d["window_id"], d["trade_copies"], d["unique_trade_ids"], d["duplicate_count"]]
-        if not d["duplicates"]:
-            lines.append(row(head + [None] * 6))
-        for dup in d["duplicates"]:
+        lines.append(row([d["exchange"], d["window_id"], d["trade_copies"], d["unique_trade_ids"],
+                          d["duplicate_count"], json.dumps(d.get("classes") or {}, sort_keys=True),
+                          json.dumps(d.get("by_symbol_class") or {}, sort_keys=True),
+                          " ".join(f"{k}@{v}" for k, v in (d.get("connections_first_trade_utc") or {}).items()),
+                          d.get("max_gap_ms"), d.get("max_later_seconds_since_connection_first_trade")]))
+    lines += ["", "### Duplicate samples (non-overlap first)", "",
+              row(["exchange", "window", "symbol", "trade id", "class", "identical fields", "gap ms",
+                   "later s after conn start", "copies (conn@UTC action)"]),
+              row(["---"] * 9)]
+    for d in report.get("trade_duplicates") or []:
+        for dup in d["duplicates"][:25]:
             copies = "; ".join(f"{o['conn']}@{o['wall_utc']} {o['action']}" for o in dup["occurrences"])
-            lines.append(row(head + [dup["symbol"], dup["trade_id"], dup["same_connection"],
-                                     dup["identical_fields"], dup["gap_ms"], copies]))
+            lines.append(row([d["exchange"], d["window_id"], dup["symbol"], dup["trade_id"], dup["class"],
+                              dup["identical_fields"], dup["gap_ms"],
+                              dup["later_seconds_since_connection_first_trade"], copies]))
     for d in report.get("trade_duplicates") or []:
         if d["duplicates"] and d["meta_events"]:
             lines += ["", f"META events in {d['exchange']} {d['window_id']}:", ""]
@@ -487,7 +546,8 @@ def main():
             "anchor_search": [],
             "trade_duplicates": [],
         }
-        for target in args.trade_dup_target or ["2026-11-24T12:00Z"]:
+        targets = [t.strip() for raw in (args.trade_dup_target or DUP_TARGETS) for t in raw.split(",") if t.strip()]
+        for target in targets:
             for exchange in ("bitget_v3", "gate_futures", "bybit_linear"):
                 report["trade_duplicates"].append(trade_duplicates(arc, exchange, window_start(target)))
         if not args.skip_anchor_search:
