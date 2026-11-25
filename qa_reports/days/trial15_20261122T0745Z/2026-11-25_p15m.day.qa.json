@@ -10,10 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 43,
+  "observed_windows_count": 45,
   "missing_windows": [
-    "2026-11-25T10:45Z",
-    "2026-11-25T11:00Z",
     "2026-11-25T11:15Z",
     "2026-11-25T11:30Z",
     "2026-11-25T11:45Z",
@@ -69,7 +67,8 @@
   "failed_windows": [
     "2026-11-25T01:30Z",
     "2026-11-25T03:00Z",
-    "2026-11-25T06:45Z"
+    "2026-11-25T06:45Z",
+    "2026-11-25T10:45Z"
   ],
   "overdue_windows": [],
   "pending_windows": [],
@@ -90,10 +89,25 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 649,
+  "clock_certified_minutes": 679,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
   "damaged_partitions": [
+    {
+      "exchange": "binance_futures",
+      "window_id": "2026-11-25T10:45Z",
+      "window_span_id": "2026-11-25T10:45Z__2026-11-25T11:00Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "binance_futures_20261125_1045_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/binance_futures/2026-11-25/binance_futures_20261125_1045_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 1,
+      "problems": [
+        "recorded loss/gap events: loss=0, gap_start=1",
+        "depth unavailable events recorded: 5"
+      ]
+    },
     {
       "exchange": "bitget_v3",
       "window_id": "2026-11-25T01:30Z",
