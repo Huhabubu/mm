@@ -1094,6 +1094,7 @@ def test_accepted_reconciliation_stale_requeue_and_low_freq_catchup_completion()
             archive_root,
             token="pat_test",
             max_dispatches=2,
+            max_in_flight=2,
             now_epoch_s=t0,
             http_sender=ok_sender,
             qa_state_dir=state_dir,
@@ -1609,10 +1610,10 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
         expected_checker_commit="commit_new",
     ) is None
 
-    # 6. Non-terminal anchor_unverified protocol report -> MUST return None!
-    proto_unverified = {
-        "status": "anchor_unverified",
-        "protocol_status": "anchor_unverified",
+    # 6. Non-terminal pending/retryable protocol report -> MUST return None!
+    proto_pending = {
+        "status": "pending",
+        "protocol_status": "pending",
         "run_id": rec["run_id"],
         "window_id": rec["target_window_utc"],
         "archive_revision": rec["archive_revision"],
@@ -1621,10 +1622,33 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
     assert qd.evaluate_qa_reports_for_record(
         rec,
         window_report=good_win,
-        protocol_report=proto_unverified,
+        protocol_report=proto_pending,
         require_protocol_report=True,
         expected_protocol_checker="commit_new/rules_v2",
     ) is None
+
+    # 6b. anchor_unverified and replay_init_unverified terminate the dispatch job WITHOUT passing quality!
+    for unv_status in ("anchor_unverified", "replay_init_unverified"):
+        proto_unv = {
+            "status": unv_status,
+            "protocol_status": unv_status,
+            "run_id": rec["run_id"],
+            "window_id": rec["target_window_utc"],
+            "archive_revision": rec["archive_revision"],
+            "checker": "commit_new/rules_v2",
+            "input_checkpoint_digest": "digest_abc",
+        }
+        unv_verdict = qd.evaluate_qa_reports_for_record(
+            rec,
+            window_report=good_win,
+            protocol_report=proto_unv,
+            require_protocol_report=True,
+            expected_protocol_checker="commit_new/rules_v2",
+        )
+        assert unv_verdict is not None
+        assert unv_verdict["qa_result_status"] == unv_status
+        assert unv_verdict["qa_result_status"] != "passed"
+        assert unv_verdict["qa_evidence_digest"] == "digest_abc"
 
     # 7. All four dimensions (run_id, window_id, archive_revision, bound checker+rules) match -> completes!
     proto_ok = {
@@ -1650,3 +1674,157 @@ def test_reconciliation_rejects_missing_revision_and_stale_checker_protocol_repo
     assert verdict["protocol_checker"] == "commit_new/rules_v2"
 
 
+
+
+def test_unverified_termination_inflight_throttle_backoff_and_conditional_revalidation(tmp_path):
+    """Verify:
+    1. anchor_unverified / replay_init_unverified complete the outbox dispatch (QA_COMPLETED)
+       with qa_result_status != 'passed'.
+    2. max_in_flight=1 prevents dispatching new workflows while another ACCEPTED run is in flight.
+    3. Stale ACCEPTED requeue (accepted_result_missing_or_replaced) uses exponential backoff.
+    4. Completed passed/protocol_failed rows are NEVER requeued; unverified rows update in-place
+       when remote reports promote to passed, or requeue ONLY on new pending evidence / rules update.
+    5. Historical failed/needs_review file memoization invalidates on checker change while passed stays cached.
+    """
+    now_s = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc).timestamp()
+    now_iso = qd._iso_utc(now_s)
+    run_id = "trial15_20261122T0745Z"
+    w1_id, w2_id, w3_id = "2026-11-24T14:00Z", "2026-11-24T14:15Z", "2026-11-24T14:30Z"
+    rev1, rev2, rev3 = "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64
+    state_dir = tmp_path / "qa_state"
+    ledger_path = tmp_path / arch.LEDGER_DB_FILENAME
+
+    with arch.ArchiveLedger(ledger_path) as ledger:
+        for wid, rev in ((w1_id, rev1), (w2_id, rev2), (w3_id, rev3)):
+            ledger.enqueue_qa_dispatch(
+                run_id=run_id,
+                target_window_utc=wid,
+                archive_revision=rev,
+                partition_minutes=15,
+                window_span_id=None,
+                index_sha256="9" * 64,
+                index_synced_at_utc=now_iso,
+                manifests=[],
+                now_iso=now_iso,
+            )
+
+    sent = []
+
+    def sender(_url, _hdrs, body_bytes, _ct, _tt):
+        sent.append(json.loads(body_bytes.decode("utf-8"))["inputs"]["target_window_utc"])
+        return qd.HttpDispatchResponse(204, {}, "")
+
+    def write_pair(wid, rev, *, qa_status="passed", win_checker="chk_v1", proto_status="passed", proto_checker="chk_v1/r1", digest="d1", reason=None):
+        rec = {"run_id": run_id, "target_window_utc": wid, "archive_revision": rev, "partition_minutes": 15}
+        wpath = state_dir / qd._window_report_rel_paths(rec)[0]
+        wpath.parent.mkdir(parents=True, exist_ok=True)
+        wpath.write_text(json.dumps({
+            "run_id": run_id, "window_id": wid, "archive_revision": rev,
+            "checker_commit_sha": win_checker, "qa_status": qa_status,
+        }), encoding="utf-8")
+        ppath = state_dir / qd._protocol_report_rel_path(rec)
+        ppath.parent.mkdir(parents=True, exist_ok=True)
+        pobj = {
+            "status": proto_status, "protocol_status": proto_status, "run_id": run_id,
+            "window_id": wid, "archive_revision": rev, "checker": proto_checker,
+            "input_checkpoint_digest": digest, "completed_at_utc": now_iso,
+        }
+        if reason:
+            pobj["reason"] = reason
+        ppath.write_text(json.dumps(pobj), encoding="utf-8")
+
+    # Tick 1: 3 PENDING rows, max_in_flight=1 -> dispatches ONLY 1 (newest: w3)!
+    r1 = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=2, max_in_flight=1, now_epoch_s=now_s,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v1", expected_protocol_checker="chk_v1/r1",
+        recover_from_index=False,
+    )
+    assert sent == [w3_id]
+    assert r1["outbox_counts"] == {"PENDING": 2, "ACCEPTED": 1, "QA_COMPLETED": 0}
+
+    # Tick 2 while w3 is still ACCEPTED -> throttled, sends NOTHING!
+    r2 = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=2, max_in_flight=1, now_epoch_s=now_s + 60,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v1", expected_protocol_checker="chk_v1/r1",
+        recover_from_index=False,
+    )
+    assert sent == [w3_id]
+    assert r2["in_flight_throttled"] is True
+
+    # w3 times out at +1800s -> requeued with backoff (next_attempt_at_epoch_s = now_s + 1800 + 30)
+    r_stale = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=2, max_in_flight=1, now_epoch_s=now_s + 1800,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v1", expected_protocol_checker="chk_v1/r1",
+        accepted_stale_timeout_s=1800, base_backoff_s=30, recover_from_index=False,
+    )
+    assert r_stale["reconciliation"]["requeued_stale_count"] == 1
+    with arch.ArchiveLedger(ledger_path) as ledger:
+        w3_row = ledger.get_qa_dispatch(run_id=run_id, target_window_utc=w3_id, archive_revision=rev3)
+        assert w3_row["next_attempt_at_epoch_s"] == now_s + 1830
+
+    # Complete w3 as anchor_unverified, w2 as replay_init_unverified, w1 as passed.
+    write_pair(w3_id, rev3, proto_status="anchor_unverified")
+    r_w3_done = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=1, max_in_flight=1, now_epoch_s=now_s + 1810,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v1", expected_protocol_checker="chk_v1/r1",
+        recover_from_index=False,
+    )
+    assert r_w3_done["reconciliation"]["completed_count"] == 1
+    assert r_w3_done["reconciliation"]["completed"][0]["qa_result_status"] == "anchor_unverified"
+    assert sent == [w3_id, w2_id]
+
+    write_pair(w2_id, rev2, proto_status="replay_init_unverified")
+    r_w2_done = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=1, max_in_flight=1, now_epoch_s=now_s + 1820,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v1", expected_protocol_checker="chk_v1/r1",
+        recover_from_index=False,
+    )
+    assert r_w2_done["reconciliation"]["completed"][0]["qa_result_status"] == "replay_init_unverified"
+    assert sent == [w3_id, w2_id, w1_id]
+
+    write_pair(w1_id, rev1, proto_status="passed")
+    r_w1_done = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=1, max_in_flight=1, now_epoch_s=now_s + 1830,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v1", expected_protocol_checker="chk_v1/r1",
+        recover_from_index=False,
+    )
+    assert r_w1_done["outbox_counts"] == {"PENDING": 0, "ACCEPTED": 0, "QA_COMPLETED": 3}
+    assert r_w1_done["quality_counts"] == {"anchor_unverified": 1, "replay_init_unverified": 1, "passed": 1}
+
+    # Case A: catch-up promotes w2 from replay_init_unverified -> passed on state_dir.
+    # Dispatcher reconciles in-place with ZERO new dispatches!
+    write_pair(w2_id, rev2, proto_status="passed", digest="d2")
+    r_promote = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=1, max_in_flight=1, now_epoch_s=now_s + 2500,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v1", expected_protocol_checker="chk_v1/r1",
+        unverified_recheck_interval_s=600, recover_from_index=False,
+    )
+    assert r_promote["reconciliation"]["revalidated_unverified_count"] == 1
+    assert r_promote["attempted_count"] == 0
+    assert r_promote["quality_counts"] == {"anchor_unverified": 1, "passed": 2}
+
+    # Case B: rules updated (chk_v2/r2) -> ONLY unverified w3 requeues; passed w1/w2 NEVER requeue!
+    r_rules = qd.dispatch_pending_qa(
+        tmp_path, token="pat", max_dispatches=1, max_in_flight=1, now_epoch_s=now_s + 3200,
+        http_sender=sender, qa_state_dir=state_dir, require_protocol_report=True,
+        expected_checker_commit="chk_v2", expected_protocol_checker="chk_v2/r2",
+        unverified_recheck_interval_s=600, recover_from_index=False,
+    )
+    assert r_rules["reconciliation"]["requeued_unverified_count"] == 1
+    assert r_rules["reconciliation"]["requeued_unverified"][0]["target_window_utc"] == w3_id
+    assert sent == [w3_id, w2_id, w1_id, w3_id]
+
+    # Verify _is_memoized_up_to_date historical invalidation behavior
+    cand = {"source_manifest": "m.json", "data_sha256": "a", "manifest_sha256": "b"}
+    prev_pass = {"qa_version": qa.QA_VERSION, "source_manifest": "m.json", "effective_config_sha256": "cfg",
+                 "partition_minutes": 15, "checker_commit_sha": "old", "qa_status": "passed", "sha256": "a", "manifest_sha256": "b"}
+    prev_fail = dict(prev_pass, qa_status="failed")
+    assert qa._is_memoized_up_to_date(prev_pass, cand, cfg_hash="cfg", config_pm=15, checker_commit="new", recheck_non_passed_on_checker_change=True) is True
+    assert qa._is_memoized_up_to_date(prev_fail, cand, cfg_hash="cfg", config_pm=15, checker_commit="new", recheck_non_passed_on_checker_change=True) is False

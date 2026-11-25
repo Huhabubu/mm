@@ -212,6 +212,7 @@ class AssetDayBuffers:
     seen_snapshot: bool = False
     # Dedup set for trades: (symbol, trade_id)
     seen_trade_ids: set[str] = field(default_factory=set)
+    seen_agg_trade_ids: set[str] = field(default_factory=set)
     dedup_trades_dropped: int = 0
     special_flag_counts: dict[str, int] = field(
         default_factory=lambda: {"is_internal": 0, "BT": 0, "RPI": 0}
@@ -882,8 +883,9 @@ def _ingest_binance_record(
             anchor["last_u"] = last_u
         _emit_depth_batch(buf, False, exch_ts, local_ts, bids, asks)
     elif ev == "aggTrade" or stream.endswith("@aggTrade"):
-        # Preserve raw aggTrade without splitting!
-        sym = canonical_asset("binance_futures", str(data["s"]))
+        # Preserve raw aggTrade without splitting, deduplicating by (raw_symbol, agg_id) keeping first received!
+        raw_sym = str(data["s"])
+        sym = canonical_asset("binance_futures", raw_sym)
         exch_ms = int(data.get("T") or data.get("E") or (local_ts // 1_000_000))
         exch_ts = exch_ms * 1_000_000
         agg_id = int(data["a"])
@@ -896,6 +898,11 @@ def _ingest_binance_record(
             ("binance_futures", sym, date_utc),
             AssetDayBuffers("binance_futures", sym, date_utc),
         )
+        dedup_key = f"{raw_sym}:{agg_id}"
+        if dedup_key in buf.seen_agg_trade_ids:
+            buf.dedup_trades_dropped += 1
+            return
+        buf.seen_agg_trade_ids.add(dedup_key)
         if exch_ts > local_ts:
             buf.exch_ahead_of_local_count += 1
         buf.agg_trade_rows.append((local_ts, exch_ts, agg_id, first_id, last_id, px, qty, is_buyer_maker))

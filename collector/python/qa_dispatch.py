@@ -55,6 +55,9 @@ DEFAULT_MAX_BACKOFF_S = 900.0
 DEFAULT_AUTH_BACKOFF_S = 300.0
 DEFAULT_ACCEPTED_STALE_TIMEOUT_S = 1800.0
 DEFAULT_MAX_DISPATCHES_PER_RUN = 2
+DEFAULT_MAX_IN_FLIGHT = 1
+DEFAULT_UNVERIFIED_RECHECK_INTERVAL_S = 600.0
+DEFAULT_MAX_UNVERIFIED_RECHECK = 4
 MAX_GITHUB_GET_BODY_BYTES = 1024 * 1024
 
 _PROTOCOL_RULE_SCRIPT_PATHS = (
@@ -63,7 +66,16 @@ _PROTOCOL_RULE_SCRIPT_PATHS = (
     "scripts/tokyo_l2_recurring_qa.py",
 )
 _TERMINAL_ARCHIVE_QA_STATUSES = frozenset({"passed", "failed", "needs_review"})
-_TERMINAL_PROTOCOL_QA_STATUSES = frozenset({"passed", "data_failed"})
+_TERMINAL_PROTOCOL_QA_STATUSES = frozenset(
+    {"passed", "data_failed", "anchor_unverified", "replay_init_unverified"}
+)
+_UNVERIFIED_PROTOCOL_RESULT_STATUSES = frozenset({"anchor_unverified", "replay_init_unverified"})
+_PROTOCOL_RESULT_STATUS_MAP = {
+    "passed": "passed",
+    "data_failed": "protocol_failed",
+    "anchor_unverified": "anchor_unverified",
+    "replay_init_unverified": "replay_init_unverified",
+}
 
 
 @dataclass(frozen=True)
@@ -390,13 +402,15 @@ def evaluate_qa_reports_for_record(
         ):
             proto_ok = True
             proto_status = str(protocol_report.get("protocol_status") or p_status)
-            final_status = "passed" if p_status == "passed" else "protocol_failed"
+            final_status = _PROTOCOL_RESULT_STATUS_MAP[p_status]
+            evidence_digest = str(protocol_report.get("input_checkpoint_digest") or "").strip() or None
             return {
                 "qa_result_status": final_status,
                 "window_qa_status": win_status,
                 "protocol_status": proto_status,
                 "checker_commit_sha": win_checker,
                 "protocol_checker": p_checker_full,
+                "qa_evidence_digest": evidence_digest,
                 "qa_completed_at_utc": protocol_report.get("completed_at_utc"),
             }
 
@@ -429,14 +443,24 @@ def make_state_dir_result_fetcher(
         except (OSError, ValueError):
             return None
 
-    def _fetch(record: dict[str, Any]) -> dict[str, Any] | None:
+    def _inspect(record: dict[str, Any]) -> dict[str, Any]:
         win_rep: dict[str, Any] | None = None
         for rel in _window_report_rel_paths(record):
             win_rep = _read_json(state_dir / rel)
             if win_rep is not None:
                 break
         proto_rep = _read_json(state_dir / _protocol_report_rel_path(record))
-        return evaluate_qa_reports_for_record(
+        verdict = evaluate_qa_reports_for_record(
+            record,
+            window_report=win_rep,
+            protocol_report=proto_rep,
+            require_protocol_report=require_protocol_report,
+            expected_checker_commit=expected_checker_commit,
+            expected_protocol_checker=expected_protocol_checker,
+        )
+        if verdict is not None:
+            return {"kind": "terminal", "verdict": verdict}
+        return _classify_non_terminal_report_pair(
             record,
             window_report=win_rep,
             protocol_report=proto_rep,
@@ -445,6 +469,11 @@ def make_state_dir_result_fetcher(
             expected_protocol_checker=expected_protocol_checker,
         )
 
+    def _fetch(record: dict[str, Any]) -> dict[str, Any] | None:
+        info = _inspect(record)
+        return info["verdict"] if info["kind"] == "terminal" else None
+
+    _fetch.inspect_record = _inspect  # type: ignore[attr-defined]
     return _fetch
 
 
@@ -503,6 +532,53 @@ def resolve_expected_checker_from_github(
         scripts_bytes[rel] = s_resp.body.encode("utf-8")
     rules_sha = compute_protocol_rules_sha(scripts_bytes)
     return checker_commit, f"{checker_commit}/{rules_sha}"
+
+
+def _classify_non_terminal_report_pair(
+    record: dict[str, Any],
+    *,
+    window_report: dict[str, Any] | None,
+    protocol_report: dict[str, Any] | None,
+    require_protocol_report: bool,
+    expected_checker_commit: str | None,
+    expected_protocol_checker: str | None,
+) -> dict[str, Any]:
+    if not isinstance(window_report, dict):
+        return {"kind": "missing"}
+    exp_run_id = str(record.get("run_id") or "").strip()
+    exp_wid = str(record.get("target_window_utc") or "").strip()
+    exp_rev = str(record.get("archive_revision") or "").strip()
+    if (
+        str(window_report.get("run_id") or "").strip() != exp_run_id
+        or str(window_report.get("window_id") or "").strip() != exp_wid
+        or str(window_report.get("archive_revision") or "").strip() != exp_rev
+    ):
+        return {"kind": "missing"}
+    if isinstance(protocol_report, dict):
+        if (
+            str(protocol_report.get("run_id") or "").strip() == exp_run_id
+            and str(protocol_report.get("window_id") or "").strip() == exp_wid
+            and str(protocol_report.get("archive_revision") or "").strip() == exp_rev
+        ):
+            p_status = str(protocol_report.get("status") or "").strip()
+            if p_status == "pending":
+                return {
+                    "kind": "pending_revalidation",
+                    "reason": str(protocol_report.get("reason") or "protocol_inputs_changed"),
+                }
+            exp_proto = str(expected_protocol_checker or "").strip()
+            p_chk = str(protocol_report.get("checker") or "").strip()
+            if exp_proto and p_chk and p_chk != exp_proto:
+                return {"kind": "stale_checker", "reason": "qa_rules_updated"}
+            exp_commit = str(expected_checker_commit or (exp_proto.split("/", 1)[0] if exp_proto else "")).strip()
+            if exp_commit and p_chk and p_chk.split("/", 1)[0] != exp_commit:
+                return {"kind": "stale_checker", "reason": "qa_checker_updated"}
+    if not require_protocol_report:
+        exp_commit = str(expected_checker_commit or "").strip()
+        win_chk = str(window_report.get("checker_commit_sha") or "").strip()
+        if exp_commit and win_chk and win_chk != exp_commit:
+            return {"kind": "stale_checker", "reason": "qa_checker_updated"}
+    return {"kind": "unchanged"}
 
 
 def make_github_result_fetcher(
@@ -587,7 +663,7 @@ def make_github_result_fetcher(
             return parsed if isinstance(parsed, dict) else None
         raise RuntimeError(f"GitHub state read failed for {rel_path}: HTTP {resp.status_code}")
 
-    def _fetch(record: dict[str, Any]) -> dict[str, Any] | None:
+    def _inspect(record: dict[str, Any]) -> dict[str, Any]:
         exp_commit, exp_proto = _ensure_expected_checker()
         win_rep: dict[str, Any] | None = None
         for rel in _window_report_rel_paths(record):
@@ -595,11 +671,21 @@ def make_github_result_fetcher(
             if win_rep is not None:
                 break
         if win_rep is None:
-            return None
+            return {"kind": "missing"}
         proto_rep: dict[str, Any] | None = None
         if str(win_rep.get("qa_status") or "") == "passed":
             proto_rep = _get_json(_protocol_report_rel_path(record))
-        return evaluate_qa_reports_for_record(
+        verdict = evaluate_qa_reports_for_record(
+            record,
+            window_report=win_rep,
+            protocol_report=proto_rep,
+            require_protocol_report=require_protocol_report,
+            expected_checker_commit=exp_commit,
+            expected_protocol_checker=exp_proto,
+        )
+        if verdict is not None:
+            return {"kind": "terminal", "verdict": verdict}
+        return _classify_non_terminal_report_pair(
             record,
             window_report=win_rep,
             protocol_report=proto_rep,
@@ -608,6 +694,11 @@ def make_github_result_fetcher(
             expected_protocol_checker=exp_proto,
         )
 
+    def _fetch(record: dict[str, Any]) -> dict[str, Any] | None:
+        info = _inspect(record)
+        return info["verdict"] if info["kind"] == "terminal" else None
+
+    _fetch.inspect_record = _inspect  # type: ignore[attr-defined]
     return _fetch
 
 
@@ -621,6 +712,8 @@ def reconcile_accepted_dispatches(
     max_backoff_s: float = DEFAULT_MAX_BACKOFF_S,
     now_epoch_s: float | None = None,
     token: str | None = None,
+    unverified_recheck_interval_s: float = DEFAULT_UNVERIFIED_RECHECK_INTERVAL_S,
+    max_unverified_recheck: int = DEFAULT_MAX_UNVERIFIED_RECHECK,
 ) -> dict[str, Any]:
     """Reconcile ACCEPTED (and previously attempted PENDING) outbox entries against final QA reports.
 
@@ -679,6 +772,8 @@ def reconcile_accepted_dispatches(
                 archive_revision=str(row["archive_revision"]),
                 qa_result_status=result_status,
                 qa_completed_at_utc=completed_ts,
+                qa_checker=verdict.get("protocol_checker") or verdict.get("checker_commit_sha"),
+                qa_evidence_digest=verdict.get("qa_evidence_digest"),
                 workflow_run_id=verdict.get("workflow_run_id"),
                 workflow_run_url=verdict.get("workflow_run_url"),
                 workflow_run_started_at_utc=verdict.get("workflow_run_started_at_utc"),
@@ -722,7 +817,12 @@ def reconcile_accepted_dispatches(
                     f"No matching final QA report for ({row['run_id']}, {row['target_window_utc']}, "
                     f"{row['archive_revision']}) after {int(age_s)}s (possibly replaced in concurrency queue)"
                 )
-                next_attempt_s = now_s
+                next_attempt_s = now_s + _compute_retry_delay_s(
+                    attempt_index=max(0, int(row["attempt_count"]) - 1),
+                    base_backoff_s=base_backoff_s,
+                    max_backoff_s=max_backoff_s,
+                    now_s=now_s,
+                )
             else:
                 error_code = "accepted_result_fetch_failed"
                 event_type = "QA_DISPATCH_REQUEUED_FETCH_ERROR"
@@ -775,14 +875,115 @@ def reconcile_accepted_dispatches(
                 }
             )
 
+    revalidated_items: list[dict[str, Any]] = []
+    requeued_unverified_items: list[dict[str, Any]] = []
+    inspect_fn = getattr(result_fetcher, "inspect_record", None)
+    if (
+        callable(inspect_fn)
+        and int(max_unverified_recheck) > 0
+        and len(in_flight_items) == 0
+        and len(requeued_items) == 0
+    ):
+        last_recheck_raw = ledger.get_meta("qa_dispatch_last_unverified_recheck_s")
+        last_recheck_s = float(last_recheck_raw) if last_recheck_raw else 0.0
+        if (now_s - last_recheck_s) >= float(unverified_recheck_interval_s):
+            unverified_rows = [
+                r
+                for r in ledger.list_qa_dispatches(
+                    states=("QA_COMPLETED",),
+                    run_id=run_id_filter,
+                    newest_first=False,
+                )
+                if r.get("qa_result_status") in _UNVERIFIED_PROTOCOL_RESULT_STATUSES
+            ]
+            unverified_rows.sort(
+                key=lambda r: (str(r.get("updated_at_utc") or ""), str(r.get("target_window_utc") or ""))
+            )
+            if unverified_rows:
+                ledger.set_meta("qa_dispatch_last_unverified_recheck_s", str(now_s))
+            for urow in unverified_rows[: int(max_unverified_recheck)]:
+                try:
+                    info = inspect_fn(urow)
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "id": urow["id"],
+                            "run_id": urow["run_id"],
+                            "target_window_utc": urow["target_window_utc"],
+                            "archive_revision": urow["archive_revision"],
+                            "error": _sanitize_error(f"{type(exc).__name__}: {exc}", token=token),
+                        }
+                    )
+                    continue
+                if info["kind"] == "terminal":
+                    verdict = info["verdict"]
+                    new_status = str(verdict["qa_result_status"])
+                    new_checker = verdict.get("protocol_checker") or verdict.get("checker_commit_sha")
+                    new_digest = verdict.get("qa_evidence_digest")
+                    if (
+                        new_status != urow.get("qa_result_status")
+                        or (new_checker and new_checker != urow.get("qa_checker"))
+                        or (new_digest and new_digest != urow.get("qa_evidence_digest"))
+                    ):
+                        completed_ts = str(verdict.get("qa_completed_at_utc") or now_iso)
+                        ledger.mark_qa_dispatch_completed(
+                            run_id=str(urow["run_id"]),
+                            target_window_utc=str(urow["target_window_utc"]),
+                            archive_revision=str(urow["archive_revision"]),
+                            qa_result_status=new_status,
+                            qa_completed_at_utc=completed_ts,
+                            qa_checker=new_checker,
+                            qa_evidence_digest=new_digest,
+                            now_iso=now_iso,
+                        )
+                        revalidated_items.append(
+                            {
+                                "id": urow["id"],
+                                "target_window_utc": urow["target_window_utc"],
+                                "previous_status": urow.get("qa_result_status"),
+                                "qa_result_status": new_status,
+                            }
+                        )
+                elif info["kind"] in ("pending_revalidation", "stale_checker"):
+                    reason = str(info.get("reason") or info["kind"])
+                    if ledger.mark_qa_dispatch_recheck(
+                        int(urow["id"]),
+                        error_code=reason,
+                        error_message=f"Revalidating unverified window ({urow.get('qa_result_status')}): {reason}",
+                        now_iso=now_iso,
+                    ):
+                        ledger.record_event(
+                            ts_utc=now_iso,
+                            run_id=str(urow["run_id"] or "qa_dispatch"),
+                            event_type="QA_DISPATCH_REVALIDATION_QUEUED",
+                            detail={
+                                "target_window_utc": urow["target_window_utc"],
+                                "archive_revision": urow["archive_revision"],
+                                "previous_status": urow.get("qa_result_status"),
+                                "reason": reason,
+                            },
+                        )
+                        requeued_unverified_items.append(
+                            {
+                                "id": urow["id"],
+                                "target_window_utc": urow["target_window_utc"],
+                                "previous_status": urow.get("qa_result_status"),
+                                "reason": reason,
+                            }
+                        )
+
     return {
         "checked_count": len(accepted_rows) + len(retried_pending_rows),
         "completed_count": len(completed_items),
         "requeued_stale_count": len(requeued_items),
+        "revalidated_unverified_count": len(revalidated_items),
+        "requeued_unverified_count": len(requeued_unverified_items),
         "in_flight_count": len(in_flight_items),
         "error_count": len(errors),
         "completed": completed_items,
         "requeued_stale": requeued_items,
+        "revalidated_unverified": revalidated_items,
+        "requeued_unverified": requeued_unverified_items,
         "in_flight": in_flight_items,
         "errors": errors,
     }
@@ -887,6 +1088,9 @@ def dispatch_pending_qa(
     run_id_filter: str | None = None,
     partition_minutes_filter: int | None = None,
     max_dispatches: int = DEFAULT_MAX_DISPATCHES_PER_RUN,
+    max_in_flight: int | None = None,
+    unverified_recheck_interval_s: float | None = None,
+    max_unverified_recheck: int | None = None,
     max_age_hours: float | None = None,
     connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
     total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
@@ -934,6 +1138,21 @@ def dispatch_pending_qa(
         )
     else:
         eff_require_protocol = bool(require_protocol_report)
+    if max_in_flight is None:
+        env_inflight = os.environ.get("TOKYO_L2_GITHUB_QA_MAX_IN_FLIGHT", "").strip()
+        eff_max_in_flight = int(env_inflight) if env_inflight else DEFAULT_MAX_IN_FLIGHT
+    else:
+        eff_max_in_flight = max(1, int(max_in_flight))
+    eff_recheck_interval_s = (
+        float(unverified_recheck_interval_s)
+        if unverified_recheck_interval_s is not None
+        else DEFAULT_UNVERIFIED_RECHECK_INTERVAL_S
+    )
+    eff_max_unverified_recheck = (
+        int(max_unverified_recheck)
+        if max_unverified_recheck is not None
+        else DEFAULT_MAX_UNVERIFIED_RECHECK
+    )
     eff_expected_checker_commit = (
         expected_checker_commit
         if expected_checker_commit is not None
@@ -1032,6 +1251,8 @@ def dispatch_pending_qa(
                         max_backoff_s=max_backoff_s,
                         now_epoch_s=now_s,
                         token=eff_token or None,
+                        unverified_recheck_interval_s=eff_recheck_interval_s,
+                        max_unverified_recheck=eff_max_unverified_recheck,
                     )
                     reconciliation = {
                         "enabled": True,
@@ -1108,7 +1329,12 @@ def dispatch_pending_qa(
             auth_errors: list[dict[str, Any]] = []
             rejected_errors: list[dict[str, Any]] = []
 
-            to_send = due_pending[: max(0, int(max_dispatches))]
+            in_flight_now = len(
+                ledger.list_qa_dispatches(states=("ACCEPTED",), run_id=run_id_filter, newest_first=True)
+            )
+            in_flight_slots = max(0, eff_max_in_flight - in_flight_now)
+            in_flight_throttled = bool(due_pending) and in_flight_slots == 0
+            to_send = due_pending[: min(max(0, int(max_dispatches)), in_flight_slots)]
             for rec in to_send:
                 payload = build_workflow_dispatch_payload(
                     rec,
@@ -1312,6 +1538,11 @@ def dispatch_pending_qa(
             else:
                 overall_status = "ok"
 
+            quality_counts: dict[str, int] = {}
+            for row in completed_total:
+                qkey = str(row.get("qa_result_status") or "unknown")
+                quality_counts[qkey] = quality_counts.get(qkey, 0) + 1
+
             return {
                 "status": overall_status,
                 "phase": "qa_dispatch",
@@ -1320,6 +1551,8 @@ def dispatch_pending_qa(
                 "workflow": eff_workflow,
                 "ref": eff_ref,
                 "token_configured": True,
+                "max_in_flight": eff_max_in_flight,
+                "in_flight_throttled": in_flight_throttled,
                 "recovery": recovery,
                 "reconciliation": reconciliation,
                 "attempted_count": len(to_send),
@@ -1336,6 +1569,7 @@ def dispatch_pending_qa(
                     "ACCEPTED": len(accepted_total),
                     "QA_COMPLETED": len(completed_total),
                 },
+                "quality_counts": quality_counts,
             }
     finally:
         lock.release()
@@ -1417,6 +1651,10 @@ def get_dispatch_status(
         accepted = ledger.list_qa_dispatches(states=("ACCEPTED",), run_id=run_id_filter, newest_first=True)
         completed = ledger.list_qa_dispatches(states=("QA_COMPLETED",), run_id=run_id_filter, newest_first=True)
         failed = ledger.list_qa_dispatches(states=("FAILED_PERMANENT",), run_id=run_id_filter, newest_first=True)
+    quality_counts: dict[str, int] = {}
+    for row in completed:
+        qkey = str(row.get("qa_result_status") or "unknown")
+        quality_counts[qkey] = quality_counts.get(qkey, 0) + 1
     return {
         "status": "ok",
         "ledger_db_path": str(ledger_path),
@@ -1426,6 +1664,7 @@ def get_dispatch_status(
             "QA_COMPLETED": len(completed),
             "FAILED_PERMANENT": len(failed),
         },
+        "quality_counts": quality_counts,
         "pending": pending[:limit],
         "accepted": accepted[:limit],
         "completed": completed[:limit],
@@ -1445,6 +1684,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", default=None, help="Git ref to dispatch (production default: main)")
     parser.add_argument("--token-env", default=DEFAULT_TOKEN_ENV, help="Env var holding fine-grained GitHub PAT")
     parser.add_argument("--max-dispatches", type=int, default=DEFAULT_MAX_DISPATCHES_PER_RUN)
+    parser.add_argument("--max-in-flight", type=int, default=None, help="Max concurrent ACCEPTED dispatches allowed before throttling new triggers (default: 1)")
     parser.add_argument("--max-age-hours", type=float, default=None, help="Optional max window age for index recovery")
     parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT_S)
     parser.add_argument("--total-timeout", type=float, default=DEFAULT_TOTAL_TIMEOUT_S)
@@ -1485,6 +1725,7 @@ def main(argv: list[str] | None = None) -> int:
         run_id_filter=run_id_filter,
         partition_minutes_filter=pm_filter,
         max_dispatches=args.max_dispatches,
+        max_in_flight=args.max_in_flight,
         max_age_hours=args.max_age_hours,
         connect_timeout_s=args.connect_timeout,
         total_timeout_s=args.total_timeout,

@@ -1313,6 +1313,7 @@ def _is_memoized_up_to_date(
     cfg_hash: str,
     config_pm: int,
     checker_commit: str | None = None,
+    recheck_non_passed_on_checker_change: bool = False,
 ) -> bool:
     if previous.get("qa_version") != QA_VERSION:
         return False
@@ -1323,7 +1324,11 @@ def _is_memoized_up_to_date(
     if int(previous.get("partition_minutes") or 0) != int(config_pm):
         return False
     if checker_commit is not None and previous.get("checker_commit_sha") != checker_commit:
-        return False
+        if not recheck_non_passed_on_checker_change or previous.get("qa_status") in {
+            QA_STATUS_FAILED,
+            QA_STATUS_NEEDS_REVIEW,
+        }:
+            return False
     if previous.get("qa_status") not in {QA_STATUS_PASSED, QA_STATUS_FAILED, QA_STATUS_NEEDS_REVIEW}:
         return False
     if not cand.get("data_sha256") or not cand.get("manifest_sha256"):
@@ -2297,7 +2302,8 @@ def run(
                     cand,
                     cfg_hash=cfg_hash,
                     config_pm=pm,
-                    checker_commit=commit_sha if is_target_cand else None,
+                    checker_commit=commit_sha,
+                    recheck_non_passed_on_checker_change=not is_target_cand,
                 ):
                     skipped += 1
                     file_reports[rel] = previous
@@ -2426,7 +2432,8 @@ def run(
                     cand,
                     cfg_hash=cfg_hash,
                     config_pm=pm,
-                    checker_commit=commit_sha if is_tgt else None,
+                    checker_commit=commit_sha,
+                    recheck_non_passed_on_checker_change=not is_tgt,
                 ):
                     file_reports.setdefault(rel, obj)
                     qst = obj.get("qa_status")
@@ -2896,6 +2903,11 @@ def main() -> int:
     parser.add_argument("--download-retries", type=int, default=3, help="Retry count for transient cloud download errors")
     parser.add_argument("--limit", type=int, default=16)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--exit-zero-on-clean-execution",
+        action="store_true",
+        help="Exit 0 when the QA runner executed cleanly even if data quality status is failed/blocked",
+    )
     args = parser.parse_args()
     if args.limit < 1:
         parser.error("--limit must be positive")
@@ -2917,6 +2929,13 @@ def main() -> int:
         download_retries=args.download_retries,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.exit_zero_on_clean_execution:
+        clean_exec = (
+            result.get("job_execution_status") == "ok"
+            and result.get("target_window_execution_status") == "ok"
+            and int(result.get("target_retry_needed") or 0) == 0
+        )
+        return 0 if clean_exec else 2
     return 0 if result["status"] == "ok" else 2
 
 
