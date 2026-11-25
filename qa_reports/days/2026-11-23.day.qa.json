@@ -1,7 +1,7 @@
 {
   "report_level": "day",
   "qa_version": 2,
-  "checker_commit_sha": "0211a0b3b9d3a3ed3ebd9f0193738d7d25936100",
+  "checker_commit_sha": "02058d432e21252c248cb2bfd61e36c34533b996",
   "effective_config_sha256": "b266588d4021978dbe1dcfe0ca29dade8584ef60a7f5de51cdba25401b0c669a",
   "date_utc": "2026-11-23",
   "partition_minutes": 15,
@@ -15,20 +15,23 @@
   "failed_windows": [
     "2026-11-23T00:00Z",
     "2026-11-23T06:30Z",
-    "2026-11-23T12:00Z",
     "2026-11-23T12:45Z",
     "2026-11-23T13:45Z",
-    "2026-11-23T14:00Z",
+    "2026-11-23T14:00Z"
+  ],
+  "overdue_windows": [],
+  "pending_windows": [],
+  "archived_pending_qa_windows": [
     "2026-11-23T14:15Z",
     "2026-11-23T14:30Z",
     "2026-11-23T14:45Z",
     "2026-11-23T19:30Z"
   ],
-  "overdue_windows": [],
-  "pending_windows": [],
-  "archived_pending_qa_windows": [],
   "review_windows": [],
-  "cross_window_sequence_issues": [],
+  "cross_window_sequence_issues": [
+    "bitget_v3:2026-11-23T15:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=45653888,got=48959575",
+    "bitget_v3:2026-11-23T19:45Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=59264382,got=59870552"
+  ],
   "restarts_by_exchange": {
     "binance_futures": [
       "trial15_20261122T0745Z_1795333473410706867"
@@ -105,26 +108,6 @@
     },
     {
       "exchange": "bitget_v3",
-      "window_id": "2026-11-23T12:00Z",
-      "window_span_id": "2026-11-23T12:00Z__2026-11-23T12:15Z_15m",
-      "run_id": "trial15_20261122T0745Z",
-      "file_name": "bitget_v3_20261123_1200_p15m_trial15_20261122_da93ae54.tsv.zst",
-      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1200_p15m_trial15_20261122_da93ae54.manifest.json",
-      "qa_status": "failed",
-      "local_loss_events": 0,
-      "gap_start_events": 0,
-      "problems": [
-        "planned_rotation missing continuous delta after snapshot for BTCUSDT (A:14)",
-        "planned_rotation missing continuous delta after snapshot for DOGEUSDT (A:14)",
-        "planned_rotation missing continuous delta after snapshot for ETHUSDT (A:14)",
-        "planned_rotation missing continuous delta after snapshot for SOLUSDT (A:14)",
-        "planned_rotation missing continuous delta after snapshot for SUIUSDT (A:14)",
-        "planned_rotation missing continuous delta after snapshot for XRPUSDT (A:14)",
-        "depth unavailable events recorded: 6"
-      ]
-    },
-    {
-      "exchange": "bitget_v3",
       "window_id": "2026-11-23T12:45Z",
       "window_span_id": "2026-11-23T12:45Z__2026-11-23T13:00Z_15m",
       "run_id": "trial15_20261122T0745Z",
@@ -164,62 +147,6 @@
       "gap_start_events": 0,
       "problems": [
         "depth unavailable events recorded: 18"
-      ]
-    },
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-23T14:15Z",
-      "window_span_id": "2026-11-23T14:15Z__2026-11-23T14:30Z_15m",
-      "run_id": "trial15_20261122T0745Z",
-      "file_name": "bitget_v3_20261123_1415_p15m_trial15_20261122_da93ae54.tsv.zst",
-      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1415_p15m_trial15_20261122_da93ae54.manifest.json",
-      "qa_status": "failed",
-      "local_loss_events": 0,
-      "gap_start_events": 0,
-      "problems": [
-        "depth unavailable events recorded: 6"
-      ]
-    },
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-23T14:30Z",
-      "window_span_id": "2026-11-23T14:30Z__2026-11-23T14:45Z_15m",
-      "run_id": "trial15_20261122T0745Z",
-      "file_name": "bitget_v3_20261123_1430_p15m_trial15_20261122_da93ae54.tsv.zst",
-      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1430_p15m_trial15_20261122_da93ae54.manifest.json",
-      "qa_status": "failed",
-      "local_loss_events": 0,
-      "gap_start_events": 0,
-      "problems": [
-        "depth unavailable events recorded: 18"
-      ]
-    },
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-23T14:45Z",
-      "window_span_id": "2026-11-23T14:45Z__2026-11-23T15:00Z_15m",
-      "run_id": "trial15_20261122T0745Z",
-      "file_name": "bitget_v3_20261123_1445_p15m_trial15_20261122_da93ae54.tsv.zst",
-      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1445_p15m_trial15_20261122_da93ae54.manifest.json",
-      "qa_status": "failed",
-      "local_loss_events": 0,
-      "gap_start_events": 0,
-      "problems": [
-        "depth unavailable events recorded: 6"
-      ]
-    },
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-23T19:30Z",
-      "window_span_id": "2026-11-23T19:30Z__2026-11-23T19:45Z_15m",
-      "run_id": "trial15_20261122T0745Z",
-      "file_name": "bitget_v3_20261123_1930_p15m_trial15_20261122_da93ae54.tsv.zst",
-      "source_manifest": "raw/bitget_v3/2026-11-23/bitget_v3_20261123_1930_p15m_trial15_20261122_da93ae54.manifest.json",
-      "qa_status": "failed",
-      "local_loss_events": 0,
-      "gap_start_events": 0,
-      "problems": [
-        "depth unavailable events recorded: 6"
       ]
     }
   ],

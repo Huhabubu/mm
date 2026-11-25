@@ -1,7 +1,7 @@
 {
   "report_level": "day",
   "qa_version": 2,
-  "checker_commit_sha": "0211a0b3b9d3a3ed3ebd9f0193738d7d25936100",
+  "checker_commit_sha": "02058d432e21252c248cb2bfd61e36c34533b996",
   "effective_config_sha256": "b266588d4021978dbe1dcfe0ca29dade8584ef60a7f5de51cdba25401b0c669a",
   "date_utc": "2026-11-25",
   "partition_minutes": 15,
@@ -10,9 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 11,
+  "observed_windows_count": 12,
   "missing_windows": [
-    "2026-11-25T02:45Z",
     "2026-11-25T03:00Z",
     "2026-11-25T03:15Z",
     "2026-11-25T03:30Z",
@@ -98,14 +97,18 @@
     "2026-11-25T23:30Z",
     "2026-11-25T23:45Z"
   ],
-  "failed_windows": [
+  "failed_windows": [],
+  "overdue_windows": [],
+  "pending_windows": [
+    "2026-11-25T02:45Z"
+  ],
+  "archived_pending_qa_windows": [
     "2026-11-25T01:30Z"
   ],
-  "overdue_windows": [],
-  "pending_windows": [],
-  "archived_pending_qa_windows": [],
   "review_windows": [],
-  "cross_window_sequence_issues": [],
+  "cross_window_sequence_issues": [
+    "bitget_v3:2026-11-25T01:45Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=110367336,got=110906948"
+  ],
   "restarts_by_exchange": {
     "binance_futures": [
       "trial15_20261122T0745Z_1795333473410706867"
@@ -120,26 +123,10 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 169,
+  "clock_certified_minutes": 184,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
-  "damaged_partitions": [
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-25T01:30Z",
-      "window_span_id": "2026-11-25T01:30Z__2026-11-25T01:45Z_15m",
-      "run_id": "trial15_20261122T0745Z",
-      "file_name": "bitget_v3_20261125_0130_p15m_trial15_20261122_da93ae54.tsv.zst",
-      "source_manifest": "raw/bitget_v3/2026-11-25/bitget_v3_20261125_0130_p15m_trial15_20261122_da93ae54.manifest.json",
-      "qa_status": "failed",
-      "local_loss_events": 0,
-      "gap_start_events": 1,
-      "problems": [
-        "recorded loss/gap events: loss=0, gap_start=1",
-        "depth unavailable events recorded: 5"
-      ]
-    }
-  ],
+  "damaged_partitions": [],
   "qa_status": "failed",
   "status": "blocked"
 }
