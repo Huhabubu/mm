@@ -453,6 +453,11 @@ _PARTITION_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("late_frames_rejected", "INTEGER NOT NULL DEFAULT 0"),
 )
 
+_QA_DISPATCH_OUTBOX_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("qa_checker", "TEXT"),
+    ("qa_evidence_digest", "TEXT"),
+)
+
 
 class ArchiveLedger:
     """Durable SQLite WAL incremental archive state store & event journal."""
@@ -486,6 +491,13 @@ class ArchiveLedger:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_partitions_window ON partitions(window_id, exchange)"
         )
+        outbox_cols = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(qa_dispatch_outbox)").fetchall()
+        }
+        for col_name, col_ddl in _QA_DISPATCH_OUTBOX_EXTRA_COLUMNS:
+            if col_name not in outbox_cols:
+                self.conn.execute(f"ALTER TABLE qa_dispatch_outbox ADD COLUMN {col_name} {col_ddl}")
 
     def _init_schema(self) -> None:
         with self.conn:
@@ -620,6 +632,8 @@ class ArchiveLedger:
                     workflow_run_started_at_utc TEXT,
                     qa_completed_at_utc TEXT,
                     qa_result_status TEXT,
+                    qa_checker TEXT,
+                    qa_evidence_digest TEXT,
                     last_http_status INTEGER,
                     last_error_code TEXT,
                     last_error_message TEXT,
@@ -1481,6 +1495,8 @@ class ArchiveLedger:
         archive_revision: str,
         qa_result_status: str,
         qa_completed_at_utc: str,
+        qa_checker: str | None = None,
+        qa_evidence_digest: str | None = None,
         workflow_run_id: int | None = None,
         workflow_run_url: str | None = None,
         workflow_run_started_at_utc: str | None = None,
@@ -1491,8 +1507,13 @@ class ArchiveLedger:
                 """
                 UPDATE qa_dispatch_outbox
                 SET state = 'QA_COMPLETED',
+                    qa_completed_at_utc = CASE
+                        WHEN COALESCE(qa_result_status, '') != ? THEN ?
+                        ELSE COALESCE(qa_completed_at_utc, ?)
+                    END,
                     qa_result_status = ?,
-                    qa_completed_at_utc = COALESCE(qa_completed_at_utc, ?),
+                    qa_checker = COALESCE(?, qa_checker),
+                    qa_evidence_digest = COALESCE(?, qa_evidence_digest),
                     workflow_run_id = COALESCE(?, workflow_run_id),
                     workflow_run_url = COALESCE(?, workflow_run_url),
                     workflow_run_started_at_utc = COALESCE(?, workflow_run_started_at_utc),
@@ -1504,6 +1525,10 @@ class ArchiveLedger:
                 (
                     str(qa_result_status),
                     str(qa_completed_at_utc),
+                    str(qa_completed_at_utc),
+                    str(qa_result_status),
+                    str(qa_checker) if qa_checker else None,
+                    str(qa_evidence_digest) if qa_evidence_digest else None,
                     int(workflow_run_id) if workflow_run_id is not None else None,
                     workflow_run_url,
                     workflow_run_started_at_utc,
@@ -1511,6 +1536,36 @@ class ArchiveLedger:
                     str(run_id),
                     str(target_window_utc),
                     str(archive_revision),
+                ),
+            )
+            return cur.rowcount > 0
+
+    def mark_qa_dispatch_recheck(
+        self,
+        dispatch_id: int,
+        *,
+        error_code: str,
+        error_message: str,
+        now_iso: str,
+    ) -> bool:
+        """Requeue an unverified QA_COMPLETED entry ONLY when new evidence or rules require revalidation."""
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                UPDATE qa_dispatch_outbox
+                SET state = 'PENDING',
+                    next_attempt_at_epoch_s = 0,
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    updated_at_utc = ?
+                WHERE id = ? AND state = 'QA_COMPLETED'
+                  AND qa_result_status IN ('anchor_unverified', 'replay_init_unverified')
+                """,
+                (
+                    str(error_code),
+                    str(error_message)[:500],
+                    now_iso,
+                    int(dispatch_id),
                 ),
             )
             return cur.rowcount > 0
