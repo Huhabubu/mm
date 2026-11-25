@@ -1081,8 +1081,21 @@ def _prepare_single_candidate(remote, cand, run_id, dest_dir):
     return cand, manifest, data_path
 
 
-def _clean_snapshot_markets_in_file(exchange, manifest, data_path, expected_for_ex):
+def _cleanup_tree(path):
+    if path is not None and path.exists():
+        for p in sorted(path.rglob("*"), reverse=True):
+            if p.is_file() or p.is_symlink():
+                p.unlink(missing_ok=True)
+            elif p.is_dir():
+                p.rmdir()
+
+
+def _inspect_lookback_partition(exchange, manifest, data_path, expected_for_ex, required_next_conn):
+    """Inspect one lookback file for clean anchors vs unrecoverable gaps/connection barriers."""
     seen_snap = set()
+    had_barrier = set()
+    first_conn = {}
+    last_conn = {}
     boot = manifest.get("boot_id") or manifest["file_name"]
     for _wall, conn, epoch, kind, obj in rows(data_path):
         if kind == "META" and obj.get("event") in {
@@ -1093,24 +1106,48 @@ def _clean_snapshot_markets_in_file(exchange, manifest, data_path, expected_for_
             }:
                 continue
             sym = symbol_key(str(obj.get("symbol") or "ALL"))
-            for market in list(seen_snap):
+            for market in expected_for_ex:
                 if sym == "ALL" or market[1] == sym:
                     seen_snap.discard(market)
+                    had_barrier.add(market)
             continue
         event = depth_event(exchange, boot, conn, epoch, kind, obj)
         if event is None or (exchange, event.symbol) not in expected_for_ex:
             continue
+        market = (exchange, event.symbol)
         payload_issue = archive._validate_depth_book_sides(
             event.bids, event.asks, required=event.mode == "snapshot",
             require_non_empty=event.mode == "snapshot", require_string_size=exchange == GATE,
             ctx=exchange,
         )
         if payload_issue or (exchange == GATE and not verify_gate_sizes(event)):
-            seen_snap.discard((exchange, event.symbol))
+            seen_snap.discard(market)
+            had_barrier.add(market)
             continue
+        first_conn.setdefault(market, event.connection)
+        if market in last_conn and last_conn[market] != event.connection:
+            seen_snap.discard(market)
+            had_barrier.add(market)
+        last_conn[market] = event.connection
         if event.mode == "snapshot":
-            seen_snap.add((exchange, event.symbol))
-    return seen_snap
+            seen_snap.add(market)
+
+    anchored_here = set()
+    blocked_markets = set()
+    for market in expected_for_ex:
+        req_conn = required_next_conn.get(market)
+        if market in seen_snap:
+            if req_conn is not None and last_conn.get(market) != req_conn:
+                blocked_markets.add(market)
+            else:
+                anchored_here.add(market)
+        elif market in had_barrier or market not in first_conn:
+            blocked_markets.add(market)
+        elif req_conn is not None and last_conn.get(market) != req_conn:
+            blocked_markets.add(market)
+        else:
+            required_next_conn[market] = first_conn[market]
+    return anchored_here, blocked_markets
 
 
 def reconstruct_historical_checkpoint(
@@ -1130,7 +1167,7 @@ def reconstruct_historical_checkpoint(
     ancestor_checkpoints=None,
     source_restrictions=None,
 ):
-    """Walk back up to anchor_lookback_windows, stopping per exchange at snapshots or gaps, and rebuild forward."""
+    """Walk back up to anchor_lookback_windows, stopping per market at snapshots or barriers, and rebuild forward."""
     expected_depths = _expected_depth_markets_set(config)
     if not expected_depths or anchor_lookback_windows <= 0:
         return checkpoint, checkpoint_books, checkpoint_quote, {}
@@ -1164,152 +1201,189 @@ def reconstruct_historical_checkpoint(
     replay_start = {}
     startup_stub_windows = set()
     used_lookback_cands = []
-
-    for k in range(1, anchor_lookback_windows + 1):
-        if not missing_by_ex:
-            break
-        w = begin - k * step
-        prev_w = w - step
-        anc = ancestors.get(prev_w)
-        if anc is not None:
-            anc_rows, anc_books = anc[0], anc[1]
-            anc_row_map = {(r["exchange"], r["symbol"]): r for r in anc_rows or ()}
-            for ex in list(missing_by_ex):
-                for sym in list(missing_by_ex[ex]):
-                    key = (ex, sym)
-                    r = anc_row_map.get(key)
-                    if r and r.get("book_anchored") and anc_books and key in anc_books:
-                        replay_start[ex] = min(replay_start.get(ex, w), w)
-                        missing_by_ex[ex].discard(sym)
-                if not missing_by_ex[ex]:
-                    missing_by_ex.pop(ex)
-        if not missing_by_ex:
-            break
-
-        for ex in list(missing_by_ex):
-            if w in restrictions and ex in restrictions[w]:
-                missing_by_ex.pop(ex, None)
-                continue
-            cand = by_ws_ex.get((w, ex))
-            if cand is None:
-                missing_by_ex.pop(ex, None)
-                continue
-            expected_for_ex = {(ex, sym) for sym in missing_by_ex[ex]}
-            w_tmp = tmp_root / f"lb_probe_{k}_{ex}"
-            try:
-                _cand, mf, data_path = _prepare_single_candidate(remote, cand, run_id, w_tmp)
-                audited = archive.check_partition(data_path, mf, config)
-                bad = (
-                    bool(audited.get("structural_problems"))
-                    or (audited.get("coverage_incomplete") is True and audited.get("is_startup_stub") is not True)
-                )
-                if bad:
-                    missing_by_ex.pop(ex, None)
-                    continue
-                if audited.get("is_startup_stub") is True and audited.get("coverage_incomplete") is True:
-                    startup_stub_windows.add((w, ex))
-                found = _clean_snapshot_markets_in_file(ex, mf, data_path, expected_for_ex)
-                if found:
-                    replay_start[ex] = w
-                    for _e, sym in found:
-                        missing_by_ex[ex].discard(sym)
-                    if not missing_by_ex[ex]:
-                        missing_by_ex.pop(ex)
-            finally:
-                if w_tmp.exists():
-                    for p in sorted(w_tmp.rglob("*"), reverse=True):
-                        if p.is_file() or p.is_symlink():
-                            p.unlink(missing_ok=True)
-                        elif p.is_dir():
-                            p.rmdir()
-
-    if not replay_start:
-        return checkpoint, checkpoint_books, checkpoint_quote, {}
-
-    min_w = min(replay_start.values())
-    carry_rows = list(checkpoint or ())
-    carry_books = dict(checkpoint_books) if checkpoint_books is not None else {}
-    carry_quote = checkpoint_quote
-    # Reset carry maps to empty for forward reconstruction from min_w, merging caller state afterwards.
-    fwd_ckpt = []
-    fwd_books = {}
-    fwd_quote = None
-    fwd_streams = {}
+    required_next_conn = {}
+    cached_files = {}
+    cached_bytes = 0
+    max_cache_bytes = 1_500_000_000
     reconstructed_windows = 0
 
-    for w in range(min_w, begin, step):
-        active_ex = sorted(ex for ex, ew in replay_start.items() if ew <= w)
-        if not active_ex:
-            continue
-        reconstructed_windows += 1
-        anc = ancestors.get(w - step)
-        if anc is not None:
-            anc_rows, anc_books, anc_q = anc[0], anc[1], anc[2]
-            anc_s = anc[3] if len(anc) > 3 else {}
-            have = {(r["exchange"], r["symbol"]): r for r in fwd_ckpt}
-            for r in anc_rows or ():
-                key = (r["exchange"], r["symbol"])
-                if key[0] in active_ex and (key not in have or (r.get("book_anchored") and not have[key].get("book_anchored"))):
-                    have[key] = r
-                    if r.get("book_anchored") and anc_books and key in anc_books:
-                        fwd_books[key] = anc_books[key]
-            fwd_ckpt = list(have.values())
-            if fwd_quote is None and anc_q is not None:
-                fwd_quote = anc_q
-            for skey, sns in (anc_s or {}).items():
-                if skey[0] in active_ex and skey not in fwd_streams:
-                    fwd_streams[skey] = sns
+    try:
+        for k in range(1, anchor_lookback_windows + 1):
+            if not missing_by_ex:
+                break
+            w = begin - k * step
+            prev_w = w - step
+            anc = ancestors.get(prev_w)
+            if anc is not None:
+                anc_rows, anc_books = anc[0], anc[1]
+                anc_row_map = {(r["exchange"], r["symbol"]): r for r in anc_rows or ()}
+                for ex in list(missing_by_ex):
+                    for sym in list(missing_by_ex[ex]):
+                        key = (ex, sym)
+                        r = anc_row_map.get(key)
+                        if r and r.get("book_anchored") and anc_books and key in anc_books:
+                            replay_start[ex] = min(replay_start.get(ex, w), w)
+                            missing_by_ex[ex].discard(sym)
+                    if not missing_by_ex[ex]:
+                        missing_by_ex.pop(ex)
+            if not missing_by_ex:
+                break
 
-        w_tmp = tmp_root / f"lb_fwd_{w}"
-        step_items = []
-        valid_ex = []
-        try:
-            for ex in active_ex:
+            probe_list = []
+            for ex in list(missing_by_ex):
                 if w in restrictions and ex in restrictions[w]:
+                    missing_by_ex.pop(ex, None)
                     continue
                 cand = by_ws_ex.get((w, ex))
                 if cand is None:
+                    missing_by_ex.pop(ex, None)
                     continue
-                step_items.append(_prepare_single_candidate(remote, cand, run_id, w_tmp / ex))
-                used_lookback_cands.append(cand)
-                valid_ex.append(ex)
-            if not step_items:
+                probe_list.append((ex, cand, tmp_root / f"lb_cache_{w}_{ex}"))
+
+            if probe_list:
+                with ThreadPoolExecutor(max_workers=min(4, len(probe_list))) as pool:
+                    prepared = list(
+                        pool.map(
+                            lambda item: _prepare_single_candidate(remote, item[1], run_id, item[2]),
+                            probe_list,
+                        )
+                    )
+                for (ex, cand, w_tmp), (_c, mf, data_path) in zip(probe_list, prepared):
+                    expected_for_ex = {(ex, sym) for sym in missing_by_ex.get(ex, ())}
+                    audited = archive.check_partition(data_path, mf, config)
+                    bad = (
+                        bool(audited.get("structural_problems"))
+                        or (audited.get("coverage_incomplete") is True and audited.get("is_startup_stub") is not True)
+                    )
+                    if bad:
+                        missing_by_ex.pop(ex, None)
+                        _cleanup_tree(w_tmp)
+                        continue
+                    if audited.get("is_startup_stub") is True and audited.get("coverage_incomplete") is True:
+                        startup_stub_windows.add((w, ex))
+                    anchored_here, blocked_markets = _inspect_lookback_partition(
+                        ex, mf, data_path, expected_for_ex, required_next_conn,
+                    )
+                    if anchored_here:
+                        replay_start[ex] = w
+                        for _e, sym in anchored_here:
+                            missing_by_ex[ex].discard(sym)
+                    for _e, sym in blocked_markets:
+                        missing_by_ex[ex].discard(sym)
+                    if ex in missing_by_ex and not missing_by_ex[ex]:
+                        missing_by_ex.pop(ex)
+                    fsize = int(cand.get("data_bytes") or 0)
+                    if cached_bytes + fsize <= max_cache_bytes:
+                        cached_files[(w, ex)] = (cand, mf, data_path, w_tmp)
+                        cached_bytes += fsize
+                    else:
+                        _cleanup_tree(w_tmp)
+
+        if not replay_start:
+            return checkpoint, checkpoint_books, checkpoint_quote, {}
+
+        min_w = min(replay_start.values())
+        carry_rows = list(checkpoint or ())
+        carry_books = dict(checkpoint_books) if checkpoint_books is not None else {}
+        carry_quote = checkpoint_quote
+        fwd_ckpt = []
+        fwd_books = {}
+        fwd_quote = None
+        fwd_streams = {}
+
+        for w in range(min_w, begin, step):
+            active_ex = sorted(ex for ex, ew in replay_start.items() if ew <= w)
+            if not active_ex:
                 continue
-            sub_config = {
-                **config,
-                "exchanges": {ex: spec for ex, spec in config.get("exchanges", {}).items() if ex in valid_ex},
-            }
-            step_summary = {}
-            export_state = {}
-            allowed_stubs = {ex for ex in valid_ex if (w, ex) in startup_stub_windows}
-            scan(
-                step_items,
-                sub_config,
-                w * NS,
-                (w + step) * NS,
-                0,
-                {},
-                step_summary,
-                checkpoint=fwd_ckpt or None,
-                source_restrictions=source_restrictions,
-                checkpoint_books=fwd_books,
-                checkpoint_quote=fwd_quote,
-                checkpoint_streams=fwd_streams,
-                export_checkpoint_state=export_state,
-                allow_startup_stub_exchanges=allowed_stubs,
-            )
-            fwd_ckpt = step_summary.get("end_sequence_checkpoint") or []
-            fwd_books = export_state.get("books") or {}
-            fwd_streams = export_state.get("streams") or {}
-            if BINANCE in valid_ex and export_state.get("end_signal_quote") is not None:
-                fwd_quote = export_state["end_signal_quote"]
-        finally:
-            if w_tmp.exists():
-                for p in sorted(w_tmp.rglob("*"), reverse=True):
-                    if p.is_file() or p.is_symlink():
-                        p.unlink(missing_ok=True)
-                    elif p.is_dir():
-                        p.rmdir()
+            reconstructed_windows += 1
+            anc = ancestors.get(w - step)
+            if anc is not None:
+                anc_rows, anc_books, anc_q = anc[0], anc[1], anc[2]
+                anc_s = anc[3] if len(anc) > 3 else {}
+                have = {(r["exchange"], r["symbol"]): r for r in fwd_ckpt}
+                for r in anc_rows or ():
+                    key = (r["exchange"], r["symbol"])
+                    if key[0] in active_ex and (key not in have or (r.get("book_anchored") and not have[key].get("book_anchored"))):
+                        have[key] = r
+                        if r.get("book_anchored") and anc_books and key in anc_books:
+                            fwd_books[key] = anc_books[key]
+                fwd_ckpt = list(have.values())
+                if fwd_quote is None and anc_q is not None:
+                    fwd_quote = anc_q
+                for skey, sns in (anc_s or {}).items():
+                    if skey[0] in active_ex and skey not in fwd_streams:
+                        fwd_streams[skey] = sns
+
+            step_items = []
+            valid_ex = []
+            step_dirs = []
+            uncached = []
+            for ex in active_ex:
+                if w in restrictions and ex in restrictions[w]:
+                    continue
+                cached = cached_files.pop((w, ex), None)
+                if cached is not None:
+                    c_cand, c_mf, c_data, c_dir = cached
+                    step_items.append((c_cand, c_mf, c_data))
+                    used_lookback_cands.append(c_cand)
+                    valid_ex.append(ex)
+                    step_dirs.append(c_dir)
+                else:
+                    cand = by_ws_ex.get((w, ex))
+                    if cand is not None:
+                        uncached.append((ex, cand, tmp_root / f"lb_fwd_{w}_{ex}"))
+
+            try:
+                if uncached:
+                    with ThreadPoolExecutor(max_workers=min(4, len(uncached))) as pool:
+                        fetched = list(
+                            pool.map(
+                                lambda item: _prepare_single_candidate(remote, item[1], run_id, item[2]),
+                                uncached,
+                            )
+                        )
+                    for (ex, cand, d_dir), item in zip(uncached, fetched):
+                        step_items.append(item)
+                        used_lookback_cands.append(cand)
+                        valid_ex.append(ex)
+                        step_dirs.append(d_dir)
+                if not step_items:
+                    continue
+                sub_config = {
+                    **config,
+                    "exchanges": {ex: spec for ex, spec in config.get("exchanges", {}).items() if ex in valid_ex},
+                }
+                step_summary = {}
+                export_state = {}
+                allowed_stubs = {ex for ex in valid_ex if (w, ex) in startup_stub_windows}
+                scan(
+                    step_items,
+                    sub_config,
+                    w * NS,
+                    (w + step) * NS,
+                    0,
+                    {},
+                    step_summary,
+                    checkpoint=fwd_ckpt or None,
+                    source_restrictions=source_restrictions,
+                    checkpoint_books=fwd_books,
+                    checkpoint_quote=fwd_quote,
+                    checkpoint_streams=fwd_streams,
+                    export_checkpoint_state=export_state,
+                    allow_startup_stub_exchanges=allowed_stubs,
+                )
+                fwd_ckpt = step_summary.get("end_sequence_checkpoint") or []
+                fwd_books = export_state.get("books") or {}
+                fwd_streams = export_state.get("streams") or {}
+                if BINANCE in valid_ex and export_state.get("end_signal_quote") is not None:
+                    fwd_quote = export_state["end_signal_quote"]
+            finally:
+                for d_dir in step_dirs:
+                    _cleanup_tree(d_dir)
+    finally:
+        for _k, (_c, _m, _p, c_dir) in list(cached_files.items()):
+            _cleanup_tree(c_dir)
+        cached_files.clear()
 
     merged_rows = {(r["exchange"], r["symbol"]): r for r in carry_rows}
     merged_books = dict(carry_books)
