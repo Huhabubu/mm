@@ -412,7 +412,7 @@ jobs:
           extra_proto+=(
             --max-runtime-seconds "$PROTO_MAX_RUNTIME"
             --download-timeout-seconds 120
-            --lookback-timeout-seconds 300
+            --lookback-timeout-seconds 720
           )
           python workflow_code/scripts/tokyo_l2_recurring_qa.py \
             --remote qa: --state-dir state --config "source/$QA_BOUND_CONFIG_PATH" \
