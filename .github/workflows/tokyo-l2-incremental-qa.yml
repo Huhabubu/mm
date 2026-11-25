@@ -86,6 +86,11 @@ on:
         required: false
         type: boolean
         default: false
+      max_runtime_seconds:
+        description: "Soft wall-clock budget in seconds for recurring protocol QA (default: 1500 catchup/schedule, 900 live)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -396,6 +401,19 @@ jobs:
           if [[ "${{ inputs.catchup_first }}" == "true" ]]; then
             extra_proto+=(--catchup-first)
           fi
+          PROTO_MAX_RUNTIME="${{ inputs.max_runtime_seconds }}"
+          if [[ -z "$PROTO_MAX_RUNTIME" ]]; then
+            if [[ "${{ inputs.catchup_first }}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
+              PROTO_MAX_RUNTIME="1500"
+            else
+              PROTO_MAX_RUNTIME="900"
+            fi
+          fi
+          extra_proto+=(
+            --max-runtime-seconds "$PROTO_MAX_RUNTIME"
+            --download-timeout-seconds 120
+            --lookback-timeout-seconds 300
+          )
           python workflow_code/scripts/tokyo_l2_recurring_qa.py \
             --remote qa: --state-dir state --config "source/$QA_BOUND_CONFIG_PATH" \
             --run-id "$QA_BOUND_RUN_ID" --cutover "$QA_BOUND_SINCE_WINDOW" \
@@ -458,6 +476,7 @@ jobs:
           proto_ready="${QA_ACTIVE_WINDOW_READY_FOR_PROTOCOL_QA:-false}"
           proto_exec="${QA_PROTOCOL_JOB_EXECUTION_STATUS:-ok}"
           proto_wstatus="${QA_PROTOCOL_WINDOW_STATUS:-${QA_PROTOCOL_STATUS:-pending}}"
+          proto_budget_stop="${QA_PROTOCOL_STOPPED_BY_BUDGET:-false}"
           cur_wid="${QA_CURRENT_WINDOW_ID:-none}"
           cur_done="${QA_CURRENT_WINDOW_COMPLETED:-false}"
           cur_vstatus="${QA_CURRENT_WINDOW_VERIFICATION_STATUS:-unknown}"
@@ -470,7 +489,9 @@ jobs:
           # (including protocol anchor_unverified / replay_init_unverified / data_failed),
           # while keeping GitHub Actions job exit green when execution itself completed cleanly.
           status="success"
-          if [[ "$INSPECT_OUTCOME" != "success" || ("$proto_ready" == "true" && ("$PROTOCOL_OUTCOME" != "success" || "$proto_exec" != "ok" || "$proto_wstatus" != "passed")) || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
+          if [[ "${{ inputs.catchup_first }}" == "true" && "$proto_budget_stop" == "true" && "$proto_exec" == "ok" && "$INSPECT_OUTCOME" == "success" && "$PROTOCOL_OUTCOME" == "success" && "$PERSIST_OUTCOME" == "success" ]]; then
+            status="success"
+          elif [[ "$INSPECT_OUTCOME" != "success" || ("$proto_ready" == "true" && ("$PROTOCOL_OUTCOME" != "success" || "$proto_exec" != "ok" || "$proto_wstatus" != "passed")) || "$PERSIST_OUTCOME" != "success" || "$hb_status" != "ok" || "$job_status" != "ok" || "$cur_done" != "true" || "$cur_vstatus" != "passed" ]]; then
             status="failure"
             url="${url}/fail"
           fi

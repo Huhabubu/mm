@@ -10,6 +10,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import time
 import zlib
 
 import data_coverage as coverage
@@ -215,6 +216,9 @@ def _summarize_protocol_diagnostics(report):
 
 
 MAX_ANCHOR_LOOKBACK_WINDOWS = 24
+DEFAULT_MAX_RUNTIME_SECONDS = 1500.0
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 120.0
+DEFAULT_LOOKBACK_TIMEOUT_SECONDS = 300.0
 
 
 def _lookback_inputs(groups, start, step, windows):
@@ -235,8 +239,27 @@ def _expected_depth_markets(config):
     }
 
 
-def run(remote, config, run_id, cutover, current, state, checker, *, archive_revision=None, trigger_mode=None, max_catchup=None, catchup_first=False):
+def run(
+    remote,
+    config,
+    run_id,
+    cutover,
+    current,
+    state,
+    checker,
+    *,
+    archive_revision=None,
+    trigger_mode=None,
+    max_catchup=None,
+    catchup_first=False,
+    max_runtime_seconds=DEFAULT_MAX_RUNTIME_SECONDS,
+    download_timeout_seconds=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+    lookback_timeout_seconds=DEFAULT_LOOKBACK_TIMEOUT_SECONDS,
+):
+    started_mono = time.monotonic()
     started_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    budget_s = float(max_runtime_seconds) if max_runtime_seconds is not None else 0.0
+    deadline_mono = (started_mono + budget_s) if budget_s > 0 else None
     pm = coverage.configured_partition_minutes(config)
     step = pm * 60
     candidates = verified_candidates(
@@ -407,7 +430,50 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         "checkpoint_books" in audit_params
         or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in audit_params.values())
     )
-    for start in plan_windows(ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred, catchup_first=catchup_first):
+    supports_timeout_audit = (
+        "download_timeout_seconds" in audit_params
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in audit_params.values())
+    )
+
+    def persist_consistent_state(just_checked=None):
+        current_validated = _reports_with_current_checkpoints(proofs, step)
+        if just_checked is not None and just_checked in current_validated:
+            archive._atomic_write_json(report_path(just_checked), current_validated[just_checked])
+            write_checkpoint_sidecar(
+                sidecar_path(just_checked), run_id, wid(just_checked),
+                current_validated[just_checked].get("end_sequence_checkpoint") or [],
+                new_exports.get(just_checked),
+            )
+            saved_reports[just_checked] = current_validated[just_checked]
+        for s in sorted(saved_reports.keys() | checked):
+            if s in current_validated:
+                continue
+            if s in checked or (saved_reports.get(s) or {}).get("status") != "pending":
+                # Reconciliation reads these reports directly, so revoke stale terminal results on disk.
+                revoked = {
+                    "protocol_qa_version": PROTOCOL_QA_VERSION,
+                    "status": "pending",
+                    "protocol_status": "pending",
+                    "reason": "protocol_inputs_changed",
+                    "run_id": run_id,
+                    "window_id": wid(s),
+                    "archive_revision": revisions.get(s),
+                    "checker": checker,
+                }
+                archive._atomic_write_json(report_path(s), revoked)
+                if sidecar_path(s).exists():
+                    sidecar_path(s).unlink()
+                saved_reports[s] = revoked
+        return current_validated
+
+    planned = plan_windows(
+        ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred, catchup_first=catchup_first,
+    )
+    stopped_by_runtime_budget = False
+    for idx, start in enumerate(planned):
+        if idx > 0 and deadline_mono is not None and time.monotonic() >= deadline_mono:
+            stopped_by_runtime_budget = True
+            break
         replay_seconds = 660 if start % 3600 == 0 else 0
         checkpoint = validated.get(start - step, {}).get("end_sequence_checkpoint") or []
         prev_books, prev_quote, prev_streams = (None, None, {})
@@ -457,6 +523,12 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
                 "ancestor_checkpoints": ancestors or None,
                 "export_checkpoint_state": export_state,
             }
+        if supports_timeout_audit:
+            eff_lb_timeout = lookback_timeout_seconds
+            if deadline_mono is not None and eff_lb_timeout is not None and float(eff_lb_timeout) > 0:
+                eff_lb_timeout = min(float(eff_lb_timeout), max(30.0, deadline_mono - time.monotonic()))
+            extra_audit_kwargs["download_timeout_seconds"] = download_timeout_seconds
+            extra_audit_kwargs["lookback_timeout_seconds"] = eff_lb_timeout
         report = audit_window(
             remote, config, run_id, start, wid(start), replay_seconds, warmup_windows,
             candidates=candidates, checkpoint=checkpoint or None, anchor_lookback_windows=lookback,
@@ -481,34 +553,12 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
                 export_state.get("end_signal_quote"),
                 export_state.get("streams") or {},
             )
-        # The target runs first. A subsequent catch-up can change the checkpoint the target used.
-        validated = _reports_with_current_checkpoints(proofs, step)
         checked.add(start)
         checked_windows.append(wid(start))
+        # Persist each completed window + checkpoint sidecar atomically and revoke stale downstream reports immediately.
+        validated = persist_consistent_state(start)
 
-    for start in sorted(saved_reports.keys() | checked):
-        if start in validated:
-            if start in checked:
-                archive._atomic_write_json(report_path(start), validated[start])
-                write_checkpoint_sidecar(
-                    sidecar_path(start), run_id, wid(start),
-                    validated[start].get("end_sequence_checkpoint") or [],
-                    new_exports.get(start),
-                )
-        elif start in checked or saved_reports[start].get("status") != "pending":
-            # Reconciliation reads these reports directly, so revoke stale terminal results on disk.
-            archive._atomic_write_json(report_path(start), {
-                "protocol_qa_version": PROTOCOL_QA_VERSION,
-                "status": "pending",
-                "protocol_status": "pending",
-                "reason": "protocol_inputs_changed",
-                "run_id": run_id,
-                "window_id": wid(start),
-                "archive_revision": revisions[start],
-                "checker": checker,
-            })
-            if sidecar_path(start).exists():
-                sidecar_path(start).unlink()
+    validated = persist_consistent_state()
 
     all_known = {
         start: proof for start, proof in validated.items()
@@ -541,6 +591,7 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         and (
             cur_status in terminal_quality
             or (cur_status == "pending" and current not in ready)
+            or (stopped_by_runtime_budget and bool(checked))
         )
     )
     out = {
@@ -570,6 +621,9 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         "historical_replay_init_unverified_windows": historical_replay_init,
         "historical_failed_windows": historical,
         "pending_ready_windows": len(set(ready) - set(all_known)),
+        "stopped_by_runtime_budget": stopped_by_runtime_budget,
+        "max_runtime_seconds": budget_s,
+        "runtime_elapsed_seconds": round(time.monotonic() - started_mono, 3),
         "started_at_utc": started_at_utc,
         "completed_at_utc": completed_at_utc,
     }
@@ -594,6 +648,24 @@ def main():
         help="Process backlog windows chronologically before the current window.",
     )
     parser.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        default=DEFAULT_MAX_RUNTIME_SECONDS,
+        help="Soft wall-clock budget in seconds (0 disables); exits cleanly and persists completed windows when reached.",
+    )
+    parser.add_argument(
+        "--download-timeout-seconds",
+        type=float,
+        default=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+        help="Per-file rclone download timeout in seconds.",
+    )
+    parser.add_argument(
+        "--lookback-timeout-seconds",
+        type=float,
+        default=DEFAULT_LOOKBACK_TIMEOUT_SECONDS,
+        help="Time budget in seconds for bounded historical checkpoint lookback per window.",
+    )
+    parser.add_argument(
         "--exit-zero-on-clean-execution",
         action="store_true",
         help="Return exit code 0 whenever job_execution_status == 'ok', even if data quality is failed/unverified.",
@@ -603,12 +675,21 @@ def main():
                coverage.parse_window_start_s(args.cutover), coverage.parse_window_start_s(args.current),
                args.state_dir, args.checker,
                archive_revision=args.archive_revision, trigger_mode=args.trigger_mode,
-               max_catchup=args.max_catchup, catchup_first=args.catchup_first)
+               max_catchup=args.max_catchup, catchup_first=args.catchup_first,
+               max_runtime_seconds=args.max_runtime_seconds,
+               download_timeout_seconds=args.download_timeout_seconds,
+               lookback_timeout_seconds=args.lookback_timeout_seconds)
     body = json.dumps(data, indent=2)
     print(body)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as dest:
             dest.write("\n## Archive protocol QA and hourly BTC replay\n\n")
+            if data.get("stopped_by_runtime_budget"):
+                dest.write(
+                    f"- **Soft runtime budget reached**: elapsed=`{data.get('runtime_elapsed_seconds')}s` / "
+                    f"budget=`{data.get('max_runtime_seconds')}s` | checked=`{len(data.get('checked_windows') or [])}` | "
+                    f"pending_ready_windows=`{data.get('pending_ready_windows')}`\n"
+                )
             if data.get("proven_protocol_issues"):
                 issue_str = "; ".join(
                     f"{x.get('exchange')}:{x.get('symbol')}={x.get('issue')}({x.get('count')})"
@@ -635,6 +716,7 @@ def main():
             dest.write(f"QA_PROTOCOL_WINDOW_STATUS={data.get('status', 'pending')}\n")
             dest.write(f"QA_PROTOCOL_JOB_EXECUTION_STATUS={data.get('job_execution_status', 'failed')}\n")
             dest.write(f"QA_PROTOCOL_REUSED={'true' if data.get('reused_current_result') else 'false'}\n")
+            dest.write(f"QA_PROTOCOL_STOPPED_BY_BUDGET={'true' if data.get('stopped_by_runtime_budget') else 'false'}\n")
             dest.write(f"QA_PROTOCOL_COMPLETED_AT_UTC={data.get('completed_at_utc', '')}\n")
             replay = ",".join(f"{e}={s}" for e, s in data["hourly_btc_replay"].items()) or "pending"
             dest.write(f"QA_HOURLY_BTC_REPLAY={replay}\n")
