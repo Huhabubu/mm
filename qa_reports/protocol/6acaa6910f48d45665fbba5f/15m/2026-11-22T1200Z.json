@@ -2,26 +2,9 @@
   "status": "data_failed",
   "run_id": "trial15_20261122T0745Z",
   "window_id": "2026-11-22T12:00Z",
-  "warmup_windows": 1,
+  "warmup_windows": 0,
   "replay_sample_seconds": 660,
-  "warmup_inputs": [
-    {
-      "exchange": "binance_futures",
-      "window_id": "2026-11-22T11:45Z"
-    },
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-22T11:45Z"
-    },
-    {
-      "exchange": "bybit_linear",
-      "window_id": "2026-11-22T11:45Z"
-    },
-    {
-      "exchange": "gate_futures",
-      "window_id": "2026-11-22T11:45Z"
-    }
-  ],
+  "warmup_inputs": [],
   "target_inputs": [
     {
       "exchange": "binance_futures",
@@ -45,6 +28,25 @@
     }
   ],
   "boundary_checkpoint_markets": 24,
+  "boundary_book_anchored_markets": 24,
+  "connection_overlap_trades": [],
+  "replay_trade_rows": [
+    {
+      "exchange": "gate_futures",
+      "trade_rows": 10417,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bybit_linear",
+      "trade_rows": 21221,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bitget_v3",
+      "trade_rows": 16094,
+      "dedup_trades_dropped": 0
+    }
+  ],
   "observed_snapshot_markets": [
     {
       "exchange": "binance_futures",
@@ -97,22 +99,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "BTCUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 6
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "DOGEUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 6
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "DOGEUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 6
     },
@@ -125,22 +113,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "ETHUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 6
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "SOLUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 6
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "SOLUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 6
     },
@@ -153,22 +127,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "SUIUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 6
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "XRPUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 6
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "XRPUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 6
     },
@@ -656,18 +616,6 @@
       "intervals": [
         {
           "start_wall_ns": 1795348800000000000,
-          "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
-        },
-        {
-          "start_wall_ns": 1795348800411573939,
-          "end_wall_ns": 1795348800733216195,
-          "status": "unverified",
-          "reason": "switch"
-        },
-        {
-          "start_wall_ns": 1795348800733216195,
           "end_wall_ns": 1795349700000000000,
           "status": "verified_usable",
           "reason": "observed_stream"
@@ -1352,8 +1300,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -1427,8 +1375,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -1502,8 +1450,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -1577,8 +1525,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -1727,8 +1675,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -1802,8 +1750,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -1877,8 +1825,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -1952,8 +1900,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -2027,8 +1975,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -2052,8 +2000,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -2102,8 +2050,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -2127,8 +2075,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -2177,8 +2125,8 @@
         {
           "start_wall_ns": 1795348800000000000,
           "end_wall_ns": 1795348800411573939,
-          "status": "verified_usable",
-          "reason": "observed_stream"
+          "status": "unverified",
+          "reason": "initial_state_unverified"
         },
         {
           "start_wall_ns": 1795348800411573939,
@@ -2206,7 +2154,12 @@
       ],
       "seq": 12200754169007,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699941965035
+      "last_wall_ns": 1795349699941965035,
+      "book_anchored": true,
+      "book_sha256": "2a99d6117b2f11714aa4cea35ca2d9831d9402f3683dadd3dfd3dc4d13fb0d49",
+      "last_exchange_ns": 1795349699940000000,
+      "bid_levels": 7700,
+      "ask_levels": 6516
     },
     {
       "exchange": "binance_futures",
@@ -2218,7 +2171,12 @@
       ],
       "seq": 12200754152193,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699802918107
+      "last_wall_ns": 1795349699802918107,
+      "book_anchored": true,
+      "book_sha256": "b196f0689dc8e93b6be103f5aebe981419ea93083e42d346903f862ab5c9adb1",
+      "last_exchange_ns": 1795349699700000000,
+      "bid_levels": 1057,
+      "ask_levels": 1011
     },
     {
       "exchange": "binance_futures",
@@ -2230,7 +2188,12 @@
       ],
       "seq": 12200754171931,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699952739488
+      "last_wall_ns": 1795349699952739488,
+      "book_anchored": true,
+      "book_sha256": "f3dca0257806f057f43b939556a88938b2e2d40215aafa817fba5837af7f0eaa",
+      "last_exchange_ns": 1795349699950000000,
+      "bid_levels": 5176,
+      "ask_levels": 4613
     },
     {
       "exchange": "binance_futures",
@@ -2242,7 +2205,12 @@
       ],
       "seq": 12200754165958,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699905177172
+      "last_wall_ns": 1795349699905177172,
+      "book_anchored": true,
+      "book_sha256": "3c418d327355367f6687203eaa12466007a328533fe72355c7b9695279a966c8",
+      "last_exchange_ns": 1795349699893000000,
+      "bid_levels": 1246,
+      "ask_levels": 1045
     },
     {
       "exchange": "binance_futures",
@@ -2254,7 +2222,12 @@
       ],
       "seq": 12200754172983,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699958941734
+      "last_wall_ns": 1795349699958941734,
+      "book_anchored": true,
+      "book_sha256": "f31f47df36d215ea434dbdf3493cdaae6ea35709ce78705c164af1efbfbcaa1d",
+      "last_exchange_ns": 1795349699954000000,
+      "bid_levels": 1049,
+      "ask_levels": 1009
     },
     {
       "exchange": "binance_futures",
@@ -2266,7 +2239,12 @@
       ],
       "seq": 12200754172666,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699960883277
+      "last_wall_ns": 1795349699960883277,
+      "book_anchored": true,
+      "book_sha256": "7f3a75a8b304590ac21611b25faa344bb4c84dae6073e9a863f1e2f3d4d80153",
+      "last_exchange_ns": 1795349699953000000,
+      "bid_levels": 1297,
+      "ask_levels": 1032
     },
     {
       "exchange": "bitget_v3",
@@ -2278,7 +2256,12 @@
       ],
       "seq": 1287184064760,
       "awaiting_delta": true,
-      "last_wall_ns": 1795349699987041123
+      "last_wall_ns": 1795349699987041123,
+      "book_anchored": true,
+      "book_sha256": "26d7095bab4cae52a11271d8e8f70e3f08c1d519f1851ee4dfaad5ba8d8b5d87",
+      "last_exchange_ns": 1795349699980000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -2290,7 +2273,12 @@
       ],
       "seq": 526260105005,
       "awaiting_delta": true,
-      "last_wall_ns": 1795349699965751619
+      "last_wall_ns": 1795349699965751619,
+      "book_anchored": true,
+      "book_sha256": "ed16c8e9f6c0c4a6f35cd8529bc6aee9200b19347bc5f370fd363e2224b18e54",
+      "last_exchange_ns": 1795349699939000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -2302,7 +2290,12 @@
       ],
       "seq": 1060555850973,
       "awaiting_delta": true,
-      "last_wall_ns": 1795349699987038841
+      "last_wall_ns": 1795349699987038841,
+      "book_anchored": true,
+      "book_sha256": "1f4d50e8439c5132cd3d4c144265dce7952b60a4b357145a568ebcb61f1d75ae",
+      "last_exchange_ns": 1795349699980000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -2314,7 +2307,12 @@
       ],
       "seq": 221919403227,
       "awaiting_delta": true,
-      "last_wall_ns": 1795349699987488594
+      "last_wall_ns": 1795349699987488594,
+      "book_anchored": true,
+      "book_sha256": "baaa85da5f85e717cb7cb49effd28931c03bd4475abc3fad11986f77532ab574",
+      "last_exchange_ns": 1795349699981000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -2326,7 +2324,12 @@
       ],
       "seq": 526260104907,
       "awaiting_delta": true,
-      "last_wall_ns": 1795349699965747599
+      "last_wall_ns": 1795349699965747599,
+      "book_anchored": true,
+      "book_sha256": "ab51d20e93e5358af58fd288a798efaceeeca4318435e28d3d0777f04c0bf3aa",
+      "last_exchange_ns": 1795349699927000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bitget_v3",
@@ -2338,7 +2341,12 @@
       ],
       "seq": 221919403217,
       "awaiting_delta": true,
-      "last_wall_ns": 1795349699987042638
+      "last_wall_ns": 1795349699987042638,
+      "book_anchored": true,
+      "book_sha256": "11f3c277e201b652fcc4388e0351adb233e71d71d666c36762c52192a16d7df7",
+      "last_exchange_ns": 1795349699980000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -2350,7 +2358,12 @@
       ],
       "seq": 11430746,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699980111131
+      "last_wall_ns": 1795349699980111131,
+      "book_anchored": true,
+      "book_sha256": "7f94a1d171dc537203cb604cc86756e3f67c558ad4876118f29aecfeb44e15a4",
+      "last_exchange_ns": 1795349699971000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -2362,7 +2375,12 @@
       ],
       "seq": 9177128,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699949754989
+      "last_wall_ns": 1795349699949754989,
+      "book_anchored": true,
+      "book_sha256": "8d48f4566f4090c04d2ec0f37636ecf53dcf3bb42b9b09d9b50a7a356d641232",
+      "last_exchange_ns": 1795349699939000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -2374,7 +2392,12 @@
       ],
       "seq": 12142468,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699998261085
+      "last_wall_ns": 1795349699998261085,
+      "book_anchored": true,
+      "book_sha256": "fa4172030ce5e0867caf9305f3a0287cd7288453a4b9f3098dc284f6701d139b",
+      "last_exchange_ns": 1795349699972000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -2386,7 +2409,12 @@
       ],
       "seq": 10853615,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699994242557
+      "last_wall_ns": 1795349699994242557,
+      "book_anchored": true,
+      "book_sha256": "67a253e162a72fdedb0486146dedccf3a03d63ca7d74abf2faee7c95a2a4deca",
+      "last_exchange_ns": 1795349699975000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -2398,7 +2426,12 @@
       ],
       "seq": 8404721,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699959423238
+      "last_wall_ns": 1795349699959423238,
+      "book_anchored": true,
+      "book_sha256": "9553351ed488fe7bca848e8712a4b25bada3f8ac7cb3e19b2512b470f4c768ce",
+      "last_exchange_ns": 1795349699950000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "bybit_linear",
@@ -2410,7 +2443,12 @@
       ],
       "seq": 11190969,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699993891480
+      "last_wall_ns": 1795349699993891480,
+      "book_anchored": true,
+      "book_sha256": "9742995d5915a3c42176f54471c0c2d14bedd3b6ca2733cc0bde5d91994d669c",
+      "last_exchange_ns": 1795349699976000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -2422,7 +2460,12 @@
       ],
       "seq": 133889738873,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699991375300
+      "last_wall_ns": 1795349699991375300,
+      "book_anchored": true,
+      "book_sha256": "93ad6d1b46082ebeb68f61c5e36d62800181efea5104fdef5a8c82eaafdd4b37",
+      "last_exchange_ns": 1795349699989000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -2434,7 +2477,12 @@
       ],
       "seq": 40014289606,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699939251870
+      "last_wall_ns": 1795349699939251870,
+      "book_anchored": true,
+      "book_sha256": "1f15c7b801f23a993e59c3daa8616cca23c1424ce6600b59dcaa63754e5d0c75",
+      "last_exchange_ns": 1795349699936000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -2446,7 +2494,12 @@
       ],
       "seq": 116145647694,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699986402865
+      "last_wall_ns": 1795349699986402865,
+      "book_anchored": true,
+      "book_sha256": "c8690c374818c7648ac8e747e5dca26332a132de8fd08b9696ca62482333db9d",
+      "last_exchange_ns": 1795349699983000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -2458,7 +2511,12 @@
       ],
       "seq": 44786584819,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699976681409
+      "last_wall_ns": 1795349699976681409,
+      "book_anchored": true,
+      "book_sha256": "f0284f0452c4b738be3bbf8a9a086de5be811c75f055f660013859942d70aadb",
+      "last_exchange_ns": 1795349699974000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -2470,7 +2528,12 @@
       ],
       "seq": 15633955651,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699940657324
+      "last_wall_ns": 1795349699940657324,
+      "book_anchored": true,
+      "book_sha256": "15fa1c79dcaaa70a425122c58638f47db382612a2ce6cd70818d66c8d2610af6",
+      "last_exchange_ns": 1795349699938000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     },
     {
       "exchange": "gate_futures",
@@ -2482,7 +2545,12 @@
       ],
       "seq": 28800750939,
       "awaiting_delta": false,
-      "last_wall_ns": 1795349699928210587
+      "last_wall_ns": 1795349699928210587,
+      "book_anchored": true,
+      "book_sha256": "fc732414d12aa039fbf8498c7d183159a69bc329a3ac51a232649f86f0b49730",
+      "last_exchange_ns": 1795349699926000000,
+      "bid_levels": 50,
+      "ask_levels": 50
     }
   ],
   "replay": {
@@ -2505,19 +2573,11 @@
   "common_replay_intervals": {
     "gate_futures": [
       {
-        "start_wall_ns": 1795348800159322741,
-        "end_wall_ns": 1795348800411573939
-      },
-      {
         "start_wall_ns": 1795348801025586723,
         "end_wall_ns": 1795349460000000000
       }
     ],
     "bybit_linear": [
-      {
-        "start_wall_ns": 1795348800078917583,
-        "end_wall_ns": 1795348800411573939
-      },
       {
         "start_wall_ns": 1795348800608173902,
         "end_wall_ns": 1795349460000000000
@@ -2534,7 +2594,8 @@
       }
     ]
   },
-  "checker": "0211a0b3b9d3a3ed3ebd9f0193738d7d25936100/100cbe92b5da86ba373fe98dc5a855237b6abc38a7b60488e979e204686a2de2",
+  "protocol_qa_version": 2,
+  "checker": "31590e1ab0f58436b0967a969384994aabfc6b82/9cded9fcb4900fbd729cfdf610731dffa756d1e0d8513d85ec114ac133c86d2a",
   "archive_revision": "sha256:dd023f02d0f3f76864f94425c01f2574d313a9a1af9a735a7929ecb84c9c81df",
   "previous_inputs": [
     {
@@ -2558,30 +2619,9 @@
       "data_sha256": "8eac68ba6b0bb049b93cdf51447107a635182d72348ee859e29f53fb2f33757e"
     }
   ],
-  "anchor_lookback_windows": 1,
-  "anchor_lookback_inputs": [
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "d86ec8b7a76cbcaa323d3921e859014c4de8767f572635e8e507e57c5844618e",
-      "data_sha256": "99820e6d14d859780b222e847d6a5187f10f500a91de75e60673512d6b7c22ac"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "058e681728cd707c897ee6958c32ad9196531359b618c58037fd12c53b89180c",
-      "data_sha256": "287fbca21112640675d6fe1915771cff6c116c3db79d9493936b4b24765467d6"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "1231e73b4d5dcde4101d6e83fd4f26cae1bc2af851fcf9d283358890a850ae5a",
-      "data_sha256": "498b28f61760bc37026613988ed5c04100dbc1a16eb7a599b6b4f6eff0cba53f"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "01ecf04a743e35b0c284514d7ac0d825f98124ae62d41dd73bc03b7b16b991d0",
-      "data_sha256": "8eac68ba6b0bb049b93cdf51447107a635182d72348ee859e29f53fb2f33757e"
-    }
-  ],
+  "anchor_lookback_windows": 0,
+  "anchor_lookback_inputs": [],
   "source_restrictions": {},
-  "input_checkpoint_digest": "22a2dc2eb62a2c94c2084ce0ce40fb1668915bc0e70201bc8dbf35d46f18611c",
-  "completed_at_utc": "2026-11-24T17:23:21Z"
+  "input_checkpoint_digest": "6ddefc1218bc3bc89e8272c64d6558c0b02e74e0d8cbf0437925daeaed33c11b",
+  "completed_at_utc": "2026-11-25T11:00:11Z"
 }
