@@ -791,7 +791,10 @@ class StreamConverter:
             if sha256_file(f) != p["part_sha256"]:
                 raise ValueError(f"part output changed: {f.name}")
             with np.load(f) as z:
-                arrays.append(z[key])
+                arr = z[key]
+            if arr.dtype.fields != dtype.fields or arr.dtype.itemsize != dtype.itemsize:
+                raise ValueError(f"part {f.name}:{key} dtype {arr.dtype} != {dtype}")
+            arrays.append(arr.view(dtype))
         return np.concatenate(arrays) if arrays else np.empty(0, dtype=dtype)
 
     def _write_outputs(self, parts_dir: Path, out_dir: Path, label_date: str, report: dict[str, Any]) -> None:
