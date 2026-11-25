@@ -1246,6 +1246,7 @@ class ProtocolTest(unittest.TestCase):
                                              [["50000.0", str(2 + step_idx)]], [["50001.0", str(2 + step_idx)]]))
                     b_rows.append(binance_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val - 1))
                 g_rows.append(gate_trade((w + 10) * 1_000_000_000, (w + 10) * 1000, idx * 10 + 1))
+                g_rows.append(gate_trade((w + 700) * 1_000_000_000, (w + 700) * 1000, idx * 10 + 2))
                 b_rows.append(binance_bbo((w + 2) * 1_000_000_000, (w + 2) * 1000))
                 b_rows.append(binance_bbo((w + 610) * 1_000_000_000, (w + 610) * 1000))
                 b_rows.append(binance_bbo((w + 700) * 1_000_000_000, (w + 700) * 1000))
@@ -1281,6 +1282,7 @@ class ProtocolTest(unittest.TestCase):
                     checkpoint=s0["end_sequence_checkpoint"],
                     checkpoint_books=exp0["books"],
                     checkpoint_quote=exp0["end_signal_quote"],
+                    checkpoint_streams=exp0["streams"],
                     export_checkpoint_state=exp1,
                 )
                 self.assertEqual("passed", s1["protocol_status"])
@@ -1296,9 +1298,10 @@ class ProtocolTest(unittest.TestCase):
                     checkpoint=s1["end_sequence_checkpoint"],
                     checkpoint_books=exp1["books"],
                     checkpoint_quote=exp1["end_signal_quote"],
+                    checkpoint_streams=exp1["streams"],
                 )
                 self.assertEqual("passed", s2["protocol_status"])
-                self.assertEqual("passed", s2["replay"]["gate_futures"]["status"])
+                self.assertEqual("passed", s2["replay"]["gate_futures"]["status"], s2["replay"]["gate_futures"])
                 self.assertEqual("passed", replay.window_status(s2["protocol_status"], True, list(s2["replay"].values())))
 
                 # Tampering book levels fails digest validation closed (never silently accepts bad state).
@@ -1313,6 +1316,7 @@ class ProtocolTest(unittest.TestCase):
                     checkpoint=s1["end_sequence_checkpoint"],
                     checkpoint_books=tampered_books,
                     checkpoint_quote=exp1["end_signal_quote"],
+                    checkpoint_streams=exp1["streams"],
                 )
                 self.assertEqual("anchor_unverified", s_tampered["protocol_status"])
                 self.assertEqual("blocked", s_tampered["replay"]["gate_futures"]["status"])

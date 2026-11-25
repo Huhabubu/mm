@@ -335,6 +335,7 @@ def scan(
     *,
     checkpoint_books=None,
     checkpoint_quote=None,
+    checkpoint_streams=None,
     export_checkpoint_state=None,
     allow_startup_stub_exchanges=None,
 ):
@@ -345,6 +346,8 @@ def scan(
         book_anchored,
         last_depth_exchange_ns,
     ) = _load_boundary_state(checkpoint, checkpoint_books, summary)
+    prior_streams = dict(checkpoint_streams or {})
+    stream_boundary_used = set()
     chains = {}
     replay_warmup_chains = {}
     checkpoint_applied = set()
@@ -407,6 +410,10 @@ def scan(
             evidence.interrupt(exchange, previous_end.get(exchange, file_start), "ARCHIVE_DISCONTINUITY")
             if exchange == BINANCE and (file_start >= start_ns or file_end == start_ns or (BINANCE, BTC) not in boundary_checkpoints):
                 quotes_before = None
+            if file_start >= start_ns or file_end == start_ns:
+                for stream in evidence.by_exchange.get(exchange, ()):
+                    stream_boundary_used.add(stream)
+                    prior_streams.pop(stream, None)
             for key in expected_depths:
                 if key[0] == exchange:
                     chains.pop(key, None)
@@ -469,6 +476,18 @@ def scan(
                             book_anchored.discard(key)
                             last_depth_exchange_ns.pop(key, None)
                         replay_warmup_chains.pop(key, None)
+            if in_target and kind == "META" and obj.get("event") in {
+                "LOCAL_LOSS", "GAP_START", "DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY", "SWITCH",
+            }:
+                meta_sym = symbol_key(str(obj.get("symbol") or "ALL"))
+                meta_ep = obj.get("endpoint")
+                for s_key in evidence.by_exchange.get(exchange, ()):
+                    if meta_sym != "ALL" and s_key[1] != meta_sym:
+                        continue
+                    if meta_ep and meta_ep != coverage.stream_owning_endpoint(exchange, s_key[2]):
+                        continue
+                    stream_boundary_used.add(s_key)
+                    prior_streams.pop(s_key, None)
             if exchange == BINANCE and kind != "META":
                 data = obj.get("data", obj)
                 if data.get("e") == "bookTicker" and data.get("s") == BTC:
@@ -489,8 +508,22 @@ def scan(
                     stream = (ex, symbol_key(sym), channel)
                     if stream in evidence.limits and coverage.classify_channel(exchange, channel) != coverage.CHANNEL_CATEGORY_DEPTH:
                         if valid_non_depth_frame(ex, stream[1], channel, obj):
-                            evidence.observe(stream, wall)
+                            if in_target and stream not in stream_boundary_used:
+                                stream_boundary_used.add(stream)
+                                prior_w = prior_streams.get(stream)
+                                fits_stream_boundary = (
+                                    prior_w is not None and 0 <= wall - int(prior_w) <= evidence.limits[stream]
+                                )
+                                evidence.observe(
+                                    stream, wall,
+                                    resume_at=start_ns if fits_stream_boundary else None,
+                                )
+                            else:
+                                evidence.observe(stream, wall)
                         else:
+                            if in_target:
+                                stream_boundary_used.add(stream)
+                                prior_streams.pop(stream, None)
                             evidence.interrupt(ex, wall, "INVALID_STREAM_FRAME", stream[1], channel=channel)
             event = depth_event(exchange, mf.get("boot_id") or mf["file_name"], conn, epoch, kind, obj)
             if event is not None and (exchange, event.symbol) in expected_depths:
@@ -834,6 +867,13 @@ def scan(
             if last_target_signal_quote is not None and BINANCE not in invalid_exchanges
             else None
         )
+        export_checkpoint_state["streams"] = {
+            stream: last_ns
+            for stream, last_ns in sorted(evidence.last.items())
+            if stream[0] not in invalid_exchanges
+            and evidence.timeline.state(stream) == "verified_usable"
+            and end_ns - last_ns <= evidence.limits[stream]
+        }
     summary["replay"] = {}
     if sample_end <= start_ns:
         return
@@ -1069,6 +1109,7 @@ def reconstruct_historical_checkpoint(
     checkpoint=None,
     checkpoint_books=None,
     checkpoint_quote=None,
+    checkpoint_streams=None,
     ancestor_checkpoints=None,
     source_restrictions=None,
 ):
@@ -1114,7 +1155,7 @@ def reconstruct_historical_checkpoint(
         prev_w = w - step
         anc = ancestors.get(prev_w)
         if anc is not None:
-            anc_rows, anc_books, _ = anc
+            anc_rows, anc_books = anc[0], anc[1]
             anc_row_map = {(r["exchange"], r["symbol"]): r for r in anc_rows or ()}
             for ex in list(missing_by_ex):
                 for sym in list(missing_by_ex[ex]):
@@ -1176,6 +1217,7 @@ def reconstruct_historical_checkpoint(
     fwd_ckpt = []
     fwd_books = {}
     fwd_quote = None
+    fwd_streams = {}
     reconstructed_windows = 0
 
     for w in range(min_w, begin, step):
@@ -1185,7 +1227,8 @@ def reconstruct_historical_checkpoint(
         reconstructed_windows += 1
         anc = ancestors.get(w - step)
         if anc is not None:
-            anc_rows, anc_books, anc_q = anc
+            anc_rows, anc_books, anc_q = anc[0], anc[1], anc[2]
+            anc_s = anc[3] if len(anc) > 3 else {}
             have = {(r["exchange"], r["symbol"]): r for r in fwd_ckpt}
             for r in anc_rows or ():
                 key = (r["exchange"], r["symbol"])
@@ -1196,6 +1239,9 @@ def reconstruct_historical_checkpoint(
             fwd_ckpt = list(have.values())
             if fwd_quote is None and anc_q is not None:
                 fwd_quote = anc_q
+            for skey, sns in (anc_s or {}).items():
+                if skey[0] in active_ex and skey not in fwd_streams:
+                    fwd_streams[skey] = sns
 
         w_tmp = tmp_root / f"lb_fwd_{w}"
         step_items = []
@@ -1231,11 +1277,13 @@ def reconstruct_historical_checkpoint(
                 source_restrictions=source_restrictions,
                 checkpoint_books=fwd_books,
                 checkpoint_quote=fwd_quote,
+                checkpoint_streams=fwd_streams,
                 export_checkpoint_state=export_state,
                 allow_startup_stub_exchanges=allowed_stubs,
             )
             fwd_ckpt = step_summary.get("end_sequence_checkpoint") or []
             fwd_books = export_state.get("books") or {}
+            fwd_streams = export_state.get("streams") or {}
             if BINANCE in valid_ex and export_state.get("end_signal_quote") is not None:
                 fwd_quote = export_state["end_signal_quote"]
         finally:
@@ -1256,18 +1304,21 @@ def reconstruct_historical_checkpoint(
             if key in fwd_books:
                 merged_books[key] = fwd_books[key]
     merged_quote = carry_quote if carry_quote is not None else fwd_quote
+    merged_streams = dict(fwd_streams)
+    merged_streams.update(checkpoint_streams or {})
     diag = {
         "reconstructed_lookback_windows": reconstructed_windows,
         "reconstructed_exchanges": sorted(replay_start),
         "reconstructed_inputs": input_digests(used_lookback_cands),
+        "merged_streams": merged_streams,
     }
     return list(merged_rows.values()), merged_books, merged_quote, diag
 
 
 def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_windows,
                  candidates=None, checkpoint=None, anchor_lookback_windows=None, source_restrictions=None,
-                 checkpoint_books=None, checkpoint_quote=None, ancestor_checkpoints=None,
-                 export_checkpoint_state=None):
+                 checkpoint_books=None, checkpoint_quote=None, checkpoint_streams=None,
+                 ancestor_checkpoints=None, export_checkpoint_state=None):
     out = {"status": "retryable", "run_id": run_id, "window_id": window,
            "warmup_windows": warmup_windows, "replay_sample_seconds": replay_seconds}
     stage = "validate_window"
@@ -1284,6 +1335,7 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
             eff_checkpoint = checkpoint
             eff_books = checkpoint_books
             eff_quote = checkpoint_quote
+            eff_streams = checkpoint_streams
             lookback = warmup_windows if anchor_lookback_windows is None else anchor_lookback_windows
             if anchor_lookback_windows is not None and anchor_lookback_windows > warmup_windows:
                 stage = "reconstruct_historical_checkpoint"
@@ -1299,10 +1351,12 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                     checkpoint=eff_checkpoint,
                     checkpoint_books=eff_books if eff_books is not None else {},
                     checkpoint_quote=eff_quote,
+                    checkpoint_streams=eff_streams,
                     ancestor_checkpoints=ancestor_checkpoints,
                     source_restrictions=source_restrictions,
                 )
                 if lb_diag:
+                    eff_streams = lb_diag.pop("merged_streams", eff_streams)
                     out.update(lb_diag)
                 selected_warmup = warmup_windows
             else:
@@ -1328,6 +1382,7 @@ def audit_window(remote, config, run_id, begin, window, replay_seconds, warmup_w
                 source_restrictions=source_restrictions,
                 checkpoint_books=eff_books,
                 checkpoint_quote=eff_quote,
+                checkpoint_streams=eff_streams,
                 export_checkpoint_state=export_checkpoint_state,
             )
         files_ok = all(x["qa_status"] == "passed" for x in out["archive_file_checks"])
@@ -1355,6 +1410,7 @@ def audit_range(remote, config, run_id, first, last):
     checkpoint = None
     checkpoint_books = None
     checkpoint_quote = None
+    checkpoint_streams = None
     for start in range(first, last + step, step):
         window = coverage.window_descriptor(start, pm)["window_id"]
         context = by_window.get(start - step, []) if start == first else []
@@ -1363,6 +1419,7 @@ def audit_range(remote, config, run_id, first, last):
             remote, config, run_id, start, window, 0, int(bool(context)),
             candidates=context + by_window.get(start, []), checkpoint=checkpoint,
             checkpoint_books=checkpoint_books, checkpoint_quote=checkpoint_quote,
+            checkpoint_streams=checkpoint_streams,
             export_checkpoint_state=export_state,
         )
         reports.append(report)
@@ -1370,10 +1427,12 @@ def audit_range(remote, config, run_id, first, last):
             checkpoint = report.get("end_sequence_checkpoint")
             checkpoint_books = export_state.get("books")
             checkpoint_quote = export_state.get("end_signal_quote")
+            checkpoint_streams = export_state.get("streams")
         else:
             checkpoint = None
             checkpoint_books = None
             checkpoint_quote = None
+            checkpoint_streams = None
         panels = report.get("market_availability", ())
         by_status = Counter(
             (row["exchange"], status)

@@ -69,12 +69,13 @@ def _checkpoint_sidecar_path(state, run_id, pm, window_id):
 def write_checkpoint_sidecar(path, run_id, window_id, checkpoint_rows, export_state):
     books = (export_state or {}).get("books") or {}
     end_quote = (export_state or {}).get("end_signal_quote")
+    streams = (export_state or {}).get("streams") or {}
     anchored_keys = {
         (row["exchange"], row["symbol"]): row
         for row in checkpoint_rows or ()
         if row.get("book_anchored")
     }
-    if not anchored_keys and end_quote is None:
+    if not anchored_keys and end_quote is None and not streams:
         if path.exists():
             path.unlink()
         return False
@@ -91,11 +92,16 @@ def write_checkpoint_sidecar(path, run_id, window_id, checkpoint_rows, export_st
             "last_exchange_ns": entry["last_exchange_ns"],
             "levels_zlib_b64": base64.b64encode(zlib.compress(levels_blob, level=6)).decode("ascii"),
         }
+    encoded_streams = {
+        f"{ex}|{sym}|{ch}": int(last_ns)
+        for (ex, sym, ch), last_ns in sorted(streams.items())
+    }
     payload = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "run_id": run_id,
         "window_id": window_id,
         "end_signal_quote": end_quote,
+        "streams": encoded_streams,
         "books": encoded_books,
     }
     archive._atomic_write_json(path, payload)
@@ -109,7 +115,7 @@ def read_checkpoint_sidecar(path, expected_checkpoint):
     expected_anchored = [row for row in expected_checkpoint or () if row.get("book_anchored")]
     data = read_report(path)
     if not data:
-        return None if expected_anchored else ({}, None)
+        return None if expected_anchored else ({}, None, {})
     if data.get("format_version") != CHECKPOINT_FORMAT_VERSION:
         return None
     raw_books = data.get("books")
@@ -136,7 +142,12 @@ def read_checkpoint_sidecar(path, expected_checkpoint):
             "asks": levels["asks"],
         }
     quote = data.get("end_signal_quote")
-    return decoded, quote
+    decoded_streams = {}
+    for skey, s_ns in (data.get("streams") or {}).items():
+        parts = str(skey).split("|", 2)
+        if len(parts) == 3:
+            decoded_streams[(parts[0], parts[1], parts[2])] = int(s_ns)
+    return decoded, quote, decoded_streams
 
 
 def _reports_with_current_checkpoints(proofs, step):
@@ -329,9 +340,9 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
 
     def load_sidecar(start, expected_ckpt):
         if not expected_ckpt:
-            return {}, None
+            return {}, None, {}
         if not any(r.get("book_anchored") for r in expected_ckpt):
-            return None, None
+            return None, None, {}
         cached = sidecar_cache.get(start)
         if cached is not None:
             return cached
@@ -383,15 +394,24 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
     )
     checked = set()
     checked_windows = []
-    supports_extended_audit = "checkpoint_books" in inspect.signature(audit_window).parameters
+    target_audit_fn = (
+        audit_window.side_effect
+        if callable(getattr(audit_window, "side_effect", None))
+        else audit_window
+    )
+    audit_params = inspect.signature(target_audit_fn).parameters
+    supports_extended_audit = (
+        "checkpoint_books" in audit_params
+        or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in audit_params.values())
+    )
     for start in plan_windows(ready, recorded, current, max_catchup=eff_max_catchup, deferred=deferred):
         replay_seconds = 660 if start % 3600 == 0 else 0
         checkpoint = validated.get(start - step, {}).get("end_sequence_checkpoint") or []
-        prev_books, prev_quote = (None, None)
+        prev_books, prev_quote, prev_streams = (None, None, {})
         if checkpoint:
             loaded_prev = load_sidecar(start - step, checkpoint)
             if loaded_prev is not None:
-                prev_books, prev_quote = loaded_prev
+                prev_books, prev_quote, prev_streams = loaded_prev
         covered_markets = {
             (row["exchange"], row["symbol"])
             for row in checkpoint
@@ -399,7 +419,13 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         }
         all_markets_covered = bool(expected_depth_markets) and expected_depth_markets.issubset(covered_markets)
         need_warmup_quote = bool(replay_seconds and prev_books is not None and prev_quote is None)
-        warmup_windows = 1 if (not all_markets_covered or (replay_seconds and prev_books is None) or need_warmup_quote) else 0
+        need_warmup_streams = bool(replay_seconds and prev_books is not None and not prev_streams)
+        warmup_windows = 1 if (
+            not all_markets_covered
+            or (replay_seconds and prev_books is None)
+            or need_warmup_quote
+            or need_warmup_streams
+        ) else 0
         lookback = warmup_windows
         if not all_markets_covered:
             lookback = max((i for i in range(1, MAX_ANCHOR_LOOKBACK_WINDOWS + 1)
@@ -420,10 +446,11 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
                     if any(r.get("book_anchored") for r in anc_ckpt):
                         loaded_anc = load_sidecar(anc_s, anc_ckpt)
                         if loaded_anc is not None:
-                            ancestors[anc_s] = (anc_ckpt, loaded_anc[0], loaded_anc[1])
+                            ancestors[anc_s] = (anc_ckpt, loaded_anc[0], loaded_anc[1], loaded_anc[2])
             extra_audit_kwargs = {
                 "checkpoint_books": prev_books,
                 "checkpoint_quote": prev_quote,
+                "checkpoint_streams": prev_streams or None,
                 "ancestor_checkpoints": ancestors or None,
                 "export_checkpoint_state": export_state,
             }
@@ -445,8 +472,12 @@ def run(remote, config, run_id, cutover, current, state, checker, *, archive_rev
         )
         proofs[start] = report
         new_exports[start] = export_state
-        if export_state.get("books") or export_state.get("end_signal_quote") is not None:
-            sidecar_cache[start] = (export_state.get("books") or {}, export_state.get("end_signal_quote"))
+        if export_state.get("books") or export_state.get("end_signal_quote") is not None or export_state.get("streams"):
+            sidecar_cache[start] = (
+                export_state.get("books") or {},
+                export_state.get("end_signal_quote"),
+                export_state.get("streams") or {},
+            )
         # The target runs first. A subsequent catch-up can change the checkpoint the target used.
         validated = _reports_with_current_checkpoints(proofs, step)
         checked.add(start)
