@@ -10,10 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 27,
+  "observed_windows_count": 29,
   "missing_windows": [
-    "2026-11-25T06:45Z",
-    "2026-11-25T07:00Z",
     "2026-11-25T07:15Z",
     "2026-11-25T07:30Z",
     "2026-11-25T07:45Z",
@@ -84,31 +82,27 @@
   ],
   "failed_windows": [
     "2026-11-25T01:30Z",
-    "2026-11-25T03:00Z"
+    "2026-11-25T03:00Z",
+    "2026-11-25T06:45Z"
   ],
   "overdue_windows": [],
-  "pending_windows": [],
+  "pending_windows": [
+    "2026-11-25T07:00Z"
+  ],
   "archived_pending_qa_windows": [
-    "2026-11-25T04:30Z",
-    "2026-11-25T04:45Z",
-    "2026-11-25T05:15Z",
     "2026-11-25T05:30Z",
     "2026-11-25T05:45Z",
     "2026-11-25T06:15Z"
   ],
   "review_windows": [],
   "cross_window_sequence_issues": [
-    "binance_futures:2026-11-25T05:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=513086838,got=514612607",
-    "binance_futures:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=516339008,got=520340293",
+    "binance_futures:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=519024922,got=520340293",
     "binance_futures:2026-11-25T06:30Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=521925399,got=523368844",
-    "bitget_v3:2026-11-25T05:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=116306293,got=116692777",
-    "bitget_v3:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=117100572,got=118161536",
+    "bitget_v3:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=117815813,got=118161536",
     "bitget_v3:2026-11-25T06:30Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=118566622,got=118945626",
-    "bybit_linear:2026-11-25T05:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=89435644,got=89732412",
-    "bybit_linear:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=90028983,got=90865470",
+    "bybit_linear:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=90591206,got=90865470",
     "bybit_linear:2026-11-25T06:30Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=91165817,got=91454315",
-    "gate_futures:2026-11-25T05:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=87166067,got=87717510",
-    "gate_futures:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=87996875,got=88794301",
+    "gate_futures:2026-11-25T06:00Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=88264463,got=88794301",
     "gate_futures:2026-11-25T06:30Z:boot=trial15_20261122T0745Z_1795333473410706867:expected_first_rx_seq=89079587,got=89347306"
   ],
   "restarts_by_exchange": {
@@ -125,7 +119,7 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 409,
+  "clock_certified_minutes": 439,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
   "damaged_partitions": [
@@ -151,6 +145,20 @@
       "run_id": "trial15_20261122T0745Z",
       "file_name": "bitget_v3_20261125_0300_p15m_trial15_20261122_da93ae54.tsv.zst",
       "source_manifest": "raw/bitget_v3/2026-11-25/bitget_v3_20261125_0300_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-25T06:45Z",
+      "window_span_id": "2026-11-25T06:45Z__2026-11-25T07:00Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261125_0645_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-25/bitget_v3_20261125_0645_p15m_trial15_20261122_da93ae54.manifest.json",
       "qa_status": "failed",
       "local_loss_events": 0,
       "gap_start_events": 0,
