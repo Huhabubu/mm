@@ -1,0 +1,122 @@
+name: Tokyo L2 QA performance profile (read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows:
+        description: "Comma-separated UTC windows to profile (e.g. 2026-11-23T00:00Z,2026-11-23T00:15Z)"
+        required: true
+        type: string
+        default: "2026-11-23T00:00Z,2026-11-23T00:15Z"
+      warmup_windows:
+        description: "Warmup windows passed to audit_window"
+        required: false
+        type: string
+        default: "1"
+      lookback_windows:
+        description: "Lookback windows passed to audit_window (0 = use warmup_windows)"
+        required: false
+        type: string
+        default: "0"
+      replay_seconds:
+        description: "BTC replay seconds for :00Z windows"
+        required: false
+        type: string
+        default: "660"
+      compare_parallel:
+        description: "Also run serial vs 4-exchange multiprocess equivalence benchmark"
+        required: false
+        type: boolean
+        default: false
+      ref:
+        description: "Optional branch/SHA for workflow_code scripts"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tokyo-l2-qa-profile
+  cancel-in-progress: false
+
+jobs:
+  profile:
+    name: Profile Tokyo L2 QA on real archive partition
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out profiling and QA scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+          path: workflow_code
+          sparse-checkout: |
+            scripts/tokyo_l2_protocol_qa.py
+            scripts/tokyo_l2_replay_qa.py
+            scripts/tokyo_l2_recurring_qa.py
+            scripts/profile_tokyo_l2_qa.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Checkout collector QA code
+        uses: actions/checkout@v4
+        with:
+          ref: feat/tokyo-l2-reliability-fixes
+          path: source
+          persist-credentials: false
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install bounded QA dependencies
+        run: |
+          python -m pip install hftbacktest==2.4.4 numpy numba zstandard==0.23.0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+
+      - name: Configure read-only Google Drive access
+        env:
+          QA_SERVICE_ACCOUNT: ${{ secrets.TOKYO_L2_QA_GDRIVE_SA_JSON }}
+          QA_FOLDER_ID: ${{ secrets.TOKYO_L2_QA_GDRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/tokyo-qa-auth"
+          printf '%s' "$QA_SERVICE_ACCOUNT" > "$RUNNER_TEMP/tokyo-qa-auth/service-account.json"
+          printf '[qa]\ntype = drive\nscope = drive.readonly\nservice_account_file = %s\nroot_folder_id = %s\n' \
+            "$RUNNER_TEMP/tokyo-qa-auth/service-account.json" "$QA_FOLDER_ID" \
+            > "$RUNNER_TEMP/tokyo-qa-auth/rclone.conf"
+          echo "RCLONE_CONFIG=$RUNNER_TEMP/tokyo-qa-auth/rclone.conf" >> "$GITHUB_ENV"
+
+      - name: Run read-only profiling benchmark
+        env:
+          PYTHONPATH: source/collector/python:workflow_code/scripts
+          QA_CONFIG_PATH: ${{ vars.TOKYO_L2_QA_CONFIG_PATH }}
+          QA_RUN_ID: ${{ vars.TOKYO_L2_QA_RUN_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          extra=()
+          if [[ "${{ inputs.compare_parallel }}" == "true" ]]; then
+            extra+=(--compare-parallel)
+          fi
+          python workflow_code/scripts/profile_tokyo_l2_qa.py \
+            --remote qa: \
+            --config "source/${QA_CONFIG_PATH}" \
+            --run-id "${QA_RUN_ID}" \
+            --windows "${{ inputs.windows }}" \
+            --warmup-windows "${{ inputs.warmup_windows }}" \
+            --lookback-windows "${{ inputs.lookback_windows }}" \
+            --replay-seconds "${{ inputs.replay_seconds }}" \
+            "${extra[@]}" | tee "$RUNNER_TEMP/profile.json"
+          {
+            echo "## Tokyo L2 QA Performance Profile"
+            echo '```json'
+            cat "$RUNNER_TEMP/profile.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
