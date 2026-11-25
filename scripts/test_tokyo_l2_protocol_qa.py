@@ -1187,7 +1187,7 @@ class ProtocolTest(unittest.TestCase):
                 }
                 return (wall_ns, wall_ns, "b1", 1, u, "META", json.dumps(payload))
             payload = {
-                "e": "depthUpdate", "s": "BTCUSDT", "U": pu + 1, "u": u, "pu": pu, "T": ms,
+                "e": "depthUpdate", "s": "BTCUSDT", "U": pu, "u": u, "pu": pu, "T": ms,
                 "b": [["50000.0", "1.5"]], "a": [["50001.0", "1.5"]],
             }
             return (wall_ns, wall_ns, "b1", 1, u, "DATA", json.dumps(payload))
@@ -1205,8 +1205,17 @@ class ProtocolTest(unittest.TestCase):
                 },
             },
             "exchanges": {
-                "binance_futures": {"enabled": True, "symbols": ["BTCUSDT"], "channels": ["bookTicker", "depth@100ms"]},
-                "gate_futures": {"enabled": True, "symbols": ["BTC_USDT"], "channels": ["futures.obu", "futures.trades"]},
+                "binance_futures": {
+                    "enabled": True,
+                    "symbols": ["BTCUSDT"],
+                    "public_channels": ["depth@100ms"],
+                    "market_channels": ["bookTicker"],
+                },
+                "gate_futures": {
+                    "enabled": True,
+                    "symbols": ["BTC_USDT"],
+                    "channels": ["futures.obu", "futures.trades"],
+                },
             },
         }
         specs = {
@@ -1225,7 +1234,7 @@ class ProtocolTest(unittest.TestCase):
                                              [["50000.0", "2"], ["49999.0", "2"]], [["50001.0", "2"], ["50002.0", "2"]], full=True))
                     b_rows.append(binance_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, None, is_snap=True))
                 else:
-                    g_rows.append(gate_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, u_start - 1,
+                    g_rows.append(gate_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, u_start,
                                              [["50000.0", "3"]], [["50001.0", "3"]]))
                     b_rows.append(binance_depth(w_ns + 1_000_000_000, (w + 1) * 1000, u_start, u_start - 1))
                 # Second & third updates covering target + replay window (>600s for w2).
@@ -1233,7 +1242,7 @@ class ProtocolTest(unittest.TestCase):
                 t_end = w + 850
                 for step_idx, t_s in enumerate((t_mid, t_end), start=1):
                     u_val = u_start + step_idx
-                    g_rows.append(gate_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val - 1,
+                    g_rows.append(gate_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val,
                                              [["50000.0", str(2 + step_idx)]], [["50001.0", str(2 + step_idx)]]))
                     b_rows.append(binance_depth(t_s * 1_000_000_000, t_s * 1000, u_val, u_val - 1))
                 g_rows.append(gate_trade((w + 10) * 1_000_000_000, (w + 10) * 1000, idx * 10 + 1))
@@ -1355,14 +1364,14 @@ class ProtocolTest(unittest.TestCase):
                     # Break sequence on window 3 in a copy below; here keep strictly continuous.
                     seq += 1
                     payload = {"channel": "futures.obu", "event": "update", "result": {
-                        "s": "ob.BTC_USDT.50", "u": seq, "U": seq - 1, "t": w * 1000 + 1000,
+                        "s": "ob.BTC_USDT.50", "u": seq, "U": seq, "t": w * 1000 + 1000,
                         "b": [["50000.0", str(2 + idx)]], "a": [["50001.0", "2"]],
                     }}
                     msgs.append((w_ns + 1_000_000_000, w_ns + 1_000_000_000, "c1", 1, seq, "DATA", json.dumps(payload)))
                 seq += 1
                 msgs.append(((w + 600) * 1_000_000_000, (w + 600) * 1_000_000_000, "c1", 1, seq, "DATA", json.dumps({
                     "channel": "futures.obu", "event": "update", "result": {
-                        "s": "ob.BTC_USDT.50", "u": seq, "U": seq - 1, "t": (w + 600) * 1000,
+                        "s": "ob.BTC_USDT.50", "u": seq, "U": seq, "t": (w + 600) * 1000,
                         "b": [["50000.0", str(3 + idx)]], "a": [["50001.0", "2"]],
                     },
                 })))
@@ -1486,8 +1495,14 @@ class ProtocolTest(unittest.TestCase):
             set_window_reports(sha1)
             with patch.object(recurring, "verified_candidates", return_value=cands), \
                  patch.object(recurring, "audit_window", side_effect=fake_audit):
-                r1 = recurring.run("qa:", cfg, run_id, w0, w1, state, f"{sha1}/r1", max_catchup=2)
+                r_pre = recurring.run("qa:", cfg, run_id, w0, w1, state, f"{sha1}/r1", max_catchup=2)
                 self.assertEqual([w1, w0], calls)
+                # w0's new checkpoint revokes w1's unanchored result to pending until re-evaluated.
+                self.assertEqual("pending", r_pre["status"])
+
+                calls.clear()
+                r1 = recurring.run("qa:", cfg, run_id, w0, w1, state, f"{sha1}/r1", max_catchup=2)
+                self.assertEqual([w1], calls)
                 self.assertEqual("anchor_unverified", r1["status"])
                 self.assertEqual("ok", r1["job_execution_status"])
 
