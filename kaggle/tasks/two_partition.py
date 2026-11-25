@@ -13,6 +13,8 @@ partition 1 -> checkpoint -> a new process resumes with partition 2.
 '''
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import argparse
 import json
 import os
@@ -39,6 +41,7 @@ SCRATCH = Path('/tmp/tokyo_l2_tp')
 CODE = Path(os.environ.get('TOKYO_L2_CODE_ROOT', '/tmp/tokyo_l2_code'))
 CONFIG = CODE / 'collector' / 'specs' / 'config.trial_15m.json'
 QA_DAYS = CODE / 'repo' / 'kaggle' / 'qa_days'
+QA_PROTOCOL = CODE / 'repo' / 'kaggle' / 'qa_protocol'
 CRED_FILES = {'TOKYO_L2_QA_GDRIVE_SA_JSON': 'tokyo_l2_gdrive_sa.json',
               'TOKYO_L2_QA_GDRIVE_FOLDER_ID': 'tokyo_l2_gdrive_folder_id.txt'}
 WINDOW_NS = 900 * 1_000_000_000
@@ -170,7 +173,8 @@ def download_one(c: dict, out: Path, run_id: str) -> dict:
     archive._verify_three_way_index_manifest_data(cand=c, manifest_path=mpath, manifest=manifest,
                                                   data_path=dpath, run_id_filter=run_id)
     return {'exchange': c['exchange'], 'window_id': c['window_id'], 'data_sha256': c['data_sha256'],
-            'data_bytes': int(c['data_bytes'] or 0), 'manifest': str(mpath), 'data': str(dpath)}
+            'data_bytes': int(c['data_bytes'] or 0), 'manifest_sha256': c['manifest_sha256'],
+            'manifest': str(mpath), 'data': str(dpath)}
 
 
 def fetch():
@@ -191,23 +195,36 @@ def fetch():
     per_ex = {ex: sorted((c for c in cands if c['exchange'] == ex and c['date_utc'] == DATE),
                          key=lambda c: str(c['window_id'])) for ex in EXCHANGES}
     fetched = SCRATCH / 'fetched'
+    selected = [(ex, slot, c) for ex in EXCHANGES for slot, c in enumerate(per_ex[ex][:2])]
+    if len(selected) != 4 or any(len({c['window_id'] for c in per_ex[ex][:2]}) != 2 for ex in EXCHANGES):
+        raise ValueError('need exactly two distinct adjacent partitions per exchange')
+    # Keep the previously selected concurrency; do not benchmark or fetch extra windows.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        infos = list(pool.map(lambda item: download_one(item[2], fetched, run_id), selected))
     parts = []
-    for ex in EXCHANGES:
-        for slot, c in enumerate(per_ex[ex][:2]):
-            info = download_one(c, fetched, run_id)
-            mf = json.loads(Path(info['manifest']).read_text(encoding='utf-8'))
-            planned = int(normalize_manifest_window(mf, fallback_file_name=Path(info['data']).name)['planned_start_wall_ns'])
-            expect = start_s * 1_000_000_000 + slot * WINDOW_NS
-            if planned != expect:
-                raise ValueError(f'{ex} slot {slot}: planned_start {planned} != {expect}')
-            info.update(planned_start_wall_ns=planned, slot=slot, **count_lines(Path(info['data'])))
-            parts.append(info)
-            print('FETCHED', ex, slot, info['data_bytes'], info['raw_lines'], flush=True)
+    for (ex, slot, c), info in zip(selected, infos):
+        mf = json.loads(Path(info['manifest']).read_text(encoding='utf-8'))
+        planned = int(normalize_manifest_window(mf, fallback_file_name=Path(info['data']).name)['planned_start_wall_ns'])
+        expect = start_s * 1_000_000_000 + slot * WINDOW_NS
+        if planned != expect or info['window_id'] != SAMPLE_WINDOWS[slot]:
+            raise ValueError(f'{ex} slot {slot}: wrong sample window')
+        info.update(planned_start_wall_ns=planned, slot=slot, **count_lines(Path(info['data'])))
+        parts.append(info)
+        print('FETCHED', ex, slot, info['data_bytes'], info['raw_lines'], flush=True)
+    from stage3_audit import protocol_evidence
+    protocol = protocol_evidence(QA_PROTOCOL, SAMPLE_WINDOWS, parts, run_id, day['checker_commit_sha'])
+    sample_day = dict(day)
+    for key in (*F.BLOCKING_DAY_LISTS, 'cross_window_sequence_issues', 'startup_stub_segments', 'damaged_partitions'):
+        sample_day[key] = [v for v in day.get(key, []) if any(w in json.dumps(v) for w in SAMPLE_WINDOWS)]
+    sample_integrity = F.integrity_gate(sample_day, EXCHANGES, effective_config_hash(config), DATE)
+    provenance = json.loads((QA_PROTOCOL / 'provenance.json').read_text())
+    CTX.update(protocol=protocol, qa_provenance=provenance)
     meta = F.fetch_meta(REMOTE, DATE, EXCHANGES, fetched)
     contract = F.gate_live_contract(REMOTE, fetched / 'meta', GATE_SYMBOL, start_s * 1_000_000_000)
     CTX.update(run_id=run_id, per_ex=per_ex, fetched=fetched, parts=parts, contract=contract['contract'],
                day_start_ns=start_s * 1_000_000_000)
     return {'day_report': day_path.name, 'run_id': run_id, 'integrity': integrity,
+            'sample_integrity': sample_integrity, 'protocol': protocol, 'qa_provenance': provenance,
             'index_effective_run_id': index_run_id, 'verified_windows': {ex: len(v) for ex, v in per_ex.items()},
             'parts': [{k: v for k, v in p.items() if k not in ('manifest', 'data')} for p in parts],
             'meta_files': meta, 'gate_live_contract': contract}
@@ -235,12 +252,12 @@ def child_main(kind: str, spec_json: str, result_path: str) -> int:
     out: dict = {'kind': kind}
     try:
         out.update((child_old if kind == 'old' else child_new)(json.loads(spec_json)))
-        out['ok'] = True
+        out['ok'] = out.get('rc', 0) == 0 and out.get('status', 'ok') == 'ok'
     except Exception as exc:
         out.update(ok=False, error=f'{type(exc).__name__}: {exc}'[:2000], trace=traceback.format_exc()[-4000:])
     out.update(elapsed_s=round(time.time() - t0, 1), peak_rss_mb=peak_rss_mb())
     Path(result_path).write_text(json.dumps(out, default=str), encoding='utf-8')
-    return 0
+    return 0 if out['ok'] else 2
 
 
 def run_child(kind: str, spec: dict, timeout: int = 5400) -> dict:
@@ -251,7 +268,7 @@ def run_child(kind: str, spec: dict, timeout: int = 5400) -> dict:
     out = json.loads(res_path.read_text(encoding='utf-8')) if res_path.exists() else \
         {'ok': False, 'error': 'child exited without a result file'}
     out['returncode'] = r.returncode
-    if not out.get('ok'):
+    if r.returncode != 0 or not out.get('ok') or out.get('rc', 0) != 0:
         raise RuntimeError(f'{kind} child failed rc={r.returncode}: ' + str(out.get('error')))
     return out
 
@@ -263,7 +280,8 @@ def convert_old():
     r['files'] = sorted(p.name for p in out.glob('*')) if out.exists() else []
     cal = out / 'eligibility_calendar.json'
     if cal.exists():
-        keys = ('exchange', 'symbol', 'date_utc', 'eligibility_status', 'depth_rebuild_status', 'unverified_reasons')
+        keys = ('exchange', 'symbol', 'date_utc', 'eligibility_status', 'depth_rebuild_status', 'unverified_reasons',
+                'unrebuildable_depth_intervals', 'unrebuildable_depth_reasons')
         r['calendar'] = [{k: row.get(k) for k in keys} for row in json.loads(cal.read_text(encoding='utf-8'))
                          if isinstance(row, dict) and row.get('symbol') == 'BTC']
     return r
@@ -295,6 +313,7 @@ def convert_new():
     keys = ('status', 'failed_items', 'mode', 'records', 'trade_dedup', 'hbt_event_types', 'hbt_time_range',
             'order_diagnostics', 'exch_ahead_of_local', 'special_flag_counts', 'initialization_exclusion',
             'switches', 'gaps', 'local_loss', 'binance_depth_meta', 'depth_unavailable_intervals',
+            'execution_unavailable_intervals',
             'unrebuildable_depth_intervals', 'eligibility', 'artifacts', 'parts', 'peak_rss_mb', 'finalize_s',
             'out_bytes')
     resumed = json.loads((n1 / 'stream_report.json').read_text(encoding='utf-8'))
@@ -540,76 +559,69 @@ def book():
     return out
 
 
+def raw_audit():
+    from stage3_audit import audit
+    old = report['stages']['convert_old']['result']
+    return audit(CTX['parts'], CTX['new_out'], CTX['old_out'], artifact_names(),
+                 CTX['new_report'], old.get('calendar', []), CTX['protocol'])
+
+
 def glft():
     import qa_convert
     names = artifact_names()
     tick = float(CTX['contract']['order_price_round'])
-    out: dict = {'params': {'tick_size': tick, 'note': 'qa_convert.run_offline_e2e_hbt_replay defaults otherwise; '
-                                                       'input-equivalence check, not the paper backtest'}}
-    for side, d in (('old', CTX['old_out']), ('new', CTX['new_out'])):
-        l2, bbo = d / names['gate_l2_hbt'], d / names['binance_bbo']
-        if not (l2.exists() and bbo.exists()):
-            out[side] = {'missing': True}
-            continue
-        kw = {'tick_size': tick}
-        if side == 'new':
-            kw['depth_unavailable_intervals'] = list(CTX['new_report'].get('depth_unavailable_intervals') or [])
-        try:
-            r = qa_convert.run_offline_e2e_hbt_replay(l2, bbo, **kw)
-            m = r['metrics']
-            out[side] = {'execution_status': r.get('execution_status'), 'ledger_sha256': r.get('ledger_sha256'),
-                         't0_ns': r.get('t0_ns'), 't_end_ns': r.get('t_end_ns'), 'fills': len(m.get('fill_ts_ns') or []),
-                         'metrics': {k: v for k, v in m.items() if not k.startswith('fill_')}}
-        except Exception as exc:
-            out[side] = {'error': f'{type(exc).__name__}: {exc}'[:1500], 'trace': traceback.format_exc()[-2500:]}
-    o, n = out.get('old') or {}, out.get('new') or {}
-    out['ledger_equal'] = bool(o.get('ledger_sha256')) and o.get('ledger_sha256') == n.get('ledger_sha256')
-    return out
+    # Preserve the existing stage-3 replay parameters. This is the frozen input-equivalence
+    # replay (600 s calibration + 120 s trading), not a new paper-profitability experiment.
+    intervals = list(CTX['new_report']['execution_unavailable_intervals'])
+    intervals += CTX['protocol']['execution_unavailable_intervals']
+    r = qa_convert.run_offline_e2e_hbt_replay(
+        CTX['new_out'] / names['gate_l2_hbt'], CTX['new_out'] / names['binance_bbo'],
+        tick_size=tick, depth_unavailable_intervals=intervals)
+    m = r['metrics']
+    audit = r['gap_execution_audit']
+    fills = len(m.get('fill_ts_ns') or [])
+    accepted = (r.get('status') == 'ok' and r.get('execution_status') == 'verified'
+                and int(m.get('decisions', 0)) > 0 and int(m.get('submits', 0)) > 0
+                and int(m.get('sample_count', 0)) == 7200 and bool(r['diagnostics'][5])
+                and bool(r.get('ledger_sha256')))
+    return {'passed': accepted, 'status': r.get('status'), 'execution_status': r.get('execution_status'),
+            'ledger_sha256': r.get('ledger_sha256'), 'fills': fills,
+            't0_ns': r.get('t0_ns'), 't_end_ns': r.get('t_end_ns'),
+            'metrics': {k: v for k, v in m.items() if not k.startswith('fill_')},
+            'diagnostics': r['diagnostics'],
+            'gap_execution_audit': {k: v for k, v in audit.items() if k not in ('fills', 'labeled_fills')},
+            'params': {'tick_size': tick, 'other_parameters': 'frozen run_offline_e2e_hbt_replay defaults',
+                       'trade_steps': 1200, 'note': 'input-equivalence replay, not paper profitability'},
+            'accounting_policy': 'retain diagnostic ledger; any unverified fill rejects entire replay',
+            'execution_unavailable_intervals': intervals}
 
 
-def throughput():
-    gate = CTX['per_ex']['gate_futures'][2:]
-    rows = []
-    pos = 0
-    for workers in THROUGHPUT_WORKERS:
-        batch = gate[pos:pos + THROUGHPUT_BATCH]
-        pos += THROUGHPUT_BATCH
-        if len(batch) < THROUGHPUT_BATCH:
-            break
-        dest = SCRATCH / f'tp_w{workers}'
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda c: download_one(c, dest, CTX['run_id']), batch))
-        dt = time.time() - t0
-        nbytes = sum(int(c['data_bytes'] or 0) for c in batch)
-        rows.append({'workers': workers, 'files': len(batch), 'bytes': nbytes, 'seconds': round(dt, 1),
-                     'MBps': round(nbytes / 1e6 / max(dt, 1e-3), 1), 'windows': [str(c['window_id']) for c in batch]})
-        shutil.rmtree(dest, ignore_errors=True)
-        print('THROUGHPUT', json.dumps(rows[-1]), flush=True)
-    best = max(r['MBps'] for r in rows)
-    pick = min((r for r in rows if r['MBps'] >= 0.9 * best), key=lambda r: r['workers'])
-    return {'batches': rows, 'recommended_workers': pick['workers'],
-            'note': 'distinct Gate windows per batch (no cache reuse); time includes three-way SHA-256 verification'}
+def acceptance(st):
+    def res(name):
+        return (st.get(name) or {}).get('result') or {}
+    stage_ok = {name: (st.get(name) or {}).get('ok') is True for name in STAGES}
+    fetched, raw, cmp_, replay = res('fetch'), res('raw_audit'), res('compare'), res('glft_replay')
+    new_rep = res('convert_new').get('single_report') or {}
+    diagnostic = all(stage_ok.values())
+    sample = (fetched.get('sample_integrity', {}).get('status') == 'passed'
+              and fetched.get('protocol', {}).get('passed') is True
+              and raw.get('passed') is True and new_rep.get('status') == 'ok')
+    conversion = (cmp_.get('resume_identical') is True
+                  and (cmp_.get('hbt_detail', {}).get('new') or {}).get('validate_event_order') == 'ok'
+                  and (cmp_.get('old_new_identical') is True or raw.get('old_new_difference_explained') is True))
+    stage3 = diagnostic and sample and conversion and replay.get('passed') is True
+    return {'diagnostic_execution_complete': diagnostic, 'sample_quality_passed': sample,
+            'conversion_checks_passed': conversion, 'glft_replay_passed': replay.get('passed') is True,
+            'full_day_integrity_passed': fetched.get('integrity', {}).get('status') == 'passed',
+            'stage3_accepted': stage3, 'stage4_authorized': False,
+            'stage_ok': stage_ok, 'protocol_blockers': fetched.get('protocol', {}).get('problems', []),
+            'raw_audit_failed_checks': [k for k, v in raw.get('checks', {}).items() if not v]}
 
 
 def summarize() -> None:
-    st = report['stages']
-
-    def res(name):
-        return (st.get(name) or {}).get('result') or {}
-    cmp_ = res('compare')
-    new_rep = res('convert_new').get('single_report') or {}
-    detail = cmp_.get('hbt_detail') or {}
-    s = {'integrity': (res('fetch').get('integrity') or {}).get('status'),
-         'old_status': res('convert_old').get('status'), 'new_status': new_rep.get('status'),
-         'resume_identical': cmp_.get('resume_identical'), 'old_new_identical': cmp_.get('old_new_identical'),
-         'new_hbt_validate': (detail.get('new') or {}).get('validate_event_order'),
-         'glft_ledger_equal': res('glft_replay').get('ledger_equal'),
-         'recommended_workers': res('download_throughput').get('recommended_workers'),
-         'stage_ok': {n: (st.get(n) or {}).get('ok') for n in STAGES}}
-    report['summary'] = s
-    report['all_ok'] = bool(all(s['stage_ok'].values()) and s['new_status'] == 'ok' and s['resume_identical']
-                            and s['new_hbt_validate'] == 'ok')
+    report['summary'] = acceptance(report['stages'])
+    report['all_ok'] = report['summary']['stage3_accepted']
+    report['prior_download_throughput'] = PRIOR_THROUGHPUT
 
 
 def main() -> int:
@@ -627,8 +639,8 @@ def main() -> int:
             if stage('convert_new', convert_new)['ok']:
                 stage('compare', compare)
                 stage('book_rebuild', book)
+                stage('raw_audit', raw_audit)
                 stage('glft_replay', glft)
-            stage('download_throughput', throughput)
     finally:
         shutil.rmtree(AUTH, ignore_errors=True)
         report['auth_dir_removed'] = not AUTH.exists()

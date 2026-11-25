@@ -311,5 +311,93 @@ class RowSinkTests(unittest.TestCase):
         self.assertEqual(len(sink), 7)
 
 
+
+class RecoveryConfirmationTests(Base):
+    def fixtures(self):
+        root = self.tmp / "f"
+        bn, gt = Writer(root, sc.LEADER), Writer(root, sc.FOLLOWER)
+        bn.add(D0 + NS, bn_bbo(D0 + NS, 100, 101))
+        # Identical timestamp/connection/epoch must never enter the Gate state.
+        bn.add(D0 + 4 * NS, meta("DEPTH_UNAVAILABLE", symbol="BTCUSDT"), kind="META", conn="B", epoch=2)
+        bn.seal(0)
+        return root, gt
+
+    def test_snapshot_rebuild_and_execution_confirmation_are_distinct(self):
+        root, gt = self.fixtures()
+        gt.add(D0 + NS, obu(D0 + NS, 99, 90, bids=[(100, 1)]))
+        gt.add(D0 + 2 * NS, obu(D0 + 2 * NS, 100, bids=[(100, 1)], asks=[(101, 1)]))
+        gt.add(D0 + 3 * NS, obu(D0 + 3 * NS, 101, 101, bids=[(100, 2)]))
+        gt.add(D0 + 4 * NS, meta("DEPTH_UNAVAILABLE", symbol="BTCUSDT", planned=True),
+               kind="META", conn="B", epoch=2)
+        snap, confirm = D0 + 4 * NS + 414187372, D0 + 4 * NS + 427894177
+        gt.add(snap, obu(snap, 200, bids=[(100, 1)], asks=[(101, 1)]), conn="B", epoch=2)
+        gt.add(confirm, obu(confirm, 201, 201, bids=[(100, 2)]), conn="B", epoch=2)
+        gt.seal(0)
+        rc, rep, out = self.run_conv(root, "recover")
+        self.assertEqual(rc, 0)
+        self.assertEqual(rep["initialization_exclusion"]["frames"], 1)
+        iv = rep["execution_unavailable_intervals"][-1]
+        self.assertEqual((iv["start_wall_ns"], iv["snapshot_wall_ns"], iv["end_wall_ns"]),
+                         (D0 + 4 * NS, snap, confirm))
+        self.assertEqual(iv["confirmation_lag_ns"], 13706805)
+        self.assertEqual(rep["depth_unavailable_intervals"][-1]["end_wall_ns"], snap)
+        self.assertEqual(len(rep["binance_depth_meta"]), 1)
+        from qa_convert import audit_fills_against_depth_unavailable_intervals as audit
+        fill = [{"exch_ts_ns": snap + 1, "observed_ts_ns": snap + 2, "qty": 1}]
+        self.assertEqual(audit(fill, rep["depth_unavailable_intervals"])["status"], "verified")
+        self.assertEqual(audit(fill, rep["execution_unavailable_intervals"])["status"], "execution_unverified")
+        self.assertEqual(audit([{"ts_ns": confirm, "qty": 1}],
+                               rep["execution_unavailable_intervals"])["status"], "verified")
+
+    def test_no_initialization_exemption_after_first_partition(self):
+        root, gt = self.fixtures()
+        gt.add(D0 + NS, obu(D0 + NS, 99, 90, bids=[(100, 1)]))
+        gt.seal(0)
+        gt.add(D0 + P + NS, obu(D0 + P + NS, 101, 100, bids=[(100, 1)]))
+        gt.add(D0 + P + 2 * NS, obu(D0 + P + 2 * NS, 200, bids=[(100, 1)], asks=[(101, 1)]))
+        gt.seal(15)
+        rc, rep, _ = self.run_conv(root, "late")
+        self.assertEqual(rc, 2)
+        self.assertTrue(any(x.startswith("initialization_exemption_outside_sample_start") for x in rep["failed_items"]))
+
+    def test_runtime_anchor_loss_is_not_initialization(self):
+        root, gt = self.fixtures()
+        gt.add(D0 + NS, obu(D0 + NS, 100, bids=[(100, 1)], asks=[(101, 1)]))
+        gt.add(D0 + 2 * NS, obu(D0 + 2 * NS, 101, 101, bids=[(100, 2)]))
+        gt.add(D0 + 3 * NS, meta("SWITCH"), kind="META", conn="B")
+        gt.add(D0 + 4 * NS, obu(D0 + 4 * NS, 102, 102, bids=[(100, 3)]), conn="B")
+        gt.seal(0)
+        rc, rep, _ = self.run_conv(root, "missing")
+        self.assertEqual(rc, 2)
+        self.assertEqual(rep["initialization_exclusion"]["frames"], 0)
+        self.assertTrue(any("missing_same_connection_anchor" in x for x in rep["failed_items"]))
+
+    def test_wrong_connection_delta_cannot_confirm_snapshot(self):
+        root, gt = self.fixtures()
+        gt.add(D0 + NS, obu(D0 + NS, 100, bids=[(100, 1)], asks=[(101, 1)]))
+        gt.add(D0 + 2 * NS, obu(D0 + 2 * NS, 101, 101, bids=[(100, 2)]), conn="B")
+        gt.seal(0)
+        rc, rep, _ = self.run_conv(root, "wrong")
+        self.assertEqual(rc, 2)
+        self.assertIsNone(rep["execution_unavailable_intervals"][0]["end_wall_ns"])
+
+    def test_confirmation_state_survives_checkpoint(self):
+        root, gt = self.fixtures()
+        gt.add(D0 + NS, obu(D0 + NS, 100, bids=[(100, 1)], asks=[(101, 1)]))
+        gt.seal(0)
+        gt.add(D0 + P + NS, obu(D0 + P + NS, 101, 101, bids=[(100, 2)]))
+        gt.seal(15)
+        first = self.tmp / "first"
+        shutil.copytree(root, first)
+        for path in first.rglob("*T0015*"):
+            path.unlink()
+        self.run_conv(first, "resumed", finalize=False)
+        rc, resumed, _ = self.run_conv(root, "resumed")
+        _, single, _ = self.run_conv(root, "single")
+        self.assertEqual(rc, 0)
+        self.assertEqual(resumed["execution_unavailable_intervals"], single["execution_unavailable_intervals"])
+        self.assertEqual(resumed["execution_unavailable_intervals"][0]["end_wall_ns"], D0 + P + NS)
+
+
 if __name__ == "__main__":
     unittest.main()

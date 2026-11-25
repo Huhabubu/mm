@@ -149,8 +149,11 @@ jobs:
         with:
           ref: tokyo-l2-qa-state
           path: qa_state
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
-            qa_reports/days
+            /qa_reports/days/
+            /qa_reports/protocol/*/15m/2026-11-23T0000Z.json
+            /qa_reports/protocol/*/15m/2026-11-23T0015Z.json
           persist-credentials: false
 
       - name: Stage QA day reports listed in kaggle/job.json
@@ -158,7 +161,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json, pathlib, shutil
+          import json, pathlib, shutil, subprocess
           job = json.load(open("workflow_code/kaggle/job.json"))
           src = pathlib.Path("qa_state/qa_reports/days")
           dst = pathlib.Path("workflow_code/kaggle/qa_days")
@@ -170,6 +173,19 @@ jobs:
               out.parent.mkdir(parents=True, exist_ok=True)
               shutil.copy2(hits[0], out)
               print("staged", out)
+          protocol_dst = pathlib.Path("workflow_code/kaggle/qa_protocol")
+          protocol_dst.mkdir(parents=True, exist_ok=True)
+          qa_sha = subprocess.check_output(["git", "-C", "qa_state", "rev-parse", "HEAD"], text=True).strip()
+          provenance = {"qa_state_sha": qa_sha, "protocol_files": [], "missing_protocol_windows": []}
+          for window in job.get("qa_protocol_windows", []):
+              hits = sorted(pathlib.Path("qa_state/qa_reports/protocol").glob(f"*/15m/{window}.json"))
+              if len(hits) != 1:
+                  provenance["missing_protocol_windows"].append(window)
+                  continue
+              shutil.copy2(hits[0], protocol_dst / hits[0].name)
+              provenance["protocol_files"].append(str(hits[0].relative_to("qa_state")))
+          (protocol_dst / "provenance.json").write_text(json.dumps(provenance, indent=2))
+          print("qa provenance", json.dumps(provenance))
           PY
 
       - name: Build new notebook version from kaggle/job.json
@@ -264,3 +280,12 @@ jobs:
           rc="$(python -c "import json;print(json.load(open('kaggle_out/job_status.json'))['returncode'])" 2>/dev/null || echo missing)"
           echo "kaggle_final=$KAGGLE_FINAL task_rc=$rc"
           [[ "$KAGGLE_FINAL" == *complete* && "$rc" == "0" ]]
+          python - <<'PY'
+          import json, os
+          status = json.load(open("kaggle_out/job_status.json"))
+          report = json.load(open("kaggle_out/two_partition_report.json"))
+          assert status["git_sha"] == os.environ["GITHUB_SHA"], "stale Kaggle output"
+          assert report.get("all_ok") is True, "stage 3 acceptance failed"
+          assert report["summary"]["stage3_accepted"] is True
+          assert report["summary"]["stage4_authorized"] is False
+          PY

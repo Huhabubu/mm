@@ -70,6 +70,8 @@ status = {"returncode": rc, "elapsed_s": round(time.time() - t0, 1),
 with open(os.path.join(work, "job_status.json"), "w") as fh:
     json.dump(status, fh, indent=2)
 print("JOB_STATUS", json.dumps(status))
+if rc != 0:
+    raise RuntimeError(f"Kaggle task failed with return code {rc}; diagnostic reports preserved")
 '''
 
 

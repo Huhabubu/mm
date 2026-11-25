@@ -67,7 +67,7 @@ BINANCE_DEPTH_META = frozenset({"REST_SNAPSHOT", "REST_SNAPSHOT_ANCHOR", "DEPTH_
                                 "DEPTH_UNAVAILABLE", "SNAPSHOT_BRIDGE_RETRY"})
 TRADE_COMPARE_FIELDS = ("contract", "id", "price", "size", "create_time_ms", "create_time", "is_internal")
 CHUNK_ROWS = 1 << 16
-STATE_VERSION = 1
+STATE_VERSION = 2
 STATE_FILE = "state.pkl"
 PROGRESS_FILE = "progress.json"
 BBO_DTYPE = np.dtype([("local_ts_ns", "<i8"), ("exch_ts_ns", "<i8"), ("bid_px", "<f8"), ("bid_qty", "<f8"),
@@ -306,6 +306,11 @@ class StreamConverter:
         self.gate = buf
         self.trades = TradeDedup()
         self.init_exclusion = {"frames": 0, "first_local_ts": None, "last_local_ts": None}
+        self.initial_gate_window = None
+        self.current_gate_window = None
+        self.initial_exemption_closed = False
+        self.execution_unavailable_intervals = []
+        self.pending_confirmation = None
         self.failed: Counter = Counter()
         self.failed_samples: list[str] = []
         self.day_gaps: dict[str, list[dict[str, Any]]] = {}
@@ -341,10 +346,22 @@ class StreamConverter:
                 "hbt_rows": len(buf.hbt_rows), "local_book_clears": len(buf.local_book_clears),
                 "unrebuildable_reasons": list(buf.unrebuildable_depth_reasons)}
 
+    def _block_execution(self, wall, reason):
+        if self.pending_confirmation is None:
+            iv = {"start_wall_ns": int(wall), "end_wall_ns": None, "reason": reason,
+                  "snapshot_wall_ns": None, "confirmation_lag_ns": None}
+            self.execution_unavailable_intervals.append(iv)
+            self.pending_confirmation = iv
+        return self.pending_confirmation
+
     # ------------------------------------------------------------------- META
     def _gate_meta(self, obj: dict[str, Any], ev: str, is_all: bool, wall: int, boot: str, conn: str, epoch: int) -> None:
         """qa_convert._ingest_follower_meta for the single target buffer (payload already decoded)."""
         buf = self.gate
+        if ev in ("SWITCH", "GAP_START", "LOCAL_LOSS", "DEPTH_UNAVAILABLE"):
+            self.initial_exemption_closed = True
+            iv = self._block_execution(int(obj.get("unavailable_since_wall_ns") or wall), ev)
+            iv["snapshot_wall_ns"] = None
         if ev in ("SWITCH", "GAP_START", "LOCAL_LOSS"):
             buf.follower_depth_anchor = None
             buf.emit_book_clear_if_active(wall)
@@ -373,6 +390,10 @@ class StreamConverter:
         exch_ms = int(result.get("t") or obj.get("time_ms") or (wall // 1_000_000))
         is_full = bool(result.get("full", False))
         if not buf.seen_snapshot and not is_full:
+            if self.current_gate_window != self.initial_gate_window or self.initial_exemption_closed:
+                self._fail("initialization_exemption_outside_sample_start", str(wall))
+                self.initial_exemption_closed = True
+                return
             ie = self.init_exclusion
             ie["frames"] += 1
             ie["first_local_ts"] = wall if ie["first_local_ts"] is None else ie["first_local_ts"]
@@ -380,11 +401,29 @@ class StreamConverter:
             c["obu_pre_first_snapshot"] += 1
             return
         c["obu_snapshot" if is_full else "obu_delta"] += 1
+        before_errors = len(buf.unrebuildable_depth_intervals)
         _validate_and_apply_follower_depth(
             buf=buf, exchange=FOLLOWER, rec={"boot_id": boot, "conn_id": conn, "epoch": epoch},
             is_snap=is_full, seq=int(result["u"]) if result.get("u") is not None else None,
             parent=int(result["U"]) if result.get("U") is not None else None,
             exch_ts=exch_ms * 1_000_000, local_ts=wall, raw_bids=result.get("b"), raw_asks=result.get("a"))
+        anchor = buf.follower_depth_anchor
+        valid = anchor is not None and len(buf.unrebuildable_depth_intervals) == before_errors
+        if not valid:
+            self.initial_exemption_closed = True
+            self._block_execution(wall, "depth_validation_failed")["snapshot_wall_ns"] = None
+        elif is_full:
+            self.initial_exemption_closed = True
+            iv = self._block_execution(wall, "snapshot_awaiting_contiguous_delta")
+            iv.update(snapshot_wall_ns=wall, boot_id=boot, conn_id=conn, epoch=epoch,
+                      snapshot_seq=anchor["seq"])
+        elif self.pending_confirmation is not None:
+            iv = self.pending_confirmation
+            if iv["snapshot_wall_ns"] is not None and (boot, conn, epoch) == (
+                    iv["boot_id"], iv["conn_id"], iv["epoch"]):
+                iv.update(end_wall_ns=wall, confirmation_lag_ns=wall - iv["snapshot_wall_ns"],
+                          confirming_U=int(result["U"]), confirming_u=int(result["u"]))
+                self.pending_confirmation = None
 
     def _gate_trades(self, obj, trades, wall, boot, conn, epoch, c) -> None:
         buf = self.gate
@@ -434,6 +473,11 @@ class StreamConverter:
         if in_cov:
             self.coverage.observe_partition(mf)
         boot = norm["boot_id"]
+        if exchange == FOLLOWER:
+            self.current_gate_window = norm["window_id"]
+            if self.initial_gate_window is None:
+                self.initial_gate_window = self.current_gate_window
+                self._block_execution(int(norm["planned_start_wall_ns"]), "sample_initialization")
         if boot != st.prev_boot:
             st.prev_boot, st.prev_file_last_rx_seq, st.prev_file_had_late_frames = boot, None, False
             st.boot_rx_blocks, st.producer_prev_mono = [], {}
@@ -756,6 +800,7 @@ class StreamConverter:
                                 "connection_events": len(self.trades.conn_events),
                                 "connections_with_trades": len(self.trades.conn_first_trade)},
                 "initialization_exclusion": dict(self.init_exclusion),
+                "execution_unavailable_intervals": self.execution_unavailable_intervals,
                 "depth_unavailable_intervals": buf.depth_unavailable_intervals,
                 "unrebuildable_depth_intervals": buf.unrebuildable_depth_intervals,
                 "binance_depth_meta": self.binance_depth_meta, "other_symbol_meta": dict(self.other_symbol_meta),
