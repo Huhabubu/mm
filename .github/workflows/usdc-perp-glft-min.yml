@@ -1,0 +1,242 @@
+name: USDC perp GLFT minimal (runner smoke, then private Kaggle full day)
+
+# Raw Tardis CSV and HBT NPZ never leave the runner /tmp or Kaggle /tmp; only report/log/status come back.
+on:
+  push:
+    branches: [exp/usdc-perp-glft-min]
+    paths:
+      - "research/usdc_perp_glft_min/**"
+      - "!research/usdc_perp_glft_min/**.md"
+      - ".github/workflows/usdc-perp-glft-min.yml"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "replay hours on Kaggle"
+        default: "24"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: usdc-perp-glft-min
+  cancel-in-progress: false
+
+env:
+  NOTEBOOK_NAME: usdc-perp-glft-min
+  DAY: "2026-11-01"
+  HOURS: ${{ github.event.inputs.hours || '24' }}
+  JOB_TIMEOUT_MIN: "300"
+
+jobs:
+  runner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install -q hftbacktest==2.4.4 numba numpy pandas
+          python -m pip show hftbacktest | sed -n '1,2p'
+      - name: Unit tests (glft_core)
+        working-directory: research/usdc_perp_glft_min
+        run: python test_glft_core.py
+      - name: Smoke 15 min (10 min warmup + 5 min quoting)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p smoke && cd smoke
+          export PYTHONPATH="$GITHUB_WORKSPACE/research/usdc_perp_glft_min:$GITHUB_WORKSPACE/scripts"
+          python -u "$GITHUB_WORKSPACE/research/usdc_perp_glft_min/kaggle_task.py" --day "$DAY" --hours 0.25 --chunk-minutes 15
+      - name: Check smoke report
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          r = json.load(open("smoke/report.json"))
+          print(json.dumps({k: r.get(k) for k in ("status", "error", "traceback", "elapsed_s", "download_s")}, indent=2))
+          for name, v in (r.get("variants") or {}).items():
+              print(name, json.dumps({k: v.get(k) for k in ("pnl_usdc", "fills", "turnover_usdc", "submits", "cancels",
+                                                          "max_abs_position_units", "signal_available_ratio", "fit")}))
+          assert r["status"] == "complete"
+          assert len(r["variants"]) == 4
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-${{ github.run_id }}
+          path: smoke/report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  kaggle:
+    needs: runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Kaggle CLI
+        run: |
+          python -m pip install -q -U kaggle six
+          kaggle --version
+      - name: Configure Kaggle auth (token never printed)
+        env:
+          KAGGLE_SECRET: ${{ secrets.KAGGLE_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$KAGGLE_SECRET" ]] || { echo "::error::KAGGLE_API_TOKEN secret missing"; exit 2; }
+          umask 077
+          mkdir -p ~/.kaggle
+          if [[ "$KAGGLE_SECRET" == \{* ]]; then
+            printf '%s' "$KAGGLE_SECRET" > ~/.kaggle/kaggle.json
+            echo "auth_mode=kaggle.json"
+          else
+            printf '%s' "$KAGGLE_SECRET" > ~/.kaggle/access_token
+            echo "KAGGLE_API_TOKEN=$KAGGLE_SECRET" >> "$GITHUB_ENV"
+            echo "auth_mode=api_token"
+          fi
+      - name: Resolve notebook (existing, or new private one under the same owner)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kaggle kernels list --mine --csv --page-size 100 > "$RUNNER_TEMP/kernels.csv"
+          python - "$RUNNER_TEMP/kernels.csv" > "$RUNNER_TEMP/slug.env" <<'PY'
+          import csv, os, sys
+          rows = list(csv.DictReader(open(sys.argv[1], encoding="utf-8")))
+          refs = [r.get("ref", "").strip("/").removeprefix("code/") for r in rows]
+          refs = [r for r in refs if r.count("/") == 1]
+          name = os.environ["NOTEBOOK_NAME"]
+          hits = [r for r in refs if r.split("/")[1] == name]
+          if len(hits) > 1:
+              sys.exit(f"found {len(hits)} notebooks named {name}")
+          owners = sorted({r.split("/")[0] for r in refs})
+          if not hits and len(owners) != 1:
+              sys.exit(f"cannot infer Kaggle owner from existing notebooks: {owners}")
+          print(f"KAGGLE_SLUG={hits[0] if hits else owners[0] + '/' + name}")
+          print(f"KAGGLE_EXISTS={1 if hits else 0}")
+          PY
+          cat "$RUNNER_TEMP/slug.env" | tee -a "$GITHUB_ENV"
+      - name: Refuse if the existing notebook is not private
+        if: env.KAGGLE_EXISTS == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/old"
+          kaggle kernels pull "$KAGGLE_SLUG" -p "$RUNNER_TEMP/old" -m
+          python - "$RUNNER_TEMP/old/kernel-metadata.json" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          print({k: m.get(k) for k in ("id", "is_private", "enable_internet")})
+          if m.get("is_private") is not True:
+              sys.exit("existing notebook is not private - refusing")
+          PY
+      - name: Build notebook
+        run: |
+          python research/usdc_perp_glft_min/kaggle_launcher.py --nb-dir "$RUNNER_TEMP/nb" --repo . \
+            --kernel-id "$KAGGLE_SLUG" --git-sha "$GITHUB_SHA" --day "$DAY" --hours "$HOURS"
+      - name: Push and run on Kaggle
+        shell: bash
+        run: |
+          set -euo pipefail
+          kaggle kernels push -p "$RUNNER_TEMP/nb" 2>&1 | tee "$RUNNER_TEMP/push.txt"
+          grep -qi "successfully pushed" "$RUNNER_TEMP/push.txt" || { echo "::error::kernel push failed"; exit 2; }
+          echo "PUSHED_AT=$(date -u +%s)" >> "$GITHUB_ENV"
+      - name: Confirm notebook is private
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/after"
+          kaggle kernels pull "$KAGGLE_SLUG" -p "$RUNNER_TEMP/after" -m
+          python - "$RUNNER_TEMP/after/kernel-metadata.json" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          print({k: m.get(k) for k in ("id", "is_private", "enable_internet")})
+          if m.get("is_private") is not True:
+              sys.exit("::error::notebook is NOT private - make it private on Kaggle now")
+          PY
+      - name: Poll status
+        shell: bash
+        run: |
+          set -uo pipefail
+          deadline=$(( PUSHED_AT + JOB_TIMEOUT_MIN * 60 ))
+          seen_active=0; final=""
+          while (( $(date -u +%s) < deadline )); do
+            s="$(kaggle kernels status "$KAGGLE_SLUG" 2>&1 | tr 'A-Z' 'a-z')"
+            echo "$(date -u +%H:%M:%S) $s"
+            if [[ "$s" == *queued* || "$s" == *running* ]]; then seen_active=1; fi
+            if [[ "$s" == *complete* || "$s" == *error* || "$s" == *cancel* ]]; then
+              if (( seen_active )) || (( $(date -u +%s) - PUSHED_AT > 300 )); then final="$s"; break; fi
+            fi
+            sleep 60
+          done
+          echo "KAGGLE_FINAL=${final:-timeout}" >> "$GITHUB_ENV"
+          echo "final=${final:-timeout}"
+      - name: Fetch outputs
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p kaggle_out
+          [[ -n "${KAGGLE_SLUG:-}" ]] || exit 0
+          kaggle kernels output "$KAGGLE_SLUG" -p kaggle_out 2>&1 | tail -n 20
+          find kaggle_out -type f \( -name '*.csv' -o -name '*.npz' -o -name '*.gz' \) -delete
+          ls -la kaggle_out
+      - name: Secret scan and summary
+        if: always()
+        env:
+          KAGGLE_SECRET: ${{ secrets.KAGGLE_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p kaggle_out
+          if grep -rIlE 'BEGIN (RSA )?PRIVATE KEY|"private_key"' kaggle_out >/dev/null 2>&1; then
+            echo "::error::credential material in outputs"; rm -rf kaggle_out; exit 2
+          fi
+          if [[ -n "${KAGGLE_SECRET:-}" ]] && grep -rIlF "$KAGGLE_SECRET" kaggle_out >/dev/null 2>&1; then
+            echo "::error::Kaggle token in outputs"; rm -rf kaggle_out; exit 2
+          fi
+          [[ -f kaggle_out/job_status.json ]] && cat kaggle_out/job_status.json
+          [[ -f kaggle_out/run.log ]] && tail -n 80 kaggle_out/run.log || true
+          if [[ -f kaggle_out/report.json ]]; then
+            python - <<'PY'
+          import json
+          r = json.load(open("kaggle_out/report.json"))
+          print(json.dumps({k: r.get(k) for k in ("status", "error", "elapsed_s", "download_s")}, indent=2))
+          for name, v in (r.get("variants") or {}).items():
+              print(name, json.dumps({k: v.get(k) for k in ("pnl_usdc", "pnl_by_maker_fee_bp", "fills", "turnover_usdc",
+                                                          "max_drawdown_usdc", "max_abs_position_units", "markout")}))
+          PY
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaggle-${{ github.run_id }}
+          path: kaggle_out
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Fail unless Kaggle job succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "kaggle_final=$KAGGLE_FINAL"
+          [[ "$KAGGLE_FINAL" == *complete* ]]
+          python - <<'PY'
+          import json, os
+          s = json.load(open("kaggle_out/job_status.json"))
+          r = json.load(open("kaggle_out/report.json"))
+          assert s["git_sha"] == os.environ["GITHUB_SHA"], "stale Kaggle output"
+          assert s["returncode"] == 0, s
+          assert r["status"] == "complete", r.get("error")
+          assert len(r["variants"]) == 4
+          PY
