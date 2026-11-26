@@ -65,7 +65,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                          gate_book_local_ns=None, gate_book_exchange_ns=None,
                          depth_is_20_level_snapshot=False,
                          diagnostics=None, quote_tick_mult=1,
-                         cross_timestamp_tie_mode="legacy_ns"):
+                         cross_timestamp_tie_mode="legacy_ns",
+                         audit_intervals_ns=None, audit_counts=None):
     """Two sigma gates + Binance-origin anchor; HBT retains all matching/queues."""
     if not np.isfinite(beta) or beta < 0 or beta > 1:
         raise ValueError("Invalid beta")
@@ -98,6 +99,13 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
         raise ValueError("Eleven diagnostic slots required including visible-depth cap counters")
     if fit_mode == "physical_1tick_poisson" and diagnostics is None:
         raise ValueError("Physical estimator requires diagnostic start/coverage output")
+    n_audit = 0
+    if audit_intervals_ns is not None:
+        if (audit_counts is None or audit_intervals_ns.shape[1] != 2
+                or audit_counts.shape[0] != audit_intervals_ns.shape[0]
+                or audit_counts.shape[1] < 3):
+            raise ValueError("audit_intervals_ns (N,2) and audit_counts (N,3) mismatch")
+        n_audit = len(audit_intervals_ns)
     # Always use concrete arrays: Numba must compile the disabled lock path too.
     book_locals = np.empty(0,np.int64)
     book_exchanges = np.empty(0,np.int64)
@@ -582,6 +590,8 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
             if want_bid >= want_ask:
                 raise ValueError("Proposed self-crossed quote prices")
             # One side may be pending cancellation; no replacement until cleared.
+            prev_submits = submits
+            prev_cancels = cancels
             has_bid = has_ask = False
             orders = engine.orders(0)
             it = orders.values()
@@ -628,6 +638,12 @@ def run_core_glft(engine, binance_visible_ns, binance_mid, trade_steps,
                 ask_action = now
                 submits += 1
             decisions += 1
+            if audit_intervals_ns is not None:
+                for ai in range(n_audit):
+                    if audit_intervals_ns[ai, 0] <= now < audit_intervals_ns[ai, 1]:
+                        audit_counts[ai, 0] += 1
+                        audit_counts[ai, 1] += submits - prev_submits
+                        audit_counts[ai, 2] += cancels - prev_cancels
 
     # Last event can trigger a fill immediately before the data stream ends.
     orders = engine.orders(0)

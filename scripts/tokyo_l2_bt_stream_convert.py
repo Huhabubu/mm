@@ -810,7 +810,8 @@ class StreamConverter:
                 "records": {ex: dict(s.counts) for ex, s in self.ex.items()}}
         return failed, diag
 
-    def finalize(self, parts_dir: Path, out_dir: Path, meta_dir: Path | None, label_date: str) -> dict[str, Any]:
+    def finalize(self, parts_dir: Path, out_dir: Path, meta_dir: Path | None, label_date: str,
+                 *, diagnostic_allow_known_gaps: bool = False) -> dict[str, Any]:
         t0 = time.time()
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -818,11 +819,11 @@ class StreamConverter:
         report: dict[str, Any] = {"converter": "scripts/tokyo_l2_bt_stream_convert.py", "gate_symbol": self.gate_symbol,
                                   "label_date": label_date, "mode": "complete_day" if self.coverage else "sample_no_coverage",
                                   "failed_items": failed, "parts": self.parts, **diag, "artifacts": []}
-        if failed:
+        if failed and not (diagnostic_allow_known_gaps and only_known_gap_failures(failed)):
             report["status"] = "blocked"
         else:
             self._write_outputs(Path(parts_dir), out_dir, label_date, report)
-            report["status"] = "ok"
+            report["status"] = "ok_with_known_gaps" if failed else "ok"
         report.update(finalize_s=round(time.time() - t0, 2), peak_rss_mb=peak_rss_mb(), out_bytes=dir_bytes(out_dir))
         (out_dir / "stream_report.json").write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
         return report
@@ -854,6 +855,7 @@ class StreamConverter:
         bbo = bbo[np.argsort(bbo["local_ts_ns"], kind="mergesort")]
         save("binance_bbo", out_dir / f"binance_bbo_{base}_{ymd}.npz", len(bbo),
              **{name: bbo[name] for name in BBO_DTYPE.names})
+        del bbo
         raw = self._load_parts(parts_dir, FOLLOWER, "hbt_raw", event_dtype)
         if len(raw) != len(self.gate.hbt_rows):
             raise AssertionError(f"HBT rows {len(raw)} != emitted {len(self.gate.hbt_rows)}")
@@ -870,10 +872,24 @@ class StreamConverter:
         edges = self._load_parts(parts_dir, FOLLOWER, "edges", EDGE_DTYPE)
         save("follower_l2_edges", out_dir / f"{FOLLOWER}_l2_edges_{base}_{ymd}.npz", len(edges),
              **{name: edges[name] for name in EDGE_DTYPE.names})
+        del edges
         l1 = self._load_parts(parts_dir, FOLLOWER, "l1", BBO_DTYPE)
         l1 = l1[np.argsort(l1["local_ts_ns"], kind="mergesort")]
         save("follower_l1_bbo", out_dir / f"{FOLLOWER}_l1_{base}_{ymd}.npz", len(l1),
              **{name: l1[name] for name in BBO_DTYPE.names})
+
+
+def only_known_gap_failures(failed: list[str]) -> bool:
+    """True iff failed_items contains only known/bounded interruption flags (never corruption/conflicts)."""
+    if not failed:
+        return False
+    for item in failed:
+        if item == "complete_day_gap_or_uncertified_clock":
+            continue
+        if item.startswith("gate_depth_unrebuildable:"):
+            continue
+        return False
+    return True
 
 
 def run(args: argparse.Namespace) -> int:
@@ -905,9 +921,11 @@ def run(args: argparse.Namespace) -> int:
         if not label:
             raise ValueError("--finalize needs --coverage-date or --label-date")
         meta = Path(args.meta) if args.meta else (Path(args.fetched) / "meta" if args.fetched else None)
-        report = conv.finalize(parts_dir, Path(args.out), meta if meta and meta.exists() else None, label)
+        allow_gaps = bool(getattr(args, "diagnostic_allow_known_gaps", False))
+        report = conv.finalize(parts_dir, Path(args.out), meta if meta and meta.exists() else None, label,
+                               diagnostic_allow_known_gaps=allow_gaps)
         print("FINAL", report["status"], json.dumps(report["failed_items"]), flush=True)
-        return 0 if report["status"] == "ok" else 2
+        return 0 if report["status"] in ("ok", "ok_with_known_gaps") else 2
     return 0
 
 
@@ -923,6 +941,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path)
     p.add_argument("--finalize", action="store_true")
     p.add_argument("--delete-inputs", action="store_true", help="remove each .tsv.zst after its part is saved")
+    p.add_argument("--diagnostic-allow-known-gaps", action="store_true",
+                   help="emit diagnostic .npz artifacts when only known gap/depth-gap warnings exist")
     args = p.parse_args(argv)
     if args.finalize and not args.out:
         p.error("--finalize needs --out")

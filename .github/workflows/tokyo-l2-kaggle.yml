@@ -152,10 +152,8 @@ jobs:
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /qa_reports/days/
-            /qa_reports/protocol/*/15m/2026-11-23T0000Z.json
-            /qa_reports/protocol/*/15m/2026-11-23T0015Z.json
-            /qa_reports/windows/*/2026-11-23/2026-11-23T0000Z__*.window.qa.json
-            /qa_reports/windows/*/2026-11-23/2026-11-23T0015Z__*.window.qa.json
+            /qa_reports/protocol/*/15m/2026-11-23T*.json
+            /qa_reports/windows/*/2026-11-23/*.window.qa.json
           persist-credentials: false
 
       - name: Check out current protocol QA rules (read-only)
@@ -202,8 +200,13 @@ jobs:
               "protocol_files": [],
               "missing_protocol_windows": [],
           }
-          for window in job.get("qa_protocol_windows", []):
-              whits = sorted(pathlib.Path("qa_state/qa_reports/windows").glob(f"*/2026-11-23/{window}__*.window.qa.json"))
+          proto_windows = list(job.get("qa_protocol_windows", []))
+          proto_date = job.get("qa_protocol_date")
+          if proto_date and not proto_windows:
+              proto_windows = [f"{proto_date}T{h:02d}{m:02d}Z" for h in range(24) for m in (0, 15, 30, 45)]
+          for window in proto_windows:
+              d_part = window.split("T")[0]
+              whits = sorted(pathlib.Path("qa_state/qa_reports/windows").glob(f"*/{d_part}/{window}__*.window.qa.json"))
               if len(whits) == 1:
                   wdata = json.loads(whits[0].read_text())
                   if wdata.get("window_id") and wdata.get("archive_revision"):
@@ -215,7 +218,13 @@ jobs:
               shutil.copy2(hits[0], protocol_dst / hits[0].name)
               provenance["protocol_files"].append(str(hits[0].relative_to("qa_state")))
           (protocol_dst / "provenance.json").write_text(json.dumps(provenance, indent=2))
-          print("qa provenance", json.dumps(provenance))
+          print("qa provenance summary", json.dumps({
+              "qa_state_sha": qa_sha, "qa_rules_main_sha": qa_rules_sha,
+              "expected_protocol_rules_sha": rules_digest,
+              "protocol_files_count": len(provenance["protocol_files"]),
+              "window_revisions_count": len(provenance["window_archive_revisions"]),
+              "missing_protocol_windows": provenance["missing_protocol_windows"],
+          }))
           PY
 
       - name: Build new notebook version from kaggle/job.json
@@ -290,7 +299,7 @@ jobs:
           fi
           {
             echo "### Kaggle job: \`${KAGGLE_SLUG:-unresolved}\` final=\`${KAGGLE_FINAL:-unknown}\`"
-            for f in job_status.json secrets_precheck.json probe_report.json two_partition_report.json; do
+            for f in job_status.json secrets_precheck.json probe_report.json two_partition_report.json full_day_report.json; do
               if [[ -f "kaggle_out/$f" ]]; then echo "#### $f"; echo '```json'; head -c 12000 "kaggle_out/$f"; echo; echo '```'; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
@@ -313,11 +322,19 @@ jobs:
           echo "kaggle_final=$KAGGLE_FINAL task_rc=$rc"
           [[ "$KAGGLE_FINAL" == *complete* && "$rc" == "0" ]]
           python - <<'PY'
-          import json, os
+          import json, os, pathlib
           status = json.load(open("kaggle_out/job_status.json"))
-          report = json.load(open("kaggle_out/two_partition_report.json"))
           assert status["git_sha"] == os.environ["GITHUB_SHA"], "stale Kaggle output"
-          assert report.get("all_ok") is True, "stage 3 acceptance failed"
-          assert report["summary"]["stage3_accepted"] is True
-          assert report["summary"]["stage4_authorized"] is False
+          fd_path = pathlib.Path("kaggle_out/full_day_report.json")
+          tp_path = pathlib.Path("kaggle_out/two_partition_report.json")
+          if fd_path.is_file():
+              report = json.loads(fd_path.read_text())
+              assert report.get("status") == "complete", "full-day diagnostic backtest failed"
+              assert report["summary"]["diagnostic_full_day_complete"] is True
+              assert report["summary"]["stage4_authorized"] is False
+          else:
+              report = json.loads(tp_path.read_text())
+              assert report.get("all_ok") is True, "stage 3 acceptance failed"
+              assert report["summary"]["stage3_accepted"] is True
+              assert report["summary"]["stage4_authorized"] is False
           PY

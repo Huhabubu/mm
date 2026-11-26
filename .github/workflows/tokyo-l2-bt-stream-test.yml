@@ -10,6 +10,8 @@ on:
       - scripts/tokyo_l2_bt_convert.py
       - scripts/test_tokyo_l2_bt_convert.py
       - scripts/test_kaggle_two_partition.py
+      - scripts/test_kaggle_full_day_glft.py
+      - scripts/core_glft_engine.py
       - kaggle/**
       - .github/workflows/tokyo-l2-bt-stream-test.yml
   workflow_dispatch:
@@ -55,4 +57,4 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/source/collector/python:${{ github.workspace }}/workflow_code/scripts
         run: |
           python -c "import hftbacktest, numpy; print('hftbacktest', hftbacktest.__version__ if hasattr(hftbacktest, '__version__') else '?', 'numpy', numpy.__version__)"
-          python -m unittest -v test_tokyo_l2_bt_stream_convert test_tokyo_l2_bt_convert test_kaggle_two_partition
+          python -m unittest -v test_tokyo_l2_bt_stream_convert test_tokyo_l2_bt_convert test_kaggle_two_partition test_kaggle_full_day_glft
