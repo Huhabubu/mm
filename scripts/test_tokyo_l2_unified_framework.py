@@ -626,24 +626,24 @@ class UnifiedFrameworkTests(unittest.TestCase):
                 str(unpack / "repo" / "scripts"),
                 str(unpack / "collector" / "python"),
             ]))
-            code = (
+            code = "\n".join([
                 "import json, unified_backtest, tokyo_l2_exchange_adapters, tokyo_l2_experiment_config, "
                 "tokyo_l2_bt_cache, tokyo_l2_research_stages, tokyo_l2_report_writer, "
-                "audit_gate_stage5b_same_fill, analyze_gate_1645_fill_quality; "
-                "batch = json.load(open('repo/configs/tokyo_l2_20261123_batch_3pairs.json')); "
-                "assert len(batch['experiments']) == 3; "
-                "assert sorted(batch['shared_leader_symbols']) == ['BTC', 'ETH']; "
-                "for item in batch['experiments']: "
-                "  cfg = tokyo_l2_experiment_config.load_experiment_config('repo/' + item['config']); "
-                "  assert cfg['models'] == ['glft', 'both_1p0', 'defensive_1p0', 'risk_side_pause']; "
-                "  assert cfg['stage4']['authorized'] is False; "
-                "  assert cfg['stage5c']['authorized'] is False; "
-                "  assert cfg['latency']['binance_extra_visible_delay_ns'] == 0; "
-                "  assert cfg['latency']['order_entry_latency_ns'] == 1_000_000; "
-                "  assert cfg['latency']['order_response_latency_ns'] == 1_000_000; "
-                "  assert cfg['order_controls']['min_requote_ns'] == 0; "
-                "print('BUNDLE_IMPORT_OK')"
-            )
+                "audit_gate_stage5b_same_fill, analyze_gate_1645_fill_quality",
+                "batch = json.load(open('repo/configs/tokyo_l2_20261123_batch_3pairs.json'))",
+                "assert len(batch['experiments']) == 3",
+                "assert sorted(batch['shared_leader_symbols']) == ['BTC', 'ETH']",
+                "for item in batch['experiments']:",
+                "    cfg = tokyo_l2_experiment_config.load_experiment_config('repo/' + item['config'])",
+                "    assert cfg['models'] == ['glft', 'both_1p0', 'defensive_1p0', 'risk_side_pause']",
+                "    assert cfg['stage4']['authorized'] is False",
+                "    assert cfg['stage5c']['authorized'] is False",
+                "    assert cfg['latency']['binance_extra_visible_delay_ns'] == 0",
+                "    assert cfg['latency']['order_entry_latency_ns'] == 1_000_000",
+                "    assert cfg['latency']['order_response_latency_ns'] == 1_000_000",
+                "    assert cfg['order_controls']['min_requote_ns'] == 0",
+                "print('BUNDLE_IMPORT_OK')",
+            ])
             r = subprocess.run([sys.executable, "-c", code], cwd=unpack, env=env, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("BUNDLE_IMPORT_OK", r.stdout)
@@ -655,6 +655,25 @@ class UnifiedFrameworkTests(unittest.TestCase):
         base_wall = 1795392000_000_000_000  # 2026-11-23T00:00:00Z
         with tempfile.TemporaryDirectory() as tmp:
             tdir = Path(tmp)
+
+            def _mk_mf(exchange: str, dpath: Path, blob: bytes, nlines: int) -> dict:
+                return {
+                    "exchange": exchange,
+                    "date_utc": "2026-11-23",
+                    "hour_utc": "00",
+                    "window_id": "2026-11-23T00:00Z",
+                    "window_duration_s": 900,
+                    "window_index": 0,
+                    "boot_id": "boot1",
+                    "data_file": dpath.name,
+                    "sha256": hashlib.sha256(blob).hexdigest(),
+                    "bytes": len(blob),
+                    "lines": nlines,
+                    "planned_start_wall_ns": base_wall,
+                    "planned_end_wall_ns": base_wall + 900_000_000_000,
+                    "late_frames_accepted": 0,
+                }
+
             # Build one synthetic Binance partition containing BTC + ETH bookTicker
             b_lines = [
                 f"{base_wall + 1000}\t1000\tconn0\t1\t1\tDATA\t"
@@ -668,18 +687,7 @@ class UnifiedFrameworkTests(unittest.TestCase):
             b_blob = zstd.ZstdCompressor().compress(("\n".join(b_lines) + "\n").encode("utf-8"))
             b_data.write_bytes(b_blob)
             b_mf = tdir / "binance_0000.manifest.json"
-            b_mf.write_text(json.dumps({
-                "exchange": "binance_futures",
-                "date_utc": "2026-11-23",
-                "window_id": "2026-11-23T00:00Z",
-                "boot_id": "boot1",
-                "sha256": hashlib.sha256(b_blob).hexdigest(),
-                "bytes": len(b_blob),
-                "lines": len(b_lines),
-                "planned_start_wall_ns": base_wall,
-                "planned_end_wall_ns": base_wall + 900_000_000_000,
-                "late_frames_accepted": 0,
-            }), encoding="utf-8")
+            b_mf.write_text(json.dumps(_mk_mf("binance_futures", b_data, b_blob, len(b_lines))), encoding="utf-8")
 
             # Run MultiSymbolBinanceBBOExtractor
             ext = MultiSymbolBinanceBBOExtractor(["BTC", "ETH"])
@@ -707,18 +715,7 @@ class UnifiedFrameworkTests(unittest.TestCase):
             bg_blob = zstd.ZstdCompressor().compress(("\n".join(bg_lines) + "\n").encode("utf-8"))
             bg_data.write_bytes(bg_blob)
             bg_mf = tdir / "bitget_0000.manifest.json"
-            bg_mf.write_text(json.dumps({
-                "exchange": "bitget_v3",
-                "date_utc": "2026-11-23",
-                "window_id": "2026-11-23T00:00Z",
-                "boot_id": "boot1",
-                "sha256": hashlib.sha256(bg_blob).hexdigest(),
-                "bytes": len(bg_blob),
-                "lines": len(bg_lines),
-                "planned_start_wall_ns": base_wall,
-                "planned_end_wall_ns": base_wall + 900_000_000_000,
-                "late_frames_accepted": 0,
-            }), encoding="utf-8")
+            bg_mf.write_text(json.dumps(_mk_mf("bitget_v3", bg_data, bg_blob, len(bg_lines))), encoding="utf-8")
 
             # Follower-only StreamConverter (include_leader=False) on Bitget
             fconv = StreamConverter("BTCUSDT", making_exchange="bitget_v3", include_leader=False)
@@ -752,12 +749,7 @@ class UnifiedFrameworkTests(unittest.TestCase):
             bad_blob = zstd.ZstdCompressor().compress(("\n".join(bad_lines) + "\n").encode("utf-8"))
             bad_data.write_bytes(bad_blob)
             bad_mf = tdir / "bitget_bad.manifest.json"
-            bad_mf.write_text(json.dumps({
-                "exchange": "bitget_v3", "date_utc": "2026-11-23", "window_id": "2026-11-23T00:00Z",
-                "boot_id": "boot1", "sha256": hashlib.sha256(bad_blob).hexdigest(), "bytes": len(bad_blob),
-                "lines": len(bad_lines), "planned_start_wall_ns": base_wall,
-                "planned_end_wall_ns": base_wall + 900_000_000_000, "late_frames_accepted": 0,
-            }), encoding="utf-8")
+            bad_mf.write_text(json.dumps(_mk_mf("bitget_v3", bad_data, bad_blob, len(bad_lines))), encoding="utf-8")
             bconv = StreamConverter("BTCUSDT", making_exchange="bitget_v3", include_leader=False)
             bconv.process_partition(bad_data, bad_mf, tdir / "b_parts")
             brep = bconv.finalize(tdir / "b_parts", tdir / "b_out", None, "2026-11-23", diagnostic_allow_known_gaps=True)
