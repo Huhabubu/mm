@@ -755,7 +755,8 @@ class UnifiedFrameworkTests(unittest.TestCase):
             bconv.process_partition(bad_data, bad_mf, tdir / "b_parts")
             brep = bconv.finalize(tdir / "b_parts", tdir / "b_out", None, "2026-11-23", diagnostic_allow_known_gaps=True)
             self.assertEqual(brep["status"], "blocked")
-            self.assertTrue(any("conflicting_duplicate_trade" in x for x in brep["failed_items"]))
+            self.assertEqual(brep["trade_dedup"].get("conflicting_duplicate_trade", 0), 1)
+            self.assertTrue(any("bitget_v3_unexplained_duplicate_trades" in x for x in brep["failed_items"]))
 
     def test_prefixed_reports_and_batch_markdown(self):
         from tokyo_l2_report_writer import render_batch_markdown_summary, write_unified_reports
