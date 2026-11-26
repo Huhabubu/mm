@@ -1,5 +1,30 @@
 # 跨交易所信号指导做市（mm）
 
+## 项目导航：四条任务线（2026-11-26 起）
+
+本项目研究 Binance 等高流动性市场的行情信号能否改善其他市场的高频做市。策略研究、回测数据基础设施、生产采集质检和独立探索实验分别推进。进入仓库后先确定任务线，再切换到对应分支；`main` 是项目导航和生产质检入口，不代表最新的论文策略代码。
+
+**协作入口：[项目总控 Issue #42](https://github.com/Huhabubu/mm/issues/42) · [AGENTS.md](AGENTS.md)**
+
+| 编号 | 任务线 | 活跃分支 | 进度与职责 |
+|---|---|---|---|
+| T1 | 论文策略研究主线 | [exp/chapter5-cross-exchange](https://github.com/Huhabubu/mm/tree/exp/chapter5-cross-exchange) | [progress.md](https://github.com/Huhabubu/mm/blob/exp/chapter5-cross-exchange/progress.md)：GLFT、跨所价差、五阶段机制研究及正式实证。 |
+| T2 | 自采行情回测基础设施 | [exp/tokyo-l2-glft](https://github.com/Huhabubu/mm/tree/exp/tokyo-l2-glft) | [progress.md](https://github.com/Huhabubu/mm/blob/exp/tokyo-l2-glft/progress.md)：东京自采行情下载、转换、时间轴、Kaggle 与 hftbacktest 回放验收。 |
+| T3 | 生产采集与质检 | [main](https://github.com/Huhabubu/mm/tree/main)、[feat/tokyo-l2-reliability-fixes](https://github.com/Huhabubu/mm/tree/feat/tokyo-l2-reliability-fixes) | [采集说明](https://github.com/Huhabubu/mm/blob/feat/tokyo-l2-reliability-fixes/collector/README.md)、[自动质检状态](https://github.com/Huhabubu/mm/tree/tokyo-l2-qa-state)、对应 Issue/PR：EC2 采集、归档、质量检查与监控。 |
+| T4 | USDC 合约独立实验 | [exp/usdc-perp-glft-min](https://github.com/Huhabubu/mm/tree/exp/usdc-perp-glft-min) | [PROGRESS.md](https://github.com/Huhabubu/mm/blob/exp/usdc-perp-glft-min/research/usdc_perp_glft_min/PROGRESS.md)：USDT 永续信号指导 USDC 永续做市的探索性实验。 |
+
+**交付关系：T3（已验证归档及质检证据）→ T2（数据转换与回放验收）→ T1（用户批准后接入正式研究）；T4 独立推进。**
+
+T2 从 T1 分出以复用策略核心，不代表论文主线已经迁移；更换数据源与运行环境不自动授权策略变更。历史 Gate–Binance 五阶段成果保存在 [fix/gate-stage2-stage5b-total-markout-20261118](https://github.com/Huhabubu/mm/tree/fix/gate-stage2-stage5b-total-markout-20261118)，后续统一引擎 [feat/core-glft-engine-refactor](https://github.com/Huhabubu/mm/tree/feat/core-glft-engine-refactor) 和 [多币种稳健性](https://github.com/Huhabubu/mm/tree/exp/chapter5-robustness-cross-asset) 均保留为研究节点。历史分支不因本次整理删除、重命名或合并。
+
+开始工作前阅读目标分支的 AGENTS.md、对应进度文件及 Issue；跨任务线合并、改变既有模型规则、生产部署和质检标准变更须单独授权。具体进展及阻塞更新至所属任务线，总控 Issue 只协调任务及交付。禁止向公开仓库发布原始行情和凭据。
+
+---
+
+## 早期研究记录（历史保留）
+
+以下内容为仓库初始阶段的研究说明，按原文保留；其中的“当前”“最新”仅代表当时阶段，不作为今天的任务状态。请以上方导航进入对应分支查看后续进展。
+
 研究目标：检验 Binance USDT 永续合约行情能否在 OKX 本地信息之外，为 OKX 永续合约做市提供额外预测价值。当前先做数据完整性、时间戳和跨所行情对齐检查，再开展预测与 GLFT 回测。
 
 ## 第一阶段：Tardis 数据 QA
