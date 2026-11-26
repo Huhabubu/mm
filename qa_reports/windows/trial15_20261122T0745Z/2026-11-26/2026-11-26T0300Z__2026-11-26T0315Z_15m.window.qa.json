@@ -1,0 +1,77 @@
+{
+  "report_level": "window",
+  "qa_version": 2,
+  "checker_commit_sha": "31590e1ab0f58436b0967a969384994aabfc6b82",
+  "effective_config_sha256": "b266588d4021978dbe1dcfe0ca29dade8584ef60a7f5de51cdba25401b0c669a",
+  "date_utc": "2026-11-26",
+  "window_id": "2026-11-26T03:00Z",
+  "planned_end_id": "2026-11-26T03:15Z",
+  "window_span_id": "2026-11-26T03:00Z__2026-11-26T03:15Z_15m",
+  "partition_minutes": 15,
+  "planned_start_wall_ns": 1795662000000000000,
+  "planned_end_wall_ns": 1795662900000000000,
+  "run_id": "trial15_20261122T0745Z",
+  "archive_revision": "sha256:a88cbaf9da9d22f5d7a982bdf8b12a6e9fff17779ebd8ea4d6071ea0a2d37a8c",
+  "archive_complete_in_index": true,
+  "observed_batches": [
+    "trial15_20261122T0745Z"
+  ],
+  "qa_status": "failed",
+  "status": "blocked",
+  "expected_exchanges": [
+    "binance_futures",
+    "bitget_v3",
+    "bybit_linear",
+    "gate_futures"
+  ],
+  "present_exchanges": [
+    "binance_futures",
+    "bitget_v3",
+    "bybit_linear",
+    "gate_futures"
+  ],
+  "missing_exchanges": [],
+  "expected_channel_count": 72,
+  "observed_channel_count": 72,
+  "missing_hard_channels": [],
+  "missing_trade_channels": [],
+  "worst_head_gap_seconds": 1.32997,
+  "worst_tail_gap_seconds": 29.241454,
+  "max_gap_by_category": {
+    "event_trade": 60.379872,
+    "continuous_quote": 7.843629,
+    "depth": 2.145232
+  },
+  "local_loss_events": 0,
+  "dropped_frames": 0,
+  "attributed_late_frames_rejected": 0,
+  "attributed_late_losses": [],
+  "gap_start_events": 1,
+  "depth_unavailable_events": 5,
+  "sequence_breaks": [],
+  "segment_count": 4,
+  "startup_stub_segments": [],
+  "damaged_segments": [
+    {
+      "exchange": "binance_futures",
+      "file_name": "binance_futures_20261126_0300_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/binance_futures/2026-11-26/binance_futures_20261126_0300_p15m_trial15_20261122_da93ae54.manifest.json",
+      "run_id": "trial15_20261122T0745Z",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 1,
+      "problems": [
+        "recorded loss/gap events: loss=0, gap_start=1",
+        "depth unavailable events recorded: 5"
+      ]
+    }
+  ],
+  "review_reasons": [],
+  "hard_problems": [],
+  "files": [
+    "raw/binance_futures/2026-11-26/binance_futures_20261126_0300_p15m_trial15_20261122_da93ae54.manifest.json",
+    "raw/bitget_v3/2026-11-26/bitget_v3_20261126_0300_p15m_trial15_20261122_da93ae54.manifest.json",
+    "raw/bybit_linear/2026-11-26/bybit_linear_20261126_0300_p15m_trial15_20261122_da93ae54.manifest.json",
+    "raw/gate_futures/2026-11-26/gate_futures_20261126_0300_p15m_trial15_20261122_da93ae54.manifest.json"
+  ]
+}
