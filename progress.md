@@ -654,3 +654,22 @@
 - [ ] **剩余风险、限制与下一步**：
   - 本次结果仅限 `2026-11-23 UTC` 单日 BTC_USDT 诊断性工程验证；1ms 单程订单延迟与 +2bps/+5bps 费率为模拟研究假设（非实测交易所延迟与实盘费率）；取消 20ms 冷却后单秒最大订单请求量升至 `224–491 req/s`，实盘接入前需评估交易所限频约束。
   - `stage3_strict_qa_passed=false`、`stage4_authorized=false`；暂不擅自扩大日期、币种或启动正式批量实证，等待用户审阅本轮结果并明确下一步指令。
+
+## 2026-11-26 T2：统一自采行情回测框架与五阶段研究流程（已完成主干搭建与 2026-11-23 四模型全流程实测）
+
+- [x] **统一实验框架与多所解耦架构**：在 `exp/tokyo-l2-glft` 上建立统一配置驱动框架，彻底消除入口对 BTC、Gate、2026-11-23 和固定三模型的硬编码，并保留 `scripts/core_glft_engine.py` 为唯一核心策略实现及全部历史脚本可复现性：
+  - 统一实验配置与防泄漏校验：[scripts/tokyo_l2_experiment_config.py](scripts/tokyo_l2_experiment_config.py)、预设配置 [configs/tokyo_l2_20261123_gate_btc.json](configs/tokyo_l2_20261123_gate_btc.json)。
+  - 交易所适配器（行情解析与合约规格解耦）：[scripts/tokyo_l2_exchange_adapters.py](scripts/tokyo_l2_exchange_adapters.py)，扩展 [scripts/tokyo_l2_bt_stream_convert.py](scripts/tokyo_l2_bt_stream_convert.py)、[scripts/tokyo_l2_bt_convert.py](scripts/tokyo_l2_bt_convert.py)、[scripts/tokyo_l2_bt_fetch.py](scripts/tokyo_l2_bt_fetch.py) 支持 `gate_futures`、`bybit_linear`、`bitget_v3`（含双精度网格 `quote_tick_mult`）。
+  - 转换复用与强校验缓存：[scripts/tokyo_l2_bt_cache.py](scripts/tokyo_l2_bt_cache.py)（基于源分区 SHA-256、转换器代码 SHA-256、合约规格 SHA-256 校验，单次下载转换供全部模型与五阶段复用，失配则 fail-closed 重转）。
+  - 完整六模型与五阶段研究引擎（Stage 1–5C）：[scripts/tokyo_l2_research_stages.py](scripts/tokyo_l2_research_stages.py)、JSON/CSV/Markdown 报告生成器 [scripts/tokyo_l2_report_writer.py](scripts/tokyo_l2_report_writer.py) 及统一 Kaggle 入口 [kaggle/tasks/unified_backtest.py](kaggle/tasks/unified_backtest.py)。
+- [x] **完整回归、防泄漏与跨所/跨币种单元测试**：[scripts/test_tokyo_l2_unified_framework.py](scripts/test_tokyo_l2_unified_framework.py) 覆盖 `defensive_1p0` 与 Tardis 历史参数（2.5ms/20ms）一致性、统一入口与 `full_day_glft.py` 逐位一致、全 6 模型与 Stage 1–5B 闭环、Stage 4 独立训练锁与防重叠拦截、Stage 5C 预注册锁定与盲测隔离、转换缓存命中与失配失效、以及 Gate ETH / Bybit BTC / Bitget DOGE（双网格 `quote_tick_mult=10`）配置切换端到端测试。共 **47/47** 项单元测试全部通过。
+- [x] **2026-11-23 UTC Binance–Gate BTC 统一框架 Kaggle 完整实测**：[Actions #45799437761](https://github.com/Huhabubu/mm/actions/runs/45799437761)（commit `10150a08e8c36703453b51a5ec3ddd935d2a15a2`，Artifact `kaggle-45799437761`，总耗时 `4144.0s`，`returncode=0`），单次下载（`309.2s`，192 分区）与流式转换（`2929.9s`，`status=ok`，`failed_items=[]`）供 4 个核心模型与 Stage 1/2/3/5A/5B 共用，统一参数 `0ms` Binance 额外延迟、`1ms/1ms` 模拟订单延迟、`0ms` 同边冷却、零手续费为主口径、共享校准起点 `1795392600166000000`：
+  - **与 Run #45765785646 逐位核对一致**：`glft`、`both_1p0`、`risk_side_pause` 的成交笔数、成交额、毛/净 PnL、Total Markout、库存与挂撤单次数完全一致。
+  - **四模型 Stage 5A 对比（含补齐的单边平移 `defensive_1p0`）**：
+    - `glft`：`20,146` 笔，毛收益 `-70.3841 USDT`（`-0.4342 bps`），+2bps 净收益 `-394.5931 USDT`，100/500/1000ms Total Markout `-0.3501 / -0.4312 / -0.4104 bps`，`pos_std=4.2448`，`max_abs=65.0`，`max_ops/s=349`。
+    - `both_1p0`：`17,758` 笔，毛收益 `-39.1148 USDT`（`-0.2736 bps`，较基线 `+31.2693 USDT`），+2bps 净收益 `-325.0161 USDT`，Total Markout `-0.3385 / -0.3793 / -0.2851 bps`，`pos_std=4.0014`，`max_abs=104.0`，`max_ops/s=491`。
+    - `defensive_1p0`（首次真实全天实测）：`16,936` 笔，毛收益 `-49.4660 USDT`（`-0.3630 bps`，较基线 `+20.9181 USDT`），+2bps 净收益 `-322.0207 USDT`，Total Markout `-0.3140 / -0.3888 / -0.3510 bps`（100ms 与 1000ms Worst10 尾部最优），`pos_std=3.7712`，`max_abs=52.0`，`max_ops/s=411`。
+    - `risk_side_pause`：`16,828` 笔，毛收益 `-49.1783 USDT`（`-0.3632 bps`，较基线 `+21.2058 USDT`），+2bps 净收益 `-319.9945 USDT`，Total Markout `-0.3220 / -0.3916 / -0.3534 bps`，`pos_std=3.7678`，`max_abs=52.0`，`max_ops/s=224`。
+  - **Stage 1 / 2 / 3 / 5B 完整闭环**：Stage 1 四模型 Conventions A & B 会计残差均为 `0.000000 USDT`；Stage 3 只读影子回放与 `glft` 基准逐笔成交集合及账本完全一致（`20,146` 笔中仅 3 对同纳秒买卖成交受 Rust `HashMap` 迭代顺序重排，已由规范排序严格核验），分类为 `threatened=2,112`（10.48%，500ms Total Markout `-0.8755 bps`）、`inactive_or_no_effect=17,846`（88.58%，`-0.4214 bps`）、`opposite=188`（0.93%，`+3.6276 bps`），当前 1ms 延迟 + 0ms 冷却下 `threatened` 理论成交前可撤比例达 `96.02%`（`2,028/2,112`），挂单价格一致率 `100.00%`，三个信号模型实际规避 `threatened` 成交比例分别为 `96.59%`（`both_1p0`）、`98.53%`（`defensive_1p0`）、`99.91%`（`risk_side_pause`）；Stage 5B 同成交口径完整分离点差捕获与方向漂移；四个模型在全天 3 次极短中断区间内成交均为 `0` 笔。
+  - **汇总报告已入库（无原始行情/逐笔数据）**：[reports/tokyo_l2_20261123_unified/research_report.md](reports/tokyo_l2_20261123_unified/research_report.md)、[unified_report.json](reports/tokyo_l2_20261123_unified/unified_report.json) 及 6 份 CSV 表。
+- [ ] **Stage 4 与 Stage 5C 治理状态**：Stage 4（`pending_independent_training_date`）与 Stage 5C（`pending_authorized_holdout_date`）代码、防泄漏锁定及单元测试均已就绪；因尚未指定独立非重叠训练日与经授权未触碰盲测日，均诚实标记为待执行，未在 `2026-11-23` 评价日反推参数或复用旧 Tardis 参数，亦未批量扩张多日/多币种实盘回测。

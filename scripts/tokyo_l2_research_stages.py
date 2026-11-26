@@ -758,10 +758,13 @@ def run_stage5a_ablation(
         gross = float(t["gross_marked_pnl_usdt"])
         turnover = float(t["trading_value_usdt"])
         q = (stage2_out or {}).get(name) or models_out[name].get("fill_quality") or {}
+        q_all = (q.get("groups") or {}).get("all") or {}
+        q_horizons = q_all.get("horizons") or {}
         tot_mo = {}
         for h in HORIZONS:
-            hm = q.get("horizons", {}).get(f"{h}ms", {})
-            tot_mo[f"{h}ms"] = (hm.get("total_markout_all") or {}).get("mean_bps")
+            hm = q_horizons.get(str(h)) or q_horizons.get(f"{h}ms") or {}
+            tm = hm.get("total_markout") or hm.get("total_markout_all") or {}
+            tot_mo[f"{h}ms"] = tm.get("mean_bps")
         fees = _fee_scenarios(gross, turnover, rates)
         row = {
             "date": date_utc,

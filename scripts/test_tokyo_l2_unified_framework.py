@@ -388,6 +388,10 @@ class UnifiedFrameworkTests(unittest.TestCase):
             with (rep_dir / "models_summary.csv").open(encoding="utf-8") as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual([r["model"] for r in rows], ["glft", "both_1p0", "defensive_1p0", "risk_side_pause"])
+            self.assertTrue(all(r["total_markout_100ms_bps"] != "" for r in rows))
+            with (rep_dir / "stage2_markout.csv").open(encoding="utf-8") as fh:
+                s2_rows = list(csv.DictReader(fh))
+            self.assertEqual(len(s2_rows), 12)
             self.assertIn("research_report.md", written.values())
 
     def test_stage4_independent_train_lock_and_stage5c_preregistered_lock(self):

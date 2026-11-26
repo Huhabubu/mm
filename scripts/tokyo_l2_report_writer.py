@@ -52,12 +52,23 @@ def write_unified_reports(report: dict[str, Any], out_dir: Path) -> dict[str, st
     stage5b_rows: list[dict[str, Any]] = []
     anomaly_rows: list[dict[str, Any]] = []
 
+    def _s2_tm(s2m: dict[str, Any], group: str, h: str) -> dict[str, Any]:
+        g = (s2m.get("groups") or {}).get(group) or {}
+        hmap = g.get("horizons") or {}
+        hv = hmap.get(str(h)) or hmap.get(f"{h}ms") or {}
+        return hv.get("total_markout") or {}
+
     for date_utc, drep in sorted(days.items()):
         bt = drep.get("research") or {}
         s5a = bt.get("stage5a") or {}
+        s2 = (bt.get("stage2") or {}).get("models") or {}
         for r in s5a.get("table") or []:
             fs = r.get("fee_scenarios") or {}
             rebate_net = (fs.get("maker_minus0p5bps") or {}).get("net_pnl_usdt")
+            s2m = s2.get(r["model"]) or {}
+            tm100 = r["total_markout_100ms_bps"] if r.get("total_markout_100ms_bps") is not None else _s2_tm(s2m, "all", "100").get("mean_bps")
+            tm500 = r["total_markout_500ms_bps"] if r.get("total_markout_500ms_bps") is not None else _s2_tm(s2m, "all", "500").get("mean_bps")
+            tm1000 = r["total_markout_1000ms_bps"] if r.get("total_markout_1000ms_bps") is not None else _s2_tm(s2m, "all", "1000").get("mean_bps")
             models_rows.append({
                 "date": date_utc,
                 "model": r["model"],
@@ -71,9 +82,9 @@ def write_unified_reports(report: dict[str, Any], out_dir: Path) -> dict[str, st
                 "net_marked_pnl_usdt_2bps": round(r["net_marked_pnl_usdt_2bps"], 6),
                 "fee_usdt_2bps": round(r["fee_usdt_2bps"], 6),
                 "net_marked_pnl_usdt_rebate_0p5bps": round(rebate_net, 6) if rebate_net is not None else None,
-                "total_markout_100ms_bps": r["total_markout_100ms_bps"],
-                "total_markout_500ms_bps": r["total_markout_500ms_bps"],
-                "total_markout_1000ms_bps": r["total_markout_1000ms_bps"],
+                "total_markout_100ms_bps": tm100,
+                "total_markout_500ms_bps": tm500,
+                "total_markout_1000ms_bps": tm1000,
                 "position_std_contracts": round(r["position_std_contracts"], 6),
                 "rms_inventory_contracts": round(r["rms_inventory_contracts"], 6),
                 "max_abs_position_contracts": r["max_abs_position_contracts"],
@@ -90,27 +101,28 @@ def write_unified_reports(report: dict[str, Any], out_dir: Path) -> dict[str, st
         for mname, s1m in s1.items():
             stage1_rows.append(s1m)
 
-        s2 = (bt.get("stage2") or {}).get("models") or {}
         for mname, s2m in s2.items():
-            for h_key, h_val in (s2m.get("horizons") or {}).items():
-                tm_all = h_val.get("total_markout_all") or {}
-                tm_buy = h_val.get("total_markout_buy") or {}
-                tm_sell = h_val.get("total_markout_sell") or {}
-                tm_upd = h_val.get("total_markout_updated_quote") or {}
+            g_all = (s2m.get("groups") or {}).get("all") or {}
+            for h_key, h_val in (g_all.get("horizons") or {}).items():
+                tm_all = h_val.get("total_markout") or {}
+                tm_buy = _s2_tm(s2m, "buy", h_key)
+                tm_sell = _s2_tm(s2m, "sell", h_key)
+                tm_upd = h_val.get("total_markout_after_quote_update") or {}
                 stage2_rows.append({
                     "date": date_utc,
                     "model": mname,
-                    "horizon": h_key,
-                    "fills": s2m.get("fills"),
-                    "total_fresh_n": tm_all.get("n"),
+                    "horizon_ms": h_key,
+                    "fills": s2m.get("hbt_fills"),
+                    "total_fresh_n": h_val.get("total_fresh_count"),
+                    "total_fresh_fraction": h_val.get("total_fresh_fraction"),
                     "total_markout_mean_bps": tm_all.get("mean_bps"),
-                    "total_markout_notional_weighted_bps": tm_all.get("notional_weighted_bps"),
+                    "total_markout_notional_weighted_bps": tm_all.get("notional_weighted_mean_bps"),
                     "total_markout_neg_frac": tm_all.get("negative_fraction"),
                     "total_markout_p10_bps": tm_all.get("p10_bps"),
                     "total_markout_worst10_bps": tm_all.get("worst10_mean_bps"),
                     "buy_mean_bps": tm_buy.get("mean_bps"),
                     "sell_mean_bps": tm_sell.get("mean_bps"),
-                    "updated_quote_n": tm_upd.get("n"),
+                    "updated_quote_n": h_val.get("future_quote_updated_count"),
                     "updated_quote_mean_bps": tm_upd.get("mean_bps"),
                 })
 
@@ -214,18 +226,27 @@ def render_markdown_report(report: dict[str, Any]) -> str:
 
         # Stage 5A Core Model Comparison Table
         s5a = bt.get("stage5a") or {}
+        s2 = (bt.get("stage2") or {}).get("models") or {}
+
+        def _md_s2_tm(mname: str, grp: str, h: str) -> dict[str, Any]:
+            g = ((s2.get(mname) or {}).get("groups") or {}).get(grp) or {}
+            hv = (g.get("horizons") or {}).get(str(h)) or {}
+            return hv.get("total_markout") or {}
+
         if s5a.get("table"):
             lines.append("### Stage 5A: Model Comparison (Zero-Fee Gross Primary + Fee Sensitivity)")
             lines.append("")
             lines.append("| Model | Fills | Turnover (USDT) | Gross PnL (USDT) | Gross (bps) | Net +2bps (USDT) | TM 100ms | TM 500ms | TM 1000ms | Pos Std | Max Abs | Submits | Cancels | Max Ops/s |")
             lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
             for r in s5a["table"]:
+                tm100 = r["total_markout_100ms_bps"] if r.get("total_markout_100ms_bps") is not None else _md_s2_tm(r["model"], "all", "100").get("mean_bps")
+                tm500 = r["total_markout_500ms_bps"] if r.get("total_markout_500ms_bps") is not None else _md_s2_tm(r["model"], "all", "500").get("mean_bps")
+                tm1000 = r["total_markout_1000ms_bps"] if r.get("total_markout_1000ms_bps") is not None else _md_s2_tm(r["model"], "all", "1000").get("mean_bps")
                 lines.append(
                     f"| `{r['model']}` | {_fmt(r['fills'])} | {_fmt(r['turnover_usdt'], 2)} | "
                     f"{_fmt(r['gross_marked_pnl_usdt'], 4)} | {_fmt(r['gross_pnl_bps'], 4)} | "
                     f"{_fmt(r['net_marked_pnl_usdt_2bps'], 4)} | "
-                    f"{_fmt(r['total_markout_100ms_bps'], 4)} | {_fmt(r['total_markout_500ms_bps'], 4)} | "
-                    f"{_fmt(r['total_markout_1000ms_bps'], 4)} | "
+                    f"{_fmt(tm100, 4)} | {_fmt(tm500, 4)} | {_fmt(tm1000, 4)} | "
                     f"{_fmt(r['position_std_contracts'], 4)} | {_fmt(r['max_abs_position_contracts'], 1)} | "
                     f"{_fmt(r['submits'])} | {_fmt(r['cancels'])} | {_fmt(r['max_order_ops_per_s'])} |"
                 )
@@ -245,6 +266,30 @@ def render_markdown_report(report: dict[str, Any]) -> str:
                     f"{_fmt(m['next_sample_capture_usdt'], 4)} | {_fmt(m['next_sample_inventory_pnl_usdt'], 4)} | "
                     f"{_fmt(m['accounting_residual_b_usdt'], 6)} | {_fmt(m['rms_position_contracts'], 4)} |"
                 )
+            lines.append("")
+
+        # Stage 2 Execution-Price Total Markout & Fill Quality
+        if s2:
+            lines.append("### Stage 2: Execution-Price Total Markout & Fill Quality (All / Buy / Sell / Tails)")
+            lines.append("")
+            lines.append("| Model | Horizon | Fresh N | Mean (bps) | Notional-Wtd | Buy (bps) | Sell (bps) | Neg Frac | P10 (bps) | Worst10 (bps) |")
+            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+            for mname, s2m in s2.items():
+                hmap = ((s2m.get("groups") or {}).get("all") or {}).get("horizons") or {}
+                for h in ("100", "500", "1000"):
+                    if h not in hmap:
+                        continue
+                    hv = hmap[h]
+                    tm = hv.get("total_markout") or {}
+                    tmb = _md_s2_tm(mname, "buy", h)
+                    tms = _md_s2_tm(mname, "sell", h)
+                    lines.append(
+                        f"| `{mname}` | {h}ms | {_fmt(hv.get('total_fresh_count'))} | "
+                        f"{_fmt(tm.get('mean_bps'), 4)} | {_fmt(tm.get('notional_weighted_mean_bps'), 4)} | "
+                        f"{_fmt(tmb.get('mean_bps'), 4)} | {_fmt(tms.get('mean_bps'), 4)} | "
+                        f"{_fmt(tm.get('negative_fraction'), 4)} | {_fmt(tm.get('p10_bps'), 4)} | "
+                        f"{_fmt(tm.get('worst10_mean_bps'), 4)} |"
+                    )
             lines.append("")
 
         # Stage 3 Shadow Audit
