@@ -627,6 +627,44 @@ class UnifiedFrameworkTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("BUNDLE_IMPORT_OK", r.stdout)
 
+    def test_stage3_verify_fill_parity_hashmap_tie_order(self):
+        from tokyo_l2_research_stages import verify_fill_parity
+
+        base = {
+            "exchange_timestamp_ns": np.array([100, 200, 200, 300], dtype=np.int64),
+            "local_observed_ns": np.array([101, 201, 201, 301], dtype=np.int64),
+            "side": np.array([1, 1, -1, -1], dtype=np.int64),
+            "exec_price": np.array([10.0, 10.1, 10.2, 10.3], dtype=np.float64),
+            "exec_qty": np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+        }
+        # Simultaneous BUY/SELL at exact same (local, exch) swapped by Rust HashMap order -> valid
+        swapped = {
+            "exchange_timestamp_ns": np.array([100, 200, 200, 300], dtype=np.int64),
+            "local_observed_ns": np.array([101, 201, 201, 301], dtype=np.int64),
+            "side": np.array([1, -1, 1, -1], dtype=np.int64),
+            "exec_price": np.array([10.0, 10.2, 10.1, 10.3], dtype=np.float64),
+            "exec_qty": np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+        }
+        res = verify_fill_parity(swapped, base)
+        self.assertFalse(res["exact_row_order"])
+        self.assertEqual(res["simultaneous_hashmap_tie_reorders"], 2)
+
+        # Genuine price mismatch at same timestamp -> MUST fail closed
+        bad_px = {**swapped, "exec_price": np.array([10.0, 10.25, 10.1, 10.3], dtype=np.float64)}
+        with self.assertRaises(ValueError):
+            verify_fill_parity(bad_px, base)
+
+        # Reorder across distinct timestamps -> MUST fail closed
+        bad_ts = {
+            "exchange_timestamp_ns": np.array([200, 100, 200, 300], dtype=np.int64),
+            "local_observed_ns": np.array([201, 101, 201, 301], dtype=np.int64),
+            "side": np.array([1, 1, -1, -1], dtype=np.int64),
+            "exec_price": np.array([10.1, 10.0, 10.2, 10.3], dtype=np.float64),
+            "exec_qty": np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+        }
+        with self.assertRaises(ValueError):
+            verify_fill_parity(bad_ts, base)
+
 
 if __name__ == "__main__":
     unittest.main()

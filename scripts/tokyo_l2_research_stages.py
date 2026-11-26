@@ -451,6 +451,63 @@ def classify_stage3_shadow(
     }
 
 
+def verify_fill_parity(
+    shadow_fills: dict[str, np.ndarray],
+    base_fills: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    """Verify exact bit-for-bit parity of all 5 fill arrays.
+
+    In `hftbacktest==2.4.4`, `engine.orders(0).values()` iterates a Rust HashMap whose
+    bucket order is randomized per engine instance. When two orders (e.g. BUY and SELL)
+    fill at the exact same `(local_observed_ns, exchange_timestamp_ns)`, they can be
+    emitted in either order across runs while representing the identical fill multiset.
+    This verifier asserts 100% bit-for-bit equality on the canonical sorted tuple
+    `(local_observed_ns, exchange_timestamp_ns, side, exec_price, exec_qty)` AND verifies
+    that any row-order permutation occurs exclusively within identical
+    `(local_observed_ns, exchange_timestamp_ns)` timestamps.
+    """
+    keys = ("exchange_timestamp_ns", "side", "local_observed_ns", "exec_price", "exec_qty")
+    for k in keys:
+        if shadow_fills[k].shape != base_fills[k].shape:
+            raise ValueError(
+                f"Stage 3 shadow replay broke baseline GLFT fill count on {k}: "
+                f"{shadow_fills[k].shape} != {base_fills[k].shape}"
+            )
+    if all(np.array_equal(shadow_fills[k], base_fills[k]) for k in keys):
+        return {"exact_row_order": True, "simultaneous_hashmap_tie_reorders": 0}
+
+    def _canon_perm(f: dict[str, np.ndarray]) -> np.ndarray:
+        return np.lexsort((
+            f["exec_qty"],
+            f["exec_price"],
+            f["side"],
+            f["exchange_timestamp_ns"],
+            f["local_observed_ns"],
+        ))
+
+    ps = _canon_perm(shadow_fills)
+    pb = _canon_perm(base_fills)
+    for k in keys:
+        if not np.array_equal(shadow_fills[k][ps], base_fills[k][pb]):
+            diff_idx = np.flatnonzero(shadow_fills[k][ps] != base_fills[k][pb])[:5].tolist()
+            raise ValueError(
+                f"Stage 3 shadow replay broke baseline GLFT fill parity on {k} "
+                f"(canonical diff indices={diff_idx})"
+            )
+
+    # Confirm every raw index mismatch occurred at identical (local_observed_ns, exchange_timestamp_ns)
+    diff_mask = np.zeros(len(base_fills["side"]), dtype=bool)
+    for k in keys:
+        diff_mask |= (shadow_fills[k] != base_fills[k])
+    if not (np.array_equal(shadow_fills["local_observed_ns"][diff_mask], base_fills["local_observed_ns"][diff_mask])
+            and np.array_equal(shadow_fills["exchange_timestamp_ns"][diff_mask], base_fills["exchange_timestamp_ns"][diff_mask])):
+        raise ValueError("Stage 3 shadow replay fill reordering crossed distinct timestamps")
+    return {
+        "exact_row_order": False,
+        "simultaneous_hashmap_tie_reorders": int(diff_mask.sum()),
+    }
+
+
 def run_stage3_shadow_audit(
     *,
     date_utc: str,
@@ -492,6 +549,7 @@ def run_stage3_shadow_audit(
             "date": date_utc,
             "status": "complete_zero_fills",
             "parity_verified": True,
+            "parity_details": {"exact_row_order": True, "simultaneous_hashmap_tie_reorders": 0},
             "total_fills": 0,
             "parameters": {
                 "order_entry_latency_ns": int(order_entry_latency_ns),
@@ -526,9 +584,7 @@ def run_stage3_shadow_audit(
             "exec_price": np.asarray(raw[-2][2], dtype=np.float64),
             "exec_qty": np.asarray(raw[-2][3], dtype=np.float64),
         }
-        for key, ref in base_fills.items():
-            if not np.array_equal(shadow_fills[key], ref):
-                raise ValueError(f"Stage 3 shadow replay broke baseline GLFT fill parity on {key}")
+        parity_details = verify_fill_parity(shadow_fills, base_fills)
         summary = summarize(raw, trade_minutes, True, 0.0, scenario["position_cap"], scenario["qty"],
                             tail_tolerance_samples=25)
         st = summary["trading"]
@@ -664,6 +720,7 @@ def run_stage3_shadow_audit(
         "status": "complete",
         "elapsed_s": round(time.time() - t0, 2),
         "parity_verified": True,
+        "parity_details": parity_details,
         "total_fills": n_fills,
         "category_counts": {grp: int(cat_counts.get(grp, 0)) for grp in STAGE3_GROUPS},
         "shadow_total_effective_at_deadline": int(np.sum(classified["shadow_signal_active"])),
