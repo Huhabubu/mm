@@ -728,12 +728,12 @@ def run_stage5a_ablation(
             "mean_abs_inventory_contracts": float(t["mean_abs_inventory_contracts"]),
             "max_abs_position_contracts": float(t["max_abs_position_contracts"]),
             "end_position_contracts": float(t["end_position_contracts"]),
-            "submits": int(t["submits"]),
-            "cancels": int(t["cancels"]),
+            "submits": int(t["submissions"]),
+            "cancels": int(t["cancel_requests"]),
             "modify_requests": int(t.get("modify_requests", 0)),
-            "max_order_ops_per_s": int(t.get("max_order_ops_per_s", 0)),
-            "signal_activations": int(t.get("origin_activations", 0)),
-            "ties_excluded": int(t.get("tie_excluded_checks", 0)),
+            "max_order_ops_per_s": int(models_out[name].get("max_ops_per_sec", 0)),
+            "signal_activations": int((models_out[name].get("binance_origin_filter") or {}).get("binance_origin_activations", 0)),
+            "ties_excluded": int((models_out[name].get("binance_origin_filter") or {}).get("same_timestamp_ties_blocked", 0)),
         }
         if stage1_out and name in stage1_out:
             row["stage1_spread_capture_usdt"] = stage1_out[name]["spread_capture_usdt"]
@@ -1483,6 +1483,17 @@ def run_models_on_arrays(
                 annotated, episodes, audit_counts, probe_arr, raw[-2][4], effective_begin
             )
 
+            origin_filter = {
+                k: int(v) for k, v in zip(
+                    ("binance_price_update_groups", "eligible_gap_checks",
+                     "above_threshold_checks", "directional_dominance_checks",
+                     "binance_origin_activations", "active_decisions",
+                     "same_timestamp_ties_blocked"),
+                    raw[-1],
+                )
+            }
+            origin_filter["microsecond_collisions"] = int(diag[11])
+
             model_entry: dict[str, Any] = {
                 "model": name,
                 "family": reg["family"],
@@ -1491,17 +1502,29 @@ def run_models_on_arrays(
                 "control_kind": control_kind,
                 "elapsed_s": round(time.time() - t_m, 2),
                 "first_fit_ns": first_fit,
+                "effective_trading_start_ns": effective_begin,
                 "end_time_ns": end_time_ns,
+                "decisions": int(raw[1]),
+                "submissions": int(trading["submissions"]),
+                "cancel_requests": int(trading["cancel_requests"]),
+                "modify_requests": 0,
+                "max_ops_per_sec": int(diag[0]),
+                "resting_time_ratio": {
+                    "bid": float(diag[1]),
+                    "ask": float(diag[2]),
+                    "verified_exchange_resting": False,
+                },
+                "binance_origin_filter": origin_filter,
                 "trading": trading,
                 "accounting_checks": accounting_checks,
                 "fill_quality": quality,
                 "anomaly_impact": anomaly_impact,
                 "initial_parameters": summary.get("initial_parameters"),
                 "diagnostics": {
-                    "wait_book_skips": int(diag[0]),
+                    "max_ops_per_sec": int(diag[0]),
                     "first_valid_fit_offset_ns": int(diag[3]),
                     "shared_calibration_valid": bool(diag[5] == 1),
-                    "first_order_event_ns": int(diag[11]) if diag[11] > 0 else None,
+                    "microsecond_collisions": int(diag[11]),
                 },
             }
             if control_kind == 1:

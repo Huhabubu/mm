@@ -352,11 +352,14 @@ class UnifiedFrameworkTests(unittest.TestCase):
                 legacy["effective_parameters"]["shared_first_eligible_entry_ns"],
             )
             for m in ("glft", "both_1p0", "risk_side_pause"):
-                lt = legacy["models"][m]["trading"]
-                ut = unified["models"][m]["trading"]
-                for k in ("engine_fills", "buy_fills", "sell_fills", "submits", "cancels",
-                          "max_order_ops_per_s", "origin_activations", "tie_excluded_checks"):
-                    self.assertEqual(ut[k], lt[k], f"{m}.{k} mismatch")
+                lm = legacy["models"][m]
+                um = unified["models"][m]
+                lt = lm["trading"]
+                ut = um["trading"]
+                for k in ("engine_fills", "buy_fills", "sell_fills", "submissions", "cancel_requests"):
+                    self.assertEqual(ut[k], lt[k], f"{m}.trading.{k} mismatch")
+                self.assertEqual(um["max_ops_per_sec"], lm["max_ops_per_sec"], f"{m}.max_ops_per_sec mismatch")
+                self.assertEqual(um["binance_origin_filter"], lm["binance_origin_filter"], f"{m}.origin_filter mismatch")
                 for k in ("gross_marked_pnl_usdt", "net_marked_pnl_usdt_2bps", "fee_usdt_2bps",
                           "trading_value_usdt", "position_std_contracts", "max_abs_position_contracts"):
                     self.assertAlmostEqual(ut[k], lt[k], places=9, msg=f"{m}.{k} mismatch")
