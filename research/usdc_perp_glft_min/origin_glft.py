@@ -33,7 +33,9 @@ GRID = 10
 MAX_BINS = 1000
 MIN_COUNT = 10
 DIAG_NAMES = ('signal_price_updates', 'trigger_checks', 'above_1645_sigma', 'dominant',
-              'activations', 'active_decisions', 'tie_excluded', 'decisions')
+              'activations', 'active_decisions', 'tie_excluded', 'decisions',
+              'fail_direction', 'fail_magnitude', 'shift_applied', 'shift_abs_milliticks',
+              'post_only_clamped', 'quote_moved', 'active_ns', 'intervals')
 
 @njit
 def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
@@ -68,7 +70,7 @@ def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
 
 @njit
 def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, beta, quote_mode, gamma,
-                    out_mid, out_eq, out_pos, fills, fits, diag):
+                    out_mid, out_eq, out_pos, fills, fits, diag, intervals):
     if not math.isfinite(beta) or beta < 0.0 or beta > 1.0:
         raise ValueError('invalid beta')
     if quote_mode < 0 or quote_mode > 2:
@@ -107,6 +109,8 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
     base_m = np.nan
     has_base = False
     active = False
+    act_start = t0
+    n_int = 0
     oid = 1
     n_fill = 0
     submits = 0
@@ -232,7 +236,8 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
         q = pos / ORDER_QTY
         base_bid, base_ask = glft_quotes(mid, q, half, skew, bb, ba)
         shift = 0.0
-        if beta > 0.0 and math.isfinite(latest):
+        was_active = active
+        if math.isfinite(latest):
             gi = np.searchsorted(grid_ns, now, side='left') - 1
             if gi >= 0 and math.isfinite(basis[gi]) and math.isfinite(bsigma[gi]) and bsigma[gi] > 0.0:
                 gap = latest - mid * TICK - basis[gi]
@@ -244,23 +249,51 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
                 diag[3] += dominant
                 diag[4] += activated
                 diag[6] += tie
+                if above == 1 and dominant == 0:
+                    delta_b = latest - base_b
+                    if (gap > 0 and delta_b > 0) or (gap < 0 and delta_b < 0):
+                        diag[9] += 1
+                    else:
+                        diag[8] += 1
                 if eff != 0.0:
-                    shift = eff / TICK
                     diag[5] += 1
+                    if beta > 0.0:
+                        shift = eff / TICK
             else:
                 active = False
+        if active and not was_active:
+            act_start = now
+        elif was_active and not active:
+            if n_int < intervals.shape[0]:
+                intervals[n_int, 0] = act_start
+                intervals[n_int, 1] = now
+            n_int += 1
+            diag[14] += now - act_start
+            diag[15] = n_int
         want_bid = base_bid
         want_ask = base_ask
         if shift != 0.0:
             off = beta * shift
+            diag[10] += 1
+            diag[11] += int(round(abs(off) * 1000.0))
+            raw_bid = int(round(base_bid + off))
+            raw_ask = int(round(base_ask + off))
             if quote_mode == 1:
-                want_bid = min(int(round(base_bid + off)), ba - 1)
-                want_ask = max(int(round(base_ask + off)), bb + 1)
+                want_bid = min(raw_bid, ba - 1)
+                want_ask = max(raw_ask, bb + 1)
+                if want_bid != raw_bid or want_ask != raw_ask:
+                    diag[12] += 1
             elif quote_mode == 2:
                 if shift > 0.0:
-                    want_ask = max(int(round(base_ask + off)), bb + 1)
+                    want_ask = max(raw_ask, bb + 1)
+                    if want_ask != raw_ask:
+                        diag[12] += 1
                 else:
-                    want_bid = min(int(round(base_bid + off)), ba - 1)
+                    want_bid = min(raw_bid, ba - 1)
+                    if want_bid != raw_bid:
+                        diag[12] += 1
+            if want_bid != base_bid or want_ask != base_ask:
+                diag[13] += 1
         if want_bid >= want_ask:
             raise ValueError('self-crossed quotes')
         allow_bid = q < MAX_UNITS - 1e-9 and want_bid > 0
@@ -290,6 +323,13 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
             submits += 1
         diag[7] += 1
 
+    if active:
+        if n_int < intervals.shape[0]:
+            intervals[n_int, 0] = act_start
+            intervals[n_int, 1] = now
+        n_int += 1
+        diag[14] += now - act_start
+    diag[15] = n_int
     values = hbt.orders(0).values()
     while values.has_next():
         o = values.get()
