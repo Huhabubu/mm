@@ -10,9 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 48,
+  "observed_windows_count": 49,
   "missing_windows": [
-    "2026-11-26T12:00Z",
     "2026-11-26T12:15Z",
     "2026-11-26T12:30Z",
     "2026-11-26T12:45Z",
@@ -64,7 +63,8 @@
   "failed_windows": [
     "2026-11-26T03:00Z",
     "2026-11-26T07:45Z",
-    "2026-11-26T08:00Z"
+    "2026-11-26T08:00Z",
+    "2026-11-26T12:00Z"
   ],
   "overdue_windows": [],
   "pending_windows": [],
@@ -85,7 +85,7 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 724,
+  "clock_certified_minutes": 739,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
   "damaged_partitions": [
@@ -102,6 +102,56 @@
       "problems": [
         "recorded loss/gap events: loss=0, gap_start=1",
         "depth unavailable events recorded: 5"
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "window_id": "2026-11-26T12:00Z",
+      "window_span_id": "2026-11-26T12:00Z__2026-11-26T12:15Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "binance_futures_20261126_1200_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/binance_futures/2026-11-26/binance_futures_20261126_1200_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 1,
+      "problems": [
+        "planned_rotation depth chain break after snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation unanchored delta before snapshot for BTCUSDT",
+        "planned_rotation missing new-connection snapshot for BTCUSDT (A:10)",
+        "recorded loss/gap events: loss=0, gap_start=1",
+        "depth unavailable events recorded: 6",
+        "stream gap > 300s (continuous_quote): binance_futures/BTCUSDT/bookTicker (896.9s)",
+        "stream gap > 300s (depth): binance_futures/BTCUSDT/depth@100ms (896.9s)",
+        "stream gap > 300s (continuous_quote): binance_futures/DOGEUSDT/bookTicker (897.2s)",
+        "stream gap > 300s (depth): binance_futures/DOGEUSDT/depth@100ms (896.9s)",
+        "stream gap > 300s (continuous_quote): binance_futures/ETHUSDT/bookTicker (897.0s)",
+        "stream gap > 300s (depth): binance_futures/ETHUSDT/depth@100ms (896.9s)",
+        "stream gap > 300s (continuous_quote): binance_futures/SOLUSDT/bookTicker (896.9s)",
+        "stream gap > 300s (depth): binance_futures/SOLUSDT/depth@100ms (896.9s)",
+        "stream gap > 300s (continuous_quote): binance_futures/SUIUSDT/bookTicker (896.9s)",
+        "stream gap > 300s (depth): binance_futures/SUIUSDT/depth@100ms (897.0s)",
+        "stream gap > 300s (continuous_quote): binance_futures/XRPUSDT/bookTicker (897.0s)",
+        "stream gap > 300s (depth): binance_futures/XRPUSDT/depth@100ms (897.0s)",
+        "last_rx_seq differs from manifest",
+        "data_lines count differs from manifest"
       ]
     },
     {
