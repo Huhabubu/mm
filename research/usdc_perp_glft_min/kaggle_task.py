@@ -39,6 +39,7 @@ BETAS = (0.25, 0.5, 0.75, 1.0)
 MODELS = ((('baseline', 0.0, 0),) + tuple((f'both_b{b:g}', b, 1) for b in BETAS)
           + tuple((f'defensive_b{b:g}', b, 2) for b in BETAS))
 MAX_ROWS = 75_000_000
+INTERVAL_CAP = 500_000
 WORK = Path('/tmp/usdc_perp_glft_min')
 FIT_NAMES = ('a_per_s', 'k_per_tick', 'sigma_ticks_per_sqrt_s', 'half_spread_ticks', 'skew_ticks_per_unit')
 
@@ -72,7 +73,67 @@ def pct(x):
     return dict(zip(('p05', 'p50', 'p95'), (float(v) for v in np.percentile(x, [5, 50, 95]))))
 
 
-def summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag):
+def markout_table(f, mid, steps, t0):
+    mk = {}
+    first = np.maximum(np.ceil((f[:, 0] - t0) / STEP_NS).astype(np.int64) - 1, 0)
+    for label, h in MARKOUT_STEPS:
+        idx = first + h
+        ok = idx < steps
+        if not ok.any():
+            mk[label] = None
+            continue
+        px = f[ok, 2]
+        v = f[ok, 1] * (mid[idx[ok]] - px) / px * 1e4
+        w = f[ok, 3]
+        mk[label] = {'n': int(ok.sum()), 'mean_bp': float(np.nanmean(v)), 'median_bp': float(np.nanmedian(v)),
+                     'qty_weighted_bp': float(np.nansum(v * w) / np.sum(w))}
+    return mk
+
+
+def mid_change_stats(ts, mid, lo=None, hi=None):
+    # Mid changes per row and per distinct timestamp; the replay loop sees the last row of each timestamp.
+    if lo is not None:
+        keep = (ts >= lo) & (ts < hi)
+        ts, mid = ts[keep], mid[keep]
+    if len(ts) < 2:
+        return {'rows': int(len(ts))}
+    last = np.r_[ts[1:] != ts[:-1], True]
+    jumps = np.abs(np.diff(mid[last])) / TICK
+    jumps = jumps[jumps > 0]
+    span_s = (int(ts[-1]) - int(ts[0])) / NS
+    return {'rows': int(len(ts)), 'distinct_ts': int(last.sum()),
+            'row_mid_changes': int(np.count_nonzero(np.diff(mid))),
+            'ts_mid_changes': int(jumps.size),
+            'ts_mid_changes_per_s': float(jumps.size / span_s) if span_s > 0 else None,
+            'jump_ticks': pct(jumps)}
+
+
+def window_report(f, mid, steps, intervals, n_int, t0):
+    # Group fills by origin-filter active intervals (shadow intervals for the baseline).
+    iv = intervals[:min(n_int, len(intervals))]
+    ts = f[:, 0]
+    inside = np.zeros(len(f), dtype=bool)
+    pre = np.zeros(len(f), dtype=bool)
+    if len(iv) and len(f):
+        starts = iv[:, 0].astype(np.float64)
+        ends = iv[:, 1].astype(np.float64)
+        k = np.searchsorted(starts, ts, side='right') - 1
+        inside = (k >= 0) & (ts < ends[np.maximum(k, 0)])
+        nxt = np.minimum(k + 1, len(starts) - 1)
+        to_next = np.where(k + 1 < len(starts), starts[nxt] - ts, np.inf)
+        pre = ~inside & (to_next <= NS)
+    dur = (iv[:, 1] - iv[:, 0]).astype(np.float64) / NS
+    quoting_s = max(steps - WARMUP, 0) * STEP_NS / NS
+    groups = {'in_window': inside, 'pre_1s': pre, 'outside': ~inside & ~pre}
+    return {'intervals': int(n_int), 'capacity_hit': bool(n_int > len(intervals)),
+            'active_s': float(dur.sum()),
+            'active_fraction_of_quoting': float(dur.sum() / quoting_s) if quoting_s > 0 else None,
+            'interval_s': pct(dur),
+            'fills': {g: {'n': int(m.sum()), 'markout': markout_table(f[m], mid, steps, t0) if m.any() else None}
+                      for g, m in groups.items()}}
+
+
+def summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag, intervals):
     (steps, n_fill, n_fit, submits, cancels, max_pos, n_sig, n_feed, n_resp,
      turnover, fee, n_trades, t0) = res
     mid = mid[:steps]
@@ -90,20 +151,8 @@ def summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag):
            'signal_rows': int(n_sig), 'target_feed_wakeups': int(n_feed), 'order_reply_wakeups': int(n_resp),
            'origin_diag': dict(zip(DIAG_NAMES, (int(v) for v in diag)))}
     out['pnl_by_maker_fee_bp'] = {str(bp): pnl - bp * 1e-4 * float(turnover) for bp in FEE_BPS}
-    mk = {}
-    first = np.maximum(np.ceil((f[:, 0] - t0) / STEP_NS).astype(np.int64) - 1, 0)
-    for label, h in MARKOUT_STEPS:
-        idx = first + h
-        ok = idx < steps
-        if not ok.any():
-            mk[label] = None
-            continue
-        px = f[ok, 2]
-        v = f[ok, 1] * (mid[idx[ok]] - px) / px * 1e4
-        w = f[ok, 3]
-        mk[label] = {'n': int(ok.sum()), 'mean_bp': float(np.nanmean(v)), 'median_bp': float(np.nanmedian(v)),
-                     'qty_weighted_bp': float(np.nansum(v * w) / np.sum(w))}
-    out['markout'] = mk
+    out['markout'] = markout_table(f, mid, steps, t0)
+    out['signal_window'] = window_report(f, mid, steps, intervals, int(diag[DIAG_NAMES.index('intervals')]), t0)
     hourly = []
     if steps:
         ends = list(range(STEPS_PER_HOUR - 1, steps, STEPS_PER_HOUR))
@@ -142,7 +191,9 @@ def main():
                          'models': [list(m) for m in MODELS],
                          'queue_model': 'power_prob(2.0)', 'fill_model': 'no_partial',
                          'maker_fee': 0.0, 'taker_fee': TAKER_FEE,
-                         'historical_spec_verified': False, 'maker_zero_fee_verified': False}}
+                         'historical_spec_verified': False, 'maker_zero_fee_verified': False,
+                         'diagnostics': ('origin filter also runs in shadow for the baseline (no quote effect); '
+                                         'fill windows compare fill exch_timestamp with local activation time')}}
     out_path = Path('report.json')
 
     def save():
@@ -173,6 +224,8 @@ def main():
         save()
         sig_ts, sig_mid, _, _, sig_bad = read_bbo(sig_path)
         tgt_ts, tgt_mid, lo, hi, tgt_bad = read_bbo(paths['book_ticker'])
+        report['raw_mid_changes'] = {SIGNAL: mid_change_stats(sig_ts, sig_mid),
+                                     TARGET: mid_change_stats(tgt_ts, tgt_mid)}
         sig_path.unlink()
         sig_ts = sig_ts + SIGNAL_EXTRA_NS
         grid, basis, bsigma, coverage = basis_grid(sig_ts, sig_mid, tgt_ts, tgt_mid)
@@ -209,13 +262,21 @@ def main():
             fills = np.zeros((max_steps, 4))
             fits = np.full((max_steps // REFIT_EVERY + 2, 5), np.nan)
             diag = np.zeros(len(DIAG_NAMES), np.int64)
+            intervals = np.zeros((INTERVAL_CAP, 2), np.int64)
             t1 = time.time()
             try:
                 res = run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid, basis, bsigma, beta, mode, GAMMA,
-                                      mid, eq, pos, fills, fits, diag)
+                                      mid, eq, pos, fills, fits, diag, intervals)
             finally:
                 hbt.close()
-            v = summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag)
+            v = summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag, intervals)
+            if mode == 0:
+                lo_ns = int(res[-1])
+                hi_ns = lo_ns + int(res[0]) * STEP_NS
+                report['signal_check'] = {'window_ns': [lo_ns, hi_ns],
+                                          'raw': mid_change_stats(sig_ts, sig_mid, lo_ns, hi_ns),
+                                          'loop_signal_price_updates': v['origin_diag']['signal_price_updates'],
+                                          'loop_signal_rows': v['signal_rows']}
             v['runtime_s'] = round(time.time() - t1, 1)
             report['variants'][name] = v
             print('VARIANT', name, json.dumps({k: v[k] for k in ('pnl_usdc', 'fills', 'turnover_usdc', 'submits',
