@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 struct GateObuState {
     state: ConnState,
     prev_u: Option<u64>,
+    refreshing: bool,
 }
 
 impl GateObuState {
@@ -14,6 +15,7 @@ impl GateObuState {
         Self {
             state: ConnState::WaitAnchor,
             prev_u: None,
+            refreshing: false,
         }
     }
 }
@@ -23,7 +25,10 @@ pub struct GateValidator {
     obu_states: HashMap<String, GateObuState>,
     seen_trade_ids: HashMap<String, VecDeque<u64>>,
     seen_trade_set: HashMap<String, HashSet<u64>>,
+    pending_sub_acks: Vec<(String, String)>,
+    extra_accepted_streams: Vec<(String, String)>,
     overall_invalid: bool,
+    fatal_invalid: bool,
 }
 
 impl GateValidator {
@@ -38,22 +43,25 @@ impl GateValidator {
             obu_states,
             seen_trade_ids: HashMap::new(),
             seen_trade_set: HashMap::new(),
+            pending_sub_acks: Vec::new(),
+            extra_accepted_streams: Vec::new(),
             overall_invalid: false,
+            fatal_invalid: false,
         }
+    }
+
+    pub fn build_depth_messages(symbols: &[String], now_sec: i64, event: &str) -> Vec<Value> {
+        symbols.iter().map(|symbol| json!({
+            "time": now_sec,
+            "channel": "futures.obu",
+            "event": event,
+            "payload": [format!("ob.{}.50", symbol.to_uppercase())]
+        })).collect()
     }
 
     /// Build subscribe frames for Gate Futures v4 (obu.50, book_ticker, trades).
     pub fn build_subscribe_messages(symbols: &[String], now_sec: i64) -> Vec<Value> {
-        let mut msgs = Vec::new();
-        for s in symbols {
-            let sym = s.to_uppercase();
-            msgs.push(json!({
-                "time": now_sec,
-                "channel": "futures.obu",
-                "event": "subscribe",
-                "payload": [format!("ob.{}.50", sym)]
-            }));
-        }
+        let mut msgs = Self::build_depth_messages(symbols, now_sec, "subscribe");
         let upper: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
         if !upper.is_empty() {
             msgs.push(json!({
@@ -92,27 +100,6 @@ impl GateValidator {
             Some(s) => !s.is_empty() && s.parse::<f64>().map(|x| x.is_finite()).unwrap_or(false),
             None => false,
         }
-    }
-
-    fn validate_obu_levels(levels: Option<&Value>) -> Result<(), String> {
-        let Some(arr) = levels.and_then(Value::as_array) else {
-            return Ok(());
-        };
-        for lvl in arr {
-            let pair = lvl
-                .as_array()
-                .ok_or_else(|| "gate obu level is not [price, size] array".to_string())?;
-            if pair.len() < 2 {
-                return Err("gate obu level has fewer than 2 entries".to_string());
-            }
-            if !Self::check_decimal_size_string(&pair[1]) {
-                return Err(format!(
-                    "gate obu size is not a decimal string (X-Gate-Size-Decimal: 1 missing or ignored?): {}",
-                    pair[1]
-                ));
-            }
-        }
-        Ok(())
     }
 
     fn track_trade_id(&mut self, contract: &str, trade_id: u64) -> bool {
@@ -157,9 +144,21 @@ impl GateValidator {
             }
         };
 
-        if let Err(e) = Self::validate_obu_levels(result.get("b"))
-            .and_then(|_| Self::validate_obu_levels(result.get("a")))
-        {
+        let is_full = result.get("full").and_then(Value::as_bool).unwrap_or(false);
+        if let Err(e) = crate::protocol::validate_book_sides(
+            result.get("b"),
+            result.get("a"),
+            is_full,
+            is_full,
+            true,
+            if is_full { "gate futures.obu snapshot" } else { "gate futures.obu" },
+        ) {
+            let st = self
+                .obu_states
+                .entry(sym.clone())
+                .or_insert_with(GateObuState::new);
+            st.state = ConnState::Invalid;
+            st.prev_u = None;
             self.overall_invalid = true;
             return FrameVerdict::Violation {
                 symbol: Some(sym),
@@ -181,7 +180,6 @@ impl GateValidator {
                 };
             }
         };
-        let is_full = result.get("full").and_then(Value::as_bool).unwrap_or(false);
         let st = self
             .obu_states
             .entry(sym.clone())
@@ -191,6 +189,10 @@ impl GateValidator {
             // Accept full=true initial or re-pushed snapshot even if it arrives before subscribe ACK.
             st.prev_u = Some(u);
             st.state = ConnState::Live;
+            st.refreshing = false;
+            if !self.fatal_invalid && self.obu_states.values().all(|s| s.state != ConnState::Invalid) {
+                self.overall_invalid = false;
+            }
             return FrameVerdict::AcceptData {
                 symbol: sym,
                 channel: "futures.obu".to_string(),
@@ -199,6 +201,9 @@ impl GateValidator {
             };
         }
 
+        if st.refreshing {
+            return FrameVerdict::BufferedWaitAnchor { symbol: sym };
+        }
         if st.state != ConnState::Live {
             return FrameVerdict::Violation {
                 symbol: Some(sym),
@@ -308,6 +313,32 @@ impl ProtocolValidator for GateValidator {
             };
         }
         if event == "subscribe" || event == "unsubscribe" {
+            if event == "subscribe"
+                && v.pointer("/result/status").and_then(Value::as_str) == Some("success")
+                && matches!(channel, "futures.obu" | "futures.book_ticker" | "futures.trades")
+            {
+                let mut matched_any = false;
+                if let Some(arr) = v.get("payload").and_then(Value::as_array) {
+                    for item in arr {
+                        if let Some(tok) = item.as_str() {
+                            let sym = if channel == "futures.obu" {
+                                Self::parse_obu_symbol(tok)
+                            } else {
+                                Some(tok.to_uppercase())
+                            };
+                            if let Some(s) = sym {
+                                self.pending_sub_acks.push((s, channel.to_string()));
+                                matched_any = true;
+                            }
+                        }
+                    }
+                }
+                if !matched_any {
+                    for sym in &self.expected_symbols {
+                        self.pending_sub_acks.push((sym.clone(), channel.to_string()));
+                    }
+                }
+            }
             return FrameVerdict::Control {
                 note: format!("gate {} ack for {}", event, channel),
             };
@@ -379,6 +410,7 @@ impl ProtocolValidator for GateValidator {
                     }
                 };
                 let mut first_sym = String::new();
+                let mut seen_syms = HashSet::new();
                 let mut dups = 0usize;
                 for item in arr {
                     let sym = match item.get("contract").and_then(Value::as_str) {
@@ -394,6 +426,10 @@ impl ProtocolValidator for GateValidator {
                     };
                     if first_sym.is_empty() {
                         first_sym = sym.clone();
+                        seen_syms.insert(sym.clone());
+                    } else if seen_syms.insert(sym.clone()) {
+                        self.extra_accepted_streams
+                            .push((sym.clone(), "futures.trades".to_string()));
                     }
                     let sz = match item.get("size") {
                         Some(s) => s,
@@ -450,8 +486,54 @@ impl ProtocolValidator for GateValidator {
         }
     }
 
+    fn take_subscription_acks(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_sub_acks)
+    }
+
+    fn take_extra_accepted_streams(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.extra_accepted_streams)
+    }
+
+    fn expected_symbols(&self) -> Vec<String> {
+        self.expected_symbols.clone()
+    }
+
+    fn symbol_depth_state(&self, symbol: &str) -> Option<ConnState> {
+        self.obu_states
+            .get(&symbol.to_uppercase())
+            .map(|st| if st.refreshing { ConnState::Resync } else { st.state })
+    }
+
+    fn prepare_depth_refresh(&mut self) {
+        self.reset();
+        for state in self.obu_states.values_mut() {
+            state.refreshing = true;
+        }
+    }
+
+    fn prepare_symbol_depth_refresh(&mut self, symbol: &str) {
+        if self.overall_invalid && self.obu_states.values().all(|s| s.state != ConnState::Invalid) {
+            self.fatal_invalid = true;
+        }
+        let sym = symbol.to_uppercase();
+        let st = self
+            .obu_states
+            .entry(sym)
+            .or_insert_with(GateObuState::new);
+        if st.state != ConnState::Invalid {
+            st.state = ConnState::WaitAnchor;
+        }
+        st.prev_u = None;
+        st.refreshing = true;
+        self.overall_invalid =
+            self.overall_invalid || self.obu_states.values().any(|s| s.state == ConnState::Invalid);
+    }
+
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.fatal_invalid = false;
+        self.pending_sub_acks.clear();
+        self.extra_accepted_streams.clear();
         for st in self.obu_states.values_mut() {
             *st = GateObuState::new();
         }

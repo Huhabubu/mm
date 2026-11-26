@@ -1,21 +1,18 @@
-use crate::protocol::{FrameVerdict, ProtocolValidator};
-use crate::types::{ConnState, EndpointKind};
+use crate::protocol::{BufferedDepthFrame, FrameVerdict, ProtocolValidator, RestSnapshotBridge};
+use crate::types::{ConnId, ConnState, EndpointKind, RawFrame};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug, Clone)]
-struct BufferedDepth {
-    first_u: u64,
-    last_u: u64,
-    prev_u: u64,
-}
+pub const DEFAULT_MAX_DEPTH_BUFFER_LEN: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct DepthSymbolState {
     state: ConnState,
     prev_u: Option<u64>,
     pending_snapshot_id: Option<u64>,
-    buffer: VecDeque<BufferedDepth>,
+    unavailable_since_wall_ns: Option<i64>,
+    buffer_overflow_count: u64,
+    buffer: VecDeque<BufferedDepthFrame>,
 }
 
 impl DepthSymbolState {
@@ -24,7 +21,28 @@ impl DepthSymbolState {
             state: ConnState::WaitAnchor,
             prev_u: None,
             pending_snapshot_id: None,
+            unavailable_since_wall_ns: None,
+            buffer_overflow_count: 0,
             buffer: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameMeta {
+    recv_wall_ns: i64,
+    recv_mono_ns: u64,
+    conn_id: ConnId,
+    epoch: u64,
+}
+
+impl Default for FrameMeta {
+    fn default() -> Self {
+        Self {
+            recv_wall_ns: 0,
+            recv_mono_ns: 0,
+            conn_id: ConnId::A,
+            epoch: 1,
         }
     }
 }
@@ -36,11 +54,17 @@ pub struct BinanceValidator {
     market_live_symbols: HashSet<String>,
     seen_agg_ids: HashMap<String, VecDeque<u64>>,
     seen_agg_set: HashMap<String, HashSet<u64>>,
+    pending_sub_acks: Vec<(String, String)>,
+    max_buffer_len: usize,
     overall_invalid: bool,
 }
 
 impl BinanceValidator {
     pub fn new_public(symbols: Vec<String>) -> Self {
+        Self::new_public_with_buffer_cap(symbols, DEFAULT_MAX_DEPTH_BUFFER_LEN)
+    }
+
+    pub fn new_public_with_buffer_cap(symbols: Vec<String>, max_buffer_len: usize) -> Self {
         let upper: Vec<String> = symbols.into_iter().map(|s| s.to_uppercase()).collect();
         let mut depth_states = HashMap::new();
         for s in &upper {
@@ -53,6 +77,8 @@ impl BinanceValidator {
             market_live_symbols: HashSet::new(),
             seen_agg_ids: HashMap::new(),
             seen_agg_set: HashMap::new(),
+            pending_sub_acks: Vec::new(),
+            max_buffer_len: max_buffer_len.max(1),
             overall_invalid: false,
         }
     }
@@ -66,6 +92,8 @@ impl BinanceValidator {
             market_live_symbols: HashSet::new(),
             seen_agg_ids: HashMap::new(),
             seen_agg_set: HashMap::new(),
+            pending_sub_acks: Vec::new(),
+            max_buffer_len: DEFAULT_MAX_DEPTH_BUFFER_LEN,
             overall_invalid: false,
         }
     }
@@ -78,7 +106,11 @@ impl BinanceValidator {
             streams.push(format!("{}@bookTicker", low));
             streams.push(format!("{}@depth@100ms", low));
         }
-        format!("{}?streams={}", base_url.trim_end_matches('?'), streams.join("/"))
+        format!(
+            "{}?streams={}",
+            base_url.trim_end_matches('?'),
+            streams.join("/")
+        )
     }
 
     /// Build combined stream URL for Binance /market/stream (aggTrade only).
@@ -87,7 +119,11 @@ impl BinanceValidator {
             .iter()
             .map(|s| format!("{}@aggTrade", s.to_lowercase()))
             .collect();
-        format!("{}?streams={}", base_url.trim_end_matches('?'), streams.join("/"))
+        format!(
+            "{}?streams={}",
+            base_url.trim_end_matches('?'),
+            streams.join("/")
+        )
     }
 
     fn record_agg_id(&mut self, sym: &str, agg_id: u64) -> bool {
@@ -106,7 +142,24 @@ impl BinanceValidator {
         false
     }
 
-    fn handle_depth_update(&mut self, data: &Value) -> FrameVerdict {
+    fn refresh_overall_invalid(&mut self) {
+        self.overall_invalid = self
+            .depth_states
+            .values()
+            .any(|d| d.state == ConnState::Invalid);
+    }
+
+    fn parse_binance_stream_token(token: &str) -> Option<(String, String)> {
+        let (sym_raw, chan_raw) = token.split_once('@')?;
+        let sym = sym_raw.trim().to_uppercase();
+        let chan = chan_raw.trim().to_string();
+        if sym.is_empty() || chan.is_empty() {
+            return None;
+        }
+        Some((sym, chan))
+    }
+
+    fn handle_depth_update(&mut self, data: &Value, raw: &str, meta: FrameMeta) -> FrameVerdict {
         let sym = match data.get("s").and_then(Value::as_str) {
             Some(s) => s.to_uppercase(),
             None => {
@@ -135,6 +188,35 @@ impl BinanceValidator {
             }
         };
 
+        if let Err(e) = crate::protocol::validate_book_sides(
+            data.get("b"),
+            data.get("a"),
+            false,
+            false,
+            false,
+            "binance depthUpdate",
+        ) {
+            self.overall_invalid = true;
+            return FrameVerdict::Violation {
+                symbol: Some(sym),
+                reason: e,
+                needs_resubscribe: false,
+                needs_snapshot_refetch: true,
+            };
+        }
+
+        let buffered_frame = BufferedDepthFrame {
+            first_u,
+            last_u,
+            prev_u,
+            recv_wall_ns: meta.recv_wall_ns,
+            recv_mono_ns: meta.recv_mono_ns,
+            conn_id: meta.conn_id,
+            epoch: meta.epoch,
+            payload: raw.to_string(),
+        };
+
+        let max_len = self.max_buffer_len;
         let st = self
             .depth_states
             .entry(sym.clone())
@@ -149,8 +231,10 @@ impl BinanceValidator {
                     if first_u <= snap_id && snap_id <= last_u {
                         st.prev_u = Some(last_u);
                         st.pending_snapshot_id = None;
+                        st.unavailable_since_wall_ns = None;
                         st.state = ConnState::Live;
                         st.buffer.clear();
+                        self.refresh_overall_invalid();
                         return FrameVerdict::AcceptData {
                             symbol: sym,
                             channel: "depth@100ms".to_string(),
@@ -161,11 +245,14 @@ impl BinanceValidator {
                         // Snapshot is strictly older than earliest available WS delta -> refetch!
                         st.pending_snapshot_id = None;
                         st.state = ConnState::Resync;
-                        st.buffer.push_back(BufferedDepth {
-                            first_u,
-                            last_u,
-                            prev_u,
-                        });
+                        if meta.recv_wall_ns > 0 {
+                            st.unavailable_since_wall_ns.get_or_insert(meta.recv_wall_ns);
+                        }
+                        if st.buffer.len() >= max_len {
+                            st.buffer.clear();
+                            st.buffer_overflow_count += 1;
+                        }
+                        st.buffer.push_back(buffered_frame);
                         return FrameVerdict::Violation {
                             symbol: Some(sym),
                             reason: format!(
@@ -177,14 +264,30 @@ impl BinanceValidator {
                         };
                     }
                 }
-                if st.buffer.len() >= 4096 {
-                    st.buffer.pop_front();
+                if st.buffer.len() >= max_len {
+                    // Buffer overflow while awaiting REST snapshot: clear stale prefix, mark Resync & unavailable interval.
+                    st.buffer_overflow_count += 1;
+                    if meta.recv_wall_ns > 0 {
+                        st.unavailable_since_wall_ns.get_or_insert(meta.recv_wall_ns);
+                    }
+                    st.buffer.clear();
+                    st.pending_snapshot_id = None;
+                    st.state = ConnState::Resync;
+                    st.buffer.push_back(buffered_frame);
+                    return FrameVerdict::Violation {
+                        symbol: Some(sym.clone()),
+                        reason: format!(
+                            "binance depth buffer overflow for {} (capacity={}); resync required",
+                            sym, max_len
+                        ),
+                        needs_resubscribe: false,
+                        needs_snapshot_refetch: true,
+                    };
                 }
-                st.buffer.push_back(BufferedDepth {
-                    first_u,
-                    last_u,
-                    prev_u,
-                });
+                if st.state == ConnState::WaitAnchor && st.unavailable_since_wall_ns.is_none() && meta.recv_wall_ns > 0 {
+                    st.unavailable_since_wall_ns = Some(meta.recv_wall_ns);
+                }
+                st.buffer.push_back(buffered_frame);
                 FrameVerdict::BufferedWaitAnchor { symbol: sym }
             }
             ConnState::Live => {
@@ -201,7 +304,11 @@ impl BinanceValidator {
                     st.state = ConnState::Invalid;
                     st.prev_u = None;
                     st.pending_snapshot_id = None;
+                    if meta.recv_wall_ns > 0 {
+                        st.unavailable_since_wall_ns = Some(meta.recv_wall_ns);
+                    }
                     st.buffer.clear();
+                    st.buffer.push_back(buffered_frame);
                     self.overall_invalid = true;
                     FrameVerdict::Violation {
                         symbol: Some(sym),
@@ -214,62 +321,21 @@ impl BinanceValidator {
                     }
                 }
             }
-            ConnState::Invalid => FrameVerdict::Violation {
-                symbol: Some(sym),
-                reason: "binance depth stream in INVALID state awaiting snapshot resync".to_string(),
-                needs_resubscribe: false,
-                needs_snapshot_refetch: true,
-            },
-        }
-    }
-}
-
-impl ProtocolValidator for BinanceValidator {
-    fn endpoint(&self) -> EndpointKind {
-        self.endpoint
-    }
-
-    fn state(&self) -> ConnState {
-        if self.overall_invalid {
-            return ConnState::Invalid;
-        }
-        match self.endpoint {
-            EndpointKind::BinancePublic => {
-                if self.expected_symbols.is_empty() {
-                    return ConnState::WaitAnchor;
+            ConnState::Invalid => {
+                // Keep buffering incoming WS deltas for this symbol while awaiting snapshot resync
+                // so that once the scheduled REST snapshot arrives, bridging succeeds cleanly without
+                // spamming a Violation on every 100ms frame.
+                if st.buffer.len() >= max_len {
+                    st.buffer_overflow_count += 1;
+                    st.buffer.clear();
                 }
-                if self.expected_symbols.iter().all(|s| {
-                    self.depth_states
-                        .get(s)
-                        .map(|d| d.state == ConnState::Live)
-                        .unwrap_or(false)
-                }) {
-                    ConnState::Live
-                } else if self.depth_states.values().any(|d| d.state == ConnState::Invalid) {
-                    ConnState::Invalid
-                } else if self.depth_states.values().any(|d| d.state == ConnState::Resync) {
-                    ConnState::Resync
-                } else {
-                    ConnState::WaitAnchor
-                }
+                st.buffer.push_back(buffered_frame);
+                FrameVerdict::BufferedWaitAnchor { symbol: sym }
             }
-            EndpointKind::BinanceMarket => {
-                if !self.expected_symbols.is_empty()
-                    && self
-                        .expected_symbols
-                        .iter()
-                        .all(|s| self.market_live_symbols.contains(s))
-                {
-                    ConnState::Live
-                } else {
-                    ConnState::WaitAnchor
-                }
-            }
-            _ => ConnState::Invalid,
         }
     }
 
-    fn on_text_frame(&mut self, raw: &str) -> FrameVerdict {
+    fn process_frame(&mut self, raw: &str, meta: FrameMeta) -> FrameVerdict {
         let v: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
@@ -287,6 +353,15 @@ impl ProtocolValidator for BinanceValidator {
         let (stream_name, data) = if let Some(d) = v.get("data") {
             (v.get("stream").and_then(Value::as_str).unwrap_or(""), d)
         } else if v.get("result").is_some() && v.get("id").is_some() {
+            if let Some(arr) = v.get("result").and_then(Value::as_array) {
+                for item in arr {
+                    if let Some(tok) = item.as_str() {
+                        if let Some((sym, chan)) = Self::parse_binance_stream_token(tok) {
+                            self.pending_sub_acks.push((sym, chan));
+                        }
+                    }
+                }
+            }
             return FrameVerdict::Control {
                 note: "binance subscribe ack".to_string(),
             };
@@ -304,7 +379,7 @@ impl ProtocolValidator for BinanceValidator {
                     needs_snapshot_refetch: false,
                 };
             }
-            return self.handle_depth_update(data);
+            return self.handle_depth_update(data, raw, meta);
         }
 
         if event_type == "bookTicker" || stream_name.contains("@bookTicker") {
@@ -401,8 +476,87 @@ impl ProtocolValidator for BinanceValidator {
             note: format!("unhandled binance control frame: {}", event_type),
         }
     }
+}
+
+impl ProtocolValidator for BinanceValidator {
+    fn endpoint(&self) -> EndpointKind {
+        self.endpoint
+    }
+
+    fn state(&self) -> ConnState {
+        if self.overall_invalid {
+            return ConnState::Invalid;
+        }
+        match self.endpoint {
+            EndpointKind::BinancePublic => {
+                if self.expected_symbols.is_empty() {
+                    return ConnState::WaitAnchor;
+                }
+                if self.expected_symbols.iter().all(|s| {
+                    self.depth_states
+                        .get(s)
+                        .map(|d| d.state == ConnState::Live)
+                        .unwrap_or(false)
+                }) {
+                    ConnState::Live
+                } else if self
+                    .depth_states
+                    .values()
+                    .any(|d| d.state == ConnState::Invalid)
+                {
+                    ConnState::Invalid
+                } else if self
+                    .depth_states
+                    .values()
+                    .any(|d| d.state == ConnState::Resync)
+                {
+                    ConnState::Resync
+                } else {
+                    ConnState::WaitAnchor
+                }
+            }
+            EndpointKind::BinanceMarket => {
+                if !self.expected_symbols.is_empty()
+                    && self
+                        .expected_symbols
+                        .iter()
+                        .all(|s| self.market_live_symbols.contains(s))
+                {
+                    ConnState::Live
+                } else {
+                    ConnState::WaitAnchor
+                }
+            }
+            _ => ConnState::Invalid,
+        }
+    }
+
+    fn on_text_frame(&mut self, raw: &str) -> FrameVerdict {
+        self.process_frame(raw, FrameMeta::default())
+    }
+
+    fn on_frame_with_meta(&mut self, frame: &RawFrame) -> FrameVerdict {
+        self.process_frame(
+            &frame.payload,
+            FrameMeta {
+                recv_wall_ns: frame.recv_wall_ns,
+                recv_mono_ns: frame.recv_mono_ns,
+                conn_id: frame.conn_id,
+                epoch: frame.epoch,
+            },
+        )
+    }
 
     fn on_rest_snapshot(&mut self, symbol: &str, last_update_id: u64) -> Result<usize, String> {
+        self.on_rest_snapshot_detailed(symbol, last_update_id)
+            .map(|res| res.bridged_frames.len())
+    }
+
+    fn on_rest_snapshot_detailed(
+        &mut self,
+        symbol: &str,
+        last_update_id: u64,
+    ) -> Result<RestSnapshotBridge, String> {
         let sym = symbol.to_uppercase();
         let st = self
             .depth_states
@@ -410,9 +564,11 @@ impl ProtocolValidator for BinanceValidator {
             .or_insert_with(DepthSymbolState::new);
 
         // Drop all buffered events with u < S
+        let mut dropped_before_snapshot = 0usize;
         while let Some(front) = st.buffer.front() {
             if front.last_u < last_update_id {
                 st.buffer.pop_front();
+                dropped_before_snapshot += 1;
             } else {
                 break;
             }
@@ -422,16 +578,27 @@ impl ProtocolValidator for BinanceValidator {
             // Snapshot arrived ahead of matching WS delta: wait for first WS frame with U <= S <= u
             st.pending_snapshot_id = Some(last_update_id);
             st.state = ConnState::WaitAnchor;
-            return Ok(0);
+            let unavail = st.unavailable_since_wall_ns;
+            self.refresh_overall_invalid();
+            return Ok(RestSnapshotBridge {
+                bridged_frames: Vec::new(),
+                awaiting_first_ws_delta: true,
+                unavailable_since_wall_ns: unavail,
+                dropped_before_snapshot,
+            });
         }
 
         let first = st.buffer.pop_front().unwrap();
         if !(first.first_u <= last_update_id && last_update_id <= first.last_u) {
             // Snapshot is stale (S < first.U): must refetch!
-            let (first_u, last_u) = (first.first_u, first.last_u);
+            let (first_u, last_u, first_wall) = (first.first_u, first.last_u, first.recv_wall_ns);
             st.buffer.push_front(first);
             st.state = ConnState::Resync;
             st.pending_snapshot_id = None;
+            if first_wall > 0 {
+                st.unavailable_since_wall_ns.get_or_insert(first_wall);
+            }
+            self.refresh_overall_invalid();
             return Err(format!(
                 "binance REST snapshot stale for {}: S={} not in [U={}, u={}]",
                 sym, last_update_id, first_u, last_u
@@ -439,33 +606,79 @@ impl ProtocolValidator for BinanceValidator {
         }
 
         let mut cur_u = first.last_u;
-        let mut bridged = 1usize;
+        let mut bridged_frames = Vec::with_capacity(st.buffer.len() + 1);
+        bridged_frames.push(first);
         while let Some(next) = st.buffer.pop_front() {
             if next.prev_u != cur_u {
+                let next_pu = next.prev_u;
+                let next_wall = next.recv_wall_ns;
                 st.state = ConnState::Resync;
                 st.prev_u = None;
+                st.pending_snapshot_id = None;
                 st.buffer.clear();
+                if next_wall > 0 {
+                    st.unavailable_since_wall_ns.get_or_insert(next_wall);
+                }
+                self.refresh_overall_invalid();
                 return Err(format!(
                     "binance buffered depth gap during bridge for {}: pu={} != prev_u={}",
-                    sym, next.prev_u, cur_u
+                    sym, next_pu, cur_u
                 ));
             }
             cur_u = next.last_u;
-            bridged += 1;
+            bridged_frames.push(next);
         }
+
         st.prev_u = Some(cur_u);
         st.pending_snapshot_id = None;
         st.state = ConnState::Live;
-        self.overall_invalid = self
-            .depth_states
-            .values()
-            .any(|d| d.state == ConnState::Invalid);
-        Ok(bridged)
+        let unavailable_since_wall_ns = st.unavailable_since_wall_ns.take();
+        self.refresh_overall_invalid();
+        Ok(RestSnapshotBridge {
+            bridged_frames,
+            awaiting_first_ws_delta: false,
+            unavailable_since_wall_ns,
+            dropped_before_snapshot,
+        })
+    }
+
+    fn take_subscription_acks(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_sub_acks)
+    }
+
+    fn expected_symbols(&self) -> Vec<String> {
+        self.expected_symbols.clone()
+    }
+
+    fn symbol_depth_state(&self, symbol: &str) -> Option<ConnState> {
+        self.depth_states.get(&symbol.to_uppercase()).map(|s| s.state)
+    }
+
+    fn prepare_depth_refresh(&mut self) {
+        self.overall_invalid = false;
+        for st in self.depth_states.values_mut() {
+            st.state = ConnState::Resync;
+            st.prev_u = None;
+            st.pending_snapshot_id = None;
+            st.buffer.clear();
+        }
+    }
+
+    fn prepare_symbol_depth_refresh(&mut self, symbol: &str) {
+        let sym = symbol.to_uppercase();
+        if let Some(st) = self.depth_states.get_mut(&sym) {
+            st.state = ConnState::Resync;
+            st.prev_u = None;
+            st.pending_snapshot_id = None;
+            st.buffer.clear();
+        }
+        self.refresh_overall_invalid();
     }
 
     fn reset(&mut self) {
         self.overall_invalid = false;
         self.market_live_symbols.clear();
+        self.pending_sub_acks.clear();
         for st in self.depth_states.values_mut() {
             *st = DepthSymbolState::new();
         }

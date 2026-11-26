@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 struct BybitBookState {
     state: ConnState,
     prev_u: Option<u64>,
+    refreshing: bool,
 }
 
 impl BybitBookState {
@@ -14,6 +15,7 @@ impl BybitBookState {
         Self {
             state: ConnState::WaitAnchor,
             prev_u: None,
+            refreshing: false,
         }
     }
 }
@@ -24,7 +26,9 @@ pub struct BybitValidator {
     book1_states: HashMap<String, BybitBookState>,
     seen_trade_ids: HashMap<String, VecDeque<String>>,
     seen_trade_set: HashMap<String, HashSet<String>>,
+    pending_sub_acks: Vec<(String, String)>,
     overall_invalid: bool,
+    fatal_invalid: bool,
 }
 
 impl BybitValidator {
@@ -42,8 +46,18 @@ impl BybitValidator {
             book1_states,
             seen_trade_ids: HashMap::new(),
             seen_trade_set: HashMap::new(),
+            pending_sub_acks: Vec::new(),
             overall_invalid: false,
+            fatal_invalid: false,
         }
+    }
+
+    pub fn build_depth_message(symbols: &[String], op: &str, req_id: &str) -> Value {
+        let args: Vec<String> = symbols
+            .iter()
+            .map(|s| format!("orderbook.50.{}", s.to_uppercase()))
+            .collect();
+        json!({"req_id": req_id, "op": op, "args": args})
     }
 
     pub fn build_subscribe_message(symbols: &[String]) -> Value {
@@ -114,6 +128,36 @@ impl BybitValidator {
             }
         };
 
+        let is_snapshot = msg_type == "snapshot" || u == 1;
+        if let Err(e) = crate::protocol::validate_book_sides(
+            data.get("b"),
+            data.get("a"),
+            is_snapshot,
+            is_snapshot,
+            false,
+            if is_snapshot {
+                "bybit orderbook snapshot"
+            } else {
+                "bybit orderbook delta"
+            },
+        ) {
+            let map = if is_l1 {
+                &mut self.book1_states
+            } else {
+                &mut self.book50_states
+            };
+            let st = map.entry(sym.clone()).or_insert_with(BybitBookState::new);
+            st.state = ConnState::Invalid;
+            st.prev_u = None;
+            self.overall_invalid = true;
+            return FrameVerdict::Violation {
+                symbol: Some(sym),
+                reason: e,
+                needs_resubscribe: true,
+                needs_snapshot_refetch: false,
+            };
+        }
+
         let map = if is_l1 {
             &mut self.book1_states
         } else {
@@ -124,7 +168,7 @@ impl BybitValidator {
 
         // Bybit spec: type == "snapshot" OR u == 1 (service restart) MUST full-reset local book.
         // Also for orderbook.1, 3s silence re-pushes snapshot with identical u.
-        if msg_type == "snapshot" || u == 1 {
+        if is_snapshot {
             let diag = if u == 1 && st.prev_u.is_some() {
                 Some("bybit_server_restart_u_eq_1_reset".to_string())
             } else if is_l1 && st.prev_u == Some(u) {
@@ -134,6 +178,16 @@ impl BybitValidator {
             };
             st.prev_u = Some(u);
             st.state = ConnState::Live;
+            st.refreshing = false;
+            if !is_l1
+                && !self.fatal_invalid
+                && self
+                    .book50_states
+                    .values()
+                    .all(|s| s.state != ConnState::Invalid)
+            {
+                self.overall_invalid = false;
+            }
             return FrameVerdict::AcceptData {
                 symbol: sym,
                 channel,
@@ -143,6 +197,9 @@ impl BybitValidator {
         }
 
         if msg_type == "delta" {
+            if !is_l1 && st.refreshing {
+                return FrameVerdict::BufferedWaitAnchor { symbol: sym };
+            }
             if st.state != ConnState::Live {
                 return FrameVerdict::Violation {
                     symbol: Some(sym),
@@ -231,6 +288,22 @@ impl ProtocolValidator for BybitValidator {
             }
             if op == "subscribe" {
                 if v.get("success").and_then(Value::as_bool) == Some(true) {
+                    if let Some(args) = v.get("args").and_then(Value::as_array) {
+                        for item in args {
+                            if let Some(topic) = item.as_str() {
+                                if let Some((chan, sym)) = topic.rsplit_once('.') {
+                                    self.pending_sub_acks
+                                        .push((sym.to_uppercase(), chan.to_string()));
+                                }
+                            }
+                        }
+                    } else {
+                        for sym in &self.expected_symbols {
+                            for chan in ["orderbook.50", "orderbook.1", "publicTrade"] {
+                                self.pending_sub_acks.push((sym.clone(), chan.to_string()));
+                            }
+                        }
+                    }
                     return FrameVerdict::Control {
                         note: "bybit subscribe ack".to_string(),
                     };
@@ -240,6 +313,20 @@ impl ProtocolValidator for BybitValidator {
                     symbol: None,
                     reason: format!("bybit subscribe failed: {}", raw),
                     needs_resubscribe: true,
+                    needs_snapshot_refetch: false,
+                };
+            }
+            if op == "unsubscribe" {
+                if v.get("success").and_then(Value::as_bool) == Some(true) {
+                    return FrameVerdict::Control {
+                        note: "bybit unsubscribe ack".to_string(),
+                    };
+                }
+                self.overall_invalid = true;
+                return FrameVerdict::Violation {
+                    symbol: None,
+                    reason: format!("bybit unsubscribe failed: {}", raw),
+                    needs_resubscribe: false,
                     needs_snapshot_refetch: false,
                 };
             }
@@ -307,8 +394,63 @@ impl ProtocolValidator for BybitValidator {
         }
     }
 
+    fn take_subscription_acks(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_sub_acks)
+    }
+
+    fn expected_symbols(&self) -> Vec<String> {
+        self.expected_symbols.clone()
+    }
+
+    fn symbol_depth_state(&self, symbol: &str) -> Option<ConnState> {
+        self.book50_states
+            .get(&symbol.to_uppercase())
+            .map(|st| if st.refreshing { ConnState::Resync } else { st.state })
+    }
+
+    fn prepare_depth_refresh(&mut self) {
+        self.overall_invalid = false;
+        self.fatal_invalid = false;
+        self.pending_sub_acks.clear();
+        for st in self.book50_states.values_mut() {
+            *st = BybitBookState {
+                state: ConnState::WaitAnchor,
+                prev_u: None,
+                refreshing: true,
+            };
+        }
+    }
+
+    fn prepare_symbol_depth_refresh(&mut self, symbol: &str) {
+        if self.overall_invalid
+            && self
+                .book50_states
+                .values()
+                .all(|s| s.state != ConnState::Invalid)
+        {
+            self.fatal_invalid = true;
+        }
+        let sym = symbol.to_uppercase();
+        let st = self
+            .book50_states
+            .entry(sym)
+            .or_insert_with(BybitBookState::new);
+        if st.state != ConnState::Invalid {
+            st.state = ConnState::WaitAnchor;
+        }
+        st.prev_u = None;
+        st.refreshing = true;
+        self.overall_invalid = self.overall_invalid
+            || self
+                .book50_states
+                .values()
+                .any(|s| s.state == ConnState::Invalid);
+    }
+
     fn reset(&mut self) {
         self.overall_invalid = false;
+        self.fatal_invalid = false;
+        self.pending_sub_acks.clear();
         for st in self.book50_states.values_mut() {
             *st = BybitBookState::new();
         }

@@ -408,13 +408,43 @@ fn test_ab_causal_switch_gap_and_utc_midnight_rollover() {
     // First record after 00:00 UTC seals previous hour (23) and opens hour (00)
     let sealed_prev = writer.write_record(&rot.records[0]).unwrap();
     assert!(sealed_prev.is_some(), "crossing 00:00 UTC must atomically seal prior hour");
+    // Post-switch unanchored delta u=12 before B's fresh full=true snapshot MUST be withheld (no cross-conn splice!)
+    let o5_blocked = sel.on_frame(mk_frame(
+        t_after_midnight + 40_000_000,
+        640_000_000,
+        EndpointKind::GatePublic,
+        ConnId::B,
+        1,
+        delta_u12,
+    ));
+    assert!(
+        o5_blocked.records.is_empty(),
+        "post-switch delta before fresh same-connection snapshot must not be written"
+    );
+
+    // Fresh post-switch full=true snapshot u=12 arrives on B -> emits DEPTH_RECOVERED + snapshot -> then delta u=13 emits!
+    let full_b_u12 = r#"{"time":1795478400,"time_ms":1795478400080,"channel":"futures.obu","event":"update","result":{"t":1795478400070,"full":true,"s":"ob.BTC_USDT.50","u":12,"b":[["90000.0","2.0"]],"a":[["90000.1","1.0"]]}}"#;
+    let delta_b_u13 = r#"{"time":1795478400,"time_ms":1795478400100,"channel":"futures.obu","event":"update","result":{"t":1795478400090,"s":"ob.BTC_USDT.50","U":13,"u":13,"b":[["90000.0","2.5"]],"a":[]}}"#;
+    let o5_snap = sel.on_frame(mk_frame(
+        t_after_midnight + 45_000_000,
+        645_000_000,
+        EndpointKind::GatePublic,
+        ConnId::B,
+        1,
+        full_b_u12,
+    ));
+    assert!(o5_snap.records.iter().any(|r| r.payload.contains("\"DEPTH_RECOVERED\"")));
+    assert_eq!(o5_snap.records.len(), 2);
+    for rec in &o5_snap.records {
+        writer.write_record(rec).unwrap();
+    }
     let o5 = sel.on_frame(mk_frame(
         t_after_midnight + 50_000_000,
         650_000_000,
         EndpointKind::GatePublic,
         ConnId::B,
         1,
-        delta_u12,
+        delta_b_u13,
     ));
     assert_eq!(o5.records.len(), 1);
     writer.write_record(&o5.records[0]).unwrap();
@@ -422,8 +452,12 @@ fn test_ab_causal_switch_gap_and_utc_midnight_rollover() {
     assert_eq!(writer.sealed_partitions().len(), 2);
 
     // Now test failover when standby is NOT LIVE -> MUST emit GAP_START and later GAP_END
-    sel.on_disconnect(ConnId::A, t_after_midnight + 100_000_000, 700_000_000, "planned_close");
+    let disconnected = sel.on_disconnect(ConnId::A, t_after_midnight + 100_000_000, 700_000_000, "planned_close");
     assert_eq!(sel.conn_state(ConnId::A), ConnState::Invalid);
+    assert!(!disconnected.actions.iter().any(|action| matches!(
+        action, SelectorAction::Reconnect { conn_id: ConnId::A, .. }
+    )));
+    assert!(sel.on_planned_rotation(ConnId::A, t_after_midnight + 110_000_000, 710_000_000).actions.is_empty());
     let gap_out = sel.on_disconnect(ConnId::B, t_after_midnight + 200_000_000, 800_000_000, "network_drop");
     assert!(sel.in_gap());
     assert!(gap_out.records.iter().any(|r| r.payload.contains("\"GAP_START\"")));

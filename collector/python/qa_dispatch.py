@@ -1,0 +1,1792 @@
+"""Lightweight independent GitHub Actions workflow_dispatch notifier for verified Tokyo L2 windows.
+
+Reads durable deduplicated outbox records from `meta/archive_ledger.sqlite` (and performs
+crash-recovery discovery from synced `meta/archive_manifest_index.json`), then triggers
+`tokyo-l2-incremental-qa.yml` via GitHub's REST `workflow_dispatch` endpoint.
+
+Isolation guarantees:
+  - Runs independently from `tokyo-l2-collector.service` and `tokyo-l2-archive.service`.
+  - Only this notifier reads the fine-grained GitHub PAT (`Actions: write` on this repo).
+  - GitHub timeouts, rate limits, 5xx errors, or token failures keep records PENDING with
+    visible error state and bounded exponential backoff without blocking collection or archive.
+  - Separately tracks `index_synced_at_utc`, `api_accepted_at_utc`, `workflow_run_started_at_utc`,
+    and `qa_completed_at_utc`.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import ssl
+import sys
+import time
+from typing import Any, Callable
+from urllib.parse import quote, urlparse
+
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
+
+from archive_sync import (  # noqa: E402
+    LEDGER_DB_FILENAME,
+    ArchiveLedger,
+    discover_and_enqueue_qa_dispatches,
+)
+
+DEFAULT_GITHUB_API_BASE = "https://api.github.com"
+DEFAULT_GITHUB_RAW_BASE = "https://raw.githubusercontent.com"
+DEFAULT_GITHUB_REPO = "Huhabubu/mm"
+DEFAULT_WORKFLOW_FILE = "tokyo-l2-incremental-qa.yml"
+DEFAULT_WORKFLOW_REF = "main"
+DEFAULT_QA_SOURCE_REF = "feat/tokyo-l2-reliability-fixes"
+DEFAULT_QA_STATE_BRANCH = "tokyo-l2-qa-state"
+DEFAULT_TOKEN_ENV = "TOKYO_L2_GITHUB_QA_DISPATCH_TOKEN"
+DEFAULT_CONNECT_TIMEOUT_S = 5.0
+DEFAULT_TOTAL_TIMEOUT_S = 15.0
+DEFAULT_BASE_BACKOFF_S = 30.0
+DEFAULT_MAX_BACKOFF_S = 900.0
+DEFAULT_AUTH_BACKOFF_S = 300.0
+DEFAULT_ACCEPTED_STALE_TIMEOUT_S = 1800.0
+DEFAULT_MAX_DISPATCHES_PER_RUN = 2
+DEFAULT_MAX_IN_FLIGHT = 1
+DEFAULT_UNVERIFIED_RECHECK_INTERVAL_S = 600.0
+DEFAULT_MAX_UNVERIFIED_RECHECK = 4
+MAX_GITHUB_GET_BODY_BYTES = 1024 * 1024
+
+_PROTOCOL_RULE_SCRIPT_PATHS = (
+    "scripts/tokyo_l2_protocol_qa.py",
+    "scripts/tokyo_l2_replay_qa.py",
+    "scripts/tokyo_l2_recurring_qa.py",
+)
+_TERMINAL_ARCHIVE_QA_STATUSES = frozenset({"passed", "failed", "needs_review"})
+_TERMINAL_PROTOCOL_QA_STATUSES = frozenset(
+    {"passed", "data_failed", "anchor_unverified", "replay_init_unverified"}
+)
+_UNVERIFIED_PROTOCOL_RESULT_STATUSES = frozenset({"anchor_unverified", "replay_init_unverified"})
+_PROTOCOL_RESULT_STATUS_MAP = {
+    "passed": "passed",
+    "data_failed": "protocol_failed",
+    "anchor_unverified": "anchor_unverified",
+    "replay_init_unverified": "replay_init_unverified",
+}
+
+
+@dataclass(frozen=True)
+class HttpDispatchResponse:
+    status_code: int
+    headers: dict[str, str]
+    body: str
+
+
+HttpSenderFn = Callable[
+    [str, dict[str, str], bytes, float, float],
+    HttpDispatchResponse,
+]
+HttpGetFn = Callable[
+    [str, dict[str, str], float, float],
+    HttpDispatchResponse,
+]
+QaResultFetcherFn = Callable[[dict[str, Any]], dict[str, Any] | None]
+
+
+def _iso_utc(epoch_s: float) -> str:
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso_utc(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _safe_report_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "", str(value))
+
+
+def _sanitize_error(message: str, token: str | None = None) -> str:
+    text = str(message or "").replace("\r", " ").replace("\n", " ").strip()
+    if token:
+        text = text.replace(token, "[REDACTED]")
+    return text[:500]
+
+
+class DispatchLockBusyError(RuntimeError):
+    """Raised when another qa-dispatch process already holds the non-blocking lock."""
+
+
+class _DispatchFileLock:
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = lock_path
+        self._fh: Any = None
+
+    def acquire(self) -> None:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            fh.close()
+            raise DispatchLockBusyError(f"QA dispatcher lock busy: {self.lock_path}") from exc
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"pid={os.getpid()}\n")
+        fh.flush()
+        self._fh = fh
+
+    def release(self) -> None:
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+
+
+def default_http_sender(
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    connect_timeout_s: float,
+    total_timeout_s: float,
+) -> HttpDispatchResponse:
+    """Send an HTTP(S) POST with separate connect timeout and overall wall-clock deadline."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        raise ValueError(f"Unsupported GitHub API URL: {url}")
+
+    connect_t = max(0.1, float(connect_timeout_s))
+    total_t = max(connect_t, float(total_timeout_s))
+    deadline = time.monotonic() + total_t
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    conn: http.client.HTTPConnection
+    if parsed.scheme == "https":
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(parsed.hostname, port, timeout=connect_t, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, port, timeout=connect_t)
+
+    try:
+        conn.connect()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Total timeout ({total_t}s) exceeded after connect")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        conn.request("POST", path, body=body, headers=headers)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Total timeout ({total_t}s) exceeded before response")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        resp = conn.getresponse()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Total timeout ({total_t}s) exceeded before body read")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        raw_body = resp.read(65536)
+        hdrs = {k.lower(): v for k, v in resp.getheaders()}
+        return HttpDispatchResponse(
+            status_code=int(resp.status),
+            headers=hdrs,
+            body=raw_body.decode("utf-8", errors="replace"),
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def default_http_get(
+    url: str,
+    headers: dict[str, str],
+    connect_timeout_s: float,
+    total_timeout_s: float,
+) -> HttpDispatchResponse:
+    """Send an HTTP(S) GET with separate connect timeout and overall wall-clock deadline."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        raise ValueError(f"Unsupported GitHub API URL: {url}")
+
+    connect_t = max(0.1, float(connect_timeout_s))
+    total_t = max(connect_t, float(total_timeout_s))
+    deadline = time.monotonic() + total_t
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    conn: http.client.HTTPConnection
+    if parsed.scheme == "https":
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(parsed.hostname, port, timeout=connect_t, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, port, timeout=connect_t)
+
+    try:
+        conn.connect()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Total timeout ({total_t}s) exceeded after connect")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        conn.request("GET", path, headers=headers)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Total timeout ({total_t}s) exceeded before response")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        resp = conn.getresponse()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Total timeout ({total_t}s) exceeded before body read")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        declared_length = resp.length
+        raw_body = resp.read(MAX_GITHUB_GET_BODY_BYTES + 1)
+        if len(raw_body) > MAX_GITHUB_GET_BODY_BYTES:
+            raise RuntimeError(
+                f"GitHub GET response exceeds {MAX_GITHUB_GET_BODY_BYTES} bytes (HTTP {resp.status})"
+            )
+        if declared_length is not None and len(raw_body) < declared_length:
+            raise http.client.IncompleteRead(raw_body, declared_length - len(raw_body))
+        hdrs = {k.lower(): v for k, v in resp.getheaders()}
+        return HttpDispatchResponse(
+            status_code=int(resp.status),
+            headers=hdrs,
+            body=raw_body.decode("utf-8", errors="replace"),
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _window_report_rel_paths(record: dict[str, Any]) -> list[str]:
+    run_id = str(record.get("run_id") or "")
+    wid = str(record["target_window_utc"])
+    date_utc = wid[:10]
+    span_id = record.get("window_span_id")
+    paths: list[str] = []
+    if span_id:
+        batch_folder = _safe_report_name(run_id or "default")
+        paths.append(
+            f"qa_reports/windows/{batch_folder}/{date_utc}/{_safe_report_name(str(span_id))}.window.qa.json"
+        )
+    paths.append(f"qa_reports/windows/{date_utc}/{_safe_report_name(wid)}.window.qa.json")
+    return paths
+
+
+def _protocol_report_rel_path(record: dict[str, Any]) -> str:
+    run_id = str(record.get("run_id") or "")
+    wid = str(record["target_window_utc"])
+    pm = int(record.get("partition_minutes") or 15)
+    run_hash = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:24]
+    return f"qa_reports/protocol/{run_hash}/{pm}m/{_safe_report_name(wid)}.json"
+
+
+def compute_protocol_rules_sha(script_bytes_by_rel_path: dict[str, bytes]) -> str:
+    """Compute the exact `rules_sha` produced by `.github/workflows/tokyo-l2-incremental-qa.yml`:
+    `sha256sum workflow_code/scripts/tokyo_l2_{protocol,replay,recurring}_qa.py | sha256sum`.
+    """
+    lines: list[str] = []
+    for rel in _PROTOCOL_RULE_SCRIPT_PATHS:
+        raw = script_bytes_by_rel_path.get(rel)
+        if raw is None:
+            raise KeyError(f"Missing protocol rule script bytes for {rel}")
+        digest = hashlib.sha256(raw).hexdigest()
+        lines.append(f"{digest}  workflow_code/{rel}\n")
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+
+
+def evaluate_qa_reports_for_record(
+    record: dict[str, Any],
+    *,
+    window_report: dict[str, Any] | None,
+    protocol_report: dict[str, Any] | None = None,
+    require_protocol_report: bool = False,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
+) -> dict[str, Any] | None:
+    """Verify whether persisted QA reports satisfy `(run_id, target_window_utc, archive_revision, checker)`.
+
+    Fail-closed by default: refuses to mark a dispatch completed unless the expected checker
+    commit (and full `<checker_commit>/<rules_sha>` when `require_protocol_report=True`) is
+    explicitly bound and strictly matched by both persisted reports. Two mutually consistent
+    reports from an older checker or older protocol rules can never close the record.
+    """
+    if not isinstance(window_report, dict):
+        return None
+    exp_run_id = str(record.get("run_id") or "").strip()
+    exp_wid = str(record.get("target_window_utc") or "").strip()
+    exp_rev = str(record.get("archive_revision") or "").strip()
+    if not exp_wid or not exp_rev:
+        return None
+
+    exp_commit_arg = str(expected_checker_commit or "").strip()
+    exp_proto_checker = str(expected_protocol_checker or "").strip()
+    exp_proto_commit, exp_proto_sep, exp_proto_rules = exp_proto_checker.partition("/")
+    exp_proto_commit = exp_proto_commit.strip()
+    exp_proto_rules = exp_proto_rules.strip()
+
+    if exp_commit_arg and exp_proto_commit and exp_commit_arg != exp_proto_commit:
+        return None
+    eff_expected_commit = exp_commit_arg or exp_proto_commit
+    if not eff_expected_commit:
+        # Fail closed: never accept reports without an explicitly bound expected checker commit.
+        return None
+    if require_protocol_report and not (exp_proto_commit and exp_proto_sep and exp_proto_rules):
+        # Fail closed: when protocol QA is required, BOTH checker commit and rules_sha must be bound.
+        return None
+
+    rep_run_id = str(window_report.get("run_id") or "").strip()
+    rep_wid = str(window_report.get("window_id") or "").strip()
+    rep_rev = str(window_report.get("archive_revision") or "").strip()
+    win_checker = str(window_report.get("checker_commit_sha") or "").strip()
+    win_status = str(window_report.get("qa_status") or "").strip()
+
+    if rep_run_id != exp_run_id or rep_wid != exp_wid or not rep_rev or rep_rev != exp_rev:
+        return None
+    if not win_checker or win_status not in _TERMINAL_ARCHIVE_QA_STATUSES:
+        return None
+
+    # PROTOCOL_QA_VERSION >= 2 terminal quality verdicts (`passed` / `data_failed`) preserve valid
+    # historical verification across benign checker/rules bumps without full re-dispatch; unverified
+    # (`anchor_unverified` / `replay_init_unverified`) and v1 reports still require the latest checker.
+    p_status = str(protocol_report.get("status") or "").strip() if isinstance(protocol_report, dict) else ""
+    p_ver = int(protocol_report.get("protocol_qa_version") or 0) if isinstance(protocol_report, dict) else 0
+    v2_terminal_survival = (
+        win_status == "passed"
+        and p_ver >= 2
+        and p_status in {"passed", "data_failed"}
+    )
+    if not v2_terminal_survival and win_checker != eff_expected_commit:
+        return None
+
+    if win_status in {"failed", "needs_review"}:
+        return {
+            "qa_result_status": win_status,
+            "window_qa_status": win_status,
+            "protocol_status": None,
+            "checker_commit_sha": win_checker,
+        }
+
+    # Archive window QA passed; strictly verify protocol QA report identity and checker/rules version.
+    proto_ok = False
+    proto_status: str | None = None
+    if isinstance(protocol_report, dict):
+        p_rev = str(protocol_report.get("archive_revision") or "").strip()
+        p_run_id = str(protocol_report.get("run_id") or "").strip()
+        p_wid = str(protocol_report.get("window_id") or "").strip()
+        p_checker_full = str(protocol_report.get("checker") or "").strip()
+        p_checker_commit = p_checker_full.split("/", 1)[0].strip()
+
+        if v2_terminal_survival:
+            checker_matches = bool(p_checker_full and "/" in p_checker_full and p_checker_commit == win_checker)
+        elif exp_proto_sep and exp_proto_rules:
+            checker_matches = p_checker_full == f"{eff_expected_commit}/{exp_proto_rules}"
+        else:
+            checker_matches = bool(p_checker_full) and p_checker_commit == eff_expected_commit
+
+        if (
+            p_status in _TERMINAL_PROTOCOL_QA_STATUSES
+            and p_rev == exp_rev
+            and p_run_id == exp_run_id
+            and p_wid == exp_wid
+            and checker_matches
+        ):
+            proto_ok = True
+            proto_status = str(protocol_report.get("protocol_status") or p_status)
+            final_status = _PROTOCOL_RESULT_STATUS_MAP[p_status]
+            evidence_digest = str(protocol_report.get("input_checkpoint_digest") or "").strip() or None
+            return {
+                "qa_result_status": final_status,
+                "window_qa_status": win_status,
+                "protocol_status": proto_status,
+                "checker_commit_sha": win_checker,
+                "protocol_checker": p_checker_full,
+                "qa_evidence_digest": evidence_digest,
+                "qa_completed_at_utc": protocol_report.get("completed_at_utc"),
+            }
+
+    if require_protocol_report and not proto_ok:
+        return None
+
+    return {
+        "qa_result_status": "passed",
+        "window_qa_status": win_status,
+        "protocol_status": proto_status,
+        "checker_commit_sha": win_checker,
+    }
+
+
+def make_state_dir_result_fetcher(
+    state_dir: Path,
+    *,
+    require_protocol_report: bool = False,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
+) -> QaResultFetcherFn:
+    """Create a result fetcher reading persisted QA JSON reports from a local state checkout."""
+
+    def _read_json(path: Path) -> dict[str, Any] | None:
+        if not path.is_file():
+            return None
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _inspect(record: dict[str, Any]) -> dict[str, Any]:
+        win_rep: dict[str, Any] | None = None
+        for rel in _window_report_rel_paths(record):
+            win_rep = _read_json(state_dir / rel)
+            if win_rep is not None:
+                break
+        proto_rep = _read_json(state_dir / _protocol_report_rel_path(record))
+        verdict = evaluate_qa_reports_for_record(
+            record,
+            window_report=win_rep,
+            protocol_report=proto_rep,
+            require_protocol_report=require_protocol_report,
+            expected_checker_commit=expected_checker_commit,
+            expected_protocol_checker=expected_protocol_checker,
+        )
+        if verdict is not None:
+            return {"kind": "terminal", "verdict": verdict}
+        return _classify_non_terminal_report_pair(
+            record,
+            window_report=win_rep,
+            protocol_report=proto_rep,
+            require_protocol_report=require_protocol_report,
+            expected_checker_commit=expected_checker_commit,
+            expected_protocol_checker=expected_protocol_checker,
+        )
+
+    def _fetch(record: dict[str, Any]) -> dict[str, Any] | None:
+        info = _inspect(record)
+        return info["verdict"] if info["kind"] == "terminal" else None
+
+    _fetch.inspect_record = _inspect  # type: ignore[attr-defined]
+    return _fetch
+
+
+def resolve_expected_checker_from_github(
+    *,
+    repo: str,
+    source_ref: str = DEFAULT_QA_SOURCE_REF,
+    workflow_ref: str = DEFAULT_WORKFLOW_REF,
+    api_base: str = DEFAULT_GITHUB_API_BASE,
+    token: str | None = None,
+    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
+    total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
+    http_get: HttpGetFn | None = None,
+    include_protocol_rules: bool = True,
+) -> tuple[str, str | None]:
+    """Resolve current `(checker_commit_sha, '<checker_commit_sha>/<rules_sha>' | None)` from GitHub."""
+    getter = http_get or default_http_get
+
+    def _get(url: str, accept: str) -> HttpDispatchResponse:
+        base_hdrs = {
+            "Accept": accept,
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "tokyo-l2-qa-dispatcher/1.0",
+        }
+        hdrs = dict(base_hdrs)
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
+        resp = getter(url, hdrs, connect_timeout_s, total_timeout_s)
+        if resp.status_code == 403 and token:
+            resp = getter(url, dict(base_hdrs), connect_timeout_s, total_timeout_s)
+        return resp
+
+    commit_url = f"{api_base.rstrip('/')}/repos/{repo}/commits/{quote(source_ref, safe='')}"
+    # Request just the SHA so large commit diffs cannot exceed the GET body limit.
+    c_resp = _get(commit_url, "application/vnd.github.sha")
+    if not (200 <= c_resp.status_code < 300):
+        raise RuntimeError(f"Failed to resolve checker commit for {repo}@{source_ref}: HTTP {c_resp.status_code}")
+    checker_commit = c_resp.body.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", checker_commit):
+        raise RuntimeError(f"Invalid checker commit SHA returned for {repo}@{source_ref}")
+
+    if not include_protocol_rules:
+        return checker_commit, None
+
+    scripts_bytes: dict[str, bytes] = {}
+    use_raw = http_get is None and api_base.rstrip("/") == DEFAULT_GITHUB_API_BASE
+    for rel in _PROTOCOL_RULE_SCRIPT_PATHS:
+        s_resp: HttpDispatchResponse | None = None
+        if use_raw:
+            raw_url = f"{DEFAULT_GITHUB_RAW_BASE}/{repo}/{quote(workflow_ref, safe='')}/{quote(rel, safe='/')}"
+            try:
+                candidate = getter(raw_url, {"User-Agent": "tokyo-l2-qa-dispatcher/1.0"}, connect_timeout_s, total_timeout_s)
+                if 200 <= candidate.status_code < 300:
+                    s_resp = candidate
+            except Exception:
+                s_resp = None
+        if s_resp is None:
+            s_url = (
+                f"{api_base.rstrip('/')}/repos/{repo}/contents/{quote(rel, safe='/')}"
+                f"?ref={quote(workflow_ref, safe='')}"
+            )
+            s_resp = _get(s_url, "application/vnd.github.raw+json")
+        if not (200 <= s_resp.status_code < 300):
+            raise RuntimeError(
+                f"Failed to resolve protocol rule script {rel}@{workflow_ref}: HTTP {s_resp.status_code}"
+            )
+        scripts_bytes[rel] = s_resp.body.encode("utf-8")
+    rules_sha = compute_protocol_rules_sha(scripts_bytes)
+    return checker_commit, f"{checker_commit}/{rules_sha}"
+
+
+def _classify_non_terminal_report_pair(
+    record: dict[str, Any],
+    *,
+    window_report: dict[str, Any] | None,
+    protocol_report: dict[str, Any] | None,
+    require_protocol_report: bool,
+    expected_checker_commit: str | None,
+    expected_protocol_checker: str | None,
+) -> dict[str, Any]:
+    if not isinstance(window_report, dict):
+        return {"kind": "missing"}
+    exp_run_id = str(record.get("run_id") or "").strip()
+    exp_wid = str(record.get("target_window_utc") or "").strip()
+    exp_rev = str(record.get("archive_revision") or "").strip()
+    if (
+        str(window_report.get("run_id") or "").strip() != exp_run_id
+        or str(window_report.get("window_id") or "").strip() != exp_wid
+        or str(window_report.get("archive_revision") or "").strip() != exp_rev
+    ):
+        return {"kind": "missing"}
+    if isinstance(protocol_report, dict):
+        if (
+            str(protocol_report.get("run_id") or "").strip() == exp_run_id
+            and str(protocol_report.get("window_id") or "").strip() == exp_wid
+            and str(protocol_report.get("archive_revision") or "").strip() == exp_rev
+        ):
+            p_status = str(protocol_report.get("status") or "").strip()
+            if p_status == "pending":
+                return {
+                    "kind": "pending_revalidation",
+                    "reason": str(protocol_report.get("reason") or "protocol_inputs_changed"),
+                }
+            exp_proto = str(expected_protocol_checker or "").strip()
+            p_chk = str(protocol_report.get("checker") or "").strip()
+            if exp_proto and p_chk and p_chk != exp_proto:
+                return {"kind": "stale_checker", "reason": "qa_rules_updated"}
+            exp_commit = str(expected_checker_commit or (exp_proto.split("/", 1)[0] if exp_proto else "")).strip()
+            if exp_commit and p_chk and p_chk.split("/", 1)[0] != exp_commit:
+                return {"kind": "stale_checker", "reason": "qa_checker_updated"}
+    if not require_protocol_report:
+        exp_commit = str(expected_checker_commit or "").strip()
+        win_chk = str(window_report.get("checker_commit_sha") or "").strip()
+        if exp_commit and win_chk and win_chk != exp_commit:
+            return {"kind": "stale_checker", "reason": "qa_checker_updated"}
+    return {"kind": "unchanged"}
+
+
+def make_github_result_fetcher(
+    *,
+    repo: str,
+    state_branch: str = DEFAULT_QA_STATE_BRANCH,
+    source_ref: str = DEFAULT_QA_SOURCE_REF,
+    workflow_ref: str = DEFAULT_WORKFLOW_REF,
+    api_base: str = DEFAULT_GITHUB_API_BASE,
+    token: str | None = None,
+    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
+    total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
+    http_get: HttpGetFn | None = None,
+    require_protocol_report: bool = False,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
+) -> QaResultFetcherFn:
+    """Fetch persisted window/protocol QA JSON reports from GitHub's state branch via Contents API.
+
+    If `expected_checker_commit` / `expected_protocol_checker` are not explicitly pinned, lazily
+    resolves the current `(checker_commit_sha, '<commit>/<rules_sha>')` from `source_ref` and
+    `workflow_ref` on GitHub so stale reports from older checkers/rules can never close an entry.
+    On public repos where the notifier's fine-grained PAT is strictly scoped to `Actions: write`
+    (without `Contents: read`), automatically falls back from authenticated GET (403) to
+    unauthenticated GET.
+    """
+    getter = http_get or default_http_get
+    base_headers = {
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "tokyo-l2-qa-dispatcher/1.0",
+    }
+    resolved_cache: dict[str, str | None] = {
+        "initialized": None,
+        "commit": str(expected_checker_commit or "").strip() or None,
+        "protocol_checker": str(expected_protocol_checker or "").strip() or None,
+    }
+
+    def _ensure_expected_checker() -> tuple[str | None, str | None]:
+        if resolved_cache["initialized"] is not None:
+            return resolved_cache["commit"], resolved_cache["protocol_checker"]
+        commit = resolved_cache["commit"]
+        proto_chk = resolved_cache["protocol_checker"]
+        needs_proto = require_protocol_report and not (
+            proto_chk and "/" in proto_chk and all(part.strip() for part in proto_chk.split("/", 1))
+        )
+        needs_commit = not commit and not (proto_chk and proto_chk.split("/", 1)[0].strip())
+        if needs_commit or needs_proto:
+            r_commit, r_proto = resolve_expected_checker_from_github(
+                repo=repo,
+                source_ref=source_ref,
+                workflow_ref=workflow_ref,
+                api_base=api_base,
+                token=token,
+                connect_timeout_s=connect_timeout_s,
+                total_timeout_s=total_timeout_s,
+                http_get=http_get,
+                include_protocol_rules=require_protocol_report,
+            )
+            if needs_commit:
+                commit = r_commit
+            if needs_proto:
+                proto_chk = r_proto
+        resolved_cache["commit"] = commit
+        resolved_cache["protocol_checker"] = proto_chk
+        resolved_cache["initialized"] = "1"
+        return commit, proto_chk
+
+    use_raw_state = http_get is None and api_base.rstrip("/") == DEFAULT_GITHUB_API_BASE
+
+    def _get_json(rel_path: str) -> dict[str, Any] | None:
+        encoded_path = quote(rel_path, safe="/")
+        if use_raw_state:
+            raw_url = f"{DEFAULT_GITHUB_RAW_BASE}/{repo}/{quote(state_branch, safe='')}/{encoded_path}"
+            try:
+                raw_resp = getter(
+                    raw_url,
+                    {"User-Agent": "tokyo-l2-qa-dispatcher/1.0", "Accept": "application/json"},
+                    connect_timeout_s,
+                    total_timeout_s,
+                )
+                if raw_resp.status_code == 404:
+                    return None
+                if 200 <= raw_resp.status_code < 300:
+                    parsed = json.loads(raw_resp.body)
+                    return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                pass
+        url = f"{api_base.rstrip('/')}/repos/{repo}/contents/{encoded_path}?ref={quote(state_branch, safe='')}"
+        hdrs = dict(base_headers)
+        if token:
+            hdrs["Authorization"] = f"Bearer {token}"
+        resp = getter(url, hdrs, connect_timeout_s, total_timeout_s)
+        if resp.status_code == 403 and token:
+            resp = getter(url, dict(base_headers), connect_timeout_s, total_timeout_s)
+        if resp.status_code == 404:
+            return None
+        if 200 <= resp.status_code < 300:
+            parsed = json.loads(resp.body)
+            return parsed if isinstance(parsed, dict) else None
+        raise RuntimeError(f"GitHub state read failed for {rel_path}: HTTP {resp.status_code}")
+
+    def _inspect(record: dict[str, Any]) -> dict[str, Any]:
+        exp_commit, exp_proto = _ensure_expected_checker()
+        win_rep: dict[str, Any] | None = None
+        for rel in _window_report_rel_paths(record):
+            win_rep = _get_json(rel)
+            if win_rep is not None:
+                break
+        if win_rep is None:
+            return {"kind": "missing"}
+        proto_rep: dict[str, Any] | None = None
+        if str(win_rep.get("qa_status") or "") == "passed":
+            proto_rep = _get_json(_protocol_report_rel_path(record))
+        verdict = evaluate_qa_reports_for_record(
+            record,
+            window_report=win_rep,
+            protocol_report=proto_rep,
+            require_protocol_report=require_protocol_report,
+            expected_checker_commit=exp_commit,
+            expected_protocol_checker=exp_proto,
+        )
+        if verdict is not None:
+            return {"kind": "terminal", "verdict": verdict}
+        return _classify_non_terminal_report_pair(
+            record,
+            window_report=win_rep,
+            protocol_report=proto_rep,
+            require_protocol_report=require_protocol_report,
+            expected_checker_commit=exp_commit,
+            expected_protocol_checker=exp_proto,
+        )
+
+    def _fetch(record: dict[str, Any]) -> dict[str, Any] | None:
+        info = _inspect(record)
+        return info["verdict"] if info["kind"] == "terminal" else None
+
+    _fetch.inspect_record = _inspect  # type: ignore[attr-defined]
+    return _fetch
+
+
+def reconcile_accepted_dispatches(
+    ledger: ArchiveLedger,
+    *,
+    result_fetcher: QaResultFetcherFn,
+    run_id_filter: str | None = None,
+    accepted_stale_timeout_s: float = DEFAULT_ACCEPTED_STALE_TIMEOUT_S,
+    base_backoff_s: float = DEFAULT_BASE_BACKOFF_S,
+    max_backoff_s: float = DEFAULT_MAX_BACKOFF_S,
+    now_epoch_s: float | None = None,
+    token: str | None = None,
+    unverified_recheck_interval_s: float = DEFAULT_UNVERIFIED_RECHECK_INTERVAL_S,
+    max_unverified_recheck: int = DEFAULT_MAX_UNVERIFIED_RECHECK,
+) -> dict[str, Any]:
+    """Reconcile ACCEPTED (and previously attempted PENDING) outbox entries against final QA reports.
+
+    - Matching terminal QA report on `(run_id, target_window_utc, archive_revision)` -> `QA_COMPLETED`
+      with `qa_completed_at_utc` recorded separately from `api_accepted_at_utc`.
+    - ACCEPTED entry older than `accepted_stale_timeout_s` with no matching final report (e.g. run
+      replaced in GitHub's concurrency queue) -> requeued to `PENDING` with explicit visibility.
+    - A failed lookup also requeues an overdue ACCEPTED entry, with backoff before redispatch.
+    """
+    now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
+    now_iso = _iso_utc(now_s)
+
+    accepted_rows = ledger.list_qa_dispatches(
+        states=("ACCEPTED",),
+        run_id=run_id_filter,
+        newest_first=True,
+    )
+    retried_pending_rows = [
+        r
+        for r in ledger.list_qa_dispatches(
+            states=("PENDING",),
+            run_id=run_id_filter,
+            newest_first=True,
+        )
+        if int(r.get("attempt_count") or 0) > 0
+    ][:25]
+
+    completed_items: list[dict[str, Any]] = []
+    requeued_items: list[dict[str, Any]] = []
+    in_flight_items: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for row in accepted_rows + retried_pending_rows:
+        fetch_error = None
+        try:
+            verdict = result_fetcher(row)
+        except Exception as exc:
+            verdict = None
+            fetch_error = _sanitize_error(f"{type(exc).__name__}: {exc}", token=token)
+            errors.append(
+                {
+                    "id": row["id"],
+                    "run_id": row["run_id"],
+                    "target_window_utc": row["target_window_utc"],
+                    "archive_revision": row["archive_revision"],
+                    "error": fetch_error,
+                }
+            )
+
+        if verdict is not None:
+            completed_ts = str(verdict.get("qa_completed_at_utc") or now_iso)
+            result_status = str(verdict["qa_result_status"])
+            ledger.mark_qa_dispatch_completed(
+                run_id=str(row["run_id"]),
+                target_window_utc=str(row["target_window_utc"]),
+                archive_revision=str(row["archive_revision"]),
+                qa_result_status=result_status,
+                qa_completed_at_utc=completed_ts,
+                qa_checker=verdict.get("protocol_checker") or verdict.get("checker_commit_sha"),
+                qa_evidence_digest=verdict.get("qa_evidence_digest"),
+                workflow_run_id=verdict.get("workflow_run_id"),
+                workflow_run_url=verdict.get("workflow_run_url"),
+                workflow_run_started_at_utc=verdict.get("workflow_run_started_at_utc"),
+                now_iso=now_iso,
+            )
+            ledger.record_event(
+                ts_utc=now_iso,
+                run_id=str(row["run_id"] or "qa_dispatch"),
+                event_type="QA_DISPATCH_COMPLETED",
+                detail={
+                    "target_window_utc": row["target_window_utc"],
+                    "archive_revision": row["archive_revision"],
+                    "qa_result_status": result_status,
+                    "reconciled_from_state": row["state"],
+                },
+            )
+            completed_items.append(
+                {
+                    "id": row["id"],
+                    "run_id": row["run_id"],
+                    "target_window_utc": row["target_window_utc"],
+                    "archive_revision": row["archive_revision"],
+                    "api_accepted_at_utc": row.get("api_accepted_at_utc"),
+                    "qa_completed_at_utc": completed_ts,
+                    "qa_result_status": result_status,
+                    "reconciled_from_state": row["state"],
+                }
+            )
+            continue
+
+        if row["state"] != "ACCEPTED":
+            continue
+
+        accepted_epoch = _parse_iso_utc(row.get("api_accepted_at_utc"))
+        age_s = (now_s - accepted_epoch) if accepted_epoch is not None else 0.0
+        if accepted_stale_timeout_s > 0 and accepted_epoch is not None and age_s >= float(accepted_stale_timeout_s):
+            if fetch_error is None:
+                error_code = "accepted_result_missing_or_replaced"
+                event_type = "QA_DISPATCH_REQUEUED_MISSING_RESULT"
+                err_msg = (
+                    f"No matching final QA report for ({row['run_id']}, {row['target_window_utc']}, "
+                    f"{row['archive_revision']}) after {int(age_s)}s (possibly replaced in concurrency queue)"
+                )
+                next_attempt_s = now_s + _compute_retry_delay_s(
+                    attempt_index=max(0, int(row["attempt_count"]) - 1),
+                    base_backoff_s=base_backoff_s,
+                    max_backoff_s=max_backoff_s,
+                    now_s=now_s,
+                )
+            else:
+                error_code = "accepted_result_fetch_failed"
+                event_type = "QA_DISPATCH_REQUEUED_FETCH_ERROR"
+                err_msg = fetch_error
+                next_attempt_s = now_s + _compute_retry_delay_s(
+                    attempt_index=int(row["attempt_count"]) - 1,
+                    base_backoff_s=base_backoff_s,
+                    max_backoff_s=max_backoff_s,
+                    now_s=now_s,
+                )
+            ledger.mark_qa_dispatch_requeue(
+                int(row["id"]),
+                next_attempt_at_epoch_s=next_attempt_s,
+                error_code=error_code,
+                error_message=err_msg,
+                now_iso=now_iso,
+            )
+            ledger.record_event(
+                ts_utc=now_iso,
+                run_id=str(row["run_id"] or "qa_dispatch"),
+                event_type=event_type,
+                detail={
+                    "target_window_utc": row["target_window_utc"],
+                    "archive_revision": row["archive_revision"],
+                    "accepted_age_seconds": int(age_s),
+                    "next_attempt_at_utc": _iso_utc(next_attempt_s),
+                },
+            )
+            requeued_items.append(
+                {
+                    "id": row["id"],
+                    "run_id": row["run_id"],
+                    "target_window_utc": row["target_window_utc"],
+                    "archive_revision": row["archive_revision"],
+                    "api_accepted_at_utc": row.get("api_accepted_at_utc"),
+                    "accepted_age_seconds": int(age_s),
+                    "error_code": error_code,
+                    "next_attempt_at_utc": _iso_utc(next_attempt_s),
+                }
+            )
+        elif fetch_error is None:
+            in_flight_items.append(
+                {
+                    "id": row["id"],
+                    "run_id": row["run_id"],
+                    "target_window_utc": row["target_window_utc"],
+                    "archive_revision": row["archive_revision"],
+                    "api_accepted_at_utc": row.get("api_accepted_at_utc"),
+                    "accepted_age_seconds": int(max(0.0, age_s)),
+                }
+            )
+
+    revalidated_items: list[dict[str, Any]] = []
+    requeued_unverified_items: list[dict[str, Any]] = []
+    inspect_fn = getattr(result_fetcher, "inspect_record", None)
+    if (
+        callable(inspect_fn)
+        and int(max_unverified_recheck) > 0
+        and len(in_flight_items) == 0
+        and len(requeued_items) == 0
+    ):
+        last_recheck_raw = ledger.get_meta("qa_dispatch_last_unverified_recheck_s")
+        last_recheck_s = float(last_recheck_raw) if last_recheck_raw else 0.0
+        if (now_s - last_recheck_s) >= float(unverified_recheck_interval_s):
+            unverified_rows = [
+                r
+                for r in ledger.list_qa_dispatches(
+                    states=("QA_COMPLETED",),
+                    run_id=run_id_filter,
+                    newest_first=False,
+                )
+                if r.get("qa_result_status") in _UNVERIFIED_PROTOCOL_RESULT_STATUSES
+            ]
+            unverified_rows.sort(
+                key=lambda r: (str(r.get("updated_at_utc") or ""), str(r.get("target_window_utc") or ""))
+            )
+            if unverified_rows:
+                ledger.set_meta("qa_dispatch_last_unverified_recheck_s", str(now_s))
+            for urow in unverified_rows[: int(max_unverified_recheck)]:
+                try:
+                    info = inspect_fn(urow)
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "id": urow["id"],
+                            "run_id": urow["run_id"],
+                            "target_window_utc": urow["target_window_utc"],
+                            "archive_revision": urow["archive_revision"],
+                            "error": _sanitize_error(f"{type(exc).__name__}: {exc}", token=token),
+                        }
+                    )
+                    continue
+                if info["kind"] == "terminal":
+                    verdict = info["verdict"]
+                    new_status = str(verdict["qa_result_status"])
+                    new_checker = verdict.get("protocol_checker") or verdict.get("checker_commit_sha")
+                    new_digest = verdict.get("qa_evidence_digest")
+                    if (
+                        new_status != urow.get("qa_result_status")
+                        or (new_checker and new_checker != urow.get("qa_checker"))
+                        or (new_digest and new_digest != urow.get("qa_evidence_digest"))
+                    ):
+                        completed_ts = str(verdict.get("qa_completed_at_utc") or now_iso)
+                        ledger.mark_qa_dispatch_completed(
+                            run_id=str(urow["run_id"]),
+                            target_window_utc=str(urow["target_window_utc"]),
+                            archive_revision=str(urow["archive_revision"]),
+                            qa_result_status=new_status,
+                            qa_completed_at_utc=completed_ts,
+                            qa_checker=new_checker,
+                            qa_evidence_digest=new_digest,
+                            now_iso=now_iso,
+                        )
+                        revalidated_items.append(
+                            {
+                                "id": urow["id"],
+                                "target_window_utc": urow["target_window_utc"],
+                                "previous_status": urow.get("qa_result_status"),
+                                "qa_result_status": new_status,
+                            }
+                        )
+                elif info["kind"] in ("pending_revalidation", "stale_checker"):
+                    reason = str(info.get("reason") or info["kind"])
+                    if ledger.mark_qa_dispatch_recheck(
+                        int(urow["id"]),
+                        error_code=reason,
+                        error_message=f"Revalidating unverified window ({urow.get('qa_result_status')}): {reason}",
+                        now_iso=now_iso,
+                    ):
+                        ledger.record_event(
+                            ts_utc=now_iso,
+                            run_id=str(urow["run_id"] or "qa_dispatch"),
+                            event_type="QA_DISPATCH_REVALIDATION_QUEUED",
+                            detail={
+                                "target_window_utc": urow["target_window_utc"],
+                                "archive_revision": urow["archive_revision"],
+                                "previous_status": urow.get("qa_result_status"),
+                                "reason": reason,
+                            },
+                        )
+                        requeued_unverified_items.append(
+                            {
+                                "id": urow["id"],
+                                "target_window_utc": urow["target_window_utc"],
+                                "previous_status": urow.get("qa_result_status"),
+                                "reason": reason,
+                            }
+                        )
+
+    return {
+        "checked_count": len(accepted_rows) + len(retried_pending_rows),
+        "completed_count": len(completed_items),
+        "requeued_stale_count": len(requeued_items),
+        "revalidated_unverified_count": len(revalidated_items),
+        "requeued_unverified_count": len(requeued_unverified_items),
+        "in_flight_count": len(in_flight_items),
+        "error_count": len(errors),
+        "completed": completed_items,
+        "requeued_stale": requeued_items,
+        "revalidated_unverified": revalidated_items,
+        "requeued_unverified": requeued_unverified_items,
+        "in_flight": in_flight_items,
+        "errors": errors,
+    }
+
+
+def _compute_retry_delay_s(
+    *,
+    attempt_index: int,
+    base_backoff_s: float,
+    max_backoff_s: float,
+    response: HttpDispatchResponse | None = None,
+    now_s: float,
+    min_delay_s: float = 0.0,
+) -> float:
+    exp_delay = float(base_backoff_s) * (2 ** max(0, int(attempt_index)))
+    delay = max(float(min_delay_s), min(float(max_backoff_s), exp_delay))
+    if response is not None:
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            try:
+                delay = max(delay, min(float(max_backoff_s), float(retry_after)))
+            except ValueError:
+                pass
+        rl_reset = response.headers.get("x-ratelimit-reset")
+        if rl_reset and response.headers.get("x-ratelimit-remaining") == "0":
+            try:
+                wait_reset = max(1.0, float(rl_reset) - now_s)
+                delay = max(delay, min(float(max_backoff_s), wait_reset))
+            except ValueError:
+                pass
+    return delay
+
+
+def _classify_http_failure(
+    response: HttpDispatchResponse,
+    *,
+    token: str | None = None,
+) -> tuple[str, str, bool]:
+    """Return `(error_code, sanitized_message, is_auth_error)`."""
+    code = response.status_code
+    body_msg = response.body
+    try:
+        parsed = json.loads(response.body) if response.body.strip() else {}
+        if isinstance(parsed, dict) and parsed.get("message"):
+            body_msg = str(parsed["message"])
+    except ValueError:
+        pass
+    clean_msg = _sanitize_error(body_msg or f"HTTP {code}", token=token)
+
+    is_rate_limit = (
+        code == 429
+        or (
+            code == 403
+            and (
+                response.headers.get("x-ratelimit-remaining") == "0"
+                or "retry-after" in response.headers
+                or "rate limit" in clean_msg.lower()
+            )
+        )
+    )
+    if is_rate_limit:
+        return "github_rate_limited", f"HTTP {code}: {clean_msg}", False
+    if code == 401:
+        return "github_token_invalid", f"HTTP 401: {clean_msg}", True
+    if code == 403:
+        return "github_token_forbidden", f"HTTP 403: {clean_msg}", True
+    if 500 <= code <= 599:
+        return f"github_http_{code}", f"HTTP {code}: {clean_msg}", False
+    return f"github_request_rejected_{code}", f"HTTP {code}: {clean_msg}", False
+
+
+def build_workflow_dispatch_payload(
+    record: dict[str, Any],
+    *,
+    ref: str = DEFAULT_WORKFLOW_REF,
+    extra_inputs: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    inputs: dict[str, str] = {
+        "run_id": str(record["run_id"]),
+        "target_window_utc": str(record["target_window_utc"]),
+        "archive_revision": str(record["archive_revision"]),
+    }
+    if extra_inputs:
+        for k, v in extra_inputs.items():
+            if v is not None and str(v) != "":
+                inputs[str(k)] = str(v)
+    return {
+        "ref": str(ref),
+        "inputs": inputs,
+    }
+
+
+def dispatch_pending_qa(
+    sealed_root: Path,
+    *,
+    repo: str | None = None,
+    workflow_file: str | None = None,
+    ref: str | None = None,
+    token: str | None = None,
+    token_env: str = DEFAULT_TOKEN_ENV,
+    api_base: str = DEFAULT_GITHUB_API_BASE,
+    run_id_filter: str | None = None,
+    partition_minutes_filter: int | None = None,
+    max_dispatches: int = DEFAULT_MAX_DISPATCHES_PER_RUN,
+    max_in_flight: int | None = None,
+    unverified_recheck_interval_s: float | None = None,
+    max_unverified_recheck: int | None = None,
+    max_age_hours: float | None = None,
+    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
+    total_timeout_s: float = DEFAULT_TOTAL_TIMEOUT_S,
+    base_backoff_s: float = DEFAULT_BASE_BACKOFF_S,
+    max_backoff_s: float = DEFAULT_MAX_BACKOFF_S,
+    auth_backoff_s: float = DEFAULT_AUTH_BACKOFF_S,
+    extra_inputs: dict[str, str] | None = None,
+    now_epoch_s: float | None = None,
+    http_sender: HttpSenderFn | None = None,
+    http_get: HttpGetFn | None = None,
+    qa_state_dir: Path | None = None,
+    qa_state_branch: str | None = None,
+    qa_source_ref: str | None = None,
+    accepted_stale_timeout_s: float | None = None,
+    require_protocol_report: bool | None = None,
+    expected_checker_commit: str | None = None,
+    expected_protocol_checker: str | None = None,
+    reconcile_accepted: bool = True,
+    result_fetcher: QaResultFetcherFn | None = None,
+    recover_from_index: bool = True,
+    require_token: bool = False,
+) -> dict[str, Any]:
+    """Discover missed COMPLETE windows, reconcile ACCEPTED QA results, and dispatch due outbox items."""
+    now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
+    now_iso = _iso_utc(now_s)
+    eff_repo = (repo or os.environ.get("TOKYO_L2_GITHUB_REPO") or DEFAULT_GITHUB_REPO).strip()
+    eff_workflow = (workflow_file or os.environ.get("TOKYO_L2_GITHUB_QA_WORKFLOW") or DEFAULT_WORKFLOW_FILE).strip()
+    eff_ref = (ref or os.environ.get("TOKYO_L2_GITHUB_QA_REF") or DEFAULT_WORKFLOW_REF).strip()
+    eff_source_ref = (
+        qa_source_ref or os.environ.get("TOKYO_L2_GITHUB_QA_SOURCE_REF") or DEFAULT_QA_SOURCE_REF
+    ).strip()
+    eff_state_branch = (
+        qa_state_branch or os.environ.get("TOKYO_L2_GITHUB_QA_STATE_BRANCH") or DEFAULT_QA_STATE_BRANCH
+    ).strip()
+    if accepted_stale_timeout_s is None:
+        env_stale = os.environ.get("TOKYO_L2_GITHUB_QA_ACCEPTED_STALE_TIMEOUT_S", "").strip()
+        eff_stale_timeout_s = float(env_stale) if env_stale else DEFAULT_ACCEPTED_STALE_TIMEOUT_S
+    else:
+        eff_stale_timeout_s = float(accepted_stale_timeout_s)
+    if require_protocol_report is None:
+        eff_require_protocol = os.environ.get("TOKYO_L2_GITHUB_QA_REQUIRE_PROTOCOL_REPORT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    else:
+        eff_require_protocol = bool(require_protocol_report)
+    if max_in_flight is None:
+        env_inflight = os.environ.get("TOKYO_L2_GITHUB_QA_MAX_IN_FLIGHT", "").strip()
+        eff_max_in_flight = int(env_inflight) if env_inflight else DEFAULT_MAX_IN_FLIGHT
+    else:
+        eff_max_in_flight = max(1, int(max_in_flight))
+    eff_recheck_interval_s = (
+        float(unverified_recheck_interval_s)
+        if unverified_recheck_interval_s is not None
+        else DEFAULT_UNVERIFIED_RECHECK_INTERVAL_S
+    )
+    eff_max_unverified_recheck = (
+        int(max_unverified_recheck)
+        if max_unverified_recheck is not None
+        else DEFAULT_MAX_UNVERIFIED_RECHECK
+    )
+    eff_expected_checker_commit = (
+        expected_checker_commit
+        if expected_checker_commit is not None
+        else os.environ.get("TOKYO_L2_GITHUB_QA_EXPECTED_CHECKER_COMMIT", "")
+    ).strip() or None
+    eff_expected_protocol_checker = (
+        expected_protocol_checker
+        if expected_protocol_checker is not None
+        else os.environ.get("TOKYO_L2_GITHUB_QA_EXPECTED_PROTOCOL_CHECKER", "")
+    ).strip() or None
+    eff_token = token if token is not None else os.environ.get(token_env, "")
+    eff_token = str(eff_token or "").strip()
+    sender = http_sender or default_http_sender
+
+    lock = _DispatchFileLock(sealed_root / "meta" / ".qa_dispatch.lock")
+    try:
+        lock.acquire()
+    except DispatchLockBusyError as exc:
+        return {
+            "status": "busy",
+            "phase": "qa_dispatch",
+            "checked_at_utc": now_iso,
+            "error": str(exc),
+        }
+
+    try:
+        ledger_path = sealed_root / LEDGER_DB_FILENAME
+        with ArchiveLedger(ledger_path) as ledger:
+            recovery: dict[str, Any] = {
+                "index_synced": False,
+                "enqueued": [],
+                "already_queued": [],
+                "skipped_not_complete": [],
+            }
+            if recover_from_index:
+                recovery = discover_and_enqueue_qa_dispatches(
+                    sealed_root,
+                    ledger,
+                    now_epoch_s=now_s,
+                    run_id_filter=run_id_filter,
+                    partition_minutes_filter=partition_minutes_filter,
+                    discovery_source="index_recovery",
+                    max_age_hours=max_age_hours,
+                )
+
+            reconciliation: dict[str, Any] = {
+                "enabled": False,
+                "source": None,
+                "checked_count": 0,
+                "completed_count": 0,
+                "requeued_stale_count": 0,
+                "in_flight_count": 0,
+                "error_count": 0,
+                "completed": [],
+                "requeued_stale": [],
+                "in_flight": [],
+                "errors": [],
+            }
+            if reconcile_accepted:
+                eff_fetcher: QaResultFetcherFn | None = None
+                reconcile_source: str | None = None
+                if result_fetcher is not None:
+                    eff_fetcher = result_fetcher
+                    reconcile_source = "custom_fetcher"
+                elif qa_state_dir is not None:
+                    eff_fetcher = make_state_dir_result_fetcher(
+                        qa_state_dir,
+                        require_protocol_report=eff_require_protocol,
+                        expected_checker_commit=eff_expected_checker_commit,
+                        expected_protocol_checker=eff_expected_protocol_checker,
+                    )
+                    reconcile_source = f"state_dir:{qa_state_dir}"
+                elif http_get is not None or http_sender is None:
+                    eff_fetcher = make_github_result_fetcher(
+                        repo=eff_repo,
+                        state_branch=eff_state_branch,
+                        source_ref=eff_source_ref,
+                        workflow_ref=eff_ref,
+                        api_base=api_base,
+                        token=eff_token or None,
+                        connect_timeout_s=connect_timeout_s,
+                        total_timeout_s=total_timeout_s,
+                        http_get=http_get,
+                        require_protocol_report=eff_require_protocol,
+                        expected_checker_commit=eff_expected_checker_commit,
+                        expected_protocol_checker=eff_expected_protocol_checker,
+                    )
+                    reconcile_source = f"github:{eff_repo}@{eff_state_branch}"
+                if eff_fetcher is not None:
+                    reconcile_res = reconcile_accepted_dispatches(
+                        ledger,
+                        result_fetcher=eff_fetcher,
+                        run_id_filter=run_id_filter,
+                        accepted_stale_timeout_s=eff_stale_timeout_s,
+                        base_backoff_s=base_backoff_s,
+                        max_backoff_s=max_backoff_s,
+                        now_epoch_s=now_s,
+                        token=eff_token or None,
+                        unverified_recheck_interval_s=eff_recheck_interval_s,
+                        max_unverified_recheck=eff_max_unverified_recheck,
+                    )
+                    reconciliation = {
+                        "enabled": True,
+                        "source": reconcile_source,
+                        "source_ref": eff_source_ref,
+                        "workflow_ref": eff_ref,
+                        "expected_checker_commit": eff_expected_checker_commit,
+                        "expected_protocol_checker": eff_expected_protocol_checker,
+                        "require_protocol_report": eff_require_protocol,
+                        "accepted_stale_timeout_s": eff_stale_timeout_s,
+                        **reconcile_res,
+                    }
+
+            all_pending = ledger.list_qa_dispatches(
+                states=("PENDING",),
+                run_id=run_id_filter,
+                newest_first=True,
+            )
+            due_pending = ledger.list_qa_dispatches(
+                states=("PENDING",),
+                run_id=run_id_filter,
+                due_before_epoch_s=now_s,
+                newest_first=True,
+            )
+
+            if not eff_token:
+                accepted_total_no_tok = ledger.list_qa_dispatches(
+                    states=("ACCEPTED",),
+                    run_id=run_id_filter,
+                    newest_first=True,
+                )
+                completed_total_no_tok = ledger.list_qa_dispatches(
+                    states=("QA_COMPLETED",),
+                    run_id=run_id_filter,
+                    newest_first=True,
+                )
+                status = "blocked" if require_token else "disabled_no_token"
+                return {
+                    "status": status,
+                    "phase": "qa_dispatch",
+                    "checked_at_utc": now_iso,
+                    "repo": eff_repo,
+                    "workflow": eff_workflow,
+                    "ref": eff_ref,
+                    "token_configured": False,
+                    "token_env": token_env,
+                    "recovery": recovery,
+                    "reconciliation": reconciliation,
+                    "pending_count": len(all_pending),
+                    "due_count": len(due_pending),
+                    "accepted": [],
+                    "retried": [],
+                    "auth_errors": [],
+                    "outbox_counts": {
+                        "PENDING": len(all_pending),
+                        "ACCEPTED": len(accepted_total_no_tok),
+                        "QA_COMPLETED": len(completed_total_no_tok),
+                    },
+                }
+
+            endpoint_url = (
+                f"{api_base.rstrip('/')}/repos/{eff_repo}/actions/workflows/{eff_workflow}/dispatches"
+            )
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {eff_token}",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "tokyo-l2-qa-dispatcher/1.0",
+            }
+
+            accepted: list[dict[str, Any]] = []
+            retried: list[dict[str, Any]] = []
+            auth_errors: list[dict[str, Any]] = []
+            rejected_errors: list[dict[str, Any]] = []
+
+            in_flight_now = len(
+                ledger.list_qa_dispatches(states=("ACCEPTED",), run_id=run_id_filter, newest_first=True)
+            )
+            in_flight_slots = max(0, eff_max_in_flight - in_flight_now)
+            in_flight_throttled = bool(due_pending) and in_flight_slots == 0
+            to_send = due_pending[: min(max(0, int(max_dispatches)), in_flight_slots)]
+            for rec in to_send:
+                payload = build_workflow_dispatch_payload(
+                    rec,
+                    ref=eff_ref,
+                    extra_inputs=extra_inputs,
+                )
+                body_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                attempt_ts_s = time.time() if now_epoch_s is None else now_s
+                attempt_iso = _iso_utc(attempt_ts_s)
+
+                try:
+                    resp = sender(
+                        endpoint_url,
+                        headers,
+                        body_bytes,
+                        float(connect_timeout_s),
+                        float(total_timeout_s),
+                    )
+                except (TimeoutError, socket.timeout) as exc:
+                    delay_s = _compute_retry_delay_s(
+                        attempt_index=int(rec["attempt_count"]),
+                        base_backoff_s=base_backoff_s,
+                        max_backoff_s=max_backoff_s,
+                        now_s=attempt_ts_s,
+                    )
+                    err_msg = _sanitize_error(f"{type(exc).__name__}: {exc}", token=eff_token)
+                    ledger.mark_qa_dispatch_retry(
+                        int(rec["id"]),
+                        next_attempt_at_epoch_s=attempt_ts_s + delay_s,
+                        http_status=None,
+                        error_code="github_timeout",
+                        error_message=err_msg,
+                        now_iso=attempt_iso,
+                    )
+                    ledger.record_event(
+                        ts_utc=attempt_iso,
+                        run_id=str(rec["run_id"] or "qa_dispatch"),
+                        event_type="QA_DISPATCH_RETRY_SCHEDULED",
+                        detail={
+                            "target_window_utc": rec["target_window_utc"],
+                            "archive_revision": rec["archive_revision"],
+                            "error_code": "github_timeout",
+                            "retry_in_seconds": round(delay_s, 1),
+                        },
+                    )
+                    retried.append(
+                        {
+                            "id": rec["id"],
+                            "run_id": rec["run_id"],
+                            "target_window_utc": rec["target_window_utc"],
+                            "archive_revision": rec["archive_revision"],
+                            "error_code": "github_timeout",
+                            "error_message": err_msg,
+                            "http_status": None,
+                            "next_attempt_at_utc": _iso_utc(attempt_ts_s + delay_s),
+                        }
+                    )
+                    continue
+                except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
+                    delay_s = _compute_retry_delay_s(
+                        attempt_index=int(rec["attempt_count"]),
+                        base_backoff_s=base_backoff_s,
+                        max_backoff_s=max_backoff_s,
+                        now_s=attempt_ts_s,
+                    )
+                    err_msg = _sanitize_error(f"{type(exc).__name__}: {exc}", token=eff_token)
+                    ledger.mark_qa_dispatch_retry(
+                        int(rec["id"]),
+                        next_attempt_at_epoch_s=attempt_ts_s + delay_s,
+                        http_status=None,
+                        error_code="github_network_error",
+                        error_message=err_msg,
+                        now_iso=attempt_iso,
+                    )
+                    ledger.record_event(
+                        ts_utc=attempt_iso,
+                        run_id=str(rec["run_id"] or "qa_dispatch"),
+                        event_type="QA_DISPATCH_RETRY_SCHEDULED",
+                        detail={
+                            "target_window_utc": rec["target_window_utc"],
+                            "archive_revision": rec["archive_revision"],
+                            "error_code": "github_network_error",
+                            "retry_in_seconds": round(delay_s, 1),
+                        },
+                    )
+                    retried.append(
+                        {
+                            "id": rec["id"],
+                            "run_id": rec["run_id"],
+                            "target_window_utc": rec["target_window_utc"],
+                            "archive_revision": rec["archive_revision"],
+                            "error_code": "github_network_error",
+                            "error_message": err_msg,
+                            "http_status": None,
+                            "next_attempt_at_utc": _iso_utc(attempt_ts_s + delay_s),
+                        }
+                    )
+                    continue
+
+                if 200 <= resp.status_code < 300:
+                    ledger.mark_qa_dispatch_accepted(
+                        int(rec["id"]),
+                        accepted_at_utc=attempt_iso,
+                        http_status=resp.status_code,
+                        now_iso=attempt_iso,
+                    )
+                    ledger.record_event(
+                        ts_utc=attempt_iso,
+                        run_id=str(rec["run_id"] or "qa_dispatch"),
+                        event_type="QA_DISPATCH_ACCEPTED",
+                        detail={
+                            "target_window_utc": rec["target_window_utc"],
+                            "archive_revision": rec["archive_revision"],
+                            "ref": eff_ref,
+                            "workflow": eff_workflow,
+                            "http_status": resp.status_code,
+                        },
+                    )
+                    accepted.append(
+                        {
+                            "id": rec["id"],
+                            "run_id": rec["run_id"],
+                            "target_window_utc": rec["target_window_utc"],
+                            "archive_revision": rec["archive_revision"],
+                            "index_synced_at_utc": rec["index_synced_at_utc"],
+                            "api_accepted_at_utc": attempt_iso,
+                            "qa_completed_at_utc": None,
+                            "http_status": resp.status_code,
+                            "ref": eff_ref,
+                            "workflow": eff_workflow,
+                        }
+                    )
+                else:
+                    err_code, err_msg, is_auth_err = _classify_http_failure(resp, token=eff_token)
+                    delay_s = _compute_retry_delay_s(
+                        attempt_index=int(rec["attempt_count"]),
+                        base_backoff_s=base_backoff_s,
+                        max_backoff_s=max_backoff_s,
+                        response=resp,
+                        now_s=attempt_ts_s,
+                        min_delay_s=auth_backoff_s if is_auth_err else 0.0,
+                    )
+                    ledger.mark_qa_dispatch_retry(
+                        int(rec["id"]),
+                        next_attempt_at_epoch_s=attempt_ts_s + delay_s,
+                        http_status=resp.status_code,
+                        error_code=err_code,
+                        error_message=err_msg,
+                        now_iso=attempt_iso,
+                    )
+                    ledger.record_event(
+                        ts_utc=attempt_iso,
+                        run_id=str(rec["run_id"] or "qa_dispatch"),
+                        event_type="QA_DISPATCH_AUTH_ERROR" if is_auth_err else "QA_DISPATCH_RETRY_SCHEDULED",
+                        detail={
+                            "target_window_utc": rec["target_window_utc"],
+                            "archive_revision": rec["archive_revision"],
+                            "http_status": resp.status_code,
+                            "error_code": err_code,
+                            "retry_in_seconds": round(delay_s, 1),
+                        },
+                    )
+                    entry_err = {
+                        "id": rec["id"],
+                        "run_id": rec["run_id"],
+                        "target_window_utc": rec["target_window_utc"],
+                        "archive_revision": rec["archive_revision"],
+                        "http_status": resp.status_code,
+                        "error_code": err_code,
+                        "error_message": err_msg,
+                        "next_attempt_at_utc": _iso_utc(attempt_ts_s + delay_s),
+                    }
+                    retried.append(entry_err)
+                    if is_auth_err:
+                        auth_errors.append(entry_err)
+                        # Stop hammering GitHub with an invalid/expired token in this tick.
+                        break
+                    if 400 <= resp.status_code < 500 and err_code.startswith("github_request_rejected_"):
+                        rejected_errors.append(entry_err)
+
+            remaining_pending = ledger.list_qa_dispatches(
+                states=("PENDING",),
+                run_id=run_id_filter,
+                newest_first=True,
+            )
+            accepted_total = ledger.list_qa_dispatches(
+                states=("ACCEPTED",),
+                run_id=run_id_filter,
+                newest_first=True,
+            )
+            completed_total = ledger.list_qa_dispatches(
+                states=("QA_COMPLETED",),
+                run_id=run_id_filter,
+                newest_first=True,
+            )
+
+            if auth_errors:
+                overall_status = "auth_error"
+            elif retried or rejected_errors:
+                overall_status = "retry_scheduled"
+            else:
+                overall_status = "ok"
+
+            quality_counts: dict[str, int] = {}
+            for row in completed_total:
+                qkey = str(row.get("qa_result_status") or "unknown")
+                quality_counts[qkey] = quality_counts.get(qkey, 0) + 1
+
+            return {
+                "status": overall_status,
+                "phase": "qa_dispatch",
+                "checked_at_utc": now_iso,
+                "repo": eff_repo,
+                "workflow": eff_workflow,
+                "ref": eff_ref,
+                "token_configured": True,
+                "max_in_flight": eff_max_in_flight,
+                "in_flight_throttled": in_flight_throttled,
+                "recovery": recovery,
+                "reconciliation": reconciliation,
+                "attempted_count": len(to_send),
+                "accepted_count": len(accepted),
+                "retried_count": len(retried),
+                "auth_error_count": len(auth_errors),
+                "rejected_error_count": len(rejected_errors),
+                "accepted": accepted,
+                "retried": retried,
+                "auth_errors": auth_errors,
+                "rejected_errors": rejected_errors,
+                "outbox_counts": {
+                    "PENDING": len(remaining_pending),
+                    "ACCEPTED": len(accepted_total),
+                    "QA_COMPLETED": len(completed_total),
+                },
+                "quality_counts": quality_counts,
+            }
+    finally:
+        lock.release()
+
+
+def record_qa_completion(
+    sealed_root: Path,
+    *,
+    run_id: str,
+    target_window_utc: str,
+    archive_revision: str,
+    qa_result_status: str,
+    qa_completed_at_utc: str | None = None,
+    workflow_run_id: int | None = None,
+    workflow_run_url: str | None = None,
+    workflow_run_started_at_utc: str | None = None,
+    now_epoch_s: float | None = None,
+) -> dict[str, Any]:
+    """Record QA completion separately from API acceptance on an existing outbox entry."""
+    now_s = time.time() if now_epoch_s is None else float(now_epoch_s)
+    now_iso = _iso_utc(now_s)
+    completed_iso = qa_completed_at_utc or now_iso
+    ledger_path = sealed_root / LEDGER_DB_FILENAME
+    with ArchiveLedger(ledger_path) as ledger:
+        updated = ledger.mark_qa_dispatch_completed(
+            run_id=run_id,
+            target_window_utc=target_window_utc,
+            archive_revision=archive_revision,
+            qa_result_status=qa_result_status,
+            qa_completed_at_utc=completed_iso,
+            workflow_run_id=workflow_run_id,
+            workflow_run_url=workflow_run_url,
+            workflow_run_started_at_utc=workflow_run_started_at_utc,
+            now_iso=now_iso,
+        )
+        row = ledger.get_qa_dispatch(
+            run_id=run_id,
+            target_window_utc=target_window_utc,
+            archive_revision=archive_revision,
+        )
+        if updated:
+            ledger.record_event(
+                ts_utc=now_iso,
+                run_id=run_id or "qa_dispatch",
+                event_type="QA_DISPATCH_COMPLETED",
+                detail={
+                    "target_window_utc": target_window_utc,
+                    "archive_revision": archive_revision,
+                    "qa_result_status": qa_result_status,
+                    "workflow_run_id": workflow_run_id,
+                    "workflow_run_url": workflow_run_url,
+                },
+            )
+    return {
+        "updated": updated,
+        "record": row,
+    }
+
+
+def get_dispatch_status(
+    sealed_root: Path,
+    *,
+    run_id_filter: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Return human- and machine-readable outbox status without touching credentials."""
+    ledger_path = sealed_root / LEDGER_DB_FILENAME
+    if not ledger_path.is_file():
+        return {
+            "status": "no_ledger",
+            "ledger_db_path": str(ledger_path),
+            "counts": {"PENDING": 0, "ACCEPTED": 0, "QA_COMPLETED": 0, "FAILED_PERMANENT": 0},
+            "pending": [],
+            "accepted": [],
+            "completed": [],
+        }
+    with ArchiveLedger(ledger_path) as ledger:
+        pending = ledger.list_qa_dispatches(states=("PENDING",), run_id=run_id_filter, newest_first=True)
+        accepted = ledger.list_qa_dispatches(states=("ACCEPTED",), run_id=run_id_filter, newest_first=True)
+        completed = ledger.list_qa_dispatches(states=("QA_COMPLETED",), run_id=run_id_filter, newest_first=True)
+        failed = ledger.list_qa_dispatches(states=("FAILED_PERMANENT",), run_id=run_id_filter, newest_first=True)
+    quality_counts: dict[str, int] = {}
+    for row in completed:
+        qkey = str(row.get("qa_result_status") or "unknown")
+        quality_counts[qkey] = quality_counts.get(qkey, 0) + 1
+    return {
+        "status": "ok",
+        "ledger_db_path": str(ledger_path),
+        "counts": {
+            "PENDING": len(pending),
+            "ACCEPTED": len(accepted),
+            "QA_COMPLETED": len(completed),
+            "FAILED_PERMANENT": len(failed),
+        },
+        "quality_counts": quality_counts,
+        "pending": pending[:limit],
+        "accepted": accepted[:limit],
+        "completed": completed[:limit],
+        "failed_permanent": failed[:limit],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Independent lightweight GitHub Actions QA workflow dispatcher for verified Tokyo L2 windows"
+    )
+    parser.add_argument("--dir", type=Path, required=True, help="Sealed archive root directory (e.g. /data/tokyo_l2)")
+    parser.add_argument("--config", type=Path, default=None, help="Optional collector config for partition_minutes/run_id")
+    parser.add_argument("--run-id", default=None, help="Optional collection batch run_id filter")
+    parser.add_argument("--repo", default=None, help="Target GitHub repo (default: Huhabubu/mm)")
+    parser.add_argument("--workflow", default=None, help="Workflow filename (default: tokyo-l2-incremental-qa.yml)")
+    parser.add_argument("--ref", default=None, help="Git ref to dispatch (production default: main)")
+    parser.add_argument("--token-env", default=DEFAULT_TOKEN_ENV, help="Env var holding fine-grained GitHub PAT")
+    parser.add_argument("--max-dispatches", type=int, default=DEFAULT_MAX_DISPATCHES_PER_RUN)
+    parser.add_argument("--max-in-flight", type=int, default=None, help="Max concurrent ACCEPTED dispatches allowed before throttling new triggers (default: 1)")
+    parser.add_argument("--max-age-hours", type=float, default=None, help="Optional max window age for index recovery")
+    parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT_S)
+    parser.add_argument("--total-timeout", type=float, default=DEFAULT_TOTAL_TIMEOUT_S)
+    parser.add_argument("--base-backoff", type=float, default=DEFAULT_BASE_BACKOFF_S)
+    parser.add_argument("--max-backoff", type=float, default=DEFAULT_MAX_BACKOFF_S)
+    parser.add_argument("--qa-state-dir", type=Path, default=None, help="Optional local QA state checkout for result reconciliation")
+    parser.add_argument("--qa-state-branch", default=None, help="GitHub QA state branch for result reconciliation (default: tokyo-l2-qa-state)")
+    parser.add_argument("--qa-source-ref", default=None, help="GitHub collector source ref used to resolve current checker commit SHA (default: feat/tokyo-l2-reliability-fixes)")
+    parser.add_argument("--accepted-stale-timeout", type=float, default=None, help="Requeue ACCEPTED entries missing final QA reports after N seconds (default: 1800)")
+    parser.add_argument("--require-protocol-report", action="store_true", default=None, help="Require persisted protocol QA report in addition to window QA report before marking QA_COMPLETED")
+    parser.add_argument("--expected-checker-commit", default=None, help="Optional pinned checker_commit_sha for reconciliation (auto-resolved from GitHub --qa-source-ref when omitted)")
+    parser.add_argument("--expected-protocol-checker", default=None, help="Optional pinned full protocol checker (<commit>/<rules_sha>) for reconciliation (auto-resolved from GitHub when omitted)")
+    parser.add_argument("--no-reconcile", action="store_true", help="Skip reconciling ACCEPTED entries against persisted QA reports")
+    parser.add_argument("--require-token", action="store_true", help="Exit non-zero if dispatch token is unset")
+    parser.add_argument("--status-only", action="store_true", help="Print outbox status JSON without sending requests")
+    args = parser.parse_args(argv)
+
+    run_id_filter = args.run_id
+    pm_filter: int | None = None
+    if args.config is not None and args.config.is_file():
+        from data_coverage import configured_partition_minutes, resolve_effective_run_id
+
+        cfg_obj = json.loads(args.config.read_text(encoding="utf-8"))
+        pm_filter = configured_partition_minutes(cfg_obj)
+        run_id_filter = resolve_effective_run_id(cfg_obj, args.run_id)
+
+    if args.status_only:
+        res = get_dispatch_status(args.dir, run_id_filter=run_id_filter)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+
+    res = dispatch_pending_qa(
+        args.dir,
+        repo=args.repo,
+        workflow_file=args.workflow,
+        ref=args.ref,
+        token_env=args.token_env,
+        run_id_filter=run_id_filter,
+        partition_minutes_filter=pm_filter,
+        max_dispatches=args.max_dispatches,
+        max_in_flight=args.max_in_flight,
+        max_age_hours=args.max_age_hours,
+        connect_timeout_s=args.connect_timeout,
+        total_timeout_s=args.total_timeout,
+        base_backoff_s=args.base_backoff,
+        max_backoff_s=args.max_backoff,
+        qa_state_dir=args.qa_state_dir,
+        qa_state_branch=args.qa_state_branch,
+        qa_source_ref=args.qa_source_ref,
+        accepted_stale_timeout_s=args.accepted_stale_timeout,
+        require_protocol_report=args.require_protocol_report,
+        expected_checker_commit=args.expected_checker_commit,
+        expected_protocol_checker=args.expected_protocol_checker,
+        reconcile_accepted=not args.no_reconcile,
+        require_token=args.require_token,
+    )
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    if res["status"] in ("ok", "disabled_no_token", "busy"):
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

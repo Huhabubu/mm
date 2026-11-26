@@ -14,6 +14,14 @@ pub struct CollectorConfig {
     pub exchanges: ExchangesConfig,
 }
 
+fn default_partition_minutes() -> u32 {
+    60
+}
+
+fn default_late_frame_grace_ms() -> u64 {
+    2000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentConfig {
     pub aws_region: String,
@@ -22,6 +30,14 @@ pub struct DeploymentConfig {
     pub zstd_level: i32,
     pub bounded_queue_capacity: usize,
     pub silence_watchdog_seconds: u64,
+    #[serde(default = "default_partition_minutes")]
+    pub partition_minutes: u32,
+    #[serde(default = "default_late_frame_grace_ms")]
+    pub late_frame_grace_ms: u64,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub cutover_window_utc: Option<String>,
     pub planned_rotation_utc: BTreeMap<String, String>,
 }
 
@@ -123,6 +139,21 @@ impl CollectorConfig {
             errs.push(format!(
                 "bounded_queue_capacity too small: {}",
                 self.deployment.bounded_queue_capacity
+            ));
+        }
+        if !matches!(self.deployment.partition_minutes, 5 | 15 | 30 | 60) {
+            errs.push(format!(
+                "Invalid deployment.partition_minutes: {} (must be one of 5, 15, 30, 60)",
+                self.deployment.partition_minutes
+            ));
+        }
+        let max_grace_ms = (self.deployment.partition_minutes as u64)
+            .saturating_mul(30_000)
+            .min(60_000);
+        if self.deployment.late_frame_grace_ms > max_grace_ms {
+            errs.push(format!(
+                "Invalid deployment.late_frame_grace_ms: {} (must be <= {} ms)",
+                self.deployment.late_frame_grace_ms, max_grace_ms
             ));
         }
         if !self.archive.forbid_remote_overwrite_on_hash_mismatch {
@@ -264,5 +295,56 @@ impl CollectorConfig {
         } else {
             Err(errs)
         }
+    }
+
+    /// Resolve the single effective batch `run_id` across CLI `--run-id`, `TOKYO_L2_RUN_ID`, and
+    /// `deployment.run_id` in `config.json`. Fails closed if multiple non-empty values disagree
+    /// or if all sources are empty.
+    pub fn resolve_effective_run_id(
+        &self,
+        cli_run_id: Option<&str>,
+        env_run_id: Option<&str>,
+    ) -> Result<String, String> {
+        let cli_clean = cli_run_id.map(str::trim).filter(|s| !s.is_empty());
+        let env_clean = env_run_id.map(str::trim).filter(|s| !s.is_empty());
+        let cfg_clean = self
+            .deployment
+            .run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let mut sources: Vec<(&str, &str)> = Vec::new();
+        if let Some(v) = cli_clean {
+            sources.push(("cli(--run-id)", v));
+        }
+        if let Some(v) = env_clean {
+            sources.push(("env(TOKYO_L2_RUN_ID)", v));
+        }
+        if let Some(v) = cfg_clean {
+            sources.push(("config(deployment.run_id)", v));
+        }
+
+        if sources.is_empty() {
+            return Err(
+                "missing effective run_id: specify --run-id, TOKYO_L2_RUN_ID in live.env, or deployment.run_id in config.json"
+                    .to_string(),
+            );
+        }
+
+        let first_val = sources[0].1;
+        if sources.iter().any(|(_, v)| *v != first_val) {
+            let detail = sources
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "conflicting run_id across collector entrypoints ({})",
+                detail
+            ));
+        }
+
+        Ok(first_val.to_string())
     }
 }

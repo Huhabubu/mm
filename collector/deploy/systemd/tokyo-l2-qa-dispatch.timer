@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll Tokyo L2 QA Dispatch Outbox every minute (independent backoff retries)
+
+[Timer]
+OnCalendar=*-*-* *:*:25 UTC
+AccuracySec=5s
+Persistent=true
+Unit=tokyo-l2-qa-dispatch.service
+
+[Install]
+WantedBy=timers.target
