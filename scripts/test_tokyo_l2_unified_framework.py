@@ -612,7 +612,14 @@ class UnifiedFrameworkTests(unittest.TestCase):
             unpack = Path(tmp) / "unpacked"
             with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
                 tf.extractall(unpack, filter="data")
-            self.assertTrue((unpack / "repo" / "configs" / "tokyo_l2_20261123_gate_btc.json").is_file())
+            for cfg_name in (
+                "tokyo_l2_20261123_batch_3pairs.json",
+                "tokyo_l2_20261123_gate_btc.json",
+                "tokyo_l2_20261123_gate_eth.json",
+                "tokyo_l2_20261123_bybit_btc.json",
+                "tokyo_l2_20261123_bitget_btc.json",
+            ):
+                self.assertTrue((unpack / "repo" / "configs" / cfg_name).is_file(), cfg_name)
             self.assertTrue((unpack / "repo" / "kaggle" / "tasks" / "unified_backtest.py").is_file())
             env = dict(os.environ, PYTHONPATH=os.pathsep.join([
                 str(unpack / "repo" / "kaggle" / "tasks"),
@@ -620,16 +627,173 @@ class UnifiedFrameworkTests(unittest.TestCase):
                 str(unpack / "collector" / "python"),
             ]))
             code = (
-                "import unified_backtest, tokyo_l2_exchange_adapters, tokyo_l2_experiment_config, "
+                "import json, unified_backtest, tokyo_l2_exchange_adapters, tokyo_l2_experiment_config, "
                 "tokyo_l2_bt_cache, tokyo_l2_research_stages, tokyo_l2_report_writer, "
                 "audit_gate_stage5b_same_fill, analyze_gate_1645_fill_quality; "
-                "cfg = tokyo_l2_experiment_config.load_experiment_config('repo/configs/tokyo_l2_20261123_gate_btc.json'); "
-                "assert cfg['models'] == ['glft', 'both_1p0', 'defensive_1p0', 'risk_side_pause']; "
+                "batch = json.load(open('repo/configs/tokyo_l2_20261123_batch_3pairs.json')); "
+                "assert len(batch['experiments']) == 3; "
+                "assert sorted(batch['shared_leader_symbols']) == ['BTC', 'ETH']; "
+                "for item in batch['experiments']: "
+                "  cfg = tokyo_l2_experiment_config.load_experiment_config('repo/' + item['config']); "
+                "  assert cfg['models'] == ['glft', 'both_1p0', 'defensive_1p0', 'risk_side_pause']; "
+                "  assert cfg['stage4']['authorized'] is False; "
+                "  assert cfg['stage5c']['authorized'] is False; "
+                "  assert cfg['latency']['binance_extra_visible_delay_ns'] == 0; "
+                "  assert cfg['latency']['order_entry_latency_ns'] == 1_000_000; "
+                "  assert cfg['latency']['order_response_latency_ns'] == 1_000_000; "
+                "  assert cfg['order_controls']['min_requote_ns'] == 0; "
                 "print('BUNDLE_IMPORT_OK')"
             )
             r = subprocess.run([sys.executable, "-c", code], cwd=unpack, env=env, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("BUNDLE_IMPORT_OK", r.stdout)
+
+    def test_shared_binance_multi_symbol_extractor_and_follower_only_convert(self):
+        from tokyo_l2_bt_stream_convert import MultiSymbolBinanceBBOExtractor, StreamConverter
+        import zstandard as zstd
+
+        base_wall = 1795392000_000_000_000  # 2026-11-23T00:00:00Z
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = Path(tmp)
+            # Build one synthetic Binance partition containing BTC + ETH bookTicker
+            b_lines = [
+                f"{base_wall + 1000}\t1000\tconn0\t1\t1\tDATA\t"
+                + json.dumps({"stream": "btcusdt@bookTicker", "data": {"e": "bookTicker", "s": "BTCUSDT", "b": "90000.0", "B": "1.5", "a": "90000.1", "A": "2.0", "T": 1795392000000}}),
+                f"{base_wall + 2000}\t2000\tconn0\t1\t2\tDATA\t"
+                + json.dumps({"stream": "ethusdt@bookTicker", "data": {"e": "bookTicker", "s": "ETHUSDT", "b": "3000.0", "B": "4.0", "a": "3000.1", "A": "5.0", "T": 1795392000001}}),
+                f"{base_wall + 3000}\t3000\tconn0\t1\t3\tDATA\t"
+                + json.dumps({"stream": "btcusdt@bookTicker", "data": {"e": "bookTicker", "s": "BTCUSDT", "b": "90001.0", "B": "1.0", "a": "90001.2", "A": "2.0", "T": 1795392000002}}),
+            ]
+            b_data = tdir / "binance_0000.tsv.zst"
+            b_blob = zstd.ZstdCompressor().compress(("\n".join(b_lines) + "\n").encode("utf-8"))
+            b_data.write_bytes(b_blob)
+            b_mf = tdir / "binance_0000.manifest.json"
+            b_mf.write_text(json.dumps({
+                "exchange": "binance_futures",
+                "date_utc": "2026-11-23",
+                "window_id": "2026-11-23T00:00Z",
+                "boot_id": "boot1",
+                "sha256": hashlib.sha256(b_blob).hexdigest(),
+                "bytes": len(b_blob),
+                "lines": len(b_lines),
+                "planned_start_wall_ns": base_wall,
+                "planned_end_wall_ns": base_wall + 900_000_000_000,
+                "late_frames_accepted": 0,
+            }), encoding="utf-8")
+
+            # Run MultiSymbolBinanceBBOExtractor
+            ext = MultiSymbolBinanceBBOExtractor(["BTC", "ETH"])
+            ext.process_partition(b_data, b_mf, tdir / "ext_parts")
+            ext_rep = ext.finalize(tdir / "ext_parts", tdir / "ext_out", None, "2026-11-23")
+            self.assertEqual(ext_rep["status"], "ok")
+            self.assertEqual(ext_rep["artifacts"]["BTC"]["rows"], 2)
+            self.assertEqual(ext_rep["artifacts"]["ETH"]["rows"], 1)
+
+            # Build synthetic Bitget partition with snapshot, delta, books1, and identical reconnect trade dup
+            bg_lines = [
+                f"{base_wall + 1000}\t1000\tconn0\t1\t1\tDATA\t"
+                + json.dumps({"action": "snapshot", "arg": {"topic": "books50", "symbol": "BTCUSDT"}, "data": [{"b": [["90000.0", "2.0"]], "a": [["90000.1", "2.0"]], "seq": 100, "pseq": -1, "ts": 1795392000000}]}),
+                f"{base_wall + 2000}\t2000\tconn0\t1\t2\tDATA\t"
+                + json.dumps({"action": "update", "arg": {"topic": "books50", "symbol": "BTCUSDT"}, "data": [{"b": [["90000.0", "2.5"]], "a": [], "seq": 101, "pseq": 100, "ts": 1795392000001}]}),
+                f"{base_wall + 2500}\t2500\tconn0\t1\t3\tDATA\t"
+                + json.dumps({"action": "snapshot", "arg": {"topic": "books1", "symbol": "BTCUSDT"}, "data": [{"b": [["90000.0", "2.5"]], "a": [["90000.1", "2.0"]], "ts": 1795392000001}]}),
+                f"{base_wall + 3000}\t3000\tconn0\t1\t4\tDATA\t"
+                + json.dumps({"action": "update", "arg": {"topic": "publicTrade", "symbol": "BTCUSDT"}, "data": [{"i": "t1", "p": "90000.1", "v": "0.1", "S": "buy", "T": 1795392000002}]}),
+                # Identical reconnect snapshot duplicate on same tradeId -> must deduplicate cleanly on Bitget
+                f"{base_wall + 4000}\t4000\tconn0\t2\t5\tDATA\t"
+                + json.dumps({"action": "snapshot", "arg": {"topic": "publicTrade", "symbol": "BTCUSDT"}, "data": [{"i": "t1", "p": "90000.1", "v": "0.1", "S": "buy", "T": 1795392000002}]}),
+            ]
+            bg_data = tdir / "bitget_0000.tsv.zst"
+            bg_blob = zstd.ZstdCompressor().compress(("\n".join(bg_lines) + "\n").encode("utf-8"))
+            bg_data.write_bytes(bg_blob)
+            bg_mf = tdir / "bitget_0000.manifest.json"
+            bg_mf.write_text(json.dumps({
+                "exchange": "bitget_v3",
+                "date_utc": "2026-11-23",
+                "window_id": "2026-11-23T00:00Z",
+                "boot_id": "boot1",
+                "sha256": hashlib.sha256(bg_blob).hexdigest(),
+                "bytes": len(bg_blob),
+                "lines": len(bg_lines),
+                "planned_start_wall_ns": base_wall,
+                "planned_end_wall_ns": base_wall + 900_000_000_000,
+                "late_frames_accepted": 0,
+            }), encoding="utf-8")
+
+            # Follower-only StreamConverter (include_leader=False) on Bitget
+            fconv = StreamConverter("BTCUSDT", making_exchange="bitget_v3", include_leader=False)
+            fconv.process_partition(bg_data, bg_mf, tdir / "f_parts")
+            frep = fconv.finalize(tdir / "f_parts", tdir / "f_out", None, "2026-11-23")
+            self.assertEqual(frep["status"], "ok")
+            self.assertEqual(frep["trade_dedup"]["identical_duplicates"], 1)
+            self.assertEqual(frep["trade_dedup"]["conflicting_duplicates"], 0)
+            kinds = {a["kind"] for a in frep["artifacts"]}
+            self.assertNotIn("binance_bbo", kinds)
+            self.assertIn("follower_l2_hbt", kinds)
+            self.assertIn("follower_l1_bbo", kinds)
+
+            # Single-symbol StreamConverter parity check vs MultiSymbolBinanceBBOExtractor
+            sconv = StreamConverter("BTCUSDT", making_exchange="bitget_v3", include_leader=True)
+            sconv.process_partition(b_data, b_mf, tdir / "s_parts")
+            sconv.process_partition(bg_data, bg_mf, tdir / "s_parts")
+            srep = sconv.finalize(tdir / "s_parts", tdir / "s_out", None, "2026-11-23")
+            self.assertEqual(srep["status"], "ok")
+            with np.load(tdir / "ext_out" / ext_rep["artifacts"]["BTC"]["path"]) as z1, \
+                 np.load(tdir / "s_out" / "binance_bbo_BTC_20261123.npz") as z2:
+                for col in z1.files:
+                    np.testing.assert_array_equal(z1[col], z2[col])
+
+            # Conflicting duplicate trade on Bitget MUST still hard-block!
+            bad_lines = bg_lines[:-1] + [
+                f"{base_wall + 4000}\t4000\tconn0\t2\t5\tDATA\t"
+                + json.dumps({"action": "snapshot", "arg": {"topic": "publicTrade", "symbol": "BTCUSDT"}, "data": [{"i": "t1", "p": "90099.9", "v": "0.1", "S": "buy", "T": 1795392000002}]}),
+            ]
+            bad_data = tdir / "bitget_bad.tsv.zst"
+            bad_blob = zstd.ZstdCompressor().compress(("\n".join(bad_lines) + "\n").encode("utf-8"))
+            bad_data.write_bytes(bad_blob)
+            bad_mf = tdir / "bitget_bad.manifest.json"
+            bad_mf.write_text(json.dumps({
+                "exchange": "bitget_v3", "date_utc": "2026-11-23", "window_id": "2026-11-23T00:00Z",
+                "boot_id": "boot1", "sha256": hashlib.sha256(bad_blob).hexdigest(), "bytes": len(bad_blob),
+                "lines": len(bad_lines), "planned_start_wall_ns": base_wall,
+                "planned_end_wall_ns": base_wall + 900_000_000_000, "late_frames_accepted": 0,
+            }), encoding="utf-8")
+            bconv = StreamConverter("BTCUSDT", making_exchange="bitget_v3", include_leader=False)
+            bconv.process_partition(bad_data, bad_mf, tdir / "b_parts")
+            brep = bconv.finalize(tdir / "b_parts", tdir / "b_out", None, "2026-11-23", diagnostic_allow_known_gaps=True)
+            self.assertEqual(brep["status"], "blocked")
+            self.assertTrue(any("conflicting_duplicate_trade" in x for x in brep["failed_items"]))
+
+    def test_prefixed_reports_and_batch_markdown(self):
+        from tokyo_l2_report_writer import render_batch_markdown_summary, write_unified_reports
+
+        dummy = {
+            "status": "complete",
+            "started_utc": "2026-11-23T00:00:00Z",
+            "finished_utc": "2026-11-23T01:00:00Z",
+            "config": {"experiment_name": "test_pair", "data_source": "google_drive_tokyo_l2",
+                       "signal_exchange": "binance_futures", "making_exchange": "gate_futures",
+                       "base_symbol": "ETH", "dates": {"eval_dates": ["2026-11-23"]}},
+            "days": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            written = write_unified_reports(dummy, out, prefix="gate_eth__")
+            self.assertEqual(written["json"], "gate_eth__unified_report.json")
+            self.assertEqual(written["markdown"], "gate_eth__research_report.md")
+            self.assertEqual(written["models_summary.csv"], "gate_eth__models_summary.csv")
+            for fname in written.values():
+                self.assertTrue((out / fname).is_file(), fname)
+        md = render_batch_markdown_summary({
+            "batch_name": "b1", "date_utc": "2026-11-23", "signal_exchange": "binance_futures",
+            "shared_leader_symbols": ["BTC", "ETH"], "status": "complete",
+            "started_utc": "t0", "finished_utc": "t1",
+            "experiments": {"gate_eth": {"status": "complete", "signal_exchange": "binance_futures",
+                                         "making_exchange": "gate_futures", "base_symbol": "ETH",
+                                         "stream_status": "ok", "anomaly_episode_count": 0, "elapsed_s": 12.3,
+                                         "stage5a_table": []}},
+        })
+        self.assertIn("gate_eth__", md)
 
     def test_stage3_verify_fill_parity_hashmap_tie_order(self):
         from tokyo_l2_research_stages import verify_fill_parity
