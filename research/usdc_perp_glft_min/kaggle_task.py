@@ -21,6 +21,7 @@ import pandas as pd
 
 from basis_moments import NS, exact_moments_5s
 from event_study import clocks_from_csv, fill_conditioning, lead_lag_report
+from wall_study import run_wall_study
 from check_okx_hft_data import SCHEMAS, extract_window
 from origin_glft import (DIAG_NAMES, GATE_SOURCE_SHA, LOT, MAX_UNITS, ORDER_QTY, REFIT_EVERY, STEP_NS,
                          TICK, WARMUP, run_origin_glft)
@@ -238,6 +239,16 @@ def main():
                            'min_coverage': float(coverage.min()),
                            'invalid_bbo_rows': {SIGNAL: sig_bad, TARGET: tgt_bad}}
         del tgt_ts, tgt_mid
+        save()
+        try:
+            report['wall_study'] = run_wall_study(paths['incremental_book_L2'], paths['trades'], TICK,
+                                                  lo, hi, LATENCY_NS, ORDER_QTY)
+        except Exception as exc:
+            report['wall_study'] = {'error': f'{type(exc).__name__}: {exc}',
+                                    'traceback': traceback.format_exc()[-3000:]}
+        print('WALL_STUDY', json.dumps({k: report['wall_study'].get(k) for k in
+                                        ('error', 'runtime_s', 'thresholds_eth', 'series_overflow')}),
+              flush=True)
         save()
         conv_start = min([start_us] + [int(c['first_local_us']) for c in counts.values()
                                        if c.get('first_local_us') is not None])
