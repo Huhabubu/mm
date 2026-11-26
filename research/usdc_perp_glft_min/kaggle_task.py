@@ -1,11 +1,14 @@
-'''Kaggle task: Tardis free day -> official HBT 2.4.4 -> simple GLFT on Binance USDC-M ETHUSDC.
+'''Kaggle task: Tardis free day -> official HBT 2.4.4 -> event-driven GLFT on Binance USDC-M ETHUSDC
+with the Gate-study origin-filtered ETHUSDT-perp spread signal (9 models).
 
-Fair price optionally led by the ETHUSDT perp bookTicker. Raw CSV and NPZ stay in /tmp;
-only report.json is written to the working directory.
+Signal usage follows research/gate_btc_binance_signal_20261115 (see origin_glft.py for the source SHA):
+600s time-weighted basis/sigma on a 5s clock, 1 sigma normal band, 1.645 sigma trigger, dominance and
+signal-price-event activation. Requested differences: no re-quote throttle, signal visible at its
+Tardis local_timestamp + 1ns (ordering only), order latency 1ms each way, maker fee 0.
+Raw CSV and NPZ stay in /tmp; only report.json is written to the working directory.
 '''
 import argparse
 import json
-import math
 import shutil
 import sys
 import time
@@ -15,208 +18,50 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from numba import njit
-from hftbacktest import BUY, BUY_EVENT, GTX, LIMIT, SELL
 
+from basis_moments import NS, exact_moments_5s
 from check_okx_hft_data import SCHEMAS, extract_window
-from glft_core import (fit_intensity_from_counts, glft_coefficients, glft_quotes,
-                       push_change, push_depth)
+from origin_glft import (DIAG_NAMES, GATE_SOURCE_SHA, LOT, MAX_UNITS, ORDER_QTY, REFIT_EVERY, STEP_NS,
+                         TICK, WARMUP, run_origin_glft)
 from tardis_segmented_hbt import convert_fuse_parts
 
 EXCHANGE = 'binance-futures'
 TARGET = 'ETHUSDC'
 SIGNAL = 'ETHUSDT'
-TICK = 0.01
-LOT = 0.001
-ORDER_QTY = 0.03
-MAX_UNITS = 5.0
-STEP_NS = 100_000_000
-STEP_S = 0.1
-STEPS_PER_HOUR = 36_000
-WARMUP = 6000
-WINDOW = 6000
-MIN_FIT_STEPS = 600
-REFIT_EVERY = 50
-GRID = 10
-MAX_BINS = 1000
-MIN_COUNT = 10
-BASIS_LAMBDA = 1.0 - 0.5 ** (STEP_S / 60.0)
-SIGNAL_MAX_AGE_NS = 1_000_000_000
+GAMMA = 0.05
+LATENCY_NS = 1_000_000
+SIGNAL_EXTRA_NS = 1
 TAKER_FEE = 0.0005
 FEE_BPS = (0.5, 1.0, 2.0)
-MARKOUT_STEPS = (('1s', 10), ('5s', 50), ('30s', 300), ('60s', 600))
-PARAMS = ((0.0, 0.05), (0.0, 0.01), (1.0, 0.05), (1.0, 0.01))
+MARKOUT_STEPS = (('100ms', 1), ('1s', 10), ('5s', 50), ('30s', 300), ('60s', 600))
+STEPS_PER_HOUR = 36_000
+BETAS = (0.25, 0.5, 0.75, 1.0)
+MODELS = ((('baseline', 0.0, 0),) + tuple((f'both_b{b:g}', b, 1) for b in BETAS)
+          + tuple((f'defensive_b{b:g}', b, 2) for b in BETAS))
 MAX_ROWS = 75_000_000
 WORK = Path('/tmp/usdc_perp_glft_min')
 FIT_NAMES = ('a_per_s', 'k_per_tick', 'sigma_ticks_per_sqrt_s', 'half_spread_ticks', 'skew_ticks_per_unit')
 
 
-@njit
-def run_glft(hbt, max_steps, sig_ts, sig_mid, alpha, gamma, out_mid, out_eq, fills, fits):
-    depth_ring = np.zeros(WINDOW, np.int64)
-    counts = np.zeros(MAX_BINS + 1, np.int64)
-    chg_ring = np.zeros(WINDOW, np.float64)
-    d_idx = 0
-    d_fill = 0
-    c_idx = 0
-    c_fill = 0
-    s1 = 0.0
-    s2 = 0.0
-    prev_mid = np.nan
-    a_hat = 0.0
-    k_hat = 0.0
-    sigma = 0.0
-    half = 0.0
-    skew = 0.0
-    fitted = False
-    basis = 0.0
-    basis_init = False
-    sp = 0
-    n_sig = sig_ts.shape[0]
-    sig_ok = 0
-    oid = 1
-    st = hbt.state_values(0)
-    prev_pos = st.position
-    prev_bal = st.balance
-    prev_nt = st.num_trades
-    n_fill = 0
-    n_fit = 0
-    multi = 0
-    submits = 0
-    cancels = 0
-    max_pos = 0.0
-    step = 0
-    while step < max_steps:
-        if hbt.elapse(STEP_NS) != 0:
-            break
-        now = hbt.current_timestamp
-        hbt.clear_inactive_orders(0)
-        book = hbt.depth(0)
-        bb = book.best_bid_tick
-        ba = book.best_ask_tick
-        valid = bb > 0 and ba > bb and ba < 1_000_000_000
-        mid = prev_mid
-        if valid:
-            mid = (bb + ba) / 2.0
-        if valid and not math.isnan(prev_mid):
-            furthest = 0.0
-            for tr in hbt.last_trades(0):
-                p = tr.px / TICK
-                if (tr.ev & BUY_EVENT) == BUY_EVENT:
-                    d = p - prev_mid
-                else:
-                    d = prev_mid - p
-                if d > furthest:
-                    furthest = d
-            dj = int(furthest * GRID)
-            if dj > MAX_BINS:
-                dj = MAX_BINS
-            d_idx, d_fill = push_depth(depth_ring, d_idx, d_fill, counts, dj)
-            c_idx, c_fill, s1, s2 = push_change(chg_ring, c_idx, c_fill, s1, s2, mid - prev_mid)
-        hbt.clear_last_trades(0)
-        prev_mid = mid
-
-        mt = 0.0
-        while sp + 1 < n_sig and sig_ts[sp + 1] <= now:
-            sp += 1
-        sig_valid = n_sig > 0 and sig_ts[sp] <= now and now - sig_ts[sp] <= SIGNAL_MAX_AGE_NS
-        if sig_valid:
-            sig_ok += 1
-            mt = sig_mid[sp] / TICK
-            if valid:
-                if basis_init:
-                    basis += BASIS_LAMBDA * (mid - mt - basis)
-                else:
-                    basis = mid - mt
-                    basis_init = True
-
-        if step % REFIT_EVERY == 0 and d_fill >= MIN_FIT_STEPS:
-            a, k, ok = fit_intensity_from_counts(counts, d_fill * STEP_S, MIN_COUNT)
-            mean = s1 / c_fill
-            var = s2 / c_fill - mean * mean
-            sigma = math.sqrt(var / STEP_S) if var > 0.0 else 0.0
-            if ok:
-                a_hat = a
-                k_hat = k * GRID
-                fitted = True
-            if fitted and sigma > 0.0:
-                half, skew = glft_coefficients(a_hat, k_hat, sigma, gamma, 1.0)
-            if fitted and n_fit < fits.shape[0]:
-                fits[n_fit, 0] = a_hat
-                fits[n_fit, 1] = k_hat
-                fits[n_fit, 2] = sigma
-                fits[n_fit, 3] = half
-                fits[n_fit, 4] = skew
-                n_fit += 1
-
-        st = hbt.state_values(0)
-        pos = st.position
-        dn = st.num_trades - prev_nt
-        if dn > 0:
-            if dn > 1:
-                multi += 1
-            dpos = pos - prev_pos
-            if abs(dpos) > 1e-12 and n_fill < fills.shape[0]:
-                fills[n_fill, 0] = step
-                fills[n_fill, 1] = 1.0 if dpos > 0 else -1.0
-                fills[n_fill, 2] = -(st.balance - prev_bal) / dpos
-                fills[n_fill, 3] = abs(dpos)
-                fills[n_fill, 4] = dn
-                n_fill += 1
-        prev_pos = pos
-        prev_bal = st.balance
-        prev_nt = st.num_trades
-        if abs(pos) > max_pos:
-            max_pos = abs(pos)
-        out_mid[step] = mid * TICK
-        out_eq[step] = st.balance + pos * mid * TICK - st.fee
-
-        quote = (step >= WARMUP and valid and fitted and sigma > 0.0
-                 and math.isfinite(half) and math.isfinite(skew) and half < 1e5 and skew < 1e5)
-        if quote:
-            fair = mid
-            if alpha > 0.0 and sig_valid and basis_init:
-                fair = mid + alpha * (mt + basis - mid)
-            q = pos / ORDER_QTY
-            bid, ask = glft_quotes(fair, q, half, skew, bb, ba)
-            want_bid = q < MAX_UNITS - 1e-9 and bid > 0
-            want_ask = q > -MAX_UNITS + 1e-9
-            has_bid = False
-            has_ask = False
-            values = hbt.orders(0).values()
-            while values.has_next():
-                o = values.get()
-                if o.side == BUY:
-                    if want_bid and not has_bid and o.price_tick == bid:
-                        has_bid = True
-                    elif o.cancellable:
-                        hbt.cancel(0, o.order_id, False)
-                        cancels += 1
-                elif o.side == SELL:
-                    if want_ask and not has_ask and o.price_tick == ask:
-                        has_ask = True
-                    elif o.cancellable:
-                        hbt.cancel(0, o.order_id, False)
-                        cancels += 1
-            if want_bid and not has_bid:
-                hbt.submit_buy_order(0, oid, bid * TICK, ORDER_QTY, GTX, LIMIT, False)
-                oid += 1
-                submits += 1
-            if want_ask and not has_ask:
-                hbt.submit_sell_order(0, oid, ask * TICK, ORDER_QTY, GTX, LIMIT, False)
-                oid += 1
-                submits += 1
-        step += 1
-    st = hbt.state_values(0)
-    return (step, n_fill, n_fit, multi, submits, cancels, max_pos, sig_ok,
-            st.trading_value, st.fee, st.num_trades)
-
-
 def read_bbo(path):
     df = pd.read_csv(path, usecols=['local_timestamp', 'bid_price', 'ask_price'])
     ts = df['local_timestamp'].to_numpy(np.int64) * 1000
-    mid = 0.5 * (df['bid_price'].to_numpy(np.float64) + df['ask_price'].to_numpy(np.float64))
-    return ts, mid, float(df['bid_price'].min()), float(df['ask_price'].max())
+    bid = df['bid_price'].to_numpy(np.float64)
+    ask = df['ask_price'].to_numpy(np.float64)
+    ok = np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask > bid)
+    if np.any(np.diff(ts) < 0):
+        raise ValueError(f'unsorted bookTicker {path.name}')
+    return ts[ok], 0.5 * (bid[ok] + ask[ok]), float(bid[ok].min()), float(ask[ok].max()), int((~ok).sum())
+
+
+def basis_grid(sig_ts, sig_mid, tgt_ts, tgt_mid):
+    first = max(int(sig_ts[0]), int(tgt_ts[0]))
+    last = min(int(sig_ts[-1]), int(tgt_ts[-1]))
+    step = 5 * NS
+    start = -(-(first + 600 * NS) // step) * step
+    if start > last:
+        raise ValueError('not enough paired history for a 600s basis')
+    return exact_moments_5s(sig_ts, sig_mid, tgt_ts, tgt_mid, start, last + 1)
 
 
 def pct(x):
@@ -227,33 +72,37 @@ def pct(x):
     return dict(zip(('p05', 'p50', 'p95'), (float(v) for v in np.percentile(x, [5, 50, 95]))))
 
 
-def summarize(res, alpha, gamma, mid, eq, fills, fits):
-    steps, n_fill, n_fit, multi, submits, cancels, max_pos, sig_ok, turnover, fee, n_trades = res
+def summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag):
+    (steps, n_fill, n_fit, submits, cancels, max_pos, n_sig, n_feed, n_resp,
+     turnover, fee, n_trades, t0) = res
     mid = mid[:steps]
     eq = eq[:steps]
+    pos = pos[:steps]
     f = fills[:n_fill]
     pnl = float(eq[-1]) if steps else float('nan')
-    out = {'alpha': alpha, 'gamma': gamma, 'steps': int(steps), 'pnl_usdc': pnl,
-           'pnl_before_taker_fee_usdc': pnl + float(fee), 'taker_fee_usdc': float(fee),
-           'fills': int(n_trades), 'fill_steps': int(n_fill), 'multi_fill_steps': int(multi),
-           'buy_fill_steps': int((f[:, 1] > 0).sum()), 'sell_fill_steps': int((f[:, 1] < 0).sum()),
+    out = {'model': name, 'beta': beta, 'quote_mode': int(mode), 'gamma': GAMMA, 'samples': int(steps),
+           'pnl_usdc': pnl, 'pnl_before_taker_fee_usdc': pnl + float(fee), 'taker_fee_usdc': float(fee),
+           'fills': int(n_trades), 'fill_records': int(n_fill),
+           'buy_fills': int((f[:, 1] > 0).sum()), 'sell_fills': int((f[:, 1] < 0).sum()),
            'turnover_usdc': float(turnover), 'submits': int(submits), 'cancels': int(cancels),
            'max_abs_position_eth': float(max_pos), 'max_abs_position_units': float(max_pos) / ORDER_QTY,
-           'signal_available_ratio': float(sig_ok) / steps if steps else 0.0}
+           'mean_abs_position_units': float(np.nanmean(np.abs(pos[WARMUP:]))) / ORDER_QTY if steps > WARMUP else None,
+           'signal_rows': int(n_sig), 'target_feed_wakeups': int(n_feed), 'order_reply_wakeups': int(n_resp),
+           'origin_diag': dict(zip(DIAG_NAMES, (int(v) for v in diag)))}
     out['pnl_by_maker_fee_bp'] = {str(bp): pnl - bp * 1e-4 * float(turnover) for bp in FEE_BPS}
     mk = {}
-    for name, h in MARKOUT_STEPS:
-        idx = f[:, 0].astype(np.int64) + h
+    first = np.maximum(np.ceil((f[:, 0] - t0) / STEP_NS).astype(np.int64) - 1, 0)
+    for label, h in MARKOUT_STEPS:
+        idx = first + h
         ok = idx < steps
         if not ok.any():
-            mk[name] = None
+            mk[label] = None
             continue
         px = f[ok, 2]
         v = f[ok, 1] * (mid[idx[ok]] - px) / px * 1e4
         w = f[ok, 3]
-        mk[name] = {'n': int(ok.sum()), 'mean_bp': float(np.nanmean(v)),
-                    'median_bp': float(np.nanmedian(v)),
-                    'qty_weighted_bp': float(np.nansum(v * w) / np.sum(w))}
+        mk[label] = {'n': int(ok.sum()), 'mean_bp': float(np.nanmean(v)), 'median_bp': float(np.nanmedian(v)),
+                     'qty_weighted_bp': float(np.nansum(v * w) / np.sum(w))}
     out['markout'] = mk
     hourly = []
     if steps:
@@ -269,7 +118,7 @@ def summarize(res, alpha, gamma, mid, eq, fills, fits):
         out['max_drawdown_usdc'] = float(np.max(np.maximum.accumulate(e2) - e2))
     out['hourly_pnl_usdc'] = hourly
     fz = fits[:n_fit]
-    out['fit'] = {name: pct(fz[:, i]) for i, name in enumerate(FIT_NAMES)}
+    out['fit'] = {k: pct(fz[:, i]) for i, k in enumerate(FIT_NAMES)}
     return out
 
 
@@ -282,12 +131,17 @@ def main():
     t0 = time.time()
     report = {'status': 'started', 'day': args.day, 'hours': args.hours, 'exchange': EXCHANGE,
               'target': TARGET, 'signal': SIGNAL,
-              'config': {'tick': TICK, 'lot': LOT, 'order_qty_eth': ORDER_QTY, 'max_units': MAX_UNITS,
-                         'step_ms': STEP_NS // 1_000_000, 'warmup_steps': WARMUP, 'window_steps': WINDOW,
-                         'refit_every_steps': REFIT_EVERY, 'grid_per_tick': GRID, 'min_count': MIN_COUNT,
-                         'basis_half_life_s': 60.0, 'signal_max_age_ms': SIGNAL_MAX_AGE_NS // 1_000_000,
-                         'latency_ms': [1, 1], 'queue_model': 'power_prob(2.0)', 'fill_model': 'no_partial',
-                         'maker_fee': 0.0, 'taker_fee': TAKER_FEE, 'params_alpha_gamma': PARAMS,
+              'config': {'gate_source_sha': GATE_SOURCE_SHA, 'tick': TICK, 'lot': LOT, 'order_qty_eth': ORDER_QTY,
+                         'max_units': MAX_UNITS, 'gamma': GAMMA, 'sample_ms': STEP_NS // 1_000_000,
+                         'warmup_samples': WARMUP, 'refit_every_samples': REFIT_EVERY,
+                         'decision': 'event-driven: target feed, order reply, signal row, 100ms sample',
+                         'requote_throttle_ms': None, 'latency_ms': [1, 1],
+                         'signal_extra_latency_ns': SIGNAL_EXTRA_NS,
+                         'basis': '600s time-weighted mean/sigma of ETHUSDT mid - ETHUSDC mid, 5s clock',
+                         'normal_band_sigma': 1.0, 'trigger_sigma': 1.645,
+                         'models': [list(m) for m in MODELS],
+                         'queue_model': 'power_prob(2.0)', 'fill_model': 'no_partial',
+                         'maker_fee': 0.0, 'taker_fee': TAKER_FEE,
                          'historical_spec_verified': False, 'maker_zero_fee_verified': False}}
     out_path = Path('report.json')
 
@@ -317,9 +171,17 @@ def main():
         report['feed_counts'][f'{SIGNAL}_book_ticker'] = sig_counts
         report['download_s'] = round(time.time() - t0, 1)
         save()
-        sig_ts, sig_mid, _, _ = read_bbo(sig_path)
-        _, _, lo, hi = read_bbo(paths['book_ticker'])
+        sig_ts, sig_mid, _, _, sig_bad = read_bbo(sig_path)
+        tgt_ts, tgt_mid, lo, hi, tgt_bad = read_bbo(paths['book_ticker'])
         sig_path.unlink()
+        sig_ts = sig_ts + SIGNAL_EXTRA_NS
+        grid, basis, bsigma, coverage = basis_grid(sig_ts, sig_mid, tgt_ts, tgt_mid)
+        report['basis'] = {'grid_points': int(len(grid)), 'first_grid_ns': int(grid[0]),
+                           'basis_usdt': pct(basis), 'sigma_ticks': pct(bsigma / TICK),
+                           'min_coverage': float(coverage.min()),
+                           'invalid_bbo_rows': {SIGNAL: sig_bad, TARGET: tgt_bad}}
+        del tgt_ts, tgt_mid
+        save()
         conv_start = min([start_us] + [int(c['first_local_us']) for c in counts.values()
                                        if c.get('first_local_us') is not None])
         parts, details = convert_fuse_parts(paths, counts, WORK, conv_start, end_us,
@@ -333,9 +195,9 @@ def main():
         from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
         max_steps = int(args.hours * STEPS_PER_HOUR)
         report['variants'] = {}
-        for alpha, gamma in PARAMS:
+        for name, beta, mode in MODELS:
             asset = (BacktestAsset().data([str(p) for p in parts]).linear_asset(1.0)
-                     .constant_order_latency(1_000_000, 1_000_000)
+                     .constant_order_latency(LATENCY_NS, LATENCY_NS)
                      .power_prob_queue_model(2.0).no_partial_fill_exchange()
                      .trading_value_fee_model(0.0, TAKER_FEE)
                      .tick_size(TICK).lot_size(LOT)
@@ -343,20 +205,22 @@ def main():
             hbt = ROIVectorMarketDepthBacktest([asset])
             mid = np.full(max_steps, np.nan)
             eq = np.full(max_steps, np.nan)
-            fills = np.zeros((max_steps, 5))
-            fits = np.full((max_steps // REFIT_EVERY + 1, 5), np.nan)
+            pos = np.full(max_steps, np.nan)
+            fills = np.zeros((max_steps, 4))
+            fits = np.full((max_steps // REFIT_EVERY + 2, 5), np.nan)
+            diag = np.zeros(len(DIAG_NAMES), np.int64)
             t1 = time.time()
             try:
-                res = run_glft(hbt, max_steps, sig_ts, sig_mid, alpha, gamma, mid, eq, fills, fits)
+                res = run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid, basis, bsigma, beta, mode, GAMMA,
+                                      mid, eq, pos, fills, fits, diag)
             finally:
                 hbt.close()
-            name = f'alpha{alpha:g}_gamma{gamma:g}'
-            v = summarize(res, alpha, gamma, mid, eq, fills, fits)
+            v = summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag)
             v['runtime_s'] = round(time.time() - t1, 1)
             report['variants'][name] = v
-            print('VARIANT', name, json.dumps({k: v[k] for k in ('pnl_usdc', 'fills', 'turnover_usdc',
-                                                                 'max_abs_position_units',
-                                                                 'signal_available_ratio')}), flush=True)
+            print('VARIANT', name, json.dumps({k: v[k] for k in ('pnl_usdc', 'fills', 'turnover_usdc', 'submits',
+                                                                 'cancels', 'max_abs_position_units',
+                                                                 'origin_diag', 'runtime_s')}), flush=True)
             save()
         report['status'] = 'complete'
     except Exception as exc:
