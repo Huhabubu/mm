@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from basis_moments import NS, exact_moments_5s
+from event_study import clocks_from_csv, fill_conditioning, lead_lag_report
 from check_okx_hft_data import SCHEMAS, extract_window
 from origin_glft import (DIAG_NAMES, GATE_SOURCE_SHA, LOT, MAX_UNITS, ORDER_QTY, REFIT_EVERY, STEP_NS,
                          TICK, WARMUP, run_origin_glft)
@@ -226,6 +227,9 @@ def main():
         tgt_ts, tgt_mid, lo, hi, tgt_bad = read_bbo(paths['book_ticker'])
         report['raw_mid_changes'] = {SIGNAL: mid_change_stats(sig_ts, sig_mid),
                                      TARGET: mid_change_stats(tgt_ts, tgt_mid)}
+        sig_clk = clocks_from_csv(sig_path)
+        tgt_clk = clocks_from_csv(paths['book_ticker'])
+        report['lead_lag'] = lead_lag_report(sig_clk, tgt_clk, TICK)
         sig_path.unlink()
         sig_ts = sig_ts + SIGNAL_EXTRA_NS
         grid, basis, bsigma, coverage = basis_grid(sig_ts, sig_mid, tgt_ts, tgt_mid)
@@ -277,6 +281,9 @@ def main():
                                           'raw': mid_change_stats(sig_ts, sig_mid, lo_ns, hi_ns),
                                           'loop_signal_price_updates': v['origin_diag']['signal_price_updates'],
                                           'loop_signal_rows': v['signal_rows']}
+                report['fill_event_study'] = fill_conditioning(
+                    fills[:int(res[1])], sig_clk, tgt_clk, TICK, LATENCY_NS,
+                    lambda sub: markout_table(sub, mid, int(res[0]), int(res[-1])))
             v['runtime_s'] = round(time.time() - t1, 1)
             report['variants'][name] = v
             print('VARIANT', name, json.dumps({k: v[k] for k in ('pnl_usdc', 'fills', 'turnover_usdc', 'submits',
