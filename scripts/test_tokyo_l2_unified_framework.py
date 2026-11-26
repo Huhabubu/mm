@@ -722,8 +722,9 @@ class UnifiedFrameworkTests(unittest.TestCase):
             fconv.process_partition(bg_data, bg_mf, tdir / "f_parts")
             frep = fconv.finalize(tdir / "f_parts", tdir / "f_out", None, "2026-11-23")
             self.assertEqual(frep["status"], "ok")
-            self.assertEqual(frep["trade_dedup"]["identical_duplicates"], 1)
-            self.assertEqual(frep["trade_dedup"]["conflicting_duplicates"], 0)
+            self.assertEqual(frep["trade_dedup"].get("duplicate_trade_id", 0), 1)
+            self.assertEqual(frep["trade_dedup"].get("conflicting_duplicate_trade", 0), 0)
+            self.assertEqual(frep["trade_dedup"].get("trades_emitted", 0), 1)
             kinds = {a["kind"] for a in frep["artifacts"]}
             self.assertNotIn("binance_bbo", kinds)
             self.assertIn("follower_l2_hbt", kinds)
