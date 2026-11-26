@@ -42,9 +42,11 @@ jobs:
         run: |
           python -m pip install -q hftbacktest==2.4.4 numba numpy pandas
           python -m pip show hftbacktest | sed -n '1,2p'
-      - name: Unit tests (glft_core)
+      - name: Unit tests (glft_core, origin_glft)
         working-directory: research/usdc_perp_glft_min
-        run: python test_glft_core.py
+        run: |
+          python test_glft_core.py
+          python test_origin_glft.py
       - name: Smoke 15 min (10 min warmup + 5 min quoting)
         shell: bash
         run: |
@@ -62,9 +64,9 @@ jobs:
           print(json.dumps({k: r.get(k) for k in ("status", "error", "traceback", "elapsed_s", "download_s")}, indent=2))
           for name, v in (r.get("variants") or {}).items():
               print(name, json.dumps({k: v.get(k) for k in ("pnl_usdc", "fills", "turnover_usdc", "submits", "cancels",
-                                                          "max_abs_position_units", "signal_available_ratio", "fit")}))
+                                                          "max_abs_position_units", "origin_diag", "fit")}))
           assert r["status"] == "complete"
-          assert len(r["variants"]) == 4
+          assert len(r["variants"]) == 9
           PY
       - uses: actions/upload-artifact@v4
         if: always()
@@ -238,5 +240,5 @@ jobs:
           assert s["git_sha"] == os.environ["GITHUB_SHA"], "stale Kaggle output"
           assert s["returncode"] == 0, s
           assert r["status"] == "complete", r.get("error")
-          assert len(r["variants"]) == 4
+          assert len(r["variants"]) == 9
           PY
