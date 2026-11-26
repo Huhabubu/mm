@@ -1,60 +1,10 @@
 {
-  "status": "anchor_unverified",
+  "status": "passed",
   "run_id": "trial15_20261122T0745Z",
   "window_id": "2026-11-25T08:30Z",
-  "warmup_windows": 1,
+  "warmup_windows": 0,
   "replay_sample_seconds": 0,
-  "reconstructed_lookback_windows": 2,
-  "reconstructed_exchanges": [
-    "binance_futures",
-    "bitget_v3",
-    "gate_futures"
-  ],
-  "reconstructed_inputs": [
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "04d467e896069a9fab1adcb4eb95e021aedec71ed8d666aca1d8925218fc8fe4",
-      "data_sha256": "01f9631ce4182157fc8e890ab881aaa1a98657d0ffd6e0989e9634339a99a2e7"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "4725e0a6f015d458d63f72e63dec12cc3ef2eec64deab4802d0cc5c698272c21",
-      "data_sha256": "5a06741f96a193e8362c21bb527f9410966402408f7ccebed39dc33108c93260"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "e99375e260bf3a3cc6d3987f64839d9bad0f8b8a7eeb228a7cedd282965703c8",
-      "data_sha256": "28be2ca322ab469279772965cedf498a3cf84b3eb7668527abeaada46acdfcbb"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "526ffe4b7329dc3573d87aaa25d42595a6fa1bef1afe432a01b1b0dc39b0cec0",
-      "data_sha256": "9966cd5bcb8bf58e42d73b2294f4abec059c03b4adcfb2e77f57bc5fb398bd23"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "b023d84eafe397c54007821c8275530795d1ce766c81cec1c8f7899d6f46759b",
-      "data_sha256": "136ef13b2f1fee32890c137cf2cca9b2e2bf82cbbf7646d513eda224903be684"
-    }
-  ],
-  "warmup_inputs": [
-    {
-      "exchange": "binance_futures",
-      "window_id": "2026-11-25T08:15Z"
-    },
-    {
-      "exchange": "bitget_v3",
-      "window_id": "2026-11-25T08:15Z"
-    },
-    {
-      "exchange": "bybit_linear",
-      "window_id": "2026-11-25T08:15Z"
-    },
-    {
-      "exchange": "gate_futures",
-      "window_id": "2026-11-25T08:15Z"
-    }
-  ],
+  "warmup_inputs": [],
   "target_inputs": [
     {
       "exchange": "binance_futures",
@@ -77,8 +27,8 @@
       "data_sha256": "3efc7b777ef4dc28c6ddacd2736315f559429452eda89236b449b387c6ee5691"
     }
   ],
-  "boundary_checkpoint_markets": 18,
-  "boundary_book_anchored_markets": 18,
+  "boundary_checkpoint_markets": 24,
+  "boundary_book_anchored_markets": 24,
   "connection_overlap_trades": [],
   "replay_trade_rows": [
     {
@@ -107,22 +57,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "BTCUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 46
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "DOGEUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 46
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "DOGEUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 46
     },
@@ -135,22 +71,8 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "ETHUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 46
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "SOLUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 46
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "SOLUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 46
     },
@@ -163,77 +85,14 @@
     },
     {
       "exchange": "bitget_v3",
-      "symbol": "SUIUSDT",
-      "phase": "warmup",
-      "connection": "A",
-      "epoch": 46
-    },
-    {
-      "exchange": "bitget_v3",
       "symbol": "XRPUSDT",
       "phase": "target",
-      "connection": "A",
-      "epoch": 46
-    },
-    {
-      "exchange": "bitget_v3",
-      "symbol": "XRPUSDT",
-      "phase": "warmup",
       "connection": "A",
       "epoch": 46
     }
   ],
   "missing_anchor_sources": [],
-  "unanchored_lookback_markets": [
-    {
-      "exchange": "bybit_linear",
-      "symbol": "BTCUSDT",
-      "connection": "B",
-      "epoch": 7,
-      "delta_frames_continuity_checked": 41208,
-      "proven_chain_breaks": 0
-    },
-    {
-      "exchange": "bybit_linear",
-      "symbol": "DOGEUSDT",
-      "connection": "B",
-      "epoch": 7,
-      "delta_frames_continuity_checked": 28037,
-      "proven_chain_breaks": 0
-    },
-    {
-      "exchange": "bybit_linear",
-      "symbol": "ETHUSDT",
-      "connection": "B",
-      "epoch": 7,
-      "delta_frames_continuity_checked": 42303,
-      "proven_chain_breaks": 0
-    },
-    {
-      "exchange": "bybit_linear",
-      "symbol": "SOLUSDT",
-      "connection": "B",
-      "epoch": 7,
-      "delta_frames_continuity_checked": 34126,
-      "proven_chain_breaks": 0
-    },
-    {
-      "exchange": "bybit_linear",
-      "symbol": "SUIUSDT",
-      "connection": "B",
-      "epoch": 7,
-      "delta_frames_continuity_checked": 24600,
-      "proven_chain_breaks": 0
-    },
-    {
-      "exchange": "bybit_linear",
-      "symbol": "XRPUSDT",
-      "connection": "B",
-      "epoch": 7,
-      "delta_frames_continuity_checked": 40992,
-      "proven_chain_breaks": 0
-    }
-  ],
+  "unanchored_lookback_markets": [],
   "boundary_events": [],
   "archive_file_checks": [
     {
@@ -405,7 +264,7 @@
     "issues": []
   },
   "proven_protocol_issues": [],
-  "protocol_status": "anchor_unverified",
+  "protocol_status": "passed",
   "market_availability": [
     {
       "exchange": "binance_futures",
@@ -932,8 +791,8 @@
         {
           "start_wall_ns": 1795595400000000000,
           "end_wall_ns": 1795596300000000000,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
         }
       ]
     },
@@ -971,8 +830,8 @@
         {
           "start_wall_ns": 1795595400000000000,
           "end_wall_ns": 1795596300000000000,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
         }
       ]
     },
@@ -1010,8 +869,8 @@
         {
           "start_wall_ns": 1795595400000000000,
           "end_wall_ns": 1795596300000000000,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
         }
       ]
     },
@@ -1049,8 +908,8 @@
         {
           "start_wall_ns": 1795595400000000000,
           "end_wall_ns": 1795596300000000000,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
         }
       ]
     },
@@ -1088,8 +947,8 @@
         {
           "start_wall_ns": 1795595400000000000,
           "end_wall_ns": 1795596300000000000,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
         }
       ]
     },
@@ -1127,8 +986,8 @@
         {
           "start_wall_ns": 1795595400000000000,
           "end_wall_ns": 1795596300000000000,
-          "status": "unverified",
-          "reason": "initial_state_unverified"
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
         }
       ]
     },
@@ -1586,6 +1445,108 @@
       "ask_levels": 50
     },
     {
+      "exchange": "bybit_linear",
+      "symbol": "BTCUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        7
+      ],
+      "seq": 21408161,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795596299998011554,
+      "book_anchored": true,
+      "book_sha256": "7fb45db19552d4e7a81289c53e8f38372b9551f9bffeb252c7b73470d8bb3d29",
+      "last_exchange_ns": 1795596299992000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "DOGEUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        7
+      ],
+      "seq": 15976392,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795596299988464067,
+      "book_anchored": true,
+      "book_sha256": "2504adacb1df87ca99bd3789a7f97b3743ca8e869641d56c1ae3c79f12f3e45b",
+      "last_exchange_ns": 1795596299982000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "ETHUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        7
+      ],
+      "seq": 22920314,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795596299997352463,
+      "book_anchored": true,
+      "book_sha256": "91323cde7e100c694bc85e34c2ffb5a8316c2690c358f3015eadce96d4489707",
+      "last_exchange_ns": 1795596299991000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SOLUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        7
+      ],
+      "seq": 19220386,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795596299993130047,
+      "book_anchored": true,
+      "book_sha256": "c42c2a0a125bbc9dcfe4a3f39fcb27a1267cf98ef6728d47e1171046bfc1ec82",
+      "last_exchange_ns": 1795596299987000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SUIUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        7
+      ],
+      "seq": 14743455,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795596299996283519,
+      "book_anchored": true,
+      "book_sha256": "c0de7728b866524fb9fafd276415de49d2b7b07f17ce2cf7476b53a3f8e2a56a",
+      "last_exchange_ns": 1795596299991000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "XRPUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        7
+      ],
+      "seq": 20736776,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795596299993483363,
+      "book_anchored": true,
+      "book_sha256": "680285f15e49b7579bcec659565d6af379982be99f44413890c7d0e37928dd9d",
+      "last_exchange_ns": 1795596299986000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
       "exchange": "gate_futures",
       "symbol": "BTCUSDT",
       "connection": [
@@ -1690,7 +1651,7 @@
   ],
   "replay": {},
   "protocol_qa_version": 2,
-  "checker": "31590e1ab0f58436b0967a969384994aabfc6b82/158b875b43e29569cc304778c92d9e62c761455c3f30b9d808a8d56149183cd4",
+  "checker": "2e97490cf62fa80029a19c5eb0e38fc0e14f9d56/9e9dfb0f32482e3d0cc93fb66a05ff08963aed0f9d3d06ba889554f3bd1f9274",
   "archive_revision": "sha256:1de61722aca1e3e49871ac504d13edeb38add4db1cfb75d250866804bc49eb65",
   "previous_inputs": [
     {
@@ -1714,490 +1675,9 @@
       "data_sha256": "9966cd5bcb8bf58e42d73b2294f4abec059c03b4adcfb2e77f57bc5fb398bd23"
     }
   ],
-  "anchor_lookback_windows": 24,
-  "anchor_lookback_inputs": [
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "04d467e896069a9fab1adcb4eb95e021aedec71ed8d666aca1d8925218fc8fe4",
-      "data_sha256": "01f9631ce4182157fc8e890ab881aaa1a98657d0ffd6e0989e9634339a99a2e7"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "1355476880ab62af016efac0a88d40ec4fbfe98c3844600f4339eff1ec78b8cb",
-      "data_sha256": "c337ad35b84e737671f63212be2d90cd2701afda1c190cdb782df8dcac46d344"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "1e029a045500f0c2907baea5c5e040ffe9df3c5c3d666fc0b51a59ba12ff444c",
-      "data_sha256": "66527e7c6a5aca453045d8dcbaa39e8fd65abb49fa363e417998671f03a92002"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "2bf7b145cb62ce31a53c294faec9fee4878fe34b4faec482ef8149599b584fda",
-      "data_sha256": "87c0a5a28d0ab5125a2d8118dec2e97f130372541b6d10b093f0ae9cdf356e95"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "4725e0a6f015d458d63f72e63dec12cc3ef2eec64deab4802d0cc5c698272c21",
-      "data_sha256": "5a06741f96a193e8362c21bb527f9410966402408f7ccebed39dc33108c93260"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "4c18cdf531699e413bf4abb1e33a3b5dabfadad467328082cfd8322b8cd6f3f6",
-      "data_sha256": "e6bf4abe423f87fb5f7935d25f453fc8f4c787438ed3bb212f357332497bf903"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "4c53efc75da16c3a5cb5729196a985f7a8cb9ae64cac8b619743c389dffdfb31",
-      "data_sha256": "ee63c613587ec14d39bd48ca2b96df8c13c618ad8d36ccd7a4b76354eed34aa9"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "5379e2172882abc4d88c5cfdd6e9f1d625d34dd18973085f74b601b35397c5cc",
-      "data_sha256": "c60f0ce10ceab9162e98be17cf9acca9ebb078df442bd7b7dd6323183546eb3e"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "57ed2233817bca5bef099f29739e4d803a627d12c4de2c4d43c5e13496af5de6",
-      "data_sha256": "5093a782bdf48836ccaee9697d2319d17a19002d0ee134f128e1c43a2e1b57ed"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "59a44e2e47e5d25c5d05b17b2f991f82a31c356d19268cb5d09e7ddda8d6c021",
-      "data_sha256": "40f24437a2f2c28af89d54bc99a488bda802e1edc799c644a9937d64a7f64702"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "645493d4f14ebf9051e5b05d18c4cd0b2a7da8b5a957293f29f07fabe4024217",
-      "data_sha256": "c009df943d4b288c6a3e0529c3aba7d67a4fcdea77ad8d956a77e8480138ddb6"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "6e8079e334531c04742b984472dbcc85b8c4bb85e41eb561408007dac5adbb3e",
-      "data_sha256": "7c27cce5ad272e2406ac7d288728897415522cc90f085b72e24111ee3a09d68e"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "71a9cfb5cbd180cef73664364b6d17fa88cda8b06ed55e30b38b0ad6e6861142",
-      "data_sha256": "e9d8107a164cb44659b7d4e41447629afb88adac7f87725664ef8785f8a37de0"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "8020c209a0188de9b860b48fbee0149e89ed00662f1b3fe2c776d9fbe732af4e",
-      "data_sha256": "fa1049bc0975fd5fe9e596cfd10a5c4b4cc8b23611ca1d6f3f3d01d6bdb55cab"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "808c19ac9642beaf212fea29f5a6be7d8990249c3c79dc345d6b097c8042aa85",
-      "data_sha256": "39cbe6d503510a599cfa7633ea680bf7a29f264d6a4fe8ba5491bab633cf8b14"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "860d761122e34b21aab752a7f193813675e945ac1bd19da82347d48da5ce9dfb",
-      "data_sha256": "901aa53b9069c2b8dae6554d54ce76a57182c153694b9fbd590b06b0b5866534"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "8735e9de44a30cd933e6a52fee5339867e575bf41660203415bae285d57fa179",
-      "data_sha256": "4d8f6968412a06891ba783664a5fbcc8627f2df725290e42aaae70eee2cd85e0"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "8890e20c83eb2ab300c559ffb4d6d930ebff513ac2b6a7c4c91cddad7f873a61",
-      "data_sha256": "37cb360bbf2dfbd9673ab58573189c2f0ddb0d44e50a2a77cbf8a557023c0efd"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "a11cf2453c3b4cec92717c206759f4b7b5ad065c20c09881b938ceffbec8f5fb",
-      "data_sha256": "2c563f5599887bdf9aeaf231e3a7a2d4310398307275c3a9d7d4d113f49a1112"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "b292322ae4572d6ccd877dfc6310d4e43855bb2dad6e1c999ffa12306cbc43ff",
-      "data_sha256": "d2cec60b6a64043cf873040a00917423a03dff7750c360122ef13876c5dc7f58"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "b54f77f5d97b3418a5ae9af0d1640ea77a32672070eb7df3fee1d97bda21f172",
-      "data_sha256": "96563008e490da67c385b8e74ff014b90f185b7c2f878bdd169b87e5dfd985f2"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "b7f0fb8c04d55623cc7f4dfc62cffabf4f2dbcc983d207beb315dec3708aaa49",
-      "data_sha256": "d082d4509efecb7845cd0c383d4ef662342d39c06e012b12921bc0fe01d46ab6"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "c1f960223e7a7d582534000da0438c62bbbd30ee374d36db7fc14a691c510ab9",
-      "data_sha256": "f58e0758dcddd5a65123045c508d9f4e30d693adf84acb85982fbbf5fff9ccb4"
-    },
-    {
-      "exchange": "binance_futures",
-      "manifest_sha256": "d7c2ea81ef1bf177e1adf9de81924d8213cc68777c4ebb3791cbaea4752594c4",
-      "data_sha256": "3162d64f5fbf816cb1561122059958ba7b349d2eac610afc810381208f699b53"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "287960040d9761da0550fa4cb490618c2803056cff4c0b444070dd0a9f9e981b",
-      "data_sha256": "e71a80d9d3687b978c3a68f8fbad77789925efa24f9df83ba07ab1a022db1f19"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "4470cbc4766e9afeb6e31dc3dc4ffee046a236124d0a44ee09ed57e76504b364",
-      "data_sha256": "45f68a709a0fdb5470f7d1577afab4b2f101e87c7a1454b3b777bda2d516fd50"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "479ba4b87b37806dfc0b385f73c126c3ced24b7e4889bb8ad10abe74ee6c83c7",
-      "data_sha256": "f6583bda6ae0d30b11e83b913b49b34af48e8fd39e29444a8bff918641f434c7"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "582550e50e7f8c842ed53caab8569f6b2784c0e61ba1079063795e82b64919c4",
-      "data_sha256": "f0c523a9bc485b62134031b11216f2c070a30bf4b4dc8c9728b0e98c636c660e"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "5a7fe202444800e1b99a54c3def5219df334e1f6809078ca5af41e3d5a389e84",
-      "data_sha256": "917033be507aebf9068b926c8ca9aecb4614214b8885306656210bb64ce9d269"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "5b05e055a791247d0917df1dcc7bf806674d5045d977a6407272b9f525b2c9de",
-      "data_sha256": "6d68eb1c99f88990a3610c8d75528fba589c3ddd734f4fc6bf34279813fc7065"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "61c40c83270e973a28299d61439911627d99358799df8e6cd3131910aef3e179",
-      "data_sha256": "8e7312631d69d65cda32df34e8dd5b78ea35fccda4da9a747ae1de5eb24c6b50"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "6a233d1b1dfedee62363059f2dc94af5c7ff1610bd52633f9a0013b9c1f68df0",
-      "data_sha256": "9b9b80ba66067c36cd880a7994d8da85f712ff24e42d67108912d9b0ca4d44e1"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "90a51eaae6a172663634950529f430539075dc5a7bfa039062abe2ff7971ffe1",
-      "data_sha256": "df19fcd77819202831e267b66252857de1d1ade46ff7171973bdb594565a5251"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "9401fc1440cded3d4eb8eef2996aa0c7d50045b2cd24f1c38c896fbda7da3ac9",
-      "data_sha256": "4c4d6450830954188dac7089d1a5d11177241bfc89fb14c10027a9f176eecc6b"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "97288a9dc5f09e80f65909f1cc1295829c2664108663a9c29250d16e8e68a33a",
-      "data_sha256": "b97e78e0990d2c688d6a281ac71b8b302ff1fc6af67e28edfccc9277a3cf622f"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "9a7387234f0ced8c2c8272963ee0f03bdb98b9fd3b75a890b7e1a1bba0ba47c2",
-      "data_sha256": "498237ae2747d4925cab0ab2ddd366569a9064e33f8182d447cfb3124dc15ca1"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "b1f0839541f9bdc9b636015b8a637163cfb648d80df77f0d459fa188ecd3ca43",
-      "data_sha256": "e33adf380d0bd3d6134442cbc4dc2fe5217e0c85b309b19a18f8aee4db21e9c8"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "b3c0bdf4a49061aa601c4d51e5e447c8a74824b758630cbc6062f0c737f7d794",
-      "data_sha256": "ff8c98adfe3ed6dcae4e568812aca85a4f98fb061a376ade95e82366dfa77a54"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "b92ea93d6b221209d961e8f29ae24a5116ad06d60609ab9214b667e2109a788b",
-      "data_sha256": "a2e1cd8228c592a940312caaf64522f10fdfe37d5972b504acdab7a1a6bf3181"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "c11d78a2a989d576d22a83fc808a7211d4389c906b73327c12ab65b8456f60c9",
-      "data_sha256": "05be768691e35a0933039f0c3d2d49221c5373f1b700419b98573ca05f29ef32"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "c408aa9c05135c7819f1644576256e346bfce016d837d304a45d09371c2fee25",
-      "data_sha256": "1535fee52e9ece359b6c0212f009b62282adea9fa63eb572e4f09412bebe342d"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "cae8ee17e1dbdebf1323e57feaa8ec01bcaa8ea441412a94d1f94b5fb383cfaa",
-      "data_sha256": "a59927d525464366c7757b94ff2aa929913e2bf0d6013981e950f92e3325a903"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "ce8e407adae9f8e079da4c9e9202ddfbcff6fb956a43ed238b354f48b720e222",
-      "data_sha256": "499840c6cf0126858e85d0f078b66e188bc189b2fbcb0705a4107f16ca290bde"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "e12b52cdc334cd847487692388d3a50a62dc83836755f84d6272c5e8d335a04a",
-      "data_sha256": "91e3f8481a5fbe5043ab62ff24e0b2feea42e4aac5d63ce4e787a02816c0aa7c"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "e1a975d50c8f609735b5e00b8717dfda04b0e9bd1a6ec9fad5880e64965bdce6",
-      "data_sha256": "ef23135283a9292808a7cbadfec51fcfe35cab94a0887f2c77ef1db3561f808b"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "e99375e260bf3a3cc6d3987f64839d9bad0f8b8a7eeb228a7cedd282965703c8",
-      "data_sha256": "28be2ca322ab469279772965cedf498a3cf84b3eb7668527abeaada46acdfcbb"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "f66933392cc038e1ea37bb1f6459232aeda1e3ebaa615b3a4ca0eb356939ad48",
-      "data_sha256": "efeb607853bd91c79091e7f8fec5b5d14975f9e349d6a179c11c4c4f46d02d0b"
-    },
-    {
-      "exchange": "bitget_v3",
-      "manifest_sha256": "fe4444140b4226b3e2a86b748df4bcb94269c53da3b2b4f01231b76cc1dca256",
-      "data_sha256": "5c45b0297f1a0429a4efe60e739ca78db7694280e837c71a990eaf494694c784"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "0d57c7b34aa186ea0aa923cf68e961e991e535e108316bd76d7f9ef8b171fa63",
-      "data_sha256": "fd7ca6a8aad813d77072f9cd88c503eadd204180330c3cdd503ac7d2e3eb435d"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "1dbe36d5a2584aacdbd6d6891caf4463cd242705799ec186beec17623eb3d587",
-      "data_sha256": "e3f1106c2815bc6fc184ac959350c257e9dfaa39aef1b4b2dbab6182a19feb88"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "1f1b36562ae9a0040360304cbd85dca7a2fbe6575c4d8f27fc74c89958b8f066",
-      "data_sha256": "b72098e80ab31d20aeb42cca1c14b3e54d870c9ca3c17f8b8ac8ce8ba74a4b9f"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "2a4971e53c32132e6fece376b3d1724081db4f2f36872f06a50fce3a514fe784",
-      "data_sha256": "15ff07fc0d8da29c687f30648e6e9436d218186528024d5c790952387014e979"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "2d5f45601aad7ff05df8a05d44432caafa637530c81b9931b25c4c7314593b01",
-      "data_sha256": "51e3895f8d111ff3521787b6905b96dde473149eb3d3cb7e393559096b44590b"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "349dc8225339e5573c8df60b88b186c8ed887483dd54e3db2ac34c5d9f584f70",
-      "data_sha256": "ca21000e918e94e20306e9ceb9fbf9313fbc4e455abf8fb66cad2003b5082ea4"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "3d4d4075a801b7d3f48ceeb3c8f136387e6deef47b5ea25e66afe8f86afde8da",
-      "data_sha256": "abdc532aed2d8fe5639143e0302f24be13c6d022bdc1922508d22d67886b46fd"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "5401afb9ebe00b01223ec2a5b7606790bc23d0dd34cc2a7b17e1c3a450ab872c",
-      "data_sha256": "c5cd6db2a4ec0148635e425a8428c24626d2304871944c116c863448b34f566e"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "62f2c9b5e8ad2d46a37709de2c1b4a028987ad14975924eccc96060d8a2b381a",
-      "data_sha256": "fb6c56e900397dd5511594e054f717d9be5662aca9248d4fc058ef93d8bfb733"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "7afbab82d826f2c0d89ee12732ce0a7997f52545b0e6c9fe2f5564032b9c139d",
-      "data_sha256": "0c079bfb7659c0b3d153efb738a37df639430d756bdeb1ff574d2c97ec3e0c24"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "7b43609b50e78af04a03c756dfb3d4854178df18c1e4474e9f9564209211dec2",
-      "data_sha256": "b36be7efc24b85204f34e4517eef0b285e38aabf2101e2eeb439a2eedcc69af6"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "8916a3a1f48cc4ab12c0fda38e73c692ffeb14cde9baa2159162230689db2735",
-      "data_sha256": "69bce88b7a30d2c02e059ba13868943860acafec02aed0c6ebac223b641fe237"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "8d37b20518228c019a28d5bed6b8e036d556cc9abc57f125fbe7d08cb9de66c3",
-      "data_sha256": "b23b3426de059c7920ec32757887e107c3311a3f406746c39e977fb9669f824f"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "a137e2f9037cb49fb9b21c4211040bd84ec64d9f7bedfa16dcc305f36bb067bc",
-      "data_sha256": "4fa943f9f170b90b5d77ae8c19791ce3177108db6eb72429251937b6a64f31bc"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "a16f60c7c7b9e53ac1f3f33e28dcfe7098348f3ae5018876d1434f3b0733408d",
-      "data_sha256": "b009042234571e5be301efe6cd5e811d77bb2e4d35cf2c2df4adee31b035a398"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "b37228e595c7ffc75b1fac4097c94104dad89239a8072c4ed9b4b2d53d4fc859",
-      "data_sha256": "231a747b34f017a807612cd32356b7f51a30c2b8f03245b146749cb72dccf930"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "b857dfa36451576f446780c0785141abfb4b3ee3d67f41c2850b19a3fba7e81d",
-      "data_sha256": "bd8af51c39b5f5448a9aea8de92da90e393509324598c4c4c35c94f2142d6349"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "c4c729cec630a2303d386501cf7e824810d0a49110d7b35f23491accbc8a718f",
-      "data_sha256": "e1ec91684b3a00971a957f019ad614530f04aabd3d3f57ab8d548ede83c11028"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "c5b86691e3cd1a2a2b0654456ead655f5b50a453ffe4013119d65251c261a134",
-      "data_sha256": "08b344ed9783de3756e277394b466bc6aac6e1b41318d2d6ad3fcf025ca0acca"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "c715f4afb07cab5c150d354ce99bb33bb286bf8eea8afd92edc9ada7f9b414ff",
-      "data_sha256": "a098955c93ab5fe6e28c4baa5bd3b92084c84023fb2d750ef18288fe4c604a4c"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "d7259321c2fdaa2564beb335a47037dc2ec8eb2f958c8f4531fd0ed17a7f1c43",
-      "data_sha256": "b5d547b75023d41490e07f71506d0f0edae26061843a41ff2f183a0b0faa4399"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "e0593369da042965a2313b7247ad4e1139e2a43c525c2d371e640ce7cdb8de7f",
-      "data_sha256": "141dd8307deb8b9ef6a3c156cfac8ef37cdc69dc27672d04205e0383d6c1e54d"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "f142680c6ed2d650775c09de40588187353e5324424130e90cf66caf369ea160",
-      "data_sha256": "b04b2a6036d3101859a3b712c9856d1e65b170902869ba1d3849adec777a344a"
-    },
-    {
-      "exchange": "bybit_linear",
-      "manifest_sha256": "fa4fdcd31951701d6fbfaac3895d2195f2a3d8cd6f1a182984cd6e4f8e7fc9ef",
-      "data_sha256": "944ee007aa5bf1a6e6896c4e30db5bad39ef3fdb4a798a2fc0427751280eced7"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "04e876fd1bb711c1a3d0e007eaa850a4a5d95a0547543ed98f10fc9dbbe841c5",
-      "data_sha256": "b04c2dbcf1ab4fba8f045c2a89e1eeb217224312fab721a0221351baf1506b4e"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "151087b3362196ab28c6cadac895d63a31c9a2d4295c3a88a4554a1daa44bafd",
-      "data_sha256": "9fc8a2083be067af8dab1c9ce6c0239d02d535c0c00df01a0c8228829f84f714"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "29952cb2a54a51d9a6723d883d37776f9a374df2f7b19602a9a1089dbb3c1dfe",
-      "data_sha256": "5c274de2e317a418257198d3abfbf014fd1c93e52d17186b4d6db9a23c6e9345"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "380158321c326434d77fbfdf1fe4fcbef99585cce23c54cf5f4451369864e280",
-      "data_sha256": "d9b34864017d149a26569e28d2ea06f37b05a9f286e6034a71245af508acc1e9"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "451a6e2465e8ce22fbd1244f8010eaabb8df27174a191562d5293a84d5d7fe01",
-      "data_sha256": "5d926d30f14718451bcac4cbc907653ee1da27c38a36795a6da9380637d730f8"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "511ae38705ca08f39e87faf8b156fac245845a3ad3d2edeeef8d59933a162b6a",
-      "data_sha256": "2dcac8fffe6a8e40398e2c7399d81abf2fc3318ec9e1a17456762d1674dc59fb"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "526ffe4b7329dc3573d87aaa25d42595a6fa1bef1afe432a01b1b0dc39b0cec0",
-      "data_sha256": "9966cd5bcb8bf58e42d73b2294f4abec059c03b4adcfb2e77f57bc5fb398bd23"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "55aeb27a3f6094cbed26e71e0fb772690172abbd3960cc53a205107af1f235f4",
-      "data_sha256": "8610dca63b9c2d14d97dbb6a756a3dc5a61c33ec37439350377b5d094263338c"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "5963496f73b469cf89e818cf319f99f13208f8540bdbb756884ce10d6928e124",
-      "data_sha256": "9d0e12f9f01e43779e0a73e4fc576d27496b003b79542dc29f9f742ac655dc35"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "85c53fb9333b6d3931abb7a9835ef7e7e6171b96e9864efe55886018ff9cdc87",
-      "data_sha256": "c0bdc218f93bbb5943aa2414ef3661204fa8e7a35a1c07572a26f12e776358ca"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "9c13ac1ab31524663f34087631cd9978af68fa0c06e14c408108a3328757fc12",
-      "data_sha256": "d05ad8dd145b9a0e82602ecf0fb2657788a4523169481b8057cd41d25f8b2ca9"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "a652e3a58b0a9c119b6aa71a02d2d2faba76eee60ad462cf27771d2f94329a19",
-      "data_sha256": "0288ea8899ac520b9e43d637ae8d6e18b8a8b980e3d39e13db15c66bd35c6785"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "ac5648f5d7f907e36e3edd89bb9d1bf372238d097dfe141c613ee9d3240fd9a7",
-      "data_sha256": "fdf2a1006003365a6eeada4fddbe33da52d3c5fcc6b3ebe315eb51ff6e47571c"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "afd4eb5e7b6024e525d5315d87a7268821f12fac41a76a81605998ebad6872a0",
-      "data_sha256": "97ac73bc766c3b42be97d8e19bee308ad0bcc19b62b12581939a01044052a42c"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "b023d84eafe397c54007821c8275530795d1ce766c81cec1c8f7899d6f46759b",
-      "data_sha256": "136ef13b2f1fee32890c137cf2cca9b2e2bf82cbbf7646d513eda224903be684"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "b4f1b6287f053c685bc42fe941caae74000b87e69fb544db7fb90165a3b748bb",
-      "data_sha256": "a45c850192d14739dba647bba7036b95063de87d667db75f2cb53a01849cc720"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "b914036e49d4429962de1a2a0398432fa088cf6da89c500adfe51e339663d314",
-      "data_sha256": "528ef155c76f95ae955007c3521c9a9c3a11065aa9db8894ae2b091bd296309a"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "cef99bab55c82a413eef05ad32383122a299baa511d731e3da5398aef7e41d81",
-      "data_sha256": "dda27dc742e56115ac6fca4ecb820ae994ff6880e71b0a3180779a21af5f83bd"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "d2cc9824e380d00148798ecfd148bb8a5584a049bf3b6629014176263b901617",
-      "data_sha256": "07d0729e7268bd9a3ca31357768edb6334f317ae70dcc6d664f34ad64037e0dd"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "dcb2b8fcf9a1181beafa6a9a29846fd8e36961e1d6cd9a82a0f336d1d84c0cf4",
-      "data_sha256": "b4db6383917f9c0fefaf300839236d5873b835d2c5432d56142edc8575b9461f"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "dd3207285d1a120af0b193f180e8b90e251e1397ce6a8ca2de2738b320401853",
-      "data_sha256": "e16c4969076bbc2fc67b74a9cfd70416d45abbb59a11ae8adcc2c4416977a5d3"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "e635033be5f53402aaee2764efffd63487f7dd6cfa0340513ae5bb0f4b4493ae",
-      "data_sha256": "36a7f4e56510f0c127ea464dbed1fe38e013babccf05fe0be82ddea9dbc5dcc5"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "eedd304cee160b5d03733f5d30f406e529a036ad2c5021d844bdb56a65a36818",
-      "data_sha256": "a077dfe6add1474af3540878f23a60eea5066c77cf98c418eb09968af187879c"
-    },
-    {
-      "exchange": "gate_futures",
-      "manifest_sha256": "f92bded40872eaeec60279955bdf72ed1212400dd7d617936401b16ed5a84f0f",
-      "data_sha256": "c000a47ac85e7d0e53bbeabe26c653472db80c95c2244ae234c241d5ea26cd8d"
-    }
-  ],
+  "anchor_lookback_windows": 0,
+  "anchor_lookback_inputs": [],
   "source_restrictions": {},
-  "input_checkpoint_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-  "completed_at_utc": "2026-11-25T09:27:17Z"
+  "input_checkpoint_digest": "503b9bd5947210a2f0e0c23db5c489f4d9c97ef6a72745e3e4e04501ab69524c",
+  "completed_at_utc": "2026-11-26T08:44:22Z"
 }
