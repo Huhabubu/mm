@@ -816,29 +816,8 @@ def run_batch_experiments(
     outputs (`{slug}__*`) and updating `batch_summary.json` after each pair.
     """
     _ensure_sys_path()
-    import hourly_incremental_qa as archive
-    from data_coverage import effective_config_hash
-    from tokyo_l2_bt_fetch import (
-        WINDOWS_PER_DAY_15M,
-        _safe_rel,
-        day_start_s,
-        fetch_meta,
-        find_day_report,
-        integrity_gate,
-    )
-    from tokyo_l2_bt_stream_convert import (
-        MultiSymbolBinanceBBOExtractor,
-        StreamConverter,
-        frozen_sort_key,
-    )
-    from tokyo_l2_exchange_adapters import (
-        contract_spec_digest,
-        load_live_contract_from_meta,
-        normalize_contract_spec,
-    )
     from tokyo_l2_experiment_config import load_experiment_config
     from tokyo_l2_report_writer import write_unified_reports
-    from tokyo_l2_research_stages import run_models_on_arrays
 
     batch_spec = json.loads(Path(batch_config_path).read_text(encoding="utf-8"))
     batch_name = str(batch_spec["batch_name"])
@@ -902,6 +881,28 @@ def run_batch_experiments(
     try:
         if not skip_kaggle_setup:
             batch_report["setup"] = setup_kaggle_env()
+
+        import hourly_incremental_qa as archive
+        from data_coverage import effective_config_hash
+        from tokyo_l2_bt_fetch import (
+            WINDOWS_PER_DAY_15M,
+            _safe_rel,
+            day_start_s,
+            fetch_meta,
+            find_day_report,
+            integrity_gate,
+        )
+        from tokyo_l2_bt_stream_convert import (
+            MultiSymbolBinanceBBOExtractor,
+            StreamConverter,
+            frozen_sort_key,
+        )
+        from tokyo_l2_exchange_adapters import (
+            contract_spec_digest,
+            load_live_contract_from_meta,
+            normalize_contract_spec,
+        )
+        from tokyo_l2_research_stages import run_models_on_arrays
 
         collector_cfg = json.loads(Path(collector_config_path).read_text(encoding="utf-8"))
         cfg_hash = effective_config_hash(collector_cfg)
