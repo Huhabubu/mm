@@ -9,9 +9,17 @@ on:
       - scripts/test_tokyo_l2_bt_stream_convert.py
       - scripts/tokyo_l2_bt_convert.py
       - scripts/test_tokyo_l2_bt_convert.py
+      - scripts/tokyo_l2_bt_fetch.py
+      - scripts/tokyo_l2_bt_cache.py
+      - scripts/tokyo_l2_exchange_adapters.py
+      - scripts/tokyo_l2_experiment_config.py
+      - scripts/tokyo_l2_research_stages.py
+      - scripts/tokyo_l2_report_writer.py
       - scripts/test_kaggle_two_partition.py
       - scripts/test_kaggle_full_day_glft.py
+      - scripts/test_tokyo_l2_unified_framework.py
       - scripts/core_glft_engine.py
+      - configs/**
       - kaggle/**
       - .github/workflows/tokyo-l2-bt-stream-test.yml
   workflow_dispatch:
@@ -33,6 +41,7 @@ jobs:
           sparse-checkout: |
             scripts
             kaggle
+            configs
           persist-credentials: false
 
       - name: Check out frozen collector code
@@ -57,4 +66,4 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/source/collector/python:${{ github.workspace }}/workflow_code/scripts
         run: |
           python -c "import hftbacktest, numpy; print('hftbacktest', hftbacktest.__version__ if hasattr(hftbacktest, '__version__') else '?', 'numpy', numpy.__version__)"
-          python -m unittest -v test_tokyo_l2_bt_stream_convert test_tokyo_l2_bt_convert test_kaggle_two_partition test_kaggle_full_day_glft
+          python -m unittest -v test_tokyo_l2_bt_stream_convert test_tokyo_l2_bt_convert test_kaggle_two_partition test_kaggle_full_day_glft test_tokyo_l2_unified_framework

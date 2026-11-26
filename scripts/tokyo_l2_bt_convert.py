@@ -52,21 +52,30 @@ def native_symbols(gate_symbol: str) -> tuple[str, str, str]:
     return base, f"{base}USDT", gate_symbol
 
 
-def narrowed_config(config: dict[str, Any], gate_symbol: str) -> dict[str, Any]:
-    _, binance_sym, gate_sym = native_symbols(gate_symbol)
+def narrowed_config(
+    config: dict[str, Any],
+    gate_symbol: str,
+    making_exchange: str = FOLLOWER,
+) -> dict[str, Any]:
+    if making_exchange == FOLLOWER:
+        _, binance_sym, follower_sym = native_symbols(gate_symbol)
+    else:
+        base = base_asset(gate_symbol)
+        binance_sym = f"{base}USDT"
+        follower_sym = f"{base}USDT"
     out = copy.deepcopy(config)
     for name, ex in out["exchanges"].items():
-        ex["enabled"] = name in (LEADER, FOLLOWER)
+        ex["enabled"] = name in (LEADER, making_exchange)
     b = out["exchanges"][LEADER]
-    g = out["exchanges"][FOLLOWER]
-    if binance_sym not in b["symbols"] or gate_sym not in g["symbols"]:
-        raise ValueError(f"{gate_symbol} is not collected by this config")
+    f = out["exchanges"][making_exchange]
+    if binance_sym not in b["symbols"] or follower_sym not in f["symbols"]:
+        raise ValueError(f"{gate_symbol} ({making_exchange}) is not collected by this config")
     if "bookTicker" not in b["public_channels"]:
         raise ValueError("Binance bookTicker is not collected")
     b["symbols"] = [binance_sym]
     b["public_channels"] = ["bookTicker"]
     b["market_channels"] = []
-    g["symbols"] = [gate_sym]
+    f["symbols"] = [follower_sym]
     return out
 
 

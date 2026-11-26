@@ -166,7 +166,8 @@ class ExchangeState:
 class TradeDedup:
     """First-receive Gate trade dedup with PR #30 handover classification (deferred by 5 s)."""
 
-    def __init__(self) -> None:
+    def __init__(self, compare_fields: tuple[str, ...] = TRADE_COMPARE_FIELDS) -> None:
+        self.compare_fields = tuple(compare_fields)
         self.seen: dict[str, tuple[int, int]] = {}      # key -> (fields digest, connection index)
         self.copy_conns: dict[str, list[int]] = {}      # key -> connection index of every copy
         self.conns: list[tuple[str, str, int]] = []
@@ -187,9 +188,9 @@ class TradeDedup:
     def add_event(self, wall: int) -> None:
         bisect.insort(self.conn_events, wall)
 
-    @staticmethod
-    def digest(trade: dict[str, Any]) -> int:
-        text = json.dumps([trade.get(k) for k in TRADE_COMPARE_FIELDS], separators=(",", ":"), default=str)
+    def digest(self, trade: dict[str, Any]) -> int:
+        fields = getattr(self, "compare_fields", TRADE_COMPARE_FIELDS)
+        text = json.dumps([trade.get(k) for k in fields], separators=(",", ":"), default=str)
         return int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "little")
 
     def observe(self, key: str, trade: dict[str, Any], conn_key: tuple[str, str, int], wall: int) -> bool:
@@ -273,11 +274,11 @@ def manifest_data_path(manifest_path: Path) -> Path:
     return Path(manifest_path).with_name(Path(manifest_path).name.replace(".manifest.json", ".tsv.zst"))
 
 
-def discover_partitions(fetched: Path) -> list[tuple[str, Path, Path, tuple]]:
-    """(exchange, data, manifest, sort_key) for Binance + Gate under <fetched>/raw, in frozen order."""
+def discover_partitions(fetched: Path, making_exchange: str = FOLLOWER) -> list[tuple[str, Path, Path, tuple]]:
+    """(exchange, data, manifest, sort_key) for Binance + making_exchange under <fetched>/raw, in frozen order."""
     raw_root = Path(fetched) / "raw" if (Path(fetched) / "raw").exists() else Path(fetched)
     out = []
-    for ex in (LEADER, FOLLOWER):
+    for ex in (LEADER, making_exchange):
         for mpath in sorted((raw_root / ex).rglob("*.manifest.json")):
             mf = json.loads(mpath.read_text(encoding="utf-8"))
             dpath = manifest_data_path(mpath)
@@ -287,24 +288,43 @@ def discover_partitions(fetched: Path) -> list[tuple[str, Path, Path, tuple]]:
 
 
 class StreamConverter:
-    def __init__(self, gate_symbol: str, config: dict[str, Any] | None = None, coverage_date: str | None = None):
-        base, binance_sym, gate_sym = native_symbols(gate_symbol)
+    def __init__(
+        self,
+        gate_symbol: str,
+        config: dict[str, Any] | None = None,
+        coverage_date: str | None = None,
+        making_exchange: str = FOLLOWER,
+    ):
+        self.making_exchange = str(making_exchange)
+        if self.making_exchange == FOLLOWER:
+            base, binance_sym, follower_sym = native_symbols(gate_symbol)
+            cmp_fields = TRADE_COMPARE_FIELDS
+        else:
+            from tokyo_l2_exchange_adapters import to_base_symbol, to_native_symbol, trade_compare_fields
+            base = to_base_symbol(gate_symbol)
+            binance_sym = to_native_symbol(LEADER, base)
+            follower_sym = to_native_symbol(self.making_exchange, base)
+            cmp_fields = trade_compare_fields(self.making_exchange)
         self.version = STATE_VERSION
-        self.gate_symbol = gate_symbol
+        self.gate_symbol = follower_sym if self.making_exchange != FOLLOWER else gate_symbol
+        self.follower_symbol = follower_sym
         self.base, self.binance_sym = base, binance_sym
         self.coverage_date = coverage_date
         if coverage_date is not None and config is None:
             raise ValueError("complete-day coverage needs the collector config")
-        self.coverage = CompleteDayCoverage(narrowed_config(config, gate_symbol), coverage_date) if coverage_date else None
-        self.ex = {LEADER: ExchangeState(LEADER), FOLLOWER: ExchangeState(FOLLOWER)}
+        self.coverage = (
+            CompleteDayCoverage(narrowed_config(config, self.gate_symbol, making_exchange=self.making_exchange), coverage_date)
+            if coverage_date else None
+        )
+        self.ex = {LEADER: ExchangeState(LEADER), self.making_exchange: ExchangeState(self.making_exchange)}
         self.bbo = RowSink(BBO_DTYPE)
         self.bbo_exch_ahead_of_local = 0
-        buf = AssetDayBuffers(FOLLOWER, base, "stream")
+        buf = AssetDayBuffers(self.making_exchange, base, "stream")
         buf.hbt_rows = RowSink(event_dtype)
         buf.edge_samples = RowSink(EDGE_DTYPE)
         buf.bbo_rows = RowSink(BBO_DTYPE)
         self.gate = buf
-        self.trades = TradeDedup()
+        self.trades = TradeDedup(compare_fields=cmp_fields)
         self.init_exclusion = {"frames": 0, "first_local_ts": None, "last_local_ts": None}
         self.initial_gate_window = None
         self.current_gate_window = None
@@ -453,6 +473,65 @@ class StreamConverter:
         self.gate.bbo_rows.append((wall, exch_ts, bid_px, float(result["B"]), ask_px, float(result["A"]),
                                    0.5 * (bid_px + ask_px)))
 
+    def _apply_generic_depth(self, item: dict[str, Any], wall: int, boot: str, conn: str, epoch: int, c: Counter) -> None:
+        buf = self.gate
+        is_full = bool(item["is_snapshot"])
+        if not buf.seen_snapshot and not is_full:
+            if self.current_gate_window != self.initial_gate_window or self.initial_exemption_closed:
+                self._fail("initialization_exemption_outside_sample_start", str(wall))
+                self.initial_exemption_closed = True
+                return
+            ie = self.init_exclusion
+            ie["frames"] += 1
+            ie["first_local_ts"] = wall if ie["first_local_ts"] is None else ie["first_local_ts"]
+            ie["last_local_ts"] = wall
+            c["obu_pre_first_snapshot"] += 1
+            return
+        c["obu_snapshot" if is_full else "obu_delta"] += 1
+        before_errors = len(buf.unrebuildable_depth_intervals)
+        _validate_and_apply_follower_depth(
+            buf=buf, exchange=self.making_exchange, rec={"boot_id": boot, "conn_id": conn, "epoch": epoch},
+            is_snap=is_full, seq=item["seq"], parent=item["parent"],
+            exch_ts=int(item["exch_ts_ns"]), local_ts=wall,
+            raw_bids=item["raw_bids"], raw_asks=item["raw_asks"],
+        )
+        anchor = buf.follower_depth_anchor
+        valid = anchor is not None and len(buf.unrebuildable_depth_intervals) == before_errors
+        if not valid:
+            self.initial_exemption_closed = True
+            self._block_execution(wall, "depth_validation_failed")["snapshot_wall_ns"] = None
+        elif is_full:
+            self.initial_exemption_closed = True
+            iv = self._block_execution(wall, "snapshot_awaiting_contiguous_delta")
+            iv.update(snapshot_wall_ns=wall, boot_id=boot, conn_id=conn, epoch=epoch,
+                      snapshot_seq=anchor["seq"])
+        elif self.pending_confirmation is not None:
+            iv = self.pending_confirmation
+            if iv["snapshot_wall_ns"] is not None and (boot, conn, epoch) == (
+                    iv["boot_id"], iv["conn_id"], iv["epoch"]):
+                iv.update(end_wall_ns=wall, confirmation_lag_ns=wall - iv["snapshot_wall_ns"],
+                          confirming_U=item["parent"], confirming_u=item["seq"])
+                self.pending_confirmation = None
+
+    def _apply_generic_trades(self, parsed_trades: list[dict[str, Any]], wall: int, boot: str, conn: str, epoch: int, c: Counter) -> None:
+        buf = self.gate
+        for tr in parsed_trades:
+            if not self.trades.observe(tr["dedup_key"], tr["raw_trade"], (boot, conn, epoch), wall):
+                c["trade_duplicate_copies"] += 1
+                continue
+            exch_ts = int(tr["exch_ts_ns"])
+            if exch_ts > wall:
+                buf.exch_ahead_of_local_count += 1
+            for flag_name in tr["special_flags"]:
+                buf.special_flag_counts[flag_name] += 1
+            side_flag = BUY_EVENT if tr["is_buy"] else SELL_EVENT
+            buf.hbt_rows.append((TRADE_EVENT | side_flag, exch_ts, wall,
+                                 float(tr["price"]), float(tr["qty"]), 0, int(tr["flags"]), 0.0))
+            buf.last_exch_ts = max(buf.last_exch_ts, exch_ts)
+            buf.last_local_ts = max(buf.last_local_ts, wall)
+            c["trades_emitted"] += 1
+        self.trades.resolve(wall)
+
     # ------------------------------------------------------------- partition
     def process_partition(self, data_path: Path, manifest_path: Path, parts_dir: Path,
                           progress_every: int = 2_000_000) -> dict[str, Any]:
@@ -473,7 +552,8 @@ class StreamConverter:
         if in_cov:
             self.coverage.observe_partition(mf)
         boot = norm["boot_id"]
-        if exchange == FOLLOWER:
+        making_ex = getattr(self, "making_exchange", FOLLOWER)
+        if exchange == making_ex:
             self.current_gate_window = norm["window_id"]
             if self.initial_gate_window is None:
                 self.initial_gate_window = self.current_gate_window
@@ -486,10 +566,13 @@ class StreamConverter:
         rxs = array("q")
         recorded_local_loss = dropped_frames = 0
         is_leader = exchange == LEADER
-        needle = self.binance_sym if is_leader else self.gate_symbol
+        is_gate = making_ex == FOLLOWER
+        needle = self.binance_sym if is_leader else getattr(self, "follower_symbol", self.gate_symbol)
         base = self.base
         prev_mono = st.producer_prev_mono
         coverage = self.coverage if in_cov else None
+        if not is_leader and not is_gate:
+            from tokyo_l2_exchange_adapters import is_follower_trade_raw, parse_follower_payload
         dctx = zstd.ZstdDecompressor()
         with data_path.open("rb") as fh, dctx.stream_reader(fh) as reader:
             text = io.TextIOWrapper(reader, encoding="utf-8", errors="strict")
@@ -595,48 +678,90 @@ class StreamConverter:
                     self.dates_seen.add((exchange, self._date(wall)))
                     continue
 
-                if "futures.trades" in raw and "update" in raw:
+                if is_gate:
+                    if "futures.trades" in raw and "update" in raw:
+                        self.trades.conn_first_trade.setdefault((boot, conn, epoch), wall)
+                    if needle not in raw:
+                        c["dropped_prefilter"] += 1
+                        continue
+                    obj = _decode(kind, raw)
+                    c["decoded"] += 1
+                    if not isinstance(obj, dict):
+                        c["dropped_after_decode"] += 1
+                        continue
+                    channel, result = obj.get("channel", ""), obj.get("result")
+                    if channel == "futures.trades":
+                        trades = result if isinstance(result, list) else [result]
+                        mine = [t for t in trades if isinstance(t, dict) and base_asset(t.get("contract")) == base]
+                        if not mine:
+                            c["dropped_after_decode"] += 1
+                            continue
+                        if len(mine) != len(trades):
+                            c["gate_mixed_symbol_trade_messages"] += 1
+                            obj = {**obj, "result": mine}
+                        if coverage is not None:
+                            coverage.observe_record(exchange, {"kind": kind, "recv_wall_ns": wall, "payload": obj})
+                        if obj.get("event", "") == "update":
+                            c["trade_frames"] += 1
+                            self._gate_trades(obj, mine, wall, boot, conn, epoch, c)
+                        continue
+                    if not (isinstance(result, dict) and base_asset(result.get("s")) == base):
+                        c["dropped_after_decode"] += 1
+                        continue
+                    if coverage is not None:
+                        coverage.observe_record(exchange, {"kind": kind, "recv_wall_ns": wall, "payload": obj})
+                    if obj.get("event", "") != "update":
+                        c["non_update_frames"] += 1
+                        continue
+                    self.dates_seen.add((exchange, self._date(wall)))
+                    if channel == "futures.obu":
+                        self._gate_depth(obj, result, wall, boot, conn, epoch, c)
+                    elif channel == "futures.book_ticker":
+                        self._gate_l1(obj, result, wall)
+                        c["l1"] += 1
+                    else:
+                        c["dropped_after_decode"] += 1
+                    continue
+
+                # Non-Gate making exchange (bybit_linear, bitget_v3)
+                if is_follower_trade_raw(making_ex, raw):
                     self.trades.conn_first_trade.setdefault((boot, conn, epoch), wall)
                 if needle not in raw:
                     c["dropped_prefilter"] += 1
                     continue
                 obj = _decode(kind, raw)
                 c["decoded"] += 1
-                if not isinstance(obj, dict):
-                    c["dropped_after_decode"] += 1
-                    continue
-                channel, result = obj.get("channel", ""), obj.get("result")
-                if channel == "futures.trades":
-                    trades = result if isinstance(result, list) else [result]
-                    mine = [t for t in trades if isinstance(t, dict) and base_asset(t.get("contract")) == base]
-                    if not mine:
-                        c["dropped_after_decode"] += 1
-                        continue
-                    if len(mine) != len(trades):
-                        c["gate_mixed_symbol_trade_messages"] += 1
-                        obj = {**obj, "result": mine}
-                    if coverage is not None:
-                        coverage.observe_record(exchange, {"kind": kind, "recv_wall_ns": wall, "payload": obj})
-                    if obj.get("event", "") == "update":
-                        c["trade_frames"] += 1
-                        self._gate_trades(obj, mine, wall, boot, conn, epoch, c)
-                    continue
-                if not (isinstance(result, dict) and base_asset(result.get("s")) == base):
+                parsed = parse_follower_payload(making_ex, obj, wall, base) if isinstance(obj, dict) else None
+                if parsed is None:
                     c["dropped_after_decode"] += 1
                     continue
                 if coverage is not None:
-                    coverage.observe_record(exchange, {"kind": kind, "recv_wall_ns": wall, "payload": obj})
-                if obj.get("event", "") != "update":
+                    coverage.observe_record(exchange, {"kind": kind, "recv_wall_ns": wall, "payload": parsed["coverage_obj"]})
+                pkind = parsed["kind"]
+                if pkind == "ignored_non_update":
                     c["non_update_frames"] += 1
                     continue
                 self.dates_seen.add((exchange, self._date(wall)))
-                if channel == "futures.obu":
-                    self._gate_depth(obj, result, wall, boot, conn, epoch, c)
-                elif channel == "futures.book_ticker":
-                    self._gate_l1(obj, result, wall)
+                if pkind == "trades":
+                    if parsed["trades"]:
+                        c["trade_frames"] += 1
+                        self._apply_generic_trades(parsed["trades"], wall, boot, conn, epoch, c)
+                elif pkind == "depth":
+                    self._apply_generic_depth(parsed, wall, boot, conn, epoch, c)
+                elif pkind == "depth_batch":
+                    for item in parsed["items"]:
+                        self._apply_generic_depth(item, wall, boot, conn, epoch, c)
+                elif pkind == "l1":
+                    bp, ap = parsed["bid_px"], parsed["ask_px"]
+                    self.gate.bbo_rows.append((wall, parsed["exch_ts_ns"], bp, parsed["bid_qty"],
+                                               ap, parsed["ask_qty"], 0.5 * (bp + ap)))
                     c["l1"] += 1
-                else:
-                    c["dropped_after_decode"] += 1
+                elif pkind == "l1_batch":
+                    for item in parsed["items"]:
+                        bp, ap = item["bid_px"], item["ask_px"]
+                        self.gate.bbo_rows.append((wall, item["exch_ts_ns"], bp, item["bid_qty"],
+                                                   ap, item["ask_qty"], 0.5 * (bp + ap)))
+                        c["l1"] += 1
 
         self._finish_rx_seq(st, exchange, data_path, rxs, norm)
         manifest_local_loss = int(mf.get("local_loss_lines") or 0) + int(mf.get("late_frames_rejected") or 0)
@@ -700,7 +825,7 @@ class StreamConverter:
                "boot_id": norm["boot_id"], "data_file": data_path.name, "data_sha256": mf["sha256"],
                "data_bytes": int(mf["bytes"]), "part_file": path.name, "part_sha256": sha256_file(path),
                "rows": rows, "counts": dict(c)}
-        if exchange == FOLLOWER:
+        if exchange == getattr(self, "making_exchange", FOLLOWER):
             out["book_before"] = before["state"]
             out["book_after"] = self._book_state()
             out["trade_dedup"] = dict(self.trades.counts)
@@ -719,7 +844,8 @@ class StreamConverter:
             pickle.dump(self, fh, protocol=pickle.HIGHEST_PROTOCOL)
         digest = sha256_file(tmp)
         tmp.replace(state_dir / STATE_FILE)
-        prog = {"version": STATE_VERSION, "gate_symbol": self.gate_symbol, "coverage_date": self.coverage_date,
+        prog = {"version": STATE_VERSION, "making_exchange": getattr(self, "making_exchange", FOLLOWER),
+                "gate_symbol": self.gate_symbol, "coverage_date": self.coverage_date,
                 "state_sha256": digest, "saved_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "parts": [{k: p[k] for k in ("exchange", "window_id", "data_file", "data_sha256", "part_file",
                                               "part_sha256")} for p in self.parts]}
@@ -751,6 +877,8 @@ class StreamConverter:
     def gate_report(self, meta_dir: Path | None) -> tuple[list[str], dict[str, Any]]:
         """Blocking failures and per-exchange eligibility, mirroring run_qa_convert's gates."""
         self.trades.resolve(None)
+        making_ex = getattr(self, "making_exchange", FOLLOWER)
+        prefix = "gate" if making_ex == FOLLOWER else making_ex
         buf = self.gate
         for iv in [iv for iv in buf.depth_unavailable_intervals if iv.get("end_wall_ns") is None]:
             buf.record_unrebuildable_depth(reason="depth_unavailable_unrecovered", wall_ns=int(iv.get("start_wall_ns") or 0),
@@ -767,13 +895,13 @@ class StreamConverter:
         if self.coverage is not None and (any(self.day_gaps.values()) or chrony.get(self.coverage.date)):
             failed.append("complete_day_gap_or_uncertified_clock")
         if self.trades.issues():
-            failed.append(f"gate_unexplained_duplicate_trades:{self.trades.issues()}")
+            failed.append(f"{prefix}_unexplained_duplicate_trades:{self.trades.issues()}")
         if not buf.seen_snapshot:
             failed.append("missing_l2_snapshot_anchor")
         if buf.unrebuildable_depth_reasons:
-            failed.append("gate_depth_unrebuildable:" + ",".join(buf.unrebuildable_depth_reasons))
+            failed.append(f"{prefix}_depth_unrebuildable:" + ",".join(buf.unrebuildable_depth_reasons))
         eligibility = {}
-        for ex in (LEADER, FOLLOWER):
+        for ex in (LEADER, making_ex):
             for date in sorted({d for e, d in self.dates_seen if e == ex}):
                 reasons = []
                 if self.day_gaps.get(f"{ex}|{date}"):
@@ -785,7 +913,7 @@ class StreamConverter:
                     reasons.append("clock_uncertified_gt_1ms")
                 if specs.get((ex, date)):
                     reasons.append("spec_change_isolation")
-                if ex == FOLLOWER:
+                if ex == making_ex:
                     reasons += [r for r in buf.unrebuildable_depth_reasons if r not in reasons]
                     if not buf.seen_snapshot:
                         reasons.append("missing_l2_snapshot_anchor")
@@ -805,7 +933,7 @@ class StreamConverter:
                 "unrebuildable_depth_intervals": buf.unrebuildable_depth_intervals,
                 "binance_depth_meta": self.binance_depth_meta, "other_symbol_meta": dict(self.other_symbol_meta),
                 "exch_ahead_of_local": {"binance_bbo": self.bbo_exch_ahead_of_local,
-                                        "gate": buf.exch_ahead_of_local_count},
+                                        prefix: buf.exch_ahead_of_local_count},
                 "special_flag_counts": dict(buf.special_flag_counts),
                 "records": {ex: dict(s.counts) for ex, s in self.ex.items()}}
         return failed, diag
@@ -816,7 +944,9 @@ class StreamConverter:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         failed, diag = self.gate_report(meta_dir)
-        report: dict[str, Any] = {"converter": "scripts/tokyo_l2_bt_stream_convert.py", "gate_symbol": self.gate_symbol,
+        report: dict[str, Any] = {"converter": "scripts/tokyo_l2_bt_stream_convert.py",
+                                  "making_exchange": getattr(self, "making_exchange", FOLLOWER),
+                                  "gate_symbol": self.gate_symbol,
                                   "label_date": label_date, "mode": "complete_day" if self.coverage else "sample_no_coverage",
                                   "failed_items": failed, "parts": self.parts, **diag, "artifacts": []}
         if failed and not (diagnostic_allow_known_gaps and only_known_gap_failures(failed)):
@@ -846,6 +976,7 @@ class StreamConverter:
     def _write_outputs(self, parts_dir: Path, out_dir: Path, label_date: str, report: dict[str, Any]) -> None:
         ymd = label_date.replace("-", "")
         base = self.base
+        making_ex = getattr(self, "making_exchange", FOLLOWER)
 
         def save(kind: str, path: Path, rows: int, **arrays) -> None:
             np.savez_compressed(path, **arrays)
@@ -856,26 +987,26 @@ class StreamConverter:
         save("binance_bbo", out_dir / f"binance_bbo_{base}_{ymd}.npz", len(bbo),
              **{name: bbo[name] for name in BBO_DTYPE.names})
         del bbo
-        raw = self._load_parts(parts_dir, FOLLOWER, "hbt_raw", event_dtype)
+        raw = self._load_parts(parts_dir, making_ex, "hbt_raw", event_dtype)
         if len(raw) != len(self.gate.hbt_rows):
             raise AssertionError(f"HBT rows {len(raw)} != emitted {len(self.gate.hbt_rows)}")
         ordered, order_diag = _order_and_validate_hbt_events(
-            raw, exchange=FOLLOWER, symbol=base, date_utc=label_date, stream_kind="follower_l2_hbt",
+            raw, exchange=making_ex, symbol=base, date_utc=label_date, stream_kind="follower_l2_hbt",
             local_book_clears=self.gate.local_book_clears)
         del raw
-        save("follower_l2_hbt", out_dir / f"{FOLLOWER}_l2_{base}_{ymd}.npz", len(ordered), data=ordered)
+        save("follower_l2_hbt", out_dir / f"{making_ex}_l2_{base}_{ymd}.npz", len(ordered), data=ordered)
         report["order_diagnostics"] = order_diag
         report["hbt_event_types"] = event_histogram(ordered)
         report["hbt_time_range"] = {"first_local_ts": int(ordered["local_ts"].min()) if len(ordered) else None,
                                     "last_local_ts": int(ordered["local_ts"].max()) if len(ordered) else None}
         del ordered
-        edges = self._load_parts(parts_dir, FOLLOWER, "edges", EDGE_DTYPE)
-        save("follower_l2_edges", out_dir / f"{FOLLOWER}_l2_edges_{base}_{ymd}.npz", len(edges),
+        edges = self._load_parts(parts_dir, making_ex, "edges", EDGE_DTYPE)
+        save("follower_l2_edges", out_dir / f"{making_ex}_l2_edges_{base}_{ymd}.npz", len(edges),
              **{name: edges[name] for name in EDGE_DTYPE.names})
         del edges
-        l1 = self._load_parts(parts_dir, FOLLOWER, "l1", BBO_DTYPE)
+        l1 = self._load_parts(parts_dir, making_ex, "l1", BBO_DTYPE)
         l1 = l1[np.argsort(l1["local_ts_ns"], kind="mergesort")]
-        save("follower_l1_bbo", out_dir / f"{FOLLOWER}_l1_{base}_{ymd}.npz", len(l1),
+        save("follower_l1_bbo", out_dir / f"{making_ex}_l1_{base}_{ymd}.npz", len(l1),
              **{name: l1[name] for name in BBO_DTYPE.names})
 
 
@@ -886,7 +1017,7 @@ def only_known_gap_failures(failed: list[str]) -> bool:
     for item in failed:
         if item == "complete_day_gap_or_uncertified_clock":
             continue
-        if item.startswith("gate_depth_unrebuildable:"):
+        if "_depth_unrebuildable:" in item:
             continue
         return False
     return True
@@ -894,17 +1025,19 @@ def only_known_gap_failures(failed: list[str]) -> bool:
 
 def run(args: argparse.Namespace) -> int:
     state_dir, parts_dir = Path(args.state), Path(args.state) / "parts"
+    making_ex = getattr(args, "making_exchange", FOLLOWER) or FOLLOWER
     if (state_dir / PROGRESS_FILE).is_file():
         conv = StreamConverter.load(state_dir, parts_dir)
-        if conv.gate_symbol != args.gate_symbol or conv.coverage_date != (args.coverage_date or None):
-            raise ValueError("checkpoint was made for another symbol or coverage date")
+        if (conv.gate_symbol != args.gate_symbol or conv.coverage_date != (args.coverage_date or None)
+                or getattr(conv, "making_exchange", FOLLOWER) != making_ex):
+            raise ValueError("checkpoint was made for another exchange, symbol, or coverage date")
         print(f"RESUME parts_done={len(conv.parts)}", flush=True)
     else:
         config = json.loads(Path(args.config).read_text(encoding="utf-8")) if args.config else None
-        conv = StreamConverter(args.gate_symbol, config, args.coverage_date or None)
+        conv = StreamConverter(args.gate_symbol, config, args.coverage_date or None, making_exchange=making_ex)
     done = conv.done_data()
     n = 0
-    for exchange, dpath, mpath, _key in discover_partitions(Path(args.fetched)) if args.fetched else []:
+    for exchange, dpath, mpath, _key in discover_partitions(Path(args.fetched), making_exchange=making_ex) if args.fetched else []:
         mf = json.loads(mpath.read_text(encoding="utf-8"))
         if mf.get("sha256") in done:
             continue
@@ -930,10 +1063,11 @@ def run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Streaming Tokyo L2 converter (one Gate symbol + Binance bookTicker)")
+    p = argparse.ArgumentParser(description="Streaming Tokyo L2 converter (one making exchange symbol + Binance bookTicker)")
     p.add_argument("--fetched", type=Path, help="dir with raw/<exchange>/<date>/*.{manifest.json,tsv.zst}")
     p.add_argument("--config", type=Path, help="collector config (required with --coverage-date)")
     p.add_argument("--gate-symbol", required=True)
+    p.add_argument("--making-exchange", default=FOLLOWER, help="making exchange (gate_futures, bybit_linear, bitget_v3)")
     p.add_argument("--state", type=Path, required=True, help="checkpoint dir (state.pkl, progress.json, parts/)")
     p.add_argument("--coverage-date", default="", help="enforce the complete-UTC-day gate for this date")
     p.add_argument("--label-date", default="", help="output file date when no coverage date is given")

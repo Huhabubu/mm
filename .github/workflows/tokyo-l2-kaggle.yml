@@ -325,9 +325,16 @@ jobs:
           import json, os, pathlib
           status = json.load(open("kaggle_out/job_status.json"))
           assert status["git_sha"] == os.environ["GITHUB_SHA"], "stale Kaggle output"
+          uni_path = pathlib.Path("kaggle_out/unified_report.json")
           fd_path = pathlib.Path("kaggle_out/full_day_report.json")
           tp_path = pathlib.Path("kaggle_out/two_partition_report.json")
-          if fd_path.is_file():
+          if uni_path.is_file():
+              report = json.loads(uni_path.read_text())
+              assert report.get("status") == "complete", "unified backtest failed"
+              assert report["summary"]["unified_backtest_complete"] is True
+              assert report["summary"]["stage4_authorized"] is False
+              assert report["summary"]["stage5c_authorized"] is False
+          elif fd_path.is_file():
               report = json.loads(fd_path.read_text())
               assert report.get("status") == "complete", "full-day diagnostic backtest failed"
               assert report["summary"]["diagnostic_full_day_complete"] is True

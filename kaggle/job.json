@@ -1,24 +1,35 @@
 {
-  "task": "kaggle/tasks/full_day_glft.py",
-  "args": [],
+  "task": "kaggle/tasks/unified_backtest.py",
+  "args": [
+    "--config",
+    "configs/tokyo_l2_20261123_gate_btc.json"
+  ],
   "files": [
+    "configs/tokyo_l2_20261123_gate_btc.json",
+    "scripts/tokyo_l2_exchange_adapters.py",
+    "scripts/tokyo_l2_experiment_config.py",
+    "scripts/tokyo_l2_bt_cache.py",
+    "scripts/tokyo_l2_research_stages.py",
+    "scripts/tokyo_l2_report_writer.py",
     "scripts/tokyo_l2_bt_fetch.py",
     "scripts/tokyo_l2_bt_convert.py",
     "scripts/tokyo_l2_bt_stream_convert.py",
     "scripts/core_glft_engine.py",
+    "scripts/core_glft_rules.py",
     "scripts/g0_glft_baseline.py",
     "scripts/g0_glft_rolling.py",
     "scripts/g0_glft_event_driven.py",
-    "scripts/core_glft_rules.py",
     "scripts/check_okx_hft_data.py",
     "scripts/inspect_tardis.py",
     "scripts/gate_basis_weighted_moments.py",
-    "scripts/analyze_gate_1645_fill_quality.py"
+    "scripts/analyze_gate_1645_fill_quality.py",
+    "scripts/audit_gate_stage5b_same_fill.py",
+    "kaggle/tasks/full_day_glft.py"
   ],
   "qa_days_dates": [
     "2026-11-23"
   ],
   "qa_protocol_date": "2026-11-23",
   "timeout_minutes": 270,
-  "note": "First full-day (2026-11-23 UTC) diagnostic HBT 2.4.4 backtest for GLFT, both_1p0, and risk_side_pause with 0ms Binance extra delay, 1ms order entry/response latency, and 0ms requote cooldown. Does not certify Stage 3 strict QA or authorize Stage 4 batch runs."
+  "note": "Unified config-driven full-day (2026-11-23 UTC) Binance-Gate BTC HBT 2.4.4 backtest & five-stage research run (4 core models: glft, both_1p0, defensive_1p0, risk_side_pause + Stage 1, 2, 3 shadow, 5A, 5B; Stage 4 & 5C recorded as pending independent training / authorized holdout dates). Single download & conversion reused across all models and stages."
 }

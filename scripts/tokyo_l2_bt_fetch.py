@@ -218,6 +218,25 @@ def gate_live_contract(remote, meta_dir: Path, gate_symbol: str, start_ns: int) 
             "reply_wall_ns": reply_ns, "raw_sha256": meta["sha256"]}
 
 
+def live_contract(
+    remote: str | None,
+    meta_dir: Path,
+    exchange: str,
+    native_symbol: str,
+    start_ns: int,
+    *,
+    quote_tick_mult: int = 1,
+    hbt_tick_size_override: float | None = None,
+) -> dict[str, Any]:
+    """Generic instrument snapshot loader for Gate, Bybit, and Bitget."""
+    from tokyo_l2_exchange_adapters import load_live_contract_from_meta
+
+    return load_live_contract_from_meta(
+        remote, meta_dir, exchange, native_symbol, start_ns,
+        quote_tick_mult=quote_tick_mult, hbt_tick_size_override=hbt_tick_size_override,
+    )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Fetch one verified Tokyo L2 UTC day (read-only)")
     p.add_argument("--remote", required=True, help="read-only rclone remote root, e.g. bt:")
