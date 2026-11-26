@@ -15,6 +15,7 @@ from pathlib import Path
 TASK = "research/usdc_perp_glft_min/kaggle_task.py"
 FILES = (TASK, "research/usdc_perp_glft_min/glft_core.py", "research/usdc_perp_glft_min/origin_glft.py",
          "research/usdc_perp_glft_min/basis_moments.py", "research/usdc_perp_glft_min/event_study.py",
+         "research/usdc_perp_glft_min/wall_study.py",
          "scripts/check_okx_hft_data.py",
          "scripts/inspect_tardis.py", "scripts/tardis_segmented_hbt.py")
 HBT_VERSION = "2.4.4"
