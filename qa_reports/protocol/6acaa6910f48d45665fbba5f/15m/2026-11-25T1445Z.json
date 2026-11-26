@@ -1,10 +1,1683 @@
 {
-  "protocol_qa_version": 2,
-  "status": "pending",
-  "protocol_status": "pending",
-  "reason": "protocol_inputs_changed",
+  "status": "passed",
   "run_id": "trial15_20261122T0745Z",
   "window_id": "2026-11-25T14:45Z",
+  "warmup_windows": 0,
+  "replay_sample_seconds": 0,
+  "warmup_inputs": [],
+  "target_inputs": [
+    {
+      "exchange": "binance_futures",
+      "manifest_sha256": "7b6d2ca9feed5d013e1a1367e0208f414561d5f96bb237fe1dfb27bb35e16f40",
+      "data_sha256": "21927a810b8baeed97b00dd3f2b4b8d422a233cdacf5c7562c21bcb3ee3adc10"
+    },
+    {
+      "exchange": "bitget_v3",
+      "manifest_sha256": "ae59149903555b265ded9d00da8a9477f44dd7db006da51af1e08a93a55b22ca",
+      "data_sha256": "fb9f72f41ce1bdb52f8d82ac13383d502ef302fa2473f7ec485d9fd51c5be870"
+    },
+    {
+      "exchange": "bybit_linear",
+      "manifest_sha256": "ee742665fb967beafadd52ac2dfb442e6d529bf23d987cf00fa148742e38f77a",
+      "data_sha256": "985c4fbeb6608d78e81d6c52cef72cc94fb0bd7c684f2e8e7da455d8708722b2"
+    },
+    {
+      "exchange": "gate_futures",
+      "manifest_sha256": "5287a477a633e5ccffc92753f58b80d650a7c620f6680ba683db54987cb8c914",
+      "data_sha256": "a3d4dcc42ea9faab81821ef0dfe89b70a48cccdc4efd022ff9d54264c69ce457"
+    }
+  ],
+  "boundary_checkpoint_markets": 24,
+  "boundary_book_anchored_markets": 24,
+  "connection_overlap_trades": [],
+  "replay_trade_rows": [
+    {
+      "exchange": "gate_futures",
+      "trade_rows": 0,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bybit_linear",
+      "trade_rows": 0,
+      "dedup_trades_dropped": 0
+    },
+    {
+      "exchange": "bitget_v3",
+      "trade_rows": 0,
+      "dedup_trades_dropped": 0
+    }
+  ],
+  "observed_snapshot_markets": [
+    {
+      "exchange": "bitget_v3",
+      "symbol": "BTCUSDT",
+      "phase": "target",
+      "connection": "B",
+      "epoch": 43
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "DOGEUSDT",
+      "phase": "target",
+      "connection": "B",
+      "epoch": 43
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "ETHUSDT",
+      "phase": "target",
+      "connection": "B",
+      "epoch": 43
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SOLUSDT",
+      "phase": "target",
+      "connection": "B",
+      "epoch": 43
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SUIUSDT",
+      "phase": "target",
+      "connection": "B",
+      "epoch": 43
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "XRPUSDT",
+      "phase": "target",
+      "connection": "B",
+      "epoch": 43
+    }
+  ],
+  "missing_anchor_sources": [],
+  "unanchored_lookback_markets": [],
+  "boundary_events": [],
+  "archive_file_checks": [
+    {
+      "exchange": "binance_futures",
+      "qa_status": "passed",
+      "problem_count": 0
+    },
+    {
+      "exchange": "bitget_v3",
+      "qa_status": "passed",
+      "problem_count": 0
+    },
+    {
+      "exchange": "bybit_linear",
+      "qa_status": "passed",
+      "problem_count": 0
+    },
+    {
+      "exchange": "gate_futures",
+      "qa_status": "passed",
+      "problem_count": 0
+    }
+  ],
+  "depth_frames_by_mode": [
+    {
+      "exchange": "binance_futures",
+      "mode": "delta",
+      "count": 52139
+    },
+    {
+      "exchange": "bitget_v3",
+      "mode": "snapshot",
+      "count": 68093
+    },
+    {
+      "exchange": "bybit_linear",
+      "mode": "delta",
+      "count": 251807
+    },
+    {
+      "exchange": "gate_futures",
+      "mode": "delta",
+      "count": 245032
+    }
+  ],
+  "protocol": {
+    "frames": [
+      {
+        "exchange": "binance_futures",
+        "symbol": "BTCUSDT",
+        "count": 8823
+      },
+      {
+        "exchange": "binance_futures",
+        "symbol": "DOGEUSDT",
+        "count": 8526
+      },
+      {
+        "exchange": "binance_futures",
+        "symbol": "ETHUSDT",
+        "count": 8821
+      },
+      {
+        "exchange": "binance_futures",
+        "symbol": "SOLUSDT",
+        "count": 8751
+      },
+      {
+        "exchange": "binance_futures",
+        "symbol": "SUIUSDT",
+        "count": 8521
+      },
+      {
+        "exchange": "binance_futures",
+        "symbol": "XRPUSDT",
+        "count": 8697
+      },
+      {
+        "exchange": "bitget_v3",
+        "symbol": "BTCUSDT",
+        "count": 11508
+      },
+      {
+        "exchange": "bitget_v3",
+        "symbol": "DOGEUSDT",
+        "count": 11110
+      },
+      {
+        "exchange": "bitget_v3",
+        "symbol": "ETHUSDT",
+        "count": 11541
+      },
+      {
+        "exchange": "bitget_v3",
+        "symbol": "SOLUSDT",
+        "count": 11578
+      },
+      {
+        "exchange": "bitget_v3",
+        "symbol": "SUIUSDT",
+        "count": 10927
+      },
+      {
+        "exchange": "bitget_v3",
+        "symbol": "XRPUSDT",
+        "count": 11429
+      },
+      {
+        "exchange": "bybit_linear",
+        "symbol": "BTCUSDT",
+        "count": 44893
+      },
+      {
+        "exchange": "bybit_linear",
+        "symbol": "DOGEUSDT",
+        "count": 37137
+      },
+      {
+        "exchange": "bybit_linear",
+        "symbol": "ETHUSDT",
+        "count": 44947
+      },
+      {
+        "exchange": "bybit_linear",
+        "symbol": "SOLUSDT",
+        "count": 42867
+      },
+      {
+        "exchange": "bybit_linear",
+        "symbol": "SUIUSDT",
+        "count": 38035
+      },
+      {
+        "exchange": "bybit_linear",
+        "symbol": "XRPUSDT",
+        "count": 43928
+      },
+      {
+        "exchange": "gate_futures",
+        "symbol": "BTCUSDT",
+        "count": 48768
+      },
+      {
+        "exchange": "gate_futures",
+        "symbol": "DOGEUSDT",
+        "count": 32496
+      },
+      {
+        "exchange": "gate_futures",
+        "symbol": "ETHUSDT",
+        "count": 48580
+      },
+      {
+        "exchange": "gate_futures",
+        "symbol": "SOLUSDT",
+        "count": 40579
+      },
+      {
+        "exchange": "gate_futures",
+        "symbol": "SUIUSDT",
+        "count": 36529
+      },
+      {
+        "exchange": "gate_futures",
+        "symbol": "XRPUSDT",
+        "count": 38080
+      }
+    ],
+    "issues": []
+  },
+  "proven_protocol_issues": [],
+  "protocol_status": "passed",
+  "market_availability": [
+    {
+      "exchange": "binance_futures",
+      "symbol": "BTCUSDT",
+      "channel": "aggTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "BTCUSDT",
+      "channel": "bookTicker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "BTCUSDT",
+      "channel": "depth@100ms",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "DOGEUSDT",
+      "channel": "aggTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "DOGEUSDT",
+      "channel": "bookTicker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "DOGEUSDT",
+      "channel": "depth@100ms",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "ETHUSDT",
+      "channel": "aggTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "ETHUSDT",
+      "channel": "bookTicker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "ETHUSDT",
+      "channel": "depth@100ms",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SOLUSDT",
+      "channel": "aggTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SOLUSDT",
+      "channel": "bookTicker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SOLUSDT",
+      "channel": "depth@100ms",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SUIUSDT",
+      "channel": "aggTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SUIUSDT",
+      "channel": "bookTicker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SUIUSDT",
+      "channel": "depth@100ms",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "XRPUSDT",
+      "channel": "aggTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "XRPUSDT",
+      "channel": "bookTicker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "XRPUSDT",
+      "channel": "depth@100ms",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "BTCUSDT",
+      "channel": "books1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "BTCUSDT",
+      "channel": "books50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795617900006705732,
+          "status": "unverified",
+          "reason": "initial_state_unverified"
+        },
+        {
+          "start_wall_ns": 1795617900006705732,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "BTCUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "DOGEUSDT",
+      "channel": "books1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "DOGEUSDT",
+      "channel": "books50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795617900015493377,
+          "status": "unverified",
+          "reason": "initial_state_unverified"
+        },
+        {
+          "start_wall_ns": 1795617900015493377,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "DOGEUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "ETHUSDT",
+      "channel": "books1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "ETHUSDT",
+      "channel": "books50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795617900015491905,
+          "status": "unverified",
+          "reason": "initial_state_unverified"
+        },
+        {
+          "start_wall_ns": 1795617900015491905,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "ETHUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SOLUSDT",
+      "channel": "books1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SOLUSDT",
+      "channel": "books50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795617900015486929,
+          "status": "unverified",
+          "reason": "initial_state_unverified"
+        },
+        {
+          "start_wall_ns": 1795617900015486929,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SOLUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SUIUSDT",
+      "channel": "books1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SUIUSDT",
+      "channel": "books50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795617900010633425,
+          "status": "unverified",
+          "reason": "initial_state_unverified"
+        },
+        {
+          "start_wall_ns": 1795617900010633425,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SUIUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "XRPUSDT",
+      "channel": "books1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "XRPUSDT",
+      "channel": "books50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795617900015826127,
+          "status": "unverified",
+          "reason": "initial_state_unverified"
+        },
+        {
+          "start_wall_ns": 1795617900015826127,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "XRPUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "BTCUSDT",
+      "channel": "orderbook.1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "BTCUSDT",
+      "channel": "orderbook.50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "BTCUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "DOGEUSDT",
+      "channel": "orderbook.1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "DOGEUSDT",
+      "channel": "orderbook.50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "DOGEUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "ETHUSDT",
+      "channel": "orderbook.1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "ETHUSDT",
+      "channel": "orderbook.50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "ETHUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SOLUSDT",
+      "channel": "orderbook.1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SOLUSDT",
+      "channel": "orderbook.50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SOLUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SUIUSDT",
+      "channel": "orderbook.1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SUIUSDT",
+      "channel": "orderbook.50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SUIUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "XRPUSDT",
+      "channel": "orderbook.1",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "XRPUSDT",
+      "channel": "orderbook.50",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "XRPUSDT",
+      "channel": "publicTrade",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "BTCUSDT",
+      "channel": "futures.book_ticker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "BTCUSDT",
+      "channel": "futures.obu",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "BTCUSDT",
+      "channel": "futures.trades",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "DOGEUSDT",
+      "channel": "futures.book_ticker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "DOGEUSDT",
+      "channel": "futures.obu",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "DOGEUSDT",
+      "channel": "futures.trades",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "ETHUSDT",
+      "channel": "futures.book_ticker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "ETHUSDT",
+      "channel": "futures.obu",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "ETHUSDT",
+      "channel": "futures.trades",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SOLUSDT",
+      "channel": "futures.book_ticker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SOLUSDT",
+      "channel": "futures.obu",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SOLUSDT",
+      "channel": "futures.trades",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SUIUSDT",
+      "channel": "futures.book_ticker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SUIUSDT",
+      "channel": "futures.obu",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SUIUSDT",
+      "channel": "futures.trades",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "XRPUSDT",
+      "channel": "futures.book_ticker",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "XRPUSDT",
+      "channel": "futures.obu",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "verified_depth_sequence"
+        }
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "XRPUSDT",
+      "channel": "futures.trades",
+      "intervals": [
+        {
+          "start_wall_ns": 1795617900000000000,
+          "end_wall_ns": 1795618800000000000,
+          "status": "verified_usable",
+          "reason": "observed_stream"
+        }
+      ]
+    }
+  ],
+  "end_sequence_checkpoint": [
+    {
+      "exchange": "binance_futures",
+      "symbol": "BTCUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        8
+      ],
+      "seq": 12237480299221,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799980763520,
+      "book_anchored": true,
+      "book_sha256": "3c42c931d6a489b20d014a602ff7ec966ed5df0f1612f9a3449e19f7574eecc2",
+      "last_exchange_ns": 1795618799979000000,
+      "bid_levels": 17323,
+      "ask_levels": 13918
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "DOGEUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        8
+      ],
+      "seq": 12237480301152,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799989816312,
+      "book_anchored": true,
+      "book_sha256": "0883b9d576500a020c3f74a465e054352452fc6abba1b5e483839c19e97993d1",
+      "last_exchange_ns": 1795618799985000000,
+      "bid_levels": 1147,
+      "ask_levels": 1402
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "ETHUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        8
+      ],
+      "seq": 12237480303368,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799997781455,
+      "book_anchored": true,
+      "book_sha256": "e01b08ab4c1979d9343864818d2d6a4dda2da28075eae2b3219a4325ed48ac9f",
+      "last_exchange_ns": 1795618799996000000,
+      "bid_levels": 11796,
+      "ask_levels": 10073
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SOLUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        8
+      ],
+      "seq": 12237480294354,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799949737326,
+      "book_anchored": true,
+      "book_sha256": "a90895ab8a8a7a357157ce5edc237d655c678d5994d0473d32c6f1cf98e486e4",
+      "last_exchange_ns": 1795618799945000000,
+      "bid_levels": 1815,
+      "ask_levels": 2082
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "SUIUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        8
+      ],
+      "seq": 12237480300088,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799983711625,
+      "book_anchored": true,
+      "book_sha256": "075501e7973855d7f3f507a31c5bf50029f2d3f591760c5fba2fe69f0be18ff9",
+      "last_exchange_ns": 1795618799981000000,
+      "bid_levels": 1048,
+      "ask_levels": 1110
+    },
+    {
+      "exchange": "binance_futures",
+      "symbol": "XRPUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        8
+      ],
+      "seq": 12237480292490,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799922233297,
+      "book_anchored": true,
+      "book_sha256": "73a6edc2bb974be6c1b9876110750dbc3eb4ed9fa9bc230de470b80688a643cf",
+      "last_exchange_ns": 1795618799920000000,
+      "bid_levels": 1794,
+      "ask_levels": 1733
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "BTCUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        43
+      ],
+      "seq": 1307906017783,
+      "awaiting_delta": true,
+      "last_wall_ns": 1795618799866897266,
+      "book_anchored": true,
+      "book_sha256": "11ad84d52169f7ecca2a59c7193baa22831a9e1961110f60b6d551583d4f14b2",
+      "last_exchange_ns": 1795618799850000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "DOGEUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        43
+      ],
+      "seq": 530953513950,
+      "awaiting_delta": true,
+      "last_wall_ns": 1795618799914838307,
+      "book_anchored": true,
+      "book_sha256": "49b7a9f71e3bd0e6e1081f97155eaa819dcc2ba4f53c09bbffee34b98d1f4707",
+      "last_exchange_ns": 1795618799855000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "ETHUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        43
+      ],
+      "seq": 1073391797275,
+      "awaiting_delta": true,
+      "last_wall_ns": 1795618799914760146,
+      "book_anchored": true,
+      "book_sha256": "4c7a9aa4232a70940b59807d08055f0e2986bdd3ea5cca56da35a1edf2771a00",
+      "last_exchange_ns": 1795618799851000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SOLUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        43
+      ],
+      "seq": 225021009655,
+      "awaiting_delta": true,
+      "last_wall_ns": 1795618799914758295,
+      "book_anchored": true,
+      "book_sha256": "939cdd4ac11dfe8a4eb4fee813947019ae361033f2d5e6dada5db264621ab793",
+      "last_exchange_ns": 1795618799851000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "SUIUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        43
+      ],
+      "seq": 530953513940,
+      "awaiting_delta": true,
+      "last_wall_ns": 1795618799914840301,
+      "book_anchored": true,
+      "book_sha256": "97393372315323fe87a67fac507af1c60f62c23d8bba63f4535dc8172f27846b",
+      "last_exchange_ns": 1795618799854000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bitget_v3",
+      "symbol": "XRPUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "B",
+        43
+      ],
+      "seq": 225021009653,
+      "awaiting_delta": true,
+      "last_wall_ns": 1795618799914756470,
+      "book_anchored": true,
+      "book_sha256": "ad9d6a79bb1c64c899def223670e4015e40f33db22a22d97a47c33f178e76d0b",
+      "last_exchange_ns": 1795618799850000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "BTCUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        5
+      ],
+      "seq": 22418450,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799997321183,
+      "book_anchored": true,
+      "book_sha256": "33b7ef83262abe6ebb7f096005f13d9748b664df6580083370500ecf074421f9",
+      "last_exchange_ns": 1795618799992000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "DOGEUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        5
+      ],
+      "seq": 16635338,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799987717889,
+      "book_anchored": true,
+      "book_sha256": "a28f054646fd85dd267f05814720f00931b6421ee4cfc9a1b5b59a34daca4fc3",
+      "last_exchange_ns": 1795618799982000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "ETHUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        5
+      ],
+      "seq": 23968859,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799996745757,
+      "book_anchored": true,
+      "book_sha256": "eb41d640ce3d5bf4f2319e986f72b43d2551d96d2056d72e748c5ff3ebff7784",
+      "last_exchange_ns": 1795618799991000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SOLUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        5
+      ],
+      "seq": 20033541,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799991958477,
+      "book_anchored": true,
+      "book_sha256": "37d20e9f9df003a23fd291d8c244455c8dfe45a9e345367ef5b894934eb76344",
+      "last_exchange_ns": 1795618799987000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "SUIUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        5
+      ],
+      "seq": 15357558,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799995681045,
+      "book_anchored": true,
+      "book_sha256": "91f12e8b6807660ba85e9f9aa84240f098ef9482d10817ac49682d5a45f87048",
+      "last_exchange_ns": 1795618799985000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "bybit_linear",
+      "symbol": "XRPUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        5
+      ],
+      "seq": 21714924,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799991670670,
+      "book_anchored": true,
+      "book_sha256": "6cc8629408b104235b85f7c1b2e272dc5c3764d57653b47a447e8a41f7092821",
+      "last_exchange_ns": 1795618799986000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "BTCUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        4
+      ],
+      "seq": 134752391448,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799989985392,
+      "book_anchored": true,
+      "book_sha256": "6b55d99b5cbb3ba87ab1feb8c95e0093a1650bbfe11e072b64f6636e4fec111d",
+      "last_exchange_ns": 1795618799987000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "DOGEUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        4
+      ],
+      "seq": 40054493861,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799997868268,
+      "book_anchored": true,
+      "book_sha256": "1b81e6616b1b498906dcfda56e5669c5cfabc5d990711267296ec5eace9ec051",
+      "last_exchange_ns": 1795618799995000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "ETHUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        4
+      ],
+      "seq": 116754644192,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799987131194,
+      "book_anchored": true,
+      "book_sha256": "e9334eb1d8af2e4e8205702f5eaee8663ba0b8744998b359e8560831066ce882",
+      "last_exchange_ns": 1795618799984000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SOLUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        4
+      ],
+      "seq": 44899565694,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799987685535,
+      "book_anchored": true,
+      "book_sha256": "ab0dc1bcf362fa78302cd3f7f426b2ad335e702fbafcb534fb38dbc016e09e48",
+      "last_exchange_ns": 1795618799984000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "SUIUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        4
+      ],
+      "seq": 15681985982,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799978927955,
+      "book_anchored": true,
+      "book_sha256": "4a09c3107f0b3bb4e76fdb75709f26f0a44d3099141ce86ad0eb5e8d145dd58c",
+      "last_exchange_ns": 1795618799976000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    },
+    {
+      "exchange": "gate_futures",
+      "symbol": "XRPUSDT",
+      "connection": [
+        "trial15_20261122T0745Z_1795333473410706867",
+        "A",
+        4
+      ],
+      "seq": 28876273284,
+      "awaiting_delta": false,
+      "last_wall_ns": 1795618799984419981,
+      "book_anchored": true,
+      "book_sha256": "d55224fdae74acb9ba63a93b8c7e4f078b1b79684d6b7d35f2dbfdecbc1ef8f8",
+      "last_exchange_ns": 1795618799980000000,
+      "bid_levels": 50,
+      "ask_levels": 50
+    }
+  ],
+  "replay": {},
+  "protocol_qa_version": 2,
+  "checker": "2e97490cf62fa80029a19c5eb0e38fc0e14f9d56/9e9dfb0f32482e3d0cc93fb66a05ff08963aed0f9d3d06ba889554f3bd1f9274",
   "archive_revision": "sha256:6403b01228462ef7c5d57bb631db55efd6ef34b24a122f0535960d4843098748",
-  "checker": "31590e1ab0f58436b0967a969384994aabfc6b82/9e9dfb0f32482e3d0cc93fb66a05ff08963aed0f9d3d06ba889554f3bd1f9274"
+  "previous_inputs": [
+    {
+      "exchange": "binance_futures",
+      "manifest_sha256": "c0ed6038e81a0b8a1bdce236adec6d5283e19142c97606f4979ccd65451bcd50",
+      "data_sha256": "59a065a9d227ab529ecfbf9182d44817d5d5782a286da10e0ff0ee7ff37f26e0"
+    },
+    {
+      "exchange": "bitget_v3",
+      "manifest_sha256": "2603c72bd76c178d0fa2665656184c2522bde90bec8d5e3e89ed5926e5a875e7",
+      "data_sha256": "7eb2d5647a25bf6c78edb655fc7306111438d9f3dcf81e29db136714ae845f97"
+    },
+    {
+      "exchange": "bybit_linear",
+      "manifest_sha256": "323dc498ba68aeb702ae49132aad8b922e829e193bf80752a4259bc0e726fe60",
+      "data_sha256": "6072e5bd56f4abfaf1f415da07d40ecd0172e84232a42cff89b0f22c10486a29"
+    },
+    {
+      "exchange": "gate_futures",
+      "manifest_sha256": "2abdaa6648eec0b83d4df444d2cab66c4b516e832025a5c4d3d9ab3cfd81bdd3",
+      "data_sha256": "39e3b12cc895f78ac4ee44fb5cc4c1c813ba0cb3f7694614e1d6a4ace936352b"
+    }
+  ],
+  "anchor_lookback_windows": 0,
+  "anchor_lookback_inputs": [],
+  "source_restrictions": {},
+  "input_checkpoint_digest": "30902b8dcdc3579b771cf5cb382f2cad48e9c0df82ccb9f6033258790e865788",
+  "completed_at_utc": "2026-11-26T16:28:07Z"
 }
