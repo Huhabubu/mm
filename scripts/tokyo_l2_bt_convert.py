@@ -56,6 +56,7 @@ def narrowed_config(
     config: dict[str, Any],
     gate_symbol: str,
     making_exchange: str = FOLLOWER,
+    include_leader: bool = True,
 ) -> dict[str, Any]:
     if making_exchange == FOLLOWER:
         _, binance_sym, follower_sym = native_symbols(gate_symbol)
@@ -64,18 +65,42 @@ def narrowed_config(
         binance_sym = f"{base}USDT"
         follower_sym = f"{base}USDT"
     out = copy.deepcopy(config)
+    enabled_set = {making_exchange} | ({LEADER} if include_leader else set())
     for name, ex in out["exchanges"].items():
-        ex["enabled"] = name in (LEADER, making_exchange)
-    b = out["exchanges"][LEADER]
+        ex["enabled"] = name in enabled_set
     f = out["exchanges"][making_exchange]
-    if binance_sym not in b["symbols"] or follower_sym not in f["symbols"]:
+    if follower_sym not in f["symbols"]:
         raise ValueError(f"{gate_symbol} ({making_exchange}) is not collected by this config")
+    f["symbols"] = [follower_sym]
+    if include_leader:
+        b = out["exchanges"][LEADER]
+        if binance_sym not in b["symbols"]:
+            raise ValueError(f"{binance_sym} ({LEADER}) is not collected by this config")
+        if "bookTicker" not in b["public_channels"]:
+            raise ValueError("Binance bookTicker is not collected")
+        b["symbols"] = [binance_sym]
+        b["public_channels"] = ["bookTicker"]
+        b["market_channels"] = []
+    return out
+
+
+def narrowed_binance_config(config: dict[str, Any], base_symbols: Iterable[str]) -> dict[str, Any]:
+    """Collector config narrowed to Binance @bookTicker for one or more base symbols."""
+    syms = [f"{base_asset(s)}USDT" for s in base_symbols]
+    if not syms:
+        raise ValueError("base_symbols must not be empty")
+    out = copy.deepcopy(config)
+    for name, ex in out["exchanges"].items():
+        ex["enabled"] = name == LEADER
+    b = out["exchanges"][LEADER]
+    missing = [s for s in syms if s not in b["symbols"]]
+    if missing:
+        raise ValueError(f"Binance symbols not collected by config: {missing}")
     if "bookTicker" not in b["public_channels"]:
         raise ValueError("Binance bookTicker is not collected")
-    b["symbols"] = [binance_sym]
+    b["symbols"] = sorted(set(syms))
     b["public_channels"] = ["bookTicker"]
     b["market_channels"] = []
-    f["symbols"] = [follower_sym]
     return out
 
 

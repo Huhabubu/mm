@@ -1,0 +1,89 @@
+{
+  "experiment_name": "tokyo_l2_20261123_binance_gate_eth_unified",
+  "data_source": "google_drive_tokyo_l2",
+  "signal_exchange": "binance_futures",
+  "making_exchange": "gate_futures",
+  "symbol": "ETH",
+  "dates": {
+    "eval_dates": ["2026-11-23"],
+    "train_dates": [],
+    "holdout_dates": [],
+    "holdout_chronology": "forward_oos"
+  },
+  "contract_spec": {
+    "mode": "auto_live",
+    "quote_tick_mult": 1,
+    "hbt_tick_size_override": null,
+    "explicit": null
+  },
+  "strategy": {
+    "target_notional_usdt": 80.0,
+    "risk_aversion_per_usdt": 50.0,
+    "inventory_multiple": 20,
+    "train_minutes": 10,
+    "trade_minutes": 1430,
+    "recalibration_interval_seconds": 5,
+    "fit_mode": "physical_1tick_poisson",
+    "sigma_threshold": 1.645,
+    "beta": 1.0,
+    "wait_book_after_fill": true,
+    "post_only_clamp_mode": "unified",
+    "cap_depth_at_visible_levels": false,
+    "cross_timestamp_tie_mode": "microsecond"
+  },
+  "latency": {
+    "binance_extra_visible_delay_ns": 0,
+    "order_entry_latency_ns": 1000000,
+    "order_response_latency_ns": 1000000,
+    "order_latency_assumption_note": "Uniform 1ms one-way simulated assumption; not measured live exchange order latency"
+  },
+  "order_controls": {
+    "min_requote_ns": 0,
+    "native_order_modify_enabled": false,
+    "stage3_guard_ns": 1000
+  },
+  "models": [
+    "glft",
+    "both_1p0",
+    "defensive_1p0",
+    "risk_side_pause"
+  ],
+  "stages": [
+    "stage1",
+    "stage2",
+    "stage3",
+    "stage4",
+    "stage5a",
+    "stage5b",
+    "stage5c"
+  ],
+  "stage4": {
+    "authorized": false,
+    "lock_file": null,
+    "widen_ratios": [0.10, 0.25, 0.50, 1.00],
+    "vol_quantiles": [0.55, 0.70, 0.85, 0.95]
+  },
+  "stage5c": {
+    "authorized": false,
+    "lock_file": null,
+    "selection_metric": "gross_marked_pnl_usdt",
+    "rank_order": ["both_1p0", "defensive_1p0", "risk_side_pause"],
+    "rms_multiplier_cap": 1.25
+  },
+  "fees": {
+    "primary_zero_fee": true,
+    "engine_maker_fee_rate": 0.0002,
+    "engine_taker_fee_rate": 0.0005,
+    "supplementary_maker_rates_bps": [2.0, -0.5]
+  },
+  "cache": {
+    "reuse_converted": true,
+    "cache_input_dir": null,
+    "converter_version": "stream_convert_v3"
+  },
+  "execution": {
+    "batch_windows": 8,
+    "download_workers": 8,
+    "diagnostic_allow_known_gaps": true
+  }
+}

@@ -34,13 +34,13 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | N
         w.writerows(rows)
 
 
-def write_unified_reports(report: dict[str, Any], out_dir: Path) -> dict[str, str]:
+def write_unified_reports(report: dict[str, Any], out_dir: Path, *, prefix: str = "") -> dict[str, str]:
     """Emit unified_report.json, CSV summary tables, and research_report.md into `out_dir`."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, str] = {}
 
-    json_path = out_dir / "unified_report.json"
+    json_path = out_dir / f"{prefix}unified_report.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
     written["json"] = json_path.name
 
@@ -165,10 +165,11 @@ def write_unified_reports(report: dict[str, Any], out_dir: Path) -> dict[str, st
         ("stage5b_same_fill.csv", stage5b_rows),
         ("anomalies.csv", anomaly_rows),
     ):
-        _write_csv(out_dir / fname, rows)
-        written[fname] = fname
+        out_name = f"{prefix}{fname}"
+        _write_csv(out_dir / out_name, rows)
+        written[fname] = out_name
 
-    md_path = out_dir / "research_report.md"
+    md_path = out_dir / f"{prefix}research_report.md"
     md_path.write_text(render_markdown_report(report), encoding="utf-8")
     written["markdown"] = md_path.name
     return written
@@ -357,3 +358,46 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         lines.append("")
 
     return "\n".join(lines) + "\n"
+
+
+def render_batch_markdown_summary(batch_report: dict[str, Any]) -> str:
+    """Render a cross-pair Markdown summary table for a batch unified backtest run."""
+    lines: list[str] = []
+    lines.append(f"# Unified Batch Backtest Summary: `{batch_report.get('batch_name', 'tokyo_l2_batch')}`")
+    lines.append("")
+    lines.append(f"- **Date UTC**: `{batch_report.get('date_utc')}`")
+    lines.append(f"- **Signal Exchange**: `{batch_report.get('signal_exchange')}` | **Shared Leader Symbols**: `{batch_report.get('shared_leader_symbols')}`")
+    lines.append(f"- **Status**: `{batch_report.get('status')}` | **Started UTC**: `{batch_report.get('started_utc')}` | **Finished UTC**: `{batch_report.get('finished_utc')}`")
+    sl = batch_report.get("shared_leader") or {}
+    if sl:
+        lines.append(
+            f"- **Shared Binance Pass**: status=`{sl.get('status')}`, partitions=`{sl.get('partitions_verified')}`, "
+            f"dl=`{sl.get('download_elapsed_s')}s`, convert=`{sl.get('convert_elapsed_s')}s`, failed_items=`{sl.get('failed_items')}`"
+        )
+    lines.append("")
+    lines.append("## Per-Pair Overview")
+    lines.append("")
+    lines.append("| Slug | Pair | Status | Stream QA | Anomalies | Elapsed (s) | Reports Prefix |")
+    lines.append("|---|---|---|---|---:|---:|---|")
+    for slug, info in (batch_report.get("experiments") or {}).items():
+        pair = f"{info.get('signal_exchange', '')} -> {info.get('making_exchange', '')} {info.get('base_symbol', '')}"
+        lines.append(
+            f"| `{slug}` | `{pair}` | `{info.get('status')}` | `{info.get('stream_status')}` | "
+            f"{_fmt(info.get('anomaly_episode_count'))} | {_fmt(info.get('elapsed_s'), 1)} | `{slug}__` |"
+        )
+    lines.append("")
+    lines.append("## Cross-Pair Stage 5A Highlights (Zero-Fee Gross Primary)")
+    lines.append("")
+    lines.append("| Slug | Model | Fills | Turnover (USDT) | Gross PnL (USDT) | Gross (bps) | Net +2bps (USDT) | TM 500ms (bps) | Pos Std |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    for slug, info in (batch_report.get("experiments") or {}).items():
+        for r in info.get("stage5a_table") or []:
+            lines.append(
+                f"| `{slug}` | `{r['model']}` | {_fmt(r['fills'])} | {_fmt(r['turnover_usdt'], 2)} | "
+                f"{_fmt(r['gross_marked_pnl_usdt'], 4)} | {_fmt(r['gross_pnl_bps'], 4)} | "
+                f"{_fmt(r['net_marked_pnl_usdt_2bps'], 4)} | {_fmt(r.get('total_markout_500ms_bps'), 4)} | "
+                f"{_fmt(r['position_std_contracts'], 4)} |"
+            )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+

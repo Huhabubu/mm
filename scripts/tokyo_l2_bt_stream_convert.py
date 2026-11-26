@@ -55,7 +55,7 @@ from hftbacktest import (BUY_EVENT, DEPTH_CLEAR_EVENT, DEPTH_EVENT, DEPTH_SNAPSH
 from qa_convert import (TRADE_FLAG_IS_INTERNAL, AssetDayBuffers, _order_and_validate_hbt_events,
                         _validate_and_apply_follower_depth, load_chrony_uncertified_intervals,
                         load_spec_change_isolations)
-from tokyo_l2_bt_convert import base_asset, narrowed_config, native_symbols
+from tokyo_l2_bt_convert import base_asset, narrowed_binance_config, narrowed_config, native_symbols
 
 LEADER = "binance_futures"
 FOLLOWER = "gate_futures"
@@ -166,8 +166,13 @@ class ExchangeState:
 class TradeDedup:
     """First-receive Gate trade dedup with PR #30 handover classification (deferred by 5 s)."""
 
-    def __init__(self, compare_fields: tuple[str, ...] = TRADE_COMPARE_FIELDS) -> None:
+    def __init__(
+        self,
+        compare_fields: tuple[str, ...] = TRADE_COMPARE_FIELDS,
+        strict_handover_only: bool = True,
+    ) -> None:
         self.compare_fields = tuple(compare_fields)
+        self.strict_handover_only = bool(strict_handover_only)
         self.seen: dict[str, tuple[int, int]] = {}      # key -> (fields digest, connection index)
         self.copy_conns: dict[str, list[int]] = {}      # key -> connection index of every copy
         self.conns: list[tuple[str, str, int]] = []
@@ -229,7 +234,9 @@ class TradeDedup:
                                      "near_connection_event": near_event})
 
     def issues(self) -> int:
-        return self.counts["duplicate_trade_id"] + self.counts["conflicting_duplicate_trade"]
+        if getattr(self, "strict_handover_only", True):
+            return self.counts["duplicate_trade_id"] + self.counts["conflicting_duplicate_trade"]
+        return self.counts["conflicting_duplicate_trade"]
 
 
 def _rx_dups_against(blocks: list[tuple], uniq: np.ndarray) -> int:
@@ -294,8 +301,10 @@ class StreamConverter:
         config: dict[str, Any] | None = None,
         coverage_date: str | None = None,
         making_exchange: str = FOLLOWER,
+        include_leader: bool = True,
     ):
         self.making_exchange = str(making_exchange)
+        self.include_leader = bool(include_leader)
         if self.making_exchange == FOLLOWER:
             base, binance_sym, follower_sym = native_symbols(gate_symbol)
             cmp_fields = TRADE_COMPARE_FIELDS
@@ -313,10 +322,16 @@ class StreamConverter:
         if coverage_date is not None and config is None:
             raise ValueError("complete-day coverage needs the collector config")
         self.coverage = (
-            CompleteDayCoverage(narrowed_config(config, self.gate_symbol, making_exchange=self.making_exchange), coverage_date)
+            CompleteDayCoverage(
+                narrowed_config(config, self.gate_symbol, making_exchange=self.making_exchange, include_leader=self.include_leader),
+                coverage_date,
+            )
             if coverage_date else None
         )
-        self.ex = {LEADER: ExchangeState(LEADER), self.making_exchange: ExchangeState(self.making_exchange)}
+        self.ex = (
+            {LEADER: ExchangeState(LEADER), self.making_exchange: ExchangeState(self.making_exchange)}
+            if self.include_leader else {self.making_exchange: ExchangeState(self.making_exchange)}
+        )
         self.bbo = RowSink(BBO_DTYPE)
         self.bbo_exch_ahead_of_local = 0
         buf = AssetDayBuffers(self.making_exchange, base, "stream")
@@ -324,7 +339,10 @@ class StreamConverter:
         buf.edge_samples = RowSink(EDGE_DTYPE)
         buf.bbo_rows = RowSink(BBO_DTYPE)
         self.gate = buf
-        self.trades = TradeDedup(compare_fields=cmp_fields)
+        self.trades = TradeDedup(
+            compare_fields=cmp_fields,
+            strict_handover_only=(self.making_exchange == FOLLOWER),
+        )
         self.init_exclusion = {"frames": 0, "first_local_ts": None, "last_local_ts": None}
         self.initial_gate_window = None
         self.current_gate_window = None
@@ -982,11 +1000,12 @@ class StreamConverter:
             np.savez_compressed(path, **arrays)
             report["artifacts"].append({"kind": kind, "path": path.name, "rows": rows, "sha256": sha256_file(path)})
 
-        bbo = self._load_parts(parts_dir, LEADER, "bbo", BBO_DTYPE)
-        bbo = bbo[np.argsort(bbo["local_ts_ns"], kind="mergesort")]
-        save("binance_bbo", out_dir / f"binance_bbo_{base}_{ymd}.npz", len(bbo),
-             **{name: bbo[name] for name in BBO_DTYPE.names})
-        del bbo
+        if getattr(self, "include_leader", True):
+            bbo = self._load_parts(parts_dir, LEADER, "bbo", BBO_DTYPE)
+            bbo = bbo[np.argsort(bbo["local_ts_ns"], kind="mergesort")]
+            save("binance_bbo", out_dir / f"binance_bbo_{base}_{ymd}.npz", len(bbo),
+                 **{name: bbo[name] for name in BBO_DTYPE.names})
+            del bbo
         raw = self._load_parts(parts_dir, making_ex, "hbt_raw", event_dtype)
         if len(raw) != len(self.gate.hbt_rows):
             raise AssertionError(f"HBT rows {len(raw)} != emitted {len(self.gate.hbt_rows)}")
@@ -1008,6 +1027,283 @@ class StreamConverter:
         l1 = l1[np.argsort(l1["local_ts_ns"], kind="mergesort")]
         save("follower_l1_bbo", out_dir / f"{making_ex}_l1_{base}_{ymd}.npz", len(l1),
              **{name: l1[name] for name in BBO_DTYPE.names})
+
+
+class MultiSymbolBinanceBBOExtractor:
+    """Single-pass streaming Binance @bookTicker extractor for multiple base symbols.
+
+    Decompresses and validates each Binance partition ONCE (SHA-256, rx_seq,
+    recv_mono, META gap/loss/switch, CompleteDayCoverage) and simultaneously emits
+    `binance_bbo_{BASE}_{YMD}.npz` for every requested base symbol so multiple
+    making-exchange experiments share one Binance download and scan pass.
+    """
+
+    def __init__(
+        self,
+        base_symbols: list[str] | tuple[str, ...],
+        config: dict[str, Any] | None = None,
+        coverage_date: str | None = None,
+    ) -> None:
+        self.bases = sorted({base_asset(s) for s in base_symbols})
+        if not self.bases:
+            raise ValueError("base_symbols must not be empty")
+        self.native_to_base = {f"{b}USDT": b for b in self.bases}
+        self.native_syms = tuple(sorted(self.native_to_base.keys()))
+        self.coverage_date = coverage_date
+        if coverage_date is not None and config is None:
+            raise ValueError("complete-day coverage needs the collector config")
+        self.coverage = (
+            CompleteDayCoverage(narrowed_binance_config(config, self.bases), coverage_date)
+            if coverage_date else None
+        )
+        self.st = ExchangeState(LEADER)
+        self.sinks = {b: RowSink(BBO_DTYPE) for b in self.bases}
+        self.exch_ahead_of_local: Counter = Counter()
+        self.failed: Counter = Counter()
+        self.failed_samples: list[str] = []
+        self.day_gaps: dict[str, list[dict[str, Any]]] = {}
+        self.day_local_loss: dict[str, list[dict[str, Any]]] = {}
+        self.day_switches: Counter = Counter()
+        self.local_loss_partitions: list[dict[str, Any]] = []
+        self.parts: list[dict[str, Any]] = []
+        self._day_lo = self._day_hi = None
+        self._day = ""
+
+    def _fail(self, code: str, detail: str) -> None:
+        self.failed[code] += 1
+        if len(self.failed_samples) < 50:
+            self.failed_samples.append(f"{code}:{detail}")
+
+    def _date(self, wall: int) -> str:
+        if self._day_lo is None or not (self._day_lo <= wall < self._day_hi):
+            day = datetime.fromtimestamp(wall // NS, tz=timezone.utc).strftime("%Y-%m-%d")
+            start = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) * NS
+            self._day_lo, self._day_hi, self._day = start, start + DAY_NS, day
+        return self._day
+
+    def process_partition(self, data_path: Path, manifest_path: Path, parts_dir: Path) -> dict[str, Any]:
+        data_path, manifest_path, parts_dir = Path(data_path), Path(manifest_path), Path(parts_dir)
+        t0 = time.time()
+        checked = verify_local_partition(data_path, manifest_path)
+        mf = checked["manifest"]
+        if str(mf["exchange"]) != LEADER:
+            raise ValueError(f"expected {LEADER} partition, got {mf['exchange']}")
+        norm = normalize_manifest_window(mf, fallback_file_name=data_path.name)
+        st = self.st
+        key = frozen_sort_key(mf, data_path)
+        if st.last_sort_key is not None and key <= st.last_sort_key:
+            raise ValueError(f"{LEADER}: partition {data_path.name} is not after previous")
+        in_cov = self.coverage is not None and norm["date_utc"] == self.coverage.date
+        if in_cov:
+            self.coverage.observe_partition(mf)
+        boot = norm["boot_id"]
+        if boot != st.prev_boot:
+            st.prev_boot, st.prev_file_last_rx_seq, st.prev_file_had_late_frames = boot, None, False
+            st.boot_rx_blocks, st.producer_prev_mono = [], {}
+
+        c: Counter = Counter()
+        rxs = array("q")
+        recorded_local_loss = dropped_frames = 0
+        prev_mono = st.producer_prev_mono
+        coverage = self.coverage if in_cov else None
+        bases_set = set(self.bases)
+        native_syms = self.native_syms
+        sinks = self.sinks
+
+        dctx = zstd.ZstdDecompressor()
+        with data_path.open("rb") as fh, dctx.stream_reader(fh) as reader:
+            text = io.TextIOWrapper(reader, encoding="utf-8", errors="strict")
+            for line_no, line in enumerate(text, start=1):
+                trimmed = line.rstrip("\n")
+                if not trimmed:
+                    continue
+                parts = trimmed.split("\t", 6)
+                if len(parts) != 7:
+                    raise ValueError(f"{data_path.name}:{line_no}: expected 7 TSV columns, got {len(parts)}")
+                wall, mono, conn, epoch, rx = int(parts[0]), int(parts[1]), parts[2], int(parts[3]), int(parts[4])
+                kind, raw = parts[5], parts[6]
+                rxs.append(rx)
+                c["lines"] += 1
+                obj = None
+                if kind == "META":
+                    obj = json.loads(raw)
+                    c["decoded"] += 1
+                    pkey = record_monotonic_producer_key(LEADER, kind, conn, epoch, obj)
+                else:
+                    pkey = ("binance_market" if "aggTrade" in raw else "binance_public", conn, epoch)
+                pm = prev_mono.get(pkey)
+                if pm is not None and mono < pm:
+                    self._fail("recv_mono_ns_regressed", f"{LEADER}:{data_path.name}:{pkey}:prev={pm},curr={mono}")
+                prev_mono[pkey] = mono
+
+                if kind == "META":
+                    c["meta"] += 1
+                    if not isinstance(obj, dict):
+                        self._fail("meta_not_object", f"{LEADER}:{data_path.name}:{line_no}")
+                        continue
+                    ev = str(obj.get("event") or "")
+                    sym = str(obj.get("symbol") or "ALL").strip()
+                    is_all = not sym or sym.upper() == "ALL"
+                    if ev in BINANCE_DEPTH_META:
+                        c["binance_depth_meta"] += 1
+                        continue
+                    if not (is_all or base_asset(sym) in bases_set):
+                        continue
+                    date = self._date(wall)
+                    gk = f"{LEADER}|{date}"
+                    if ev == "GAP_START":
+                        self.day_gaps.setdefault(gk, []).append(
+                            {"start_wall_ns": wall, "end_wall_ns": None, "reason": obj.get("reason", "")})
+                    elif ev == "GAP_END":
+                        gaps = self.day_gaps.setdefault(gk, [])
+                        if gaps and gaps[-1]["end_wall_ns"] is None:
+                            gaps[-1]["end_wall_ns"] = wall
+                        else:
+                            gaps.append({"start_wall_ns": None, "end_wall_ns": wall, "reason": "gap_end_cross_day"})
+                    elif ev == "LOCAL_LOSS":
+                        dropped = int(obj.get("dropped_frames", obj.get("dropped", 1)))
+                        recorded_local_loss += 1
+                        dropped_frames += dropped
+                        self.day_local_loss.setdefault(gk, []).append(
+                            {"wall_ns": wall, "dropped": dropped, "reason": obj.get("reason", "")})
+                    elif ev == "LATE_FRAME_REJECTED":
+                        dropped = int(obj.get("dropped_frames", 1))
+                        wid = str(obj.get("target_window_id") or obj.get("loss_attributed_window_id") or "")
+                        recorded_local_loss += 1
+                        dropped_frames += dropped
+                        self.day_local_loss.setdefault(f"{LEADER}|{wid[:10] if len(wid) >= 10 else date}", []).append(
+                            {"wall_ns": int(obj.get("orig_recv_wall_ns") or wall), "dropped": dropped,
+                             "reason": f"late_frame_rejected_for_{wid or 'prior_window'}"})
+                    elif ev == "SWITCH":
+                        self.day_switches[gk] += 1
+                    continue
+
+                c["data"] += 1
+                if "bookTicker" not in raw or not any(nsym in raw for nsym in native_syms):
+                    c["dropped_prefilter"] += 1
+                    continue
+                obj = _decode(kind, raw)
+                c["decoded"] += 1
+                data = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+                is_bbo = data.get("e") == "bookTicker" or str(obj.get("stream", "")).endswith("@bookTicker")
+                b = base_asset(data.get("s"))
+                if not (is_bbo and b in bases_set):
+                    c["dropped_after_decode"] += 1
+                    continue
+                if coverage is not None:
+                    coverage.observe_record(LEADER, {"kind": kind, "recv_wall_ns": wall, "payload": obj})
+                exch_ts = int(data.get("T") or data.get("E") or (wall // 1_000_000)) * 1_000_000
+                if exch_ts > wall:
+                    self.exch_ahead_of_local[b] += 1
+                bid_px, ask_px = float(data["b"]), float(data["a"])
+                sinks[b].append((wall, exch_ts, bid_px, float(data["B"]), ask_px, float(data["A"]),
+                                 0.5 * (bid_px + ask_px)))
+                c[f"bbo_{b}"] += 1
+
+        # rx_seq monotonic check (same as StreamConverter._finish_rx_seq)
+        arr = np.frombuffer(rxs, dtype=np.int64).copy() if len(rxs) else np.empty(0, dtype=np.int64)
+        if len(arr):
+            first = int(arr[0])
+            if st.prev_file_last_rx_seq is not None and not st.prev_file_had_late_frames and first <= st.prev_file_last_rx_seq:
+                self._fail("rx_seq_non_monotonic", f"{LEADER}:{data_path.name}:prev={st.prev_file_last_rx_seq},curr={first}")
+            bad = np.flatnonzero(np.diff(arr) <= 0)
+            for i in bad[:5].tolist():
+                self._fail("rx_seq_non_monotonic", f"{LEADER}:{data_path.name}:prev={int(arr[i])},curr={int(arr[i + 1])}")
+            uniq, counts = np.unique(arr, return_counts=True)
+            in_dups = int(np.sum(counts[counts > 1] - 1))
+            if in_dups:
+                self._fail("rx_seq_duplicate_in_boot", f"{LEADER}:{data_path.name}:in_file={in_dups}")
+            x_dups = _rx_dups_against(st.boot_rx_blocks, uniq)
+            if x_dups:
+                self._fail("rx_seq_duplicate_in_boot", f"{LEADER}:{data_path.name}:cross_file={x_dups}")
+            lo, hi = int(uniq[0]), int(uniq[-1])
+            st.boot_rx_blocks.append(("range", lo, hi) if len(uniq) == hi - lo + 1 else ("array", uniq))
+            last = int(arr[-1])
+            st.prev_file_last_rx_seq = last if st.prev_file_last_rx_seq is None else max(st.prev_file_last_rx_seq, last)
+        st.prev_file_had_late_frames = int(norm["late_frames_accepted"]) > 0
+
+        manifest_local_loss = int(mf.get("local_loss_lines") or 0) + int(mf.get("late_frames_rejected") or 0)
+        if recorded_local_loss or manifest_local_loss:
+            self.local_loss_partitions.append({
+                "exchange": LEADER, "date_utc": mf["date_utc"], "window_id": norm["window_id"],
+                "boot_id": boot, "data_file": data_path.name,
+            })
+        st.last_sort_key = key
+        st.counts.update(c)
+
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{LEADER}_multi_{norm['window_id'].replace(':', '')}_{len(self.parts):04d}"
+        tmp = parts_dir / f"{name}.tmp.npz"
+        payload = {f"bbo_{b}": sinks[b].drain() for b in self.bases}
+        np.savez_compressed(tmp, **payload)
+        path = parts_dir / f"{name}.npz"
+        tmp.replace(path)
+        summary = {
+            "window_id": norm["window_id"], "data_file": data_path.name, "data_sha256": mf["sha256"],
+            "part_file": path.name, "part_sha256": sha256_file(path),
+            "rows": {b: int(len(payload[f"bbo_{b}"])) for b in self.bases},
+            "elapsed_s": round(time.time() - t0, 2),
+        }
+        self.parts.append(summary)
+        return summary
+
+    def finalize(
+        self,
+        parts_dir: Path,
+        out_dir: Path,
+        meta_dir: Path | None,
+        label_date: str,
+        *,
+        diagnostic_allow_known_gaps: bool = False,
+    ) -> dict[str, Any]:
+        t0 = time.time()
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        failed = [f"{k}:{n}" for k, n in sorted(self.failed.items())]
+        coverage_report = self.coverage.report(meta_dir) if self.coverage is not None else {"status": "not_assessed"}
+        chrony = load_chrony_uncertified_intervals(meta_dir)
+        if self.coverage is not None and coverage_report["status"] != "complete":
+            failed.append("incomplete_utc_day_coverage")
+        if self.local_loss_partitions:
+            failed.append("local_loss_detected_under_strict_zero_loss_gate")
+        if self.coverage is not None and (any(self.day_gaps.values()) or chrony.get(self.coverage.date)):
+            failed.append("complete_day_gap_or_uncertified_clock")
+
+        ymd = label_date.replace("-", "")
+        artifacts: dict[str, dict[str, Any]] = {}
+        report: dict[str, Any] = {
+            "extractor": "MultiSymbolBinanceBBOExtractor",
+            "base_symbols": self.bases,
+            "label_date": label_date,
+            "failed_items": failed,
+            "coverage": coverage_report,
+            "gaps": self.day_gaps,
+            "switches": dict(self.day_switches),
+            "exch_ahead_of_local": dict(self.exch_ahead_of_local),
+            "parts_count": len(self.parts),
+            "artifacts": artifacts,
+        }
+        if failed and not (diagnostic_allow_known_gaps and only_known_gap_failures(failed)):
+            report["status"] = "blocked"
+        else:
+            for b in self.bases:
+                chunks = []
+                for p in self.parts:
+                    fpath = Path(parts_dir) / p["part_file"]
+                    if sha256_file(fpath) != p["part_sha256"]:
+                        raise ValueError(f"part output changed: {fpath.name}")
+                    with np.load(fpath) as z:
+                        chunks.append(z[f"bbo_{b}"].view(BBO_DTYPE))
+                bbo = np.concatenate(chunks) if chunks else np.empty(0, dtype=BBO_DTYPE)
+                bbo = bbo[np.argsort(bbo["local_ts_ns"], kind="mergesort")]
+                apath = out_dir / f"binance_bbo_{b}_{ymd}.npz"
+                np.savez_compressed(apath, **{name: bbo[name] for name in BBO_DTYPE.names})
+                artifacts[b] = {"path": apath.name, "rows": int(len(bbo)), "sha256": sha256_file(apath)}
+                del bbo, chunks
+            report["status"] = "ok_with_known_gaps" if failed else "ok"
+        report["finalize_s"] = round(time.time() - t0, 2)
+        (out_dir / "binance_bbo_report.json").write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+        return report
 
 
 def only_known_gap_failures(failed: list[str]) -> bool:

@@ -28,7 +28,7 @@ env:
 jobs:
   kaggle:
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 355
     steps:
       - name: Check out branch
         uses: actions/checkout@v4
@@ -299,7 +299,7 @@ jobs:
           fi
           {
             echo "### Kaggle job: \`${KAGGLE_SLUG:-unresolved}\` final=\`${KAGGLE_FINAL:-unknown}\`"
-            for f in job_status.json secrets_precheck.json probe_report.json two_partition_report.json full_day_report.json; do
+            for f in job_status.json batch_summary.json unified_report.json secrets_precheck.json probe_report.json two_partition_report.json full_day_report.json; do
               if [[ -f "kaggle_out/$f" ]]; then echo "#### $f"; echo '```json'; head -c 12000 "kaggle_out/$f"; echo; echo '```'; fi
             done
           } >> "$GITHUB_STEP_SUMMARY"
@@ -325,10 +325,20 @@ jobs:
           import json, os, pathlib
           status = json.load(open("kaggle_out/job_status.json"))
           assert status["git_sha"] == os.environ["GITHUB_SHA"], "stale Kaggle output"
+          batch_path = pathlib.Path("kaggle_out/batch_summary.json")
           uni_path = pathlib.Path("kaggle_out/unified_report.json")
           fd_path = pathlib.Path("kaggle_out/full_day_report.json")
           tp_path = pathlib.Path("kaggle_out/two_partition_report.json")
-          if uni_path.is_file():
+          if batch_path.is_file():
+              report = json.loads(batch_path.read_text())
+              assert report.get("status") == "complete", "unified batch backtest failed"
+              summary = report["summary"]
+              assert summary["all_experiments_complete"] is True
+              assert summary["experiments_total"] >= 1
+              assert summary["experiments_completed"] == summary["experiments_total"]
+              assert summary["stage4_authorized"] is False
+              assert summary["stage5c_authorized"] is False
+          elif uni_path.is_file():
               report = json.loads(uni_path.read_text())
               assert report.get("status") == "complete", "unified backtest failed"
               assert report["summary"]["unified_backtest_complete"] is True

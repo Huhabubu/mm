@@ -1,11 +1,15 @@
 {
   "task": "kaggle/tasks/unified_backtest.py",
   "args": [
-    "--config",
-    "configs/tokyo_l2_20261123_gate_btc.json"
+    "--batch-config",
+    "configs/tokyo_l2_20261123_batch_3pairs.json"
   ],
   "files": [
+    "configs/tokyo_l2_20261123_batch_3pairs.json",
     "configs/tokyo_l2_20261123_gate_btc.json",
+    "configs/tokyo_l2_20261123_gate_eth.json",
+    "configs/tokyo_l2_20261123_bybit_btc.json",
+    "configs/tokyo_l2_20261123_bitget_btc.json",
     "scripts/tokyo_l2_exchange_adapters.py",
     "scripts/tokyo_l2_experiment_config.py",
     "scripts/tokyo_l2_bt_cache.py",
@@ -30,6 +34,6 @@
     "2026-11-23"
   ],
   "qa_protocol_date": "2026-11-23",
-  "timeout_minutes": 270,
-  "note": "Unified config-driven full-day (2026-11-23 UTC) Binance-Gate BTC HBT 2.4.4 backtest & five-stage research run (4 core models: glft, both_1p0, defensive_1p0, risk_side_pause + Stage 1, 2, 3 shadow with canonical simultaneous-timestamp parity check, 5A, 5B; Stage 4 & 5C recorded as pending independent training / authorized holdout dates). Single download & conversion reused across all models and stages."
+  "timeout_minutes": 320,
+  "note": "Unified batch full-day (2026-11-23 UTC) HBT 2.4.4 backtest & Stage 1/2/3/5A/5B research run for 3 pairs sequentially in one Kaggle job: Binance->Gate ETH, Binance->Bybit BTC, Binance->Bitget BTC. Single-pass shared Binance @bookTicker extraction (BTC+ETH) reused across all 3 pairs; 4 core models (glft, both_1p0, defensive_1p0, risk_side_pause); 0ms Binance delay, 1ms/1ms order latency, 0ms cooldown, primary zero-fee; Stage 4 & 5C remain pending."
 }
