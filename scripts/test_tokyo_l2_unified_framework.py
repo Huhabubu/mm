@@ -78,6 +78,8 @@ def _write_zst_partition(
     manifest = {
         "exchange": exchange,
         "date_utc": date_utc,
+        "hour_utc": "00",
+        "minute_utc": "00",
         "window_id": window_id,
         "partition_minutes": 15,
         "planned_start_wall_ns": DAY0,

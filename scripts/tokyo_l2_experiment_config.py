@@ -207,8 +207,8 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
     strat = cfg["strategy"]
     if strat["post_only_clamp_mode"] not in ("unified", "legacy"):
         raise ValueError("strategy.post_only_clamp_mode must be 'unified' or 'legacy'")
-    if strat["cross_timestamp_tie_mode"] not in ("microsecond", "feed_status"):
-        raise ValueError("strategy.cross_timestamp_tie_mode must be 'microsecond' or 'feed_status'")
+    if strat["cross_timestamp_tie_mode"] not in ("microsecond", "legacy_ns"):
+        raise ValueError("strategy.cross_timestamp_tie_mode must be 'microsecond' or 'legacy_ns'")
     if float(strat["sigma_threshold"]) != 1.645:
         raise ValueError("Frozen core_glft_engine threshold is 1.645 sigma; do not alter strategy threshold")
     if float(strat["beta"]) < 0 or float(strat["target_notional_usdt"]) <= 0:
@@ -269,7 +269,7 @@ def tardis_legacy_config(
         },
         "strategy": {
             "post_only_clamp_mode": "legacy",
-            "cross_timestamp_tie_mode": "feed_status",
+            "cross_timestamp_tie_mode": "legacy_ns",
         },
         "latency": {
             "binance_extra_visible_delay_ns": 2_500_000,

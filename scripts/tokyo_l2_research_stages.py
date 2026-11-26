@@ -195,17 +195,23 @@ def run_stage1_accounting(
     bal = np.asarray(records["balance"], dtype=np.float64)
     if len(stamp) < 2 or np.any(np.diff(stamp) <= 0):
         raise ValueError(f"Stage 1 invalid Recorder timeline: {date_utc}, {model}")
-    if not (np.isfinite(mid).all() and np.isfinite(pos).all() and np.isfinite(bal).all()):
-        raise ValueError(f"Stage 1 non-finite Recorder values: {date_utc}, {model}")
+    if not (np.isfinite(pos).all() and np.isfinite(bal).all()):
+        raise ValueError(f"Stage 1 non-finite Recorder position/balance: {date_utc}, {model}")
 
-    t = np.asarray(fills["local_observed_ns"], dtype=np.int64)
-    exch_t = np.asarray(fills["exchange_timestamp_ns"], dtype=np.int64)
-    side = np.asarray(fills["side"], dtype=np.int64)
-    px = np.asarray(fills["exec_price"], dtype=np.float64)
-    qty = np.asarray(fills["exec_qty"], dtype=np.float64)
-    n = int(len(t))
-    if not (len(exch_t) == len(side) == len(px) == len(qty) == n):
+    raw_t = np.asarray(fills["local_observed_ns"], dtype=np.int64)
+    raw_exch_t = np.asarray(fills["exchange_timestamp_ns"], dtype=np.int64)
+    raw_side = np.asarray(fills["side"], dtype=np.int64)
+    raw_px = np.asarray(fills["exec_price"], dtype=np.float64)
+    raw_qty = np.asarray(fills["exec_qty"], dtype=np.float64)
+    n = int(len(raw_t))
+    if not (len(raw_exch_t) == len(raw_side) == len(raw_px) == len(raw_qty) == n):
         raise ValueError(f"Stage 1 ragged fill arrays: {date_utc}, {model}")
+    perm = np.argsort(raw_t, kind="stable") if n else np.empty(0, dtype=np.int64)
+    t = raw_t[perm]
+    exch_t = raw_exch_t[perm]
+    side = raw_side[perm]
+    px = raw_px[perm]
+    qty = raw_qty[perm]
     if n and not (np.all((side == 1) | (side == -1)) and np.all(qty > 0)):
         raise ValueError(f"Stage 1 invalid fill side/size: {date_utc}, {model}")
     if n and (not (np.isfinite(px).all() and np.isfinite(qty).all() and (px > 0).all()) or np.any(exch_t > t)):
@@ -224,6 +230,16 @@ def run_stage1_accounting(
     if pos_error > 1e-7 or cash_error > tolerance:
         raise ValueError(f"Stage 1 Recorder/cash/fill mismatch ({date_utc}, {model}): pos={pos_error}, cash={cash_error}")
 
+    # Exclude book-cleared instants (price=NaN during reconnect/snapshot clear) without fabricating mids.
+    valid_mid = np.isfinite(mid)
+    non_finite_mid_count = int((~valid_mid).sum())
+    if int(valid_mid.sum()) < 2:
+        raise ValueError(f"Stage 1 insufficient finite-midpoint Recorder samples: {date_utc}, {model}")
+    stamp_v = stamp[valid_mid]
+    mid_v = mid[valid_mid]
+    pos_v = pos[valid_mid]
+    bal_v = bal[valid_mid]
+
     last_mid = float(trading["end_mid_usdt_per_btc"])
     last_pos = float(trading["end_position_contracts"])
     last_bal = float(trading["balance_usdt"])
@@ -232,36 +248,38 @@ def run_stage1_accounting(
         raise ValueError(f"Stage 1 final inventory mismatch: {date_utc}, {model}")
     if abs(last_bal - bal[0] + cumulative_cost[-1]) > tolerance:
         raise ValueError(f"Stage 1 final cash mismatch: {date_utc}, {model}")
+    if abs(pos_v[0] - pos[0]) > 1e-7 or abs(bal_v[0] - bal[0]) > tolerance:
+        raise ValueError(f"Stage 1 fill occurred before first finite midpoint: {date_utc}, {model}")
 
-    zero = float(last_bal + ctval * last_pos * last_mid - bal[0] - ctval * pos[0] * mid[0])
-    net = float(trading["end_net_marked_equity_usdt"]) - float(bal[0] + ctval * pos[0] * mid[0])
+    zero = float(last_bal + ctval * last_pos * last_mid - bal_v[0] - ctval * pos_v[0] * mid_v[0])
+    net = float(trading["end_net_marked_equity_usdt"]) - float(bal_v[0] + ctval * pos_v[0] * mid_v[0])
     if abs(zero - fee - net) > tolerance:
         raise ValueError(f"Stage 1 official fee/net mismatch: {date_utc}, {model}")
 
-    # Convention A: strictly preceding 100ms midpoint, ending inventory.
+    # Convention A: strictly preceding finite 100ms midpoint, ending inventory.
     if n:
-        prior = np.searchsorted(stamp, t, side="left") - 1
+        prior = np.searchsorted(stamp_v, t, side="left") - 1
         if np.any(prior < 0):
             raise ValueError(f"Stage 1 fill lacking preceding midpoint: {date_utc}, {model}")
-        edges = signed * ctval * (mid[prior] - px)
+        edges = signed * ctval * (mid_v[prior] - px)
         buy_edge = float(np.sum(edges[side == 1]))
         sell_edge = float(np.sum(edges[side == -1]))
     else:
         buy_edge = sell_edge = 0.0
     capture = buy_edge + sell_edge
-    inventory = float(ctval * np.dot(pos[1:], np.diff(mid)) + ctval * last_pos * (last_mid - mid[-1]))
+    inventory = float(ctval * np.dot(pos_v[1:], np.diff(mid_v)) + ctval * last_pos * (last_mid - mid_v[-1]))
     discrepancy_a = capture + inventory - zero
     if abs(discrepancy_a) > tolerance:
         raise ValueError(f"Stage 1 accounting identity A failed ({date_utc}, {model}): residual={discrepancy_a}")
 
-    # Convention B: following 100ms midpoint, starting inventory (ex-post sensitivity only).
+    # Convention B: following finite 100ms midpoint, starting inventory (ex-post sensitivity only).
     if n:
-        following_idx = np.searchsorted(stamp, t, side="left")
-        following = np.where(following_idx < len(mid), mid[np.minimum(following_idx, len(mid) - 1)], last_mid)
+        following_idx = np.searchsorted(stamp_v, t, side="left")
+        following = np.where(following_idx < len(mid_v), mid_v[np.minimum(following_idx, len(mid_v) - 1)], last_mid)
         next_capture = float(np.sum(signed * ctval * (following - px)))
     else:
         next_capture = 0.0
-    next_inventory = float(ctval * np.dot(pos[:-1], np.diff(mid)) + ctval * pos[-1] * (last_mid - mid[-1]))
+    next_inventory = float(ctval * np.dot(pos_v[:-1], np.diff(mid_v)) + ctval * pos_v[-1] * (last_mid - mid_v[-1]))
     discrepancy_b = next_capture + next_inventory - zero
     if abs(discrepancy_b) > tolerance:
         raise ValueError(f"Stage 1 accounting identity B failed ({date_utc}, {model}): residual={discrepancy_b}")
@@ -292,6 +310,7 @@ def run_stage1_accounting(
         "net_pnl_bps_2bps": (10_000.0 * net / turnover) if turnover > 0 else None,
         "recorder_max_pos_error": pos_error,
         "recorder_max_cash_error": cash_error,
+        "non_finite_mid_recorder_samples": non_finite_mid_count,
         "mean_abs_position_contracts": mean_abs_pos,
         "rms_position_contracts": rms_pos,
         "accounting_closed": True,
