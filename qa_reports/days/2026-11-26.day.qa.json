@@ -10,9 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 31,
+  "observed_windows_count": 32,
   "missing_windows": [
-    "2026-11-26T07:45Z",
     "2026-11-26T08:00Z",
     "2026-11-26T08:15Z",
     "2026-11-26T08:30Z",
@@ -79,7 +78,8 @@
     "2026-11-26T23:45Z"
   ],
   "failed_windows": [
-    "2026-11-26T03:00Z"
+    "2026-11-26T03:00Z",
+    "2026-11-26T07:45Z"
   ],
   "overdue_windows": [],
   "pending_windows": [],
@@ -100,7 +100,7 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 469,
+  "clock_certified_minutes": 485,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
   "damaged_partitions": [
@@ -117,6 +117,20 @@
       "problems": [
         "recorded loss/gap events: loss=0, gap_start=1",
         "depth unavailable events recorded: 5"
+      ]
+    },
+    {
+      "exchange": "gate_futures",
+      "window_id": "2026-11-26T07:45Z",
+      "window_span_id": "2026-11-26T07:45Z__2026-11-26T08:00Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "gate_futures_20261126_0745_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/gate_futures/2026-11-26/gate_futures_20261126_0745_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 6"
       ]
     }
   ],
