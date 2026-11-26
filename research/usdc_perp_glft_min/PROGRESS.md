@@ -1,32 +1,31 @@
-# 进度记录（2026-11-25 暂停）
+# 进度记录（2026-11-26）
 
-分支 `exp/usdc-perp-glft-min`，基于 `main`；暂停前领先 `main` 1 个提交（`f4ad6c0`）。按使用者指示暂停，以下是交接状态。
+分支 `exp/usdc-perp-glft-min`（T4，独立探索，不作论文正式证据）。
 
-## 已完成（已在分支上）
+## 第二版：Gate 研究的价差信号移植（进行中）
 
-- `README.md`：实验设计、数据、GLFT 公式、输出口径、已知限制。
-- `glft_core.py`：numba GLFT 系数、强度拟合、环形缓冲、post-only 报价。
-- `test_glft_core.py`：单元测试。**目前还没有 workflow，这些测试未在 GitHub Actions 上跑过。**
+改动起点 `f1af35c`，代码提交 `b4eee4e`、`e1bebfa`、`4414cef`、`e1aefb1`、`38eb67d`，触发运行的提交 `bd0ed84`。
 
-## 已核对、准备复用（来源未改动）
+- `basis_moments.py`：`exact_moments_5s` 原样复制自 `exp/tokyo-l2-glft@6a6345b` 的 Gate 研究 `gate_basis_weighted_moments.py`，即 600s 连续时间加权的 $B_t$、$\sigma_t$，每 5s 发布一次，覆盖率低于 99% 时报错。
+- `origin_glft.py`：`gate_origin_filter` 原样复制自同一提交的 `gate_origin_glft_strategy.py`，规则为 1σ 正常带、1.645σ 触发、主导检验、Binance 价格事件激活、平局剔除。事件循环参照 `run_gate_origin_glft`，按用户要求有以下改动：
+  - 去掉 `MIN_REQUOTE_NS`（20ms）限频，目标价位一变就撤单重挂；撤单未确认前不重挂。
+  - USDT 信号不加额外延迟，只加 +1ns 用于同时间戳排序。
+  - 订单延迟单程 1ms。
+  - maker 费为 0。
+  - GLFT 的拟合沿用本目录 `glft_core`。
+- `kaggle_task.py`：9 个模型，即 β=0 基准，加上两侧平移和单边防御各取 β∈{0.25,0.5,0.75,1}。目标 ETHUSDC 永续，信号 ETHUSDT 永续 bookTicker。$B_t$ 用两边的 bookTicker 中间价离线计算。
+- `test_origin_glft.py`：10 个单元测试，覆盖过滤器状态转移，以及基准矩的常数、交替序列和无前视性。
+- Workflow：增加新测试，预期模型数改为 9；Kaggle notebook 打包时加入两个新模块。
 
-- Kaggle 运行链路：`exp/tokyo-l2-glft` 上的 `.github/workflows/tokyo-l2-kaggle.yml` 与 `kaggle/launcher.py`，包括 token 认证、notebook 私有性校验、push/轮询/取回输出、secret 扫描。这两个文件不在 `main` 上，本分支也没有。
-- Tardis 下载：`scripts/check_okx_hft_data.py` 的 `SCHEMAS` 与 `extract_window(kind, day, end_us, target, max_rows, exchange=, symbol=)`。URL 格式为 `{BASE_URL}/{exchange}/{kind}/YYYY/MM/DD/{symbol}.csv.gz`；流式解压 gzip，按 `local_timestamp` 截断，并检查快照和单调性。
-- 分段转换：`scripts/tardis_segmented_hbt.py::convert_fuse_parts`，调用 `hftbacktest.data.utils.tardis.convert_fuse(trades, L2, book_ticker, ...)`，之后执行 `validate_event_order`。
-- `main` 上的 `full-day-hbt-pilot.yml` 在 GitHub runner 上安装 `hftbacktest==2.4.4`，直接下载 Tardis 免费日数据并回测全天。
+## 运行
 
-## 待处理问题
+- [Actions 45764146949](https://github.com/Huhabubu/mm/actions/runs/45764146949)（`bd0ed84`）：runner 上 16 个单元测试全部通过。15 分钟冒烟测试完成，只有最后 5 分钟在挂单，9 个模型结果完全相同：PnL −0.077 USDC，14 笔成交。原因是这 5 分钟内 1.645σ 触发 9340 次，主导条件一次都没满足，信号从未激活。仅凭冒烟窗口无法判断这是市场常态还是实现问题，要看全天结果。ETHUSDT 的中间价变化事件只有 599 次（15 分钟），这个数偏低，需要在全天报告里用 `signal_rows` 核对。
+- Kaggle 全天运行进行中，结果待取回，并核对 `git_sha`。
 
-- README 数据表只列了 ETHUSDC 的 `trades` + `incremental_book_L2`，但 `convert_fuse` 还需要 ETHUSDC 的 `book_ticker`，README 和下载清单都要补上。
-- `extract_window` 默认 `max_rows=500_000`，ETHUSDC 全天 L2 很可能超出。要先查 Tardis 文件的实际大小再放宽。
-- 现有 Kaggle workflow 要求名为 NOTEBOOK_NAME 的 notebook 已经存在且只有一个，而 `usdc-perp-glft-min` 还没创建。需要加一条“不存在就以私有方式新建”的路径，并保留私有性校验。
-- `launcher.py` 强制要求 `--collector` 参数并打包 collector 代码，本实验用不到，需要精简版，或者把该参数改成可选。
-- 暂停时还没读完：`inspect_tardis.BASE_URL` 的具体值，以及 `g0_glft_event_driven.py` 中 hftbacktest 2.4.4 的资产配置和成交读取写法（那次读取的结果没有返回）。
-- 还要确认 `mm` 仓库的 secret `KAGGLE_API_TOKEN` 可用（tokyo workflow 用的是同名 secret）。
+## 第一版（已作废的信号用法）
 
-## 下一步（小批量提交，每次推送后核对文件树）
+[Actions 45741078187](https://github.com/Huhabubu/mm/actions/runs/45741078187)（`b7e80f8`）：100ms 轮询，EWMA 基准，整段直接平移。4 组参数全部亏损，PnL 在 −30.5 到 −45.4 USDC 之间。这一版的信号用法与 Gate 研究不一致，不能作为对这套信号的检验。
 
-1. 读完 hftbacktest API 用法和 `BASE_URL`；查 2026-11-01 ETHUSDC、ETHUSDT 的文件大小。
-2. 提交 `kaggle_task.py`（下载 → 转换 → 4 组参数回测 → `report.json`），并先让 GitHub runner 跑通单元测试。
-3. 提交精简 launcher 和 `.github/workflows/usdc-perp-glft-min.yml`（推送即触发 Kaggle）。
-4. 取回 `report.json`、`run.log`、`job_status.json`，确认 `git_sha` 一致后再汇报结果。
+## 下一步
+
+取回全天 `report.json`，检查 9 个模型的激活次数、PnL、markout 和成交数；如果全天也从不激活，排查主导条件的输入。
