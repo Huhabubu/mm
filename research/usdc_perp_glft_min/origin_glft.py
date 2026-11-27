@@ -8,7 +8,8 @@ signal rows and a 100ms sample clock) with these requested differences:
   * no MIN_REQUOTE_NS throttle on either side: re-quote whenever the target price tick changes;
   * signal visible at its Tardis local_timestamp (the caller adds +1ns for same-timestamp ordering only);
   * GLFT fit and coefficients are this directory's glft_core (unchanged from the previous run).
-Quote modes: 0 = baseline GLFT, 1 = both sides shifted by beta*G_eff, 2 = only the threatened side moved away.
+Quote modes: 0 = baseline GLFT, 1 = both sides shifted by beta*G_eff, 2 = only the threatened side moved away,
+3 = GLFT centred on mid + kappa * alpha, alpha = predicted ETHUSDC mid change in ticks visible from alpha_ts (beta 0).
 """
 import math
 
@@ -35,7 +36,8 @@ MIN_COUNT = 10
 DIAG_NAMES = ('signal_price_updates', 'trigger_checks', 'above_1645_sigma', 'dominant',
               'activations', 'active_decisions', 'tie_excluded', 'decisions',
               'fail_direction', 'fail_magnitude', 'shift_applied', 'shift_abs_milliticks',
-              'post_only_clamped', 'quote_moved', 'active_ns', 'intervals')
+              'post_only_clamped', 'quote_moved', 'active_ns', 'intervals', 'alpha_updates',
+              'alpha_shift_abs_milliticks')
 
 @njit
 def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
@@ -70,11 +72,15 @@ def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
 
 @njit
 def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, beta, quote_mode, gamma,
-                    out_mid, out_eq, out_pos, fills, fits, diag, intervals):
+                    out_mid, out_eq, out_pos, fills, fits, diag, intervals, alpha_ts, alpha_pred, kappa):
     if not math.isfinite(beta) or beta < 0.0 or beta > 1.0:
         raise ValueError('invalid beta')
-    if quote_mode < 0 or quote_mode > 2:
-        raise ValueError('0=baseline, 1=both, 2=defensive')
+    if quote_mode < 0 or quote_mode > 3:
+        raise ValueError('0=baseline, 1=both, 2=defensive, 3=alpha')
+    if alpha_ts.shape[0] != alpha_pred.shape[0]:
+        raise ValueError('alpha series length mismatch')
+    if quote_mode == 3 and (beta != 0.0 or alpha_ts.shape[0] == 0 or not math.isfinite(kappa)):
+        raise ValueError('alpha mode needs beta 0, a non-empty alpha series and a finite kappa')
     if grid_ns.shape[0] != basis.shape[0] or basis.shape[0] != bsigma.shape[0]:
         raise ValueError('basis grid length mismatch')
     if hbt.elapse(0) != 0:
@@ -87,6 +93,11 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
     sp = 0
     while sp < n_sig and sig_ts[sp] < t0:
         sp += 1
+    use_alpha = quote_mode == 3
+    n_alpha = alpha_ts.shape[0]
+    ap = -1
+    while ap + 1 < n_alpha and alpha_ts[ap + 1] <= t0:
+        ap += 1
     latest = np.nan
     depth_ring = np.zeros(WINDOW, np.int64)
     counts = np.zeros(MAX_BINS + 1, np.int64)
@@ -124,6 +135,8 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
         due = next_sample
         if sp < n_sig and sig_ts[sp] < due:
             due = sig_ts[sp]
+        if use_alpha and ap + 1 < n_alpha and alpha_ts[ap + 1] < due:
+            due = alpha_ts[ap + 1]
         if t_stop < due:
             due = t_stop
         status = 0
@@ -151,6 +164,12 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
         price_change = sig_event and math.isfinite(prior) and latest != prior
         if price_change:
             diag[0] += 1
+        alpha_event = False
+        while use_alpha and ap + 1 < n_alpha and alpha_ts[ap + 1] <= now:
+            ap += 1
+            alpha_event = True
+        if alpha_event:
+            diag[16] += 1
 
         sample_event = False
         if now >= next_sample:
@@ -206,7 +225,7 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
             next_sample += STEP_NS
             sample_event = True
 
-        if not (status == 2 or status == 3 or sig_event or sample_event):
+        if not (status == 2 or status == 3 or sig_event or sample_event or alpha_event):
             continue
         pos = hbt.position(0)
         if abs(pos) > max_pos:
@@ -234,7 +253,12 @@ def run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid_ns, basis, bsigma, bet
             continue
         mid = (bb + ba) / 2.0
         q = pos / ORDER_QTY
-        base_bid, base_ask = glft_quotes(mid, q, half, skew, bb, ba)
+        fair = mid
+        if use_alpha and ap >= 0 and math.isfinite(alpha_pred[ap]):
+            alpha_off = kappa * alpha_pred[ap]
+            fair = mid + alpha_off
+            diag[17] += int(round(abs(alpha_off) * 1000.0))
+        base_bid, base_ask = glft_quotes(fair, q, half, skew, bb, ba)
         shift = 0.0
         was_active = active
         if math.isfinite(latest):
