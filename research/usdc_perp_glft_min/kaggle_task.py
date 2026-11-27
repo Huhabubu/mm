@@ -23,6 +23,7 @@ from basis_moments import NS, exact_moments_5s
 from event_study import clocks_from_csv, fill_conditioning, lead_lag_report
 from wall_study import run_wall_study
 from sweep_study import run_sweep_study
+from fill_sweep_check import fill_sweep_check, merge_events, sweep_event_arrays
 from check_okx_hft_data import SCHEMAS, extract_window
 from origin_glft import (DIAG_NAMES, GATE_SOURCE_SHA, LOT, MAX_UNITS, ORDER_QTY, REFIT_EVERY, STEP_NS,
                          TICK, WARMUP, run_origin_glft)
@@ -245,6 +246,18 @@ def main():
                                      'traceback': traceback.format_exc()[-3000:]}
         print('SWEEP_STUDY', json.dumps({k: report['sweep_study'].get(k) for k in ('error', 'runtime_s')}),
               flush=True)
+        sweep_ev = None
+        try:
+            ev_u = sweep_event_arrays(sig_trades_path, TICK)
+            ev_c = sweep_event_arrays(paths['trades'], TICK)
+            sweep_ev = {}
+            for j in sorted(ev_u):
+                sweep_ev[f'usdt_j{j}'] = ev_u[j]
+                sweep_ev[f'usdc_j{j}'] = ev_c[j]
+                sweep_ev[f'both_j{j}'] = merge_events(ev_u[j], ev_c[j])
+        except Exception as exc:
+            report['fill_sweep_check'] = {'error': f'{type(exc).__name__}: {exc}',
+                                          'traceback': traceback.format_exc()[-3000:]}
         sig_trades_path.unlink()
         save()
         sig_path.unlink()
@@ -311,6 +324,15 @@ def main():
                 report['fill_event_study'] = fill_conditioning(
                     fills[:int(res[1])], sig_clk, tgt_clk, TICK, LATENCY_NS,
                     lambda sub: markout_table(sub, mid, int(res[0]), int(res[-1])))
+            if name == 'baseline' and sweep_ev is not None:
+                try:
+                    report['fill_sweep_check'] = fill_sweep_check(fills[:int(res[1])], sweep_ev, LATENCY_NS, mid,
+                                                                  int(res[0]), int(res[-1]), STEP_NS)
+                except Exception as exc:
+                    report['fill_sweep_check'] = {'error': f'{type(exc).__name__}: {exc}',
+                                                  'traceback': traceback.format_exc()[-3000:]}
+                print('FILL_SWEEP_CHECK', json.dumps({k: report['fill_sweep_check'].get(k)
+                                                      for k in ('error', 'fills')}), flush=True)
             v['runtime_s'] = round(time.time() - t1, 1)
             report['variants'][name] = v
             print('VARIANT', name, json.dumps({k: v[k] for k in ('pnl_usdc', 'fills', 'turnover_usdc', 'submits',
