@@ -1,6 +1,6 @@
 import numpy as np
 
-from wall_study import FILL_COLS, book_series, breach_flags, virtual_orders
+from wall_study import FILL_COLS, book_series, breach_flags, glft_half_series, virtual_orders
 
 LAT = 1000
 N = 32
@@ -13,10 +13,16 @@ def ev(rows):
             a[:, 3].astype(np.int64), a[:, 4].copy(), a[:, 5].astype(np.bool_))
 
 
-def run(rows, mode=1, dist=0.0, thr=5.0, frac=-1.0):
+HS = (np.array([0], np.int64), np.array([1.5]))
+SELL9 = [(2 * LAT, 1, -1, 9, 0.5, 0)]
+
+
+def run(rows, mode=1, dist=0.0, thr=5.0, frac=-1.0, hs=None):
+    hs_ts, hs_half = hs if hs is not None else (np.zeros(0, np.int64), np.zeros(0))
     fills = np.zeros((16, len(FILL_COLS)))
     cancels = np.zeros((16, 4))
-    nf, nc, cnt = virtual_orders(*ev(rows), N, mode, dist, thr, frac, LAT, 50.0, 60.0, fills, cancels)
+    nf, nc, cnt = virtual_orders(*ev(rows), N, mode, dist, thr, frac, LAT, 50.0, 60.0, fills, cancels,
+                                 hs_ts, hs_half, 0, 20)
     return nf, nc, cnt, fills, cancels
 
 
@@ -70,6 +76,36 @@ def test_breach_flags():
     wall = np.array([8], np.int64)
     assert not breach_flags(t, sg, wall, bts, bbv, bav, 15)[0]
     assert breach_flags(t, sg, wall, bts, bbv, bav, 25)[0]
+
+
+def test_glft_quote_control():
+    nf, nc, cnt, f, c = run(BOOK + SELL9, mode=3, thr=0.0, hs=HS)
+    assert nf == 1 and f[0, 2] == 10 and f[0, 11] == 0.0 and f[0, 12] == -1.0
+    assert cnt[7] == 3 and c[0, 2] == 2.0 and c[0, 3] == 0.0
+
+
+def test_glft_peak_literal_rule():
+    nf, _, cnt, f, _ = run(BOOK + SELL9, mode=2, thr=0.0, hs=HS)
+    assert nf == 1 and f[0, 2] == 10 and f[0, 12] == 10.0 and f[0, 11] == 0.0 and cnt[6] == 3
+
+
+def test_glft_peak_vmin_front():
+    nf, _, cnt, f, c = run(BOOK + SELL9, mode=2, thr=5.0, hs=HS)
+    assert nf == 1 and f[0, 2] == 9 and f[0, 11] == 1.0 and f[0, 12] == 8.0 and f[0, 6] == 10.0
+    assert f[0, 7] == 4.0 and cnt[6] == 2 and cnt[7] == 1 and c[0, 2] == 3.0
+
+
+def test_glft_peak_fallback_and_warmup():
+    nf, _, cnt, f, _ = run(BOOK + SELL9, mode=2, thr=50.0, hs=HS)
+    assert nf == 1 and f[0, 2] == 10 and f[0, 12] == -1.0 and cnt[7] == 3
+    nf, _, cnt, _, _ = run(BOOK + SELL9, mode=2, thr=0.0, hs=(HS[0], np.array([np.nan])))
+    assert nf == 0 and cnt[0] == 0
+
+
+def test_glft_half_series_warmup():
+    rows = BOOK + [(25 * 100_000_000 + 1, 0, 1, 10, 2.0, 0)]
+    hts, hh = glft_half_series(*ev(rows), N, 0.05)
+    assert len(hts) == 25 and hts[0] == 100_000_000 and np.isnan(hh).all()
 
 
 if __name__ == '__main__':
