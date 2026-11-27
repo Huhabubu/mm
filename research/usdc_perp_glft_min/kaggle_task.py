@@ -23,6 +23,7 @@ from basis_moments import NS, exact_moments_5s
 from event_study import clocks_from_csv, fill_conditioning, lead_lag_report
 from wall_study import run_wall_study
 from sweep_study import run_sweep_study
+from alpha_study import run_alpha_study
 from fill_sweep_check import fill_sweep_check, merge_events, sweep_event_arrays
 from check_okx_hft_data import SCHEMAS, extract_window
 from origin_glft import (DIAG_NAMES, GATE_SOURCE_SHA, LOT, MAX_UNITS, ORDER_QTY, REFIT_EVERY, STEP_NS,
@@ -258,6 +259,14 @@ def main():
         except Exception as exc:
             report['fill_sweep_check'] = {'error': f'{type(exc).__name__}: {exc}',
                                           'traceback': traceback.format_exc()[-3000:]}
+        try:
+            report['alpha_study'] = run_alpha_study(paths['trades'], sig_trades_path, paths['book_ticker'],
+                                                    sig_path, TICK, names=(TARGET, SIGNAL))
+        except Exception as exc:
+            report['alpha_study'] = {'error': f'{type(exc).__name__}: {exc}',
+                                     'traceback': traceback.format_exc()[-3000:]}
+        print('ALPHA_STUDY', json.dumps({k: report['alpha_study'].get(k) for k in ('error', 'runtime_s')}),
+              flush=True)
         sig_trades_path.unlink()
         save()
         sig_path.unlink()
