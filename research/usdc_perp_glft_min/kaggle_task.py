@@ -22,6 +22,7 @@ import pandas as pd
 from basis_moments import NS, exact_moments_5s
 from event_study import clocks_from_csv, fill_conditioning, lead_lag_report
 from wall_study import run_wall_study
+from sweep_study import run_sweep_study
 from check_okx_hft_data import SCHEMAS, extract_window
 from origin_glft import (DIAG_NAMES, GATE_SOURCE_SHA, LOT, MAX_UNITS, ORDER_QTY, REFIT_EVERY, STEP_NS,
                          TICK, WARMUP, run_origin_glft)
@@ -220,8 +221,13 @@ def main():
         sig_counts = extract_window('book_ticker', args.day, end_us, sig_path, max_rows=MAX_ROWS,
                                     exchange=EXCHANGE, symbol=SIGNAL)
         print('DOWNLOADED', SIGNAL, 'book_ticker', json.dumps(sig_counts), flush=True)
+        sig_trades_path = WORK / f'{SIGNAL}_trades.csv'
+        sig_trade_counts = extract_window('trades', args.day, end_us, sig_trades_path, max_rows=MAX_ROWS,
+                                          exchange=EXCHANGE, symbol=SIGNAL)
+        print('DOWNLOADED', SIGNAL, 'trades', json.dumps(sig_trade_counts), flush=True)
         report['feed_counts'] = {f'{TARGET}_{k}': v for k, v in counts.items()}
         report['feed_counts'][f'{SIGNAL}_book_ticker'] = sig_counts
+        report['feed_counts'][f'{SIGNAL}_trades'] = sig_trade_counts
         report['download_s'] = round(time.time() - t0, 1)
         save()
         sig_ts, sig_mid, _, _, sig_bad = read_bbo(sig_path)
@@ -231,6 +237,16 @@ def main():
         sig_clk = clocks_from_csv(sig_path)
         tgt_clk = clocks_from_csv(paths['book_ticker'])
         report['lead_lag'] = lead_lag_report(sig_clk, tgt_clk, TICK)
+        try:
+            report['sweep_study'] = run_sweep_study(paths['trades'], sig_trades_path, paths['book_ticker'],
+                                                    sig_path, TICK, names=(TARGET, SIGNAL))
+        except Exception as exc:
+            report['sweep_study'] = {'error': f'{type(exc).__name__}: {exc}',
+                                     'traceback': traceback.format_exc()[-3000:]}
+        print('SWEEP_STUDY', json.dumps({k: report['sweep_study'].get(k) for k in ('error', 'runtime_s')}),
+              flush=True)
+        sig_trades_path.unlink()
+        save()
         sig_path.unlink()
         sig_ts = sig_ts + SIGNAL_EXTRA_NS
         grid, basis, bsigma, coverage = basis_grid(sig_ts, sig_mid, tgt_ts, tgt_mid)
