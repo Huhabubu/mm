@@ -1,5 +1,6 @@
 '''Kaggle task: Tardis free day -> official HBT 2.4.4 -> event-driven GLFT on Binance USDC-M ETHUSDC
-with the Gate-study origin-filtered ETHUSDT-perp spread signal (9 models).
+with the Gate-study origin-filtered ETHUSDT-perp spread signal (9 models), plus 6 alpha models (quote mode 3):
+GLFT centred on mid + kappa * the alpha_study ridge set-B ETHUSDC mid prediction, fitted on the first half (test_half).
 
 Signal usage follows research/gate_btc_binance_signal_20261115 (see origin_glft.py for the source SHA):
 600s time-weighted basis/sigma on a 5s clock, 1 sigma normal band, 1.645 sigma trigger, dominance and
@@ -43,6 +44,8 @@ STEPS_PER_HOUR = 36_000
 BETAS = (0.25, 0.5, 0.75, 1.0)
 MODELS = ((('baseline', 0.0, 0),) + tuple((f'both_b{b:g}', b, 1) for b in BETAS)
           + tuple((f'defensive_b{b:g}', b, 2) for b in BETAS))
+ALPHA_KAPPAS = (('1s', (0.5, 1, 2, 4)), ('100ms', (1, 4)))
+ALPHA_MODELS = tuple((f'alpha_{h}_k{k:g}', h, float(k)) for h, ks in ALPHA_KAPPAS for k in ks)
 MAX_ROWS = 75_000_000
 INTERVAL_CAP = 500_000
 WORK = Path('/tmp/usdc_perp_glft_min')
@@ -138,6 +141,23 @@ def window_report(f, mid, steps, intervals, n_int, t0):
                       for g, m in groups.items()}}
 
 
+def second_half(f, eq, steps, t0, test_ns, mid):
+    # Second half only: the alpha ridge is fitted on the first half of the local grid.
+    if test_ns is None or not steps:
+        return None
+    b = (int(test_ns) - int(t0)) // STEP_NS - 1
+    if b < 0 or b >= steps - 1:
+        return None
+    e = np.nan_to_num(eq[:steps], nan=0.0)
+    seg = e[b:]
+    g = f[f[:, 0] >= test_ns]
+    return {'start_ns': int(test_ns), 'base_sample': int(b), 'pnl_usdc': float(e[-1] - e[b]),
+            'fills': int(len(g)), 'buy_fills': int((g[:, 1] > 0).sum()), 'sell_fills': int((g[:, 1] < 0).sum()),
+            'turnover_usdc': float(np.sum(g[:, 2] * g[:, 3])),
+            'max_drawdown_usdc': float(np.max(np.maximum.accumulate(seg) - seg)),
+            'markout': markout_table(g, mid, steps, t0) if len(g) else None}
+
+
 def summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag, intervals):
     (steps, n_fill, n_fit, submits, cancels, max_pos, n_sig, n_feed, n_resp,
      turnover, fee, n_trades, t0) = res
@@ -194,6 +214,10 @@ def main():
                          'basis': '600s time-weighted mean/sigma of ETHUSDT mid - ETHUSDC mid, 5s clock',
                          'normal_band_sigma': 1.0, 'trigger_sigma': 1.645,
                          'models': [list(m) for m in MODELS],
+                         'alpha_models': [list(m) for m in ALPHA_MODELS],
+                         'alpha': ('quote mode 3: GLFT fair = mid + kappa * ridge set-B predicted ETHUSDC mid change '
+                                   '(ticks) on the 10ms local grid, visible at its grid time; the ridge is fitted on '
+                                   'the first half only, so compare test_half (second half, fills by exch time)'),
                          'queue_model': 'power_prob(2.0)', 'fill_model': 'no_partial',
                          'maker_fee': 0.0, 'taker_fee': TAKER_FEE,
                          'historical_spec_verified': False, 'maker_zero_fee_verified': False,
@@ -259,9 +283,10 @@ def main():
         except Exception as exc:
             report['fill_sweep_check'] = {'error': f'{type(exc).__name__}: {exc}',
                                           'traceback': traceback.format_exc()[-3000:]}
+        alpha_pred = {}
         try:
             report['alpha_study'] = run_alpha_study(paths['trades'], sig_trades_path, paths['book_ticker'],
-                                                    sig_path, TICK, names=(TARGET, SIGNAL))
+                                                    sig_path, TICK, names=(TARGET, SIGNAL), pred_out=alpha_pred)
         except Exception as exc:
             report['alpha_study'] = {'error': f'{type(exc).__name__}: {exc}',
                                      'traceback': traceback.format_exc()[-3000:]}
@@ -301,7 +326,18 @@ def main():
         from hftbacktest import BacktestAsset, ROIVectorMarketDepthBacktest
         max_steps = int(args.hours * STEPS_PER_HOUR)
         report['variants'] = {}
-        for name, beta, mode in MODELS:
+        empty_ts = np.zeros(0, np.int64)
+        empty_pred = np.zeros(0, np.float64)
+        runs = [(name, beta, mode, empty_ts, empty_pred, 0.0, None) for name, beta, mode in MODELS]
+        need = ['grid_ns', 'test_start_ns'] + [f'B_{h}' for h, _ in ALPHA_KAPPAS]
+        if all(k in alpha_pred for k in need):
+            a_ts = np.ascontiguousarray(alpha_pred['grid_ns'], np.int64)
+            for name, h, kappa in ALPHA_MODELS:
+                runs.append((name, 0.0, 3, a_ts, np.ascontiguousarray(alpha_pred[f'B_{h}'], np.float64), kappa, h))
+        else:
+            report['alpha_variants_skipped'] = 'alpha_study returned no predictions'
+        test_ns = int(alpha_pred['test_start_ns']) if 'test_start_ns' in alpha_pred else None
+        for name, beta, mode, a_ts_m, a_pred_m, kappa, horizon in runs:
             asset = (BacktestAsset().data([str(p) for p in parts]).linear_asset(1.0)
                      .constant_order_latency(LATENCY_NS, LATENCY_NS)
                      .power_prob_queue_model(2.0).no_partial_fill_exchange()
@@ -319,10 +355,16 @@ def main():
             t1 = time.time()
             try:
                 res = run_origin_glft(hbt, max_steps, sig_ts, sig_mid, grid, basis, bsigma, beta, mode, GAMMA,
-                                      mid, eq, pos, fills, fits, diag, intervals)
+                                      mid, eq, pos, fills, fits, diag, intervals, a_ts_m, a_pred_m, kappa)
             finally:
                 hbt.close()
             v = summarize(res, name, beta, mode, mid, eq, pos, fills, fits, diag, intervals)
+            v['test_half'] = second_half(fills[:int(res[1])], eq, int(res[0]), int(res[-1]), test_ns, mid)
+            if mode == 3:
+                dg = v['origin_diag']
+                v['alpha'] = {'horizon': horizon, 'kappa': kappa, 'updates': dg['alpha_updates'],
+                              'mean_abs_shift_ticks': dg['alpha_shift_abs_milliticks'] / 1000.0
+                              / max(dg['decisions'], 1)}
             if mode == 0:
                 lo_ns = int(res[-1])
                 hi_ns = lo_ns + int(res[0]) * STEP_NS
