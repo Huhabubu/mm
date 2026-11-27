@@ -13,6 +13,8 @@ the local clock; features use only rows with local time <= t; target is the ETHU
 Ridge in closed form, train-half standardisation, clip +-10, three nested feature sets: A = ETHUSDC book and
 trade features, B = A + ETHUSDT features and basis, C = B + burst features. First half fit, second half test,
 embargo between them; placebo = target shifted +60s and refit. GBM (depth 3, 100 trees) on set C.
+pred_out (optional dict) receives grid_ns, test_start_ns and the set-B ridge prediction B_<h> (ticks) of every
+horizon on the whole grid, fitted on the first half only; the GLFT alpha backtest (quote mode 3) uses them.
 """
 import time
 
@@ -288,7 +290,7 @@ def shifted(y, k):
 
 
 def run_alpha_study(target_trades, signal_trades, target_bbo, signal_bbo, tick, names=('ETHUSDC', 'ETHUSDT'),
-                    gbm=True):
+                    gbm=True, pred_out=None):
     t_start = time.time()
     tgt, sig = names
     book = {tgt: read_book(target_bbo), sig: read_book(signal_bbo)}
@@ -381,6 +383,12 @@ def run_alpha_study(target_trades, signal_trades, target_bbo, signal_bbo, tick, 
                 if sname == 'C' and kind == 'test':
                     rep['coef_C'][lab] = {fnames[j]: float(b) for j, b in zip(sc, beta)}
             rep['ridge'][sname][lab] = blk
+    if pred_out is not None:
+        pred_out['grid_ns'] = grid
+        pred_out['test_start_ns'] = int(grid[te.start])
+        for hi, (lab, _) in enumerate(GRID_HORIZONS):
+            beta, a0 = ridge_solve(G, s, c[hi], sy[hi], ntr, sets['B'])
+            pred_out[f'B_{lab}'] = predict(F, slice(0, n), sets['B'], beta, a0)
     rep['univariate_r2_pct'] = {}
     for j, nm in enumerate(fnames):
         rep['univariate_r2_pct'][nm] = {}
