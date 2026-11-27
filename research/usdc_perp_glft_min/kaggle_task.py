@@ -242,7 +242,7 @@ def main():
         save()
         try:
             report['wall_study'] = run_wall_study(paths['incremental_book_L2'], paths['trades'], TICK,
-                                                  lo, hi, LATENCY_NS, ORDER_QTY)
+                                                  lo, hi, LATENCY_NS, ORDER_QTY, GAMMA)
         except Exception as exc:
             report['wall_study'] = {'error': f'{type(exc).__name__}: {exc}',
                                     'traceback': traceback.format_exc()[-3000:]}
