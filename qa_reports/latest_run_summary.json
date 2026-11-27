@@ -1,27 +1,27 @@
 {
-  "status": "ok",
-  "qa_status": "passed",
-  "heartbeat_status": "ok",
+  "status": "blocked",
+  "qa_status": "failed",
+  "heartbeat_status": "failed",
   "job_execution_status": "ok",
   "target_window_execution_status": "ok",
   "historical_catchup_status": "ok",
-  "active_window_ready_for_protocol_qa": true,
+  "active_window_ready_for_protocol_qa": false,
   "trigger_mode": "archive_dispatch",
-  "started_at_utc": "2026-11-27T07:33:50Z",
-  "completed_at_utc": "2026-11-27T07:34:56Z",
-  "target_window_utc": "2026-11-27T07:00Z",
-  "expected_archive_revision": "sha256:cbd6a9d7218a7332d6e8e26ea9b692148497f9df1e2e0975ccf4278f93294cf6",
-  "observed_archive_revision": "sha256:cbd6a9d7218a7332d6e8e26ea9b692148497f9df1e2e0975ccf4278f93294cf6",
+  "started_at_utc": "2026-11-27T07:50:52Z",
+  "completed_at_utc": "2026-11-27T07:52:20Z",
+  "target_window_utc": "2026-11-27T07:30Z",
+  "expected_archive_revision": "sha256:e0f591d9293e55807b1a9d4d138933b9ea23b488c4e1552947ad3b0e142c378c",
+  "observed_archive_revision": "sha256:e0f591d9293e55807b1a9d4d138933b9ea23b488c4e1552947ad3b0e142c378c",
   "target_revision_matched": true,
   "target_validation_error": null,
-  "target_window_reused_result": true,
-  "current_window_id": "2026-11-27T07:00Z",
+  "target_window_reused_result": false,
+  "current_window_id": "2026-11-27T07:30Z",
   "current_window_completed": true,
-  "current_window_verification_status": "passed",
-  "latest_due_window_id": "2026-11-27T07:15Z",
-  "latest_due_window_verification_status": "passed",
-  "latest_verified_window_id": "2026-11-27T07:15Z",
-  "latest_verified_window_status": "passed",
+  "current_window_verification_status": "failed",
+  "latest_due_window_id": "2026-11-27T07:30Z",
+  "latest_due_window_verification_status": "failed",
+  "latest_verified_window_id": "2026-11-27T07:30Z",
+  "latest_verified_window_status": "failed",
   "historical_data_quality_status": "has_historical_damage",
   "historical_damaged_windows": [
     "2026-11-22T08:00Z",
@@ -681,8 +681,27 @@
     }
   ],
   "historical_loss_manifests": [],
-  "current_damaged_windows": [],
-  "current_damaged_partitions": [],
+  "current_damaged_windows": [
+    "2026-11-27T07:30Z"
+  ],
+  "current_damaged_partitions": [
+    {
+      "source_manifest": "raw/gate_futures/2026-11-27/gate_futures_20261127_0730_p15m_trial15_20261122_da93ae54.manifest.json",
+      "file_name": "gate_futures_20261127_0730_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "exchange": "gate_futures",
+      "date_utc": "2026-11-27",
+      "window_id": "2026-11-27T07:30Z",
+      "window_span_id": "2026-11-27T07:30Z__2026-11-27T07:45Z_15m",
+      "partition_minutes": 15,
+      "run_id": "trial15_20261122T0745Z",
+      "local_loss_events": 0,
+      "dropped_frames": 0,
+      "gap_start_events": 0,
+      "problems": [
+        "depth unavailable events recorded: 12"
+      ]
+    }
+  ],
   "qa_version": 2,
   "checker_commit_sha": "2e97490cf62fa80029a19c5eb0e38fc0e14f9d56",
   "effective_config_sha256": "b266588d4021978dbe1dcfe0ca29dade8584ef60a7f5de51cdba25401b0c669a",
@@ -694,19 +713,19 @@
   "discovery_mode": "archive_manifest_index",
   "discovery_warnings": [],
   "attempted": 4,
-  "ok": 4,
-  "blocked": 0,
+  "ok": 3,
+  "blocked": 1,
   "needs_review": 0,
   "retry_needed": 0,
   "target_retry_needed": 0,
   "historical_retry_needed": 0,
   "remaining_backlog": 0,
-  "unresolved_blocked": 36,
+  "unresolved_blocked": 37,
   "unresolved_review": 0,
-  "already_checked": 1912,
-  "eligible_manifest_count": 1916,
-  "expected_window_count": 479,
-  "window_reports_written": 479,
+  "already_checked": 1916,
+  "eligible_manifest_count": 1920,
+  "expected_window_count": 480,
+  "window_reports_written": 480,
   "day_reports_written": 6,
   "passed_windows": [
     "2026-11-22T07:45Z",
@@ -1189,7 +1208,8 @@
     "2026-11-26T12:00Z",
     "2026-11-26T18:15Z",
     "2026-11-27T02:00Z",
-    "2026-11-27T02:15Z"
+    "2026-11-27T02:15Z",
+    "2026-11-27T07:30Z"
   ],
   "review_windows": [],
   "archived_pending_qa_windows": [],
@@ -1236,7 +1256,8 @@
       "2026-11-26T12:00Z",
       "2026-11-26T18:15Z",
       "2026-11-27T02:00Z",
-      "2026-11-27T02:15Z"
+      "2026-11-27T02:15Z",
+      "2026-11-27T07:30Z"
     ],
     "verified_passed": [
       "2026-11-22T07:45Z",
@@ -1689,11 +1710,10 @@
     "verified_needs_review": []
   },
   "details": [
-    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-27T07:00Z expected_archive_revision=sha256:cbd6a9d7218a7332d6e8e26ea9b692148497f9df1e2e0975ccf4278f93294cf6 observed_archive_revision=sha256:cbd6a9d7218a7332d6e8e26ea9b692148497f9df1e2e0975ccf4278f93294cf6 checker_commit=2e97490cf62fa80029a19c5eb0e38fc0e14f9d56",
-    "REUSED_TARGET_RESULT run_id=trial15_20261122T0745Z target_window_utc=2026-11-27T07:00Z archive_revision=sha256:cbd6a9d7218a7332d6e8e26ea9b692148497f9df1e2e0975ccf4278f93294cf6 checker_commit=2e97490cf62fa80029a19c5eb0e38fc0e14f9d56 files=4",
-    "PASSED raw/binance_futures/2026-11-27/binance_futures_20261127_0715_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "PASSED raw/bitget_v3/2026-11-27/bitget_v3_20261127_0715_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "PASSED raw/bybit_linear/2026-11-27/bybit_linear_20261127_0715_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "PASSED raw/gate_futures/2026-11-27/gate_futures_20261127_0715_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
+    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-27T07:30Z expected_archive_revision=sha256:e0f591d9293e55807b1a9d4d138933b9ea23b488c4e1552947ad3b0e142c378c observed_archive_revision=sha256:e0f591d9293e55807b1a9d4d138933b9ea23b488c4e1552947ad3b0e142c378c checker_commit=2e97490cf62fa80029a19c5eb0e38fc0e14f9d56",
+    "TARGET PASSED raw/binance_futures/2026-11-27/binance_futures_20261127_0730_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/bitget_v3/2026-11-27/bitget_v3_20261127_0730_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/bybit_linear/2026-11-27/bybit_linear_20261127_0730_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET FAILED raw/gate_futures/2026-11-27/gate_futures_20261127_0730_p15m_trial15_20261122_da93ae54.manifest.json: 1 issues"
   ]
 }
