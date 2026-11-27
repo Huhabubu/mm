@@ -69,9 +69,9 @@ jobs:
           print(json.dumps({k: r.get(k) for k in ("status", "error", "traceback", "elapsed_s", "download_s")}, indent=2))
           for name, v in (r.get("variants") or {}).items():
               print(name, json.dumps({k: v.get(k) for k in ("pnl_usdc", "fills", "turnover_usdc", "submits", "cancels",
-                                                          "max_abs_position_units", "origin_diag", "fit")}))
+                                                          "max_abs_position_units", "origin_diag", "fit", "alpha")}))
           assert r["status"] == "complete"
-          assert len(r["variants"]) == 9
+          assert len(r["variants"]) == 15
           PY
       - uses: actions/upload-artifact@v4
         if: always()
@@ -222,7 +222,7 @@ jobs:
           print(json.dumps({k: r.get(k) for k in ("status", "error", "elapsed_s", "download_s")}, indent=2))
           for name, v in (r.get("variants") or {}).items():
               print(name, json.dumps({k: v.get(k) for k in ("pnl_usdc", "pnl_by_maker_fee_bp", "fills", "turnover_usdc",
-                                                          "max_drawdown_usdc", "max_abs_position_units", "markout")}))
+                                                          "max_drawdown_usdc", "max_abs_position_units", "markout", "test_half")}))
           PY
           fi
       - uses: actions/upload-artifact@v4
@@ -245,5 +245,5 @@ jobs:
           assert s["git_sha"] == os.environ["GITHUB_SHA"], "stale Kaggle output"
           assert s["returncode"] == 0, s
           assert r["status"] == "complete", r.get("error")
-          assert len(r["variants"]) == 9
+          assert len(r["variants"]) == 15
           PY
