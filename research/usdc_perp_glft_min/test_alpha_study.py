@@ -85,7 +85,13 @@ def test_end_to_end():
     os.makedirs(d, exist_ok=True)
     n_bursts = synthetic(d)
     p = lambda f: os.path.join(d, f)
-    rep = run_alpha_study(p('ct.csv'), p('ut.csv'), p('cb.csv'), p('ub.csv'), TICK, gbm=True)
+    po = {}
+    rep = run_alpha_study(p('ct.csv'), p('ut.csv'), p('cb.csv'), p('ub.csv'), TICK, gbm=True, pred_out=po)
+    n = rep['grid']['rows']
+    for key in ('grid_ns', 'B_100ms', 'B_1s', 'B_5s'):
+        assert po[key].shape == (n,), key
+    assert np.all(np.isfinite(po['B_1s'])) and int(po['grid_ns'][0]) == rep['grid']['start_ns']
+    assert po['test_start_ns'] == int(po['grid_ns'][rep['grid']['test_rows'][0]])
     u = rep['events']['ETHUSDT']
     assert u['bursts'] == n_bursts and u['sweeps_exc_ge1'] == n_bursts
     assert sum(b['n'] for b in u['buckets']) == n_bursts
