@@ -1,27 +1,27 @@
 {
-  "status": "ok",
-  "qa_status": "passed",
-  "heartbeat_status": "ok",
+  "status": "blocked",
+  "qa_status": "failed",
+  "heartbeat_status": "failed",
   "job_execution_status": "ok",
   "target_window_execution_status": "ok",
   "historical_catchup_status": "ok",
-  "active_window_ready_for_protocol_qa": true,
+  "active_window_ready_for_protocol_qa": false,
   "trigger_mode": "archive_dispatch",
-  "started_at_utc": "2026-11-28T13:35:46Z",
-  "completed_at_utc": "2026-11-28T13:36:49Z",
-  "target_window_utc": "2026-11-28T13:15Z",
-  "expected_archive_revision": "sha256:4092acd560428105b32ac3969388015dfa0c97808f27d0d614278a87cbdcf2a0",
-  "observed_archive_revision": "sha256:4092acd560428105b32ac3969388015dfa0c97808f27d0d614278a87cbdcf2a0",
+  "started_at_utc": "2026-11-28T13:50:47Z",
+  "completed_at_utc": "2026-11-28T13:52:25Z",
+  "target_window_utc": "2026-11-28T13:30Z",
+  "expected_archive_revision": "sha256:68aa913f17b7c4419b1c8db3185142adc699856d98b23649df09f39ce6540c5a",
+  "observed_archive_revision": "sha256:68aa913f17b7c4419b1c8db3185142adc699856d98b23649df09f39ce6540c5a",
   "target_revision_matched": true,
   "target_validation_error": null,
   "target_window_reused_result": false,
-  "current_window_id": "2026-11-28T13:15Z",
+  "current_window_id": "2026-11-28T13:30Z",
   "current_window_completed": true,
-  "current_window_verification_status": "passed",
-  "latest_due_window_id": "2026-11-28T13:15Z",
-  "latest_due_window_verification_status": "passed",
-  "latest_verified_window_id": "2026-11-28T13:15Z",
-  "latest_verified_window_status": "passed",
+  "current_window_verification_status": "failed",
+  "latest_due_window_id": "2026-11-28T13:30Z",
+  "latest_due_window_verification_status": "failed",
+  "latest_verified_window_id": "2026-11-28T13:30Z",
+  "latest_verified_window_status": "failed",
   "historical_data_quality_status": "has_historical_damage",
   "historical_damaged_windows": [
     "2026-11-22T08:00Z",
@@ -715,8 +715,28 @@
     }
   ],
   "historical_loss_manifests": [],
-  "current_damaged_windows": [],
-  "current_damaged_partitions": [],
+  "current_damaged_windows": [
+    "2026-11-28T13:30Z"
+  ],
+  "current_damaged_partitions": [
+    {
+      "source_manifest": "raw/bitget_v3/2026-11-28/bitget_v3_20261128_1330_p15m_trial15_20261122_da93ae54.manifest.json",
+      "file_name": "bitget_v3_20261128_1330_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "exchange": "bitget_v3",
+      "date_utc": "2026-11-28",
+      "window_id": "2026-11-28T13:30Z",
+      "window_span_id": "2026-11-28T13:30Z__2026-11-28T13:45Z_15m",
+      "partition_minutes": 15,
+      "run_id": "trial15_20261122T0745Z",
+      "local_loss_events": 0,
+      "dropped_frames": 0,
+      "gap_start_events": 1,
+      "problems": [
+        "recorded loss/gap events: loss=0, gap_start=1",
+        "depth unavailable events recorded: 11"
+      ]
+    }
+  ],
   "qa_version": 2,
   "checker_commit_sha": "2e97490cf62fa80029a19c5eb0e38fc0e14f9d56",
   "effective_config_sha256": "b266588d4021978dbe1dcfe0ca29dade8584ef60a7f5de51cdba25401b0c669a",
@@ -728,19 +748,19 @@
   "discovery_mode": "archive_manifest_index",
   "discovery_warnings": [],
   "attempted": 4,
-  "ok": 4,
-  "blocked": 0,
+  "ok": 3,
+  "blocked": 1,
   "needs_review": 0,
   "retry_needed": 0,
   "target_retry_needed": 0,
   "historical_retry_needed": 0,
   "remaining_backlog": 0,
-  "unresolved_blocked": 38,
+  "unresolved_blocked": 39,
   "unresolved_review": 0,
-  "already_checked": 2392,
-  "eligible_manifest_count": 2396,
-  "expected_window_count": 599,
-  "window_reports_written": 599,
+  "already_checked": 2396,
+  "eligible_manifest_count": 2400,
+  "expected_window_count": 600,
+  "window_reports_written": 600,
   "day_reports_written": 7,
   "passed_windows": [
     "2026-11-22T07:45Z",
@@ -1343,7 +1363,8 @@
     "2026-11-27T02:00Z",
     "2026-11-27T02:15Z",
     "2026-11-27T07:30Z",
-    "2026-11-27T18:00Z"
+    "2026-11-27T18:00Z",
+    "2026-11-28T13:30Z"
   ],
   "review_windows": [],
   "archived_pending_qa_windows": [],
@@ -1392,7 +1413,8 @@
       "2026-11-27T02:00Z",
       "2026-11-27T02:15Z",
       "2026-11-27T07:30Z",
-      "2026-11-27T18:00Z"
+      "2026-11-27T18:00Z",
+      "2026-11-28T13:30Z"
     ],
     "verified_passed": [
       "2026-11-22T07:45Z",
@@ -1963,10 +1985,10 @@
     "verified_needs_review": []
   },
   "details": [
-    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-28T13:15Z expected_archive_revision=sha256:4092acd560428105b32ac3969388015dfa0c97808f27d0d614278a87cbdcf2a0 observed_archive_revision=sha256:4092acd560428105b32ac3969388015dfa0c97808f27d0d614278a87cbdcf2a0 checker_commit=2e97490cf62fa80029a19c5eb0e38fc0e14f9d56",
-    "TARGET PASSED raw/binance_futures/2026-11-28/binance_futures_20261128_1315_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/bitget_v3/2026-11-28/bitget_v3_20261128_1315_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/bybit_linear/2026-11-28/bybit_linear_20261128_1315_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
-    "TARGET PASSED raw/gate_futures/2026-11-28/gate_futures_20261128_1315_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
+    "TARGET_DISPATCH trigger=archive_dispatch run_id=trial15_20261122T0745Z target_window_utc=2026-11-28T13:30Z expected_archive_revision=sha256:68aa913f17b7c4419b1c8db3185142adc699856d98b23649df09f39ce6540c5a observed_archive_revision=sha256:68aa913f17b7c4419b1c8db3185142adc699856d98b23649df09f39ce6540c5a checker_commit=2e97490cf62fa80029a19c5eb0e38fc0e14f9d56",
+    "TARGET PASSED raw/binance_futures/2026-11-28/binance_futures_20261128_1330_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET FAILED raw/bitget_v3/2026-11-28/bitget_v3_20261128_1330_p15m_trial15_20261122_da93ae54.manifest.json: 2 issues",
+    "TARGET PASSED raw/bybit_linear/2026-11-28/bybit_linear_20261128_1330_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues",
+    "TARGET PASSED raw/gate_futures/2026-11-28/gate_futures_20261128_1330_p15m_trial15_20261122_da93ae54.manifest.json: 0 issues"
   ]
 }
