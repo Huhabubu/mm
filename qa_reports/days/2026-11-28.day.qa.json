@@ -10,9 +10,8 @@
     "trial15_20261122T0745Z"
   ],
   "expected_windows_count": 96,
-  "observed_windows_count": 67,
+  "observed_windows_count": 68,
   "missing_windows": [
-    "2026-11-28T16:45Z",
     "2026-11-28T17:00Z",
     "2026-11-28T17:15Z",
     "2026-11-28T17:30Z",
@@ -43,7 +42,8 @@
     "2026-11-28T23:45Z"
   ],
   "failed_windows": [
-    "2026-11-28T13:30Z"
+    "2026-11-28T13:30Z",
+    "2026-11-28T16:45Z"
   ],
   "overdue_windows": [],
   "pending_windows": [],
@@ -64,7 +64,7 @@
       "trial15_20261122T0745Z_1795333473410706867"
     ]
   },
-  "clock_certified_minutes": 1009,
+  "clock_certified_minutes": 1024,
   "clock_certification_passed": false,
   "startup_stub_segments": [],
   "damaged_partitions": [
@@ -75,6 +75,21 @@
       "run_id": "trial15_20261122T0745Z",
       "file_name": "bitget_v3_20261128_1330_p15m_trial15_20261122_da93ae54.tsv.zst",
       "source_manifest": "raw/bitget_v3/2026-11-28/bitget_v3_20261128_1330_p15m_trial15_20261122_da93ae54.manifest.json",
+      "qa_status": "failed",
+      "local_loss_events": 0,
+      "gap_start_events": 1,
+      "problems": [
+        "recorded loss/gap events: loss=0, gap_start=1",
+        "depth unavailable events recorded: 11"
+      ]
+    },
+    {
+      "exchange": "bitget_v3",
+      "window_id": "2026-11-28T16:45Z",
+      "window_span_id": "2026-11-28T16:45Z__2026-11-28T17:00Z_15m",
+      "run_id": "trial15_20261122T0745Z",
+      "file_name": "bitget_v3_20261128_1645_p15m_trial15_20261122_da93ae54.tsv.zst",
+      "source_manifest": "raw/bitget_v3/2026-11-28/bitget_v3_20261128_1645_p15m_trial15_20261122_da93ae54.manifest.json",
       "qa_status": "failed",
       "local_loss_events": 0,
       "gap_start_events": 1,
