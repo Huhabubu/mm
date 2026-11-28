@@ -1,21 +1,16 @@
-"""Unified Gate GLFT HBT loop: legacy baseline, Stage3 diagnostics, Stage4 controls, Stage5A pause.\n\nFresh Gate GLFT research branch: sigma gate, Binance-origin filter and two quote modes.
-
-Copied the event/reply/queue/fee/accounting backbone from g0_glft_event_driven
-without modifying that module. Gate-specific signal/price transformation is
-the only change to core strategy decisions; no prior P90 filter or L2 wall.
-"""
+"""Unified event-driven GLFT and cross-exchange quotation engine."""
 import math
 import numpy as np
 from numba import njit
 from hftbacktest import BUY, BUY_EVENT, SELL, GTX, LIMIT, FILLED
-from g0_glft_baseline import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TICK, TRAIN
-from g0_glft_rolling import (UPDATE_EVERY_STEPS, fit_recent_arrivals,
+from glft_calibration import CTVAL, GAMMA, ORDER_QTY, POSITION_CAP, STEP_NS, TICK, TRAIN
+from glft_calibration import (UPDATE_EVERY_STEPS, fit_recent_arrivals,
                              fit_physical_1tick_poisson, glft_coefficients)
 from core_glft_rules import (quoted_ticks, dual_grid_quoted_ticks, last_visible_bid_tick,
     last_visible_ask_tick, cap_quotes_to_visible_depth,
     book_update_unlocks, note_order_operation, same_microsecond_target_feed,
     inventory_sample_is_live)
-from g0_glft_event_driven import MIN_REQUOTE_NS, summarize
+from execution_metrics import MIN_REQUOTE_NS, summarize
 @njit
 def gate_origin_filter(gap, sigma, binance_price, gate_price, base_b, base_m,
                        has_base, active, binance_price_changed, gate_feed_same_time):

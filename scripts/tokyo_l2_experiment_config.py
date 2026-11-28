@@ -1,4 +1,4 @@
-"""Unified experiment configuration loader and validator for Tokyo L2 & Tardis research."""
+"""Unified experiment configuration loader and validator for self-collected Tokyo L2 research."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -16,7 +16,7 @@ from tokyo_l2_exchange_adapters import (
     to_native_symbol,
 )
 
-DATA_SOURCES = ("google_drive_tokyo_l2", "tardis")
+DATA_SOURCES = ("google_drive_tokyo_l2",)
 ALL_STAGES = ("stage1", "stage2", "stage3", "stage4", "stage5a", "stage5b", "stage5c")
 CORE_MODELS = ("glft", "both_1p0", "defensive_1p0", "risk_side_pause")
 CONTROL_MODELS = ("static_widen", "local_vol_pause")
@@ -244,47 +244,3 @@ def config_digest(cfg: dict[str, Any]) -> str:
 def load_experiment_config(path: str | Path) -> dict[str, Any]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return validate_config(raw)
-
-
-def tardis_legacy_config(
-    *,
-    making_exchange: str = "gate_futures",
-    symbol: str = "BTC",
-    eval_dates: list[str] | None = None,
-    models: list[str] | None = None,
-    stages: list[str] | None = None,
-) -> dict[str, Any]:
-    """Historical Tardis regression preset preserving 2.5ms Binance delay, 20ms cooldown, legacy clamp."""
-    return validate_config({
-        "experiment_name": f"tardis_legacy_{making_exchange}_{symbol.lower()}",
-        "data_source": "tardis",
-        "signal_exchange": "binance_futures",
-        "making_exchange": making_exchange,
-        "symbol": symbol,
-        "dates": {
-            "eval_dates": eval_dates or ["2026-06-01"],
-            "train_dates": [],
-            "holdout_dates": [],
-            "holdout_chronology": "historical_robustness",
-        },
-        "strategy": {
-            "post_only_clamp_mode": "legacy",
-            "cross_timestamp_tie_mode": "legacy_ns",
-        },
-        "latency": {
-            "binance_extra_visible_delay_ns": 2_500_000,
-            "order_entry_latency_ns": 1_000_000,
-            "order_response_latency_ns": 1_000_000,
-            "order_latency_assumption_note": "Frozen Tardis 2.5ms external delay + 1ms/1ms order latency",
-        },
-        "order_controls": {
-            "min_requote_ns": 20_000_000,
-            "native_order_modify_enabled": False,
-        },
-        "models": models or list(CORE_MODELS),
-        "stages": stages or ["stage1", "stage2", "stage3", "stage5a", "stage5b"],
-        "stage5c": {
-            "authorized": False,
-            "selection_metric": "net_marked_pnl_usdt_2bps",
-        },
-    })

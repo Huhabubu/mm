@@ -676,10 +676,10 @@ def run_unified_experiment(
 
         stage4_lock = None
         if cfg["stage4"].get("lock_file"):
-            stage4_lock = json.loads(Path(cfg["stage4"]["lock_file"]).read_text(encoding="utf-8"))
+            stage4_lock = json.loads(_resolve_config_path(cfg["stage4"]["lock_file"]).read_text(encoding="utf-8"))
         stage5c_lock = None
         if cfg["stage5c"].get("lock_file"):
-            stage5c_lock = json.loads(Path(cfg["stage5c"]["lock_file"]).read_text(encoding="utf-8"))
+            stage5c_lock = json.loads(_resolve_config_path(cfg["stage5c"]["lock_file"]).read_text(encoding="utf-8"))
 
         SCRATCH.mkdir(parents=True, exist_ok=True)
         for date_utc in cfg["dates"]["eval_dates"]:
@@ -1169,11 +1169,11 @@ def run_batch_experiments(
                 arrays = _load_converted_arrays(arts)
 
                 stage4_lock = (
-                    json.loads(Path(cfg["stage4"]["lock_file"]).read_text(encoding="utf-8"))
+                    json.loads(_resolve_config_path(cfg["stage4"]["lock_file"]).read_text(encoding="utf-8"))
                     if cfg["stage4"].get("lock_file") else None
                 )
                 stage5c_lock = (
-                    json.loads(Path(cfg["stage5c"]["lock_file"]).read_text(encoding="utf-8"))
+                    json.loads(_resolve_config_path(cfg["stage5c"]["lock_file"]).read_text(encoding="utf-8"))
                     if cfg["stage5c"].get("lock_file") else None
                 )
                 research = run_models_on_arrays(

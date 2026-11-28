@@ -20,20 +20,15 @@
     "scripts/tokyo_l2_bt_stream_convert.py",
     "scripts/core_glft_engine.py",
     "scripts/core_glft_rules.py",
-    "scripts/g0_glft_baseline.py",
-    "scripts/g0_glft_rolling.py",
-    "scripts/g0_glft_event_driven.py",
-    "scripts/check_okx_hft_data.py",
-    "scripts/inspect_tardis.py",
-    "scripts/gate_basis_weighted_moments.py",
-    "scripts/analyze_gate_1645_fill_quality.py",
-    "scripts/audit_gate_stage5b_same_fill.py",
-    "kaggle/tasks/full_day_glft.py"
+    "scripts/glft_calibration.py",
+    "scripts/execution_metrics.py",
+    "scripts/cross_exchange_signal.py",
+    "scripts/fill_quality.py"
   ],
   "qa_days_dates": [
     "2026-11-23"
   ],
   "qa_protocol_date": "2026-11-23",
   "timeout_minutes": 320,
-  "note": "Unified batch full-day (2026-11-23 UTC) HBT 2.4.4 backtest & Stage 1/2/3/5A/5B research run for 3 pairs sequentially in one Kaggle job: Binance->Gate ETH, Binance->Bybit BTC, Binance->Bitget BTC. Single-pass shared Binance @bookTicker extraction (BTC+ETH) reused across all 3 pairs; 4 core models (glft, both_1p0, defensive_1p0, risk_side_pause); 0ms Binance delay, 1ms/1ms order latency, 0ms cooldown, primary zero-fee; Stage 4 & 5C remain pending."
+  "note": "Example only: previously explored diagnostic date; explicit local submission required."
 }

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Build a new version of the EXISTING private Kaggle notebook from a job spec.
 
-Runs inside GitHub Actions only. The notebook gets one code cell that unpacks a
+Invoked locally with a staged code and QA snapshot. The notebook gets one code cell that unpacks a
 code bundle (this branch's kaggle/ + listed scripts + frozen collector code) and
 runs the job's task with stdout tee'd to /kaggle/working/run.log. Nothing secret
-is embedded: Drive credentials are read on Kaggle via the notebook's own
-attached User Secrets.
+is embedded: Drive credentials are read on Kaggle from the existing private credential dataset.
 """
 from __future__ import annotations
 

@@ -2,10 +2,10 @@
 
 Reuses:
   - `scripts/core_glft_engine.py::run_core_glft` (sole core strategy implementation)
-  - `scripts/g0_glft_event_driven.py::summarize`
-  - `scripts/gate_basis_weighted_moments.py::exact_moments_5s`
-  - `scripts/analyze_gate_1645_fill_quality.py::model_day`, `HORIZONS`, `stats`
-  - `scripts/audit_gate_stage5b_same_fill.py::check_equal_stage2_stage3`, `summarize_horizon`
+  - `scripts/execution_metrics.py::summarize`
+  - `scripts/cross_exchange_signal.py::exact_moments_5s`
+  - `scripts/fill_quality.py::model_day`, `HORIZONS`, `stats`
+  - `scripts/fill_quality.py::check_equal_stage2_stage3`, `summarize_horizon`
   - `scripts/tokyo_l2_exchange_adapters.py`
   - `scripts/tokyo_l2_experiment_config.py`
 
@@ -86,7 +86,7 @@ def descriptive_anomaly_impact(
     active_begin_ns: int,
 ) -> dict[str, Any]:
     """Descriptive interruption-impact diagnostics (official HBT fills are never altered/deleted)."""
-    from analyze_gate_1645_fill_quality import HORIZONS as FQ_HORIZONS, stats
+    from fill_quality import HORIZONS as FQ_HORIZONS, stats
 
     t_obs = np.asarray(annotated["local_observed_ns"], dtype=np.int64)
     t_exch = np.asarray(annotated["exchange_timestamp_ns"], dtype=np.int64)
@@ -531,7 +531,7 @@ def run_stage3_shadow_audit(
     """Run read-only shadow replay of baseline `glft`, verify bit-for-bit parity, and summarize Stage 3."""
     from hftbacktest import Recorder, ROIVectorMarketDepthBacktest
     from core_glft_engine import run_core_glft
-    from g0_glft_event_driven import summarize
+    from execution_metrics import summarize
 
     base_fills = baseline_result["fills"]
     base_trading = baseline_result["trading"]
@@ -828,7 +828,7 @@ def run_stage5b_same_fill_audit(
     comparison_fills: dict[str, dict[str, np.ndarray]] | None = None,
 ) -> dict[str, Any]:
     """Same-fill Stage 5B decomposition aligning Stage 2 annotations and Stage 3 shadow classes."""
-    from audit_gate_stage5b_same_fill import check_equal_stage2_stage3, summarize_horizon
+    from fill_quality import check_equal_stage2_stage3, summarize_horizon
 
     groups = check_equal_stage2_stage3(stage3_classified, stage2_annotated_glft, date_utc)
     n_fills = int(len(groups))
@@ -1208,9 +1208,9 @@ def run_models_on_arrays(
     """
     from hftbacktest import BacktestAsset, Recorder, ROIVectorMarketDepthBacktest
     from core_glft_engine import run_core_glft
-    from gate_basis_weighted_moments import exact_moments_5s
-    from g0_glft_event_driven import summarize
-    from analyze_gate_1645_fill_quality import model_day
+    from cross_exchange_signal import exact_moments_5s
+    from execution_metrics import summarize
+    from fill_quality import model_day
 
     cfg = validate_config(config)
     strat = cfg["strategy"]
